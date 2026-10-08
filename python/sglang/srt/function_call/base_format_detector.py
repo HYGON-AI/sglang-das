@@ -362,6 +362,18 @@ class BaseFormatDetector(ABC):
         """Return True if this detector supports structural tag format."""
         return True
 
+    def supports_structural_tag_for_tool_choice(
+        self,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]],
+    ) -> bool:
+        """Return whether this tool choice should use the native tag format.
+
+        Most detectors use their native structural tag for every constrained
+        tool choice.  A detector may narrow this when a particular tag shape
+        is unsafe while retaining native tags for other choices.
+        """
+        return self.supports_structural_tag()
+
     def parses_required_natively(self) -> bool:
         """Return True if ``tool_choice="required"`` must skip grammar
         constraints and parse the model's native output format instead."""

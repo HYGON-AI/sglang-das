@@ -486,7 +486,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
     get_model,
-    get_parallel,
     get_serving,
 )
 
@@ -675,43 +674,99 @@ async def health_generate(request: Request) -> Response:
     ):
         return Response(status_code=200)
 
+    tokenizer_manager = _global_state.tokenizer_manager
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
-    # uuid keeps rids unique across tokenizer workers (a bare time.time() can
-    # collide and crash the shared DetokenizerManager decode_status).
-    rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
-
-    if _global_state.tokenizer_manager.is_generation:
+    health_dp_size = (
+        tokenizer_manager.elastic_worker_count
+        if tokenizer_manager.server_args.enable_dp_attention
+        else 1
+    )
+    health_requests = []
+    if tokenizer_manager.is_generation and health_dp_size > 1:
+        # One native batch is a single scheduler message, so every explicitly
+        # routed DP item is admitted in the same model-collective round.
+        # Independent scalar tasks race at the scheduler boundary: one DP can
+        # enter FlashMLA/MoE while its peer is still idle and deadlock startup.
+        rids = [
+            f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
+            for _ in range(health_dp_size)
+        ]
         gri = GenerateReqInput(
-            rid=rid,
-            input_ids=[0],
+            rid=rids,
+            input_ids=[[0] for _ in range(health_dp_size)],
             sampling_params=sampling_params,
             log_metrics=False,
+            routed_dp_rank=list(range(health_dp_size)),
         )
         if get_disagg().disaggregation_mode != DisaggregationMode.NULL.value:
-            gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
-            gri.bootstrap_room = 0
+            gri.bootstrap_host = [FAKE_BOOTSTRAP_HOST] * health_dp_size
+            gri.bootstrap_room = list(range(health_dp_size))
+        health_requests.append(gri)
     else:
-        gri = EmbeddingReqInput(
-            rid=rid, input_ids=[0], sampling_params=sampling_params, log_metrics=False
-        )
+        for dp_rank in range(health_dp_size):
+            # uuid keeps rids unique across tokenizer workers (a bare time.time()
+            # can collide and crash the shared DetokenizerManager decode_status).
+            rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
+            if tokenizer_manager.is_generation:
+                gri = GenerateReqInput(
+                    rid=rid,
+                    input_ids=[0],
+                    sampling_params=sampling_params,
+                    log_metrics=False,
+                    routed_dp_rank=dp_rank if health_dp_size > 1 else None,
+                )
+                if get_disagg().disaggregation_mode != DisaggregationMode.NULL.value:
+                    gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
+                    gri.bootstrap_room = dp_rank
+            else:
+                gri = EmbeddingReqInput(
+                    rid=rid,
+                    input_ids=[0],
+                    sampling_params=sampling_params,
+                    log_metrics=False,
+                )
+                if health_dp_size > 1:
+                    gri.routed_dp_rank = dp_rank
+            health_requests.append(gri)
 
-    async def gen():
-        async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
+    async def gen(gri):
+        async for _ in tokenizer_manager.generate_request(gri, request):
             break
 
-    task = asyncio.create_task(gen())
+    tasks = [asyncio.create_task(gen(gri)) for gri in health_requests]
+
+    # Cross-DP model collectives require every attention-DP rank to enter the
+    # same forward.  Wait for the complete fan-out instead of returning after
+    # the first detokenizer heartbeat and cancelling a peer mid-collective.
+    if health_dp_size > 1:
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=HEALTH_CHECK_TIMEOUT)
+        except Exception:
+            for task in tasks:
+                task.cancel()
+            for gri in health_requests:
+                rids = gri.rid if isinstance(gri.rid, list) else [gri.rid]
+                for rid in rids:
+                    tokenizer_manager.rid_to_state.pop(rid, None)
+            tokenizer_manager.server_status = ServerStatus.UnHealthy
+            logger.exception(
+                "DP-attention health check failed for %s ranks", health_dp_size
+            )
+            return Response(status_code=503)
+        tokenizer_manager.server_status = ServerStatus.Up
+        return Response(status_code=200)
 
     # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
     tic = time.time()
     while time.time() < tic + HEALTH_CHECK_TIMEOUT:
         await asyncio.sleep(1)
-        if _global_state.tokenizer_manager.last_receive_tstamp > tic:
-            task.cancel()
-            _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+        if tokenizer_manager.last_receive_tstamp > tic:
+            tasks[0].cancel()
+            tokenizer_manager.rid_to_state.pop(health_requests[0].rid, None)
+            tokenizer_manager.server_status = ServerStatus.Up
             return Response(status_code=200)
 
-    task.cancel()
+    tasks[0].cancel()
     tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
     last_receive_time = time.strftime(
         "%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp)
@@ -721,8 +776,8 @@ async def health_generate(request: Request) -> Response:
         f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
         f"last_heartbeat time: {last_receive_time}"
     )
-    _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-    _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+    tokenizer_manager.rid_to_state.pop(health_requests[0].rid, None)
+    tokenizer_manager.server_status = ServerStatus.UnHealthy
     return Response(status_code=503)
 
 
@@ -2177,10 +2232,7 @@ async def _send_disaggregation_warmup_requests(
         headers=headers,
     ) as session:
         return await asyncio.gather(
-            *(
-                send_request(session, dp_rank)
-                for dp_rank in range(get_parallel().dp_size)
-            )
+            *(send_request(session, dp_rank) for dp_rank in range(server_args.dp_size))
         )
 
 
@@ -2223,27 +2275,54 @@ def _execute_server_warmup(server_args: ServerArgs):
         and not server_args.language_model_only
         and not is_mps()
     )
+    needs_dp_attention_fanout = (
+        server_args.enable_dp_attention and server_args.dp_size > 1
+    )
     if model_info["is_generation"]:
-        if is_vlm and not server_args.skip_tokenizer_init:
+        # VLM preprocessing is synchronous in the HTTP event loop.  If the
+        # first VLM request reaches a cross-DP model collective before the
+        # second request finishes preprocessing, startup deadlocks.  Use the
+        # native text endpoint for the model warmup so all DP ranks can be
+        # dispatched concurrently.  Vision inputs still use their normal path
+        # after the server is ready.
+        if (
+            is_vlm
+            and not server_args.skip_tokenizer_init
+            and not needs_dp_attention_fanout
+        ):
             request_name = "/v1/chat/completions"
         else:
             request_name = "/generate"
     else:
         request_name = "/encode"
-    max_new_tokens = 8 if model_info["is_generation"] else 1
+    # One token is sufficient to execute the full prefill path.  DP-attention
+    # ranks may have different local decode batch shapes, so a multi-token
+    # startup request can enter decode-only collectives with incompatible
+    # tensor sizes.  Keep the generic warmup depth for other topologies.
+    max_new_tokens = (
+        1
+        if model_info["is_generation"] and needs_dp_attention_fanout
+        else 8 if model_info["is_generation"] else 1
+    )
     json_data = {
         "sampling_params": {
             "temperature": 0,
             "max_new_tokens": max_new_tokens,
         },
     }
+    dp_attention_fanout = needs_dp_attention_fanout and request_name in (
+        "/generate",
+        "/encode",
+        "/v1/chat/completions",
+    )
     if server_args.skip_tokenizer_init:
-        json_data["input_ids"] = [[10, 11, 12] for _ in range(get_parallel().dp_size)]
+        json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
         # TODO Workaround the bug that embedding errors for list of size 1
-        if get_parallel().dp_size == 1:
+        if server_args.dp_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
     elif (
         is_vlm
+        and not dp_attention_fanout
         and get_disagg().disaggregation_mode == "null"
         and model_info["is_generation"]
     ):
@@ -2284,9 +2363,9 @@ def _execute_server_warmup(server_args: ServerArgs):
             "temperature": 0.0,
         }
     else:
-        json_data["text"] = ["The capital city of France is"] * get_parallel().dp_size
+        json_data["text"] = ["The capital city of France is"] * server_args.dp_size
         # TODO Workaround the bug that embedding errors for list of size 1
-        if get_parallel().dp_size == 1:
+        if server_args.dp_size == 1:
             json_data["text"] = json_data["text"][0]
 
     # Config debug dumping
@@ -2301,14 +2380,29 @@ def _execute_server_warmup(server_args: ServerArgs):
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
         if get_disagg().disaggregation_mode == "null":
-            res = requests.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=warmup_timeout if warmup_timeout > 0 else 600,
-                verify=ssl_verify,
-            )
-            assert res.status_code == 200, f"{res.text}"
+            if dp_attention_fanout:
+                json_data["routed_dp_rank"] = list(range(server_args.dp_size))
+                res = requests.post(
+                    url + request_name,
+                    json=json_data,
+                    headers=headers,
+                    timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                    verify=ssl_verify,
+                )
+                assert res.status_code == 200, f"{res.text}"
+                logger.info(
+                    "DP-attention warmup requests completed for all %s DP ranks",
+                    server_args.dp_size,
+                )
+            else:
+                res = requests.post(
+                    url + request_name,
+                    json=json_data,
+                    headers=headers,
+                    timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                    verify=ssl_verify,
+                )
+                assert res.status_code == 200, f"{res.text}"
             # Skip server_status update for Rust server
             if not envs.SGLANG_RUST_SERVER.get():
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
@@ -2328,7 +2422,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             if not failed_status_codes:
                 logger.info(
                     "Disaggregation warmup requests completed for all %s DP ranks",
-                    get_parallel().dp_size,
+                    server_args.dp_size,
                 )
                 logger.info("End of disaggregation warmup")
             else:

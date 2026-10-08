@@ -2552,7 +2552,7 @@ class ServerArgs:
         NS("exec.moe"),
     ] = 0
     ep_dispatch_algorithm: A[
-        Optional[Literal["static", "dynamic", "fake", "lp"]],
+        Optional[Literal["static", "dynamic", "fake", "lp", "load_aware"]],
         "The algorithm to choose ranks for redundant experts in expert parallel.",
         NS("exec.moe"),
     ] = None
@@ -3634,6 +3634,51 @@ class ServerArgs:
         ),
         NS("schedule"),
     ] = None
+    enable_prefill_idle_coalescing: A[
+        bool,
+        (
+            "When the engine is idle, briefly delay its first prefill batch so "
+            "concurrently arriving requests can join it. Queue growth resets a "
+            "short settle window, allowing natural BS2/4/8/16/32 formation. "
+            "Does not affect refill scheduling while a batch is running. "
+            "Disabled by default."
+        ),
+        NS("schedule"),
+    ] = False
+    prefill_idle_coalesce_max_delay_ms: A[
+        float,
+        (
+            "Maximum wall-clock delay in milliseconds for idle first-request "
+            "coalescing. Once reached, the single request is released."
+        ),
+        NS("schedule"),
+    ] = 50.0
+    prefill_idle_coalesce_settle_ms: A[
+        float,
+        (
+            "Queue quiet time in milliseconds before releasing an idle batch "
+            "containing at least two requests. Queue growth resets this timer."
+        ),
+        NS("schedule"),
+    ] = 10.0
+    prefill_idle_coalesce_burst_max_delay_ms: A[
+        float,
+        (
+            "Maximum total idle coalescing delay in milliseconds after a "
+            "second request has formed a burst. This is separate from the "
+            "smaller single-request delay bound."
+        ),
+        NS("schedule"),
+    ] = 500.0
+    prefill_idle_coalesce_max_batch_size: A[
+        int,
+        (
+            "Maximum request count collected by idle prefill coalescing. The "
+            "batch is released immediately at this size; ordinary scheduler "
+            "token and KV capacity checks still apply."
+        ),
+        NS("schedule"),
+    ] = 32
 
     # -------------------------------------------------------------------------
     # Deterministic inference
@@ -7244,9 +7289,21 @@ class ServerArgs:
             ), "Aiter allreduce fusion is not supported with context parallelism"
 
         if view.attn_cp_size != self.moe_dp_size:
-            assert (
-                self.moe_dp_size == 1
-            ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+            # DP attention and MoE-DP may use the same DP partition while CP is
+            # disabled. In that layout (EP=1, attn-DP == MoE-DP), attention TP
+            # and MoE TP are identical contiguous rank groups, so no CP token
+            # sharing is required.
+            moe_dp_matches_attn_dp = (
+                self.enable_dp_attention
+                and view.attn_cp_size == 1
+                and self.moe_dp_size == self.dp_size
+                and view.ep_size == 1
+            )
+            assert self.moe_dp_size == 1 or moe_dp_matches_attn_dp, (
+                "attn_cp_size != moe_dp_size requires moe_dp_size == 1, or "
+                "the aligned DP-attention layout: attn_cp_size=1, ep_size=1, "
+                "and moe_dp_size=dp_size"
+            )
 
         from sglang.srt.layers.cp.base import init_cp_strategy
 
@@ -7763,10 +7820,12 @@ class ServerArgs:
             )
 
         # `dynamic` / `fake` switch to the row-index pick; `static` reads a
-        # per-rank table and `lp` samples inside its kernel.
+        # per-rank table; `lp` and `load_aware` solve the current batch and
+        # sample inside their kernels.
         if needs_rank_invariant_dispatch and self.ep_dispatch_algorithm in (
             "static",
             "lp",
+            "load_aware",
         ):
             raise ValueError(
                 f"--ep-dispatch-algorithm {self.ep_dispatch_algorithm} picks a "
@@ -7774,6 +7833,18 @@ class ServerArgs:
                 "a2a backend routes each token to a single rank. Use "
                 "--ep-dispatch-algorithm dynamic with --moe-a2a-backend none."
             )
+
+        if self.ep_dispatch_algorithm == "load_aware":
+            if not is_hip():
+                raise ValueError(
+                    "--ep-dispatch-algorithm load_aware is currently supported "
+                    "only on ROCm."
+                )
+            if self.ep_num_redundant_experts <= 0:
+                raise ValueError(
+                    "--ep-dispatch-algorithm load_aware requires "
+                    "--ep-num-redundant-experts > 0."
+                )
 
         if self.enable_eplb and self.ep_join_mode != "scale":
             assert self._resolved().ep_size > 1

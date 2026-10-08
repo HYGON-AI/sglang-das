@@ -173,7 +173,9 @@ void rotary_embedding(
   int64_t head_stride = (query_ndim == positions_ndim + 2) ? query.stride(-2) : head_size;
 
   dim3 grid(num_tokens);
-  dim3 block(std::min<int64_t>(num_heads * rot_dim / 2, 512));
+  // HCU rejects launches above the compiled 256-thread bound. The kernel
+  // already strides by blockDim.x, so 256 covers every element.
+  dim3 block(std::min<int64_t>(num_heads * rot_dim / 2, 256));
   const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   DISPATCH_FLOAT_TYPES(query.scalar_type(), "rotary_embedding", [&] {

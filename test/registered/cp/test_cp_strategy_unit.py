@@ -318,12 +318,42 @@ class TestCPZigzagStrategy(CustomTestCase):
             self.assertFalse(enable_cp_v2())
             self.assertFalse(is_cp_v2_active(active_batch))
 
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
+        with (
+            patch("sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True),
+            patch(
+                "sglang.srt.environ.envs.SGLANG_PREFILL_CP_MIN_TOKENS_PER_SEQUENCE.get",
+                return_value=0,
+            ),
         ):
             self.assertTrue(enable_cp_v2())
             self.assertTrue(is_cp_v2_active(active_batch))
             self.assertFalse(is_cp_v2_active(inactive_batch))
+
+    def test_cp_v2_min_tokens_is_enforced_per_sequence(self):
+        strategy = ZigzagCPStrategy(cp_size=4)
+        mode = _ExtendMode()
+        with patch(
+            "sglang.srt.environ.envs.SGLANG_PREFILL_CP_MIN_TOKENS_PER_SEQUENCE.get",
+            return_value=4096,
+        ):
+            self.assertFalse(
+                strategy.can_apply(
+                    8192,
+                    SimpleNamespace(
+                        forward_mode=mode,
+                        extend_seq_lens_cpu=[4095, 4097],
+                    ),
+                )
+            )
+            self.assertTrue(
+                strategy.can_apply(
+                    8192,
+                    SimpleNamespace(
+                        forward_mode=mode,
+                        extend_seq_lens_cpu=[4096, 4096],
+                    ),
+                )
+            )
 
     def _expected_metadata(self, *, rank, cp_size, seq_lens, extend_seq_lens):
         bs = len(extend_seq_lens)
@@ -593,6 +623,87 @@ class TestCPZigzagStrategy(CustomTestCase):
                 )
 
             self.assertTrue(torch.equal(gathered, kv))
+
+    def test_zigzag_generic_gathers_return_independent_outputs(self):
+        cp_size = 4
+        seq_lens = [11, 13]
+        extend_seq_lens = [9, 10]
+        x = torch.arange(sum(extend_seq_lens) * 2).view(sum(extend_seq_lens), 2)
+        metas, padded_rank_tensors = self._padded_rank_tensors(
+            x,
+            cp_size=cp_size,
+            seq_lens=seq_lens,
+            extend_seq_lens=extend_seq_lens,
+        )
+        strategy = ZigzagCPStrategy(cp_size=cp_size)
+        rank = 0
+        local_x = padded_rank_tensors[rank][: metas[rank].per_rank_actual_token[rank]]
+        fb = self._forward_batch(metas[rank], extend_seq_lens)
+
+        with get_parallel().override(attn_cp_group=_FakeCPGroup(padded_rank_tensors)):
+            first = strategy.gather_kv_cache(local_x, fb)
+            second = strategy.gather_kv_cache(local_x, fb)
+
+        self.assertTrue(torch.equal(first, x))
+        self.assertTrue(torch.equal(second, x))
+        self.assertNotEqual(first.data_ptr(), second.data_ptr())
+        # Generic gathers must not reserve an unused persistent output.
+        self.assertTrue(
+            all(buffers[2] is None for buffers in strategy._gather_buffers.values())
+        )
+
+    def test_zigzag_reusable_gather_reuses_output_explicitly(self):
+        cp_size = 4
+        seq_lens = [11, 13]
+        extend_seq_lens = [9, 10]
+        x = torch.arange(sum(extend_seq_lens) * 2).view(sum(extend_seq_lens), 2)
+        metas, padded_rank_tensors = self._padded_rank_tensors(
+            x,
+            cp_size=cp_size,
+            seq_lens=seq_lens,
+            extend_seq_lens=extend_seq_lens,
+        )
+        strategy = ZigzagCPStrategy(cp_size=cp_size)
+        rank = 0
+        local_x = padded_rank_tensors[rank][: metas[rank].per_rank_actual_token[rank]]
+        fb = self._forward_batch(metas[rank], extend_seq_lens)
+
+        with get_parallel().override(attn_cp_group=_FakeCPGroup(padded_rank_tensors)):
+            first = strategy.gather_kv_cache_reusable(local_x, fb)
+            second = strategy.gather_kv_cache_reusable(local_x, fb)
+
+        self.assertTrue(torch.equal(second, x))
+        self.assertEqual(first.data_ptr(), second.data_ptr())
+
+    def test_zigzag_gather_index_cache_is_bounded(self):
+        cp_size = 4
+        strategy = ZigzagCPStrategy(cp_size=cp_size)
+
+        for length in range(16, 16 + strategy._MAX_GATHER_INDEX_CACHE_ENTRIES + 3):
+            seq_lens = [length]
+            extend_seq_lens = [length]
+            x = torch.arange(length * 2).view(length, 2)
+            metas, padded_rank_tensors = self._padded_rank_tensors(
+                x,
+                cp_size=cp_size,
+                seq_lens=seq_lens,
+                extend_seq_lens=extend_seq_lens,
+            )
+            rank = 0
+            local_x = padded_rank_tensors[rank][
+                : metas[rank].per_rank_actual_token[rank]
+            ]
+            fb = self._forward_batch(metas[rank], extend_seq_lens)
+            with get_parallel().override(
+                attn_cp_group=_FakeCPGroup(padded_rank_tensors)
+            ):
+                gathered = strategy.gather_hidden_states(local_x, fb)
+            self.assertTrue(torch.equal(gathered, x))
+
+        self.assertEqual(
+            len(strategy._gather_index_cache),
+            strategy._MAX_GATHER_INDEX_CACHE_ENTRIES,
+        )
 
     def test_zigzag_padding_aligns_local_tensors(self):
         cp_size = 2
@@ -925,7 +1036,7 @@ class TestCPInterleaveStrategy(CustomTestCase):
         self.assertEqual(metadata.per_rank_actual_token, [4, 4, 4, 4])
         self.assertEqual(metadata.max_rank_len, [4, 4, 4, 4])
 
-    def test_prepare_cp_forward_sizes_gather_buffer_for_all_cp_ranks(self):
+    def test_prepare_cp_forward_keeps_dp_buffer_until_model_body(self):
         forward_batch = SimpleNamespace(
             input_ids=torch.arange(10),
             positions=torch.arange(10),
@@ -957,7 +1068,7 @@ class TestCPInterleaveStrategy(CustomTestCase):
             forward_batch.attn_cp_metadata.per_rank_actual_token,
             [4, 4, 4, 4],
         )
-        set_buffer_len.assert_called_once_with(16)
+        set_buffer_len.assert_not_called()
 
     def test_interleave_shards_hidden_states_and_position_ids(self):
         cp_size = 4

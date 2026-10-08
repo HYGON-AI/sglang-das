@@ -89,6 +89,9 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_musa = is_musa()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_lightop_channel_fp8 = (
+    get_bool_env_var("SGLANG_USE_LIGHTOP_CHANNEL_FP8") and _is_hip
+)
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 # ROCm 7.0 hipcc miscompiles gemm_a8w8_blockscale_bpreshuffle on gfx95 (#23319).
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
@@ -251,6 +254,13 @@ if _is_hcu:
     import deepgemm
 
 use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
+
+if _use_lightop_channel_fp8:
+    from lightop.gemm_ops import (
+        hipblaslt_w8a8_channelwise_gemm,
+        hipblaslt_w8a8_channelwise_gemm_kme,
+    )
+    from lightop.quant.fp8 import per_token_quant_fp8 as lightop_per_token_quant_fp8
 
 # Input scaling factors are no longer optional in _scaled_mm starting
 # from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
@@ -1821,6 +1831,9 @@ def _process_scaled_mm_output(output, input_2d_shape, output_shape):
     return torch.narrow(output, 0, 0, input_2d_shape[0]).view(*output_shape)
 
 
+_HIPBLASLT_UNSUPPORTED_FP8_SHAPES: set[tuple] = set()
+
+
 def _apply_fallback_scaled_mm(
     qinput,
     weight,
@@ -1835,13 +1848,55 @@ def _apply_fallback_scaled_mm(
     if TORCH_DEVICE_IDENTITY is None:
         TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32, device=weight.device)
 
-    output = torch._scaled_mm(
-        qinput,
-        weight,
-        scale_a=TORCH_DEVICE_IDENTITY,
-        scale_b=TORCH_DEVICE_IDENTITY,
-        out_dtype=torch.float32,
+    # hipBLASLt does not provide solutions for every channel-FP8 matrix shape
+    # on BW1100 (for example MiniMax-M3 TP8 decode: M=17, K=6144, N=768).
+    # Probe each runtime shape once, then keep it on the numerically equivalent
+    # Triton rowwise/channelwise scaled GEMM instead of crashing every rank.
+    hip_shape_key = (
+        qinput.device.type,
+        qinput.device.index,
+        qinput.shape[0],
+        weight.shape[1],
+        qinput.shape[1],
+        qinput.dtype,
+        input_dtype,
     )
+    use_triton_fallback = _is_hip and (
+        hip_shape_key in _HIPBLASLT_UNSUPPORTED_FP8_SHAPES
+    )
+    if not use_triton_fallback:
+        try:
+            output = torch._scaled_mm(
+                qinput,
+                weight,
+                scale_a=TORCH_DEVICE_IDENTITY,
+                scale_b=TORCH_DEVICE_IDENTITY,
+                out_dtype=torch.float32,
+            )
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            if not _is_hip or "blaslt" not in message:
+                raise
+            _HIPBLASLT_UNSUPPORTED_FP8_SHAPES.add(hip_shape_key)
+            logger.warning(
+                "hipBLASLt has no channel-FP8 solution for M=%s, N=%s, K=%s; "
+                "using Triton scaled_mm for this shape.",
+                qinput.shape[0],
+                weight.shape[1],
+                qinput.shape[1],
+            )
+            use_triton_fallback = True
+
+    if use_triton_fallback:
+        output = triton_scaled_mm(
+            qinput,
+            weight,
+            x_scale,
+            weight_scale,
+            input_dtype,
+            bias,
+        )
+        return _process_scaled_mm_output(output, input_2d_shape, output_shape)
 
     output = _process_scaled_mm_output(output, input_2d_shape, output_shape)
     x_scale = torch.narrow(x_scale, 0, 0, input_2d_shape[0])
@@ -2209,6 +2264,82 @@ def apply_fp8_ptpc_linear(
     if bias is not None:
         output = output + bias
     return output.view(*output_shape)
+
+
+def apply_fp8_lightop_channelwise_linear(
+    input: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run dynamic-token/channel-weight FP8 GEMM through LightOp on ROCm.
+
+    LightOp's BW1100 channelwise kernels consume OCP E4M3 weights in ``[N, K]``
+    layout. This deliberately differs from the native gfx94/FNUZ path, which
+    stores transposed FNUZ weights for ``torch._scaled_mm``/Triton.
+    """
+    if not _use_lightop_channel_fp8:
+        raise RuntimeError(
+            "SGLANG_USE_LIGHTOP_CHANNEL_FP8=1 is required for this FP8 path"
+        )
+
+    if isinstance(input, tuple):
+        qinput, x_scale = input[0], input[1]
+        output_dtype = input[2] if len(input) > 2 else torch.bfloat16
+        input_shape = qinput.shape
+        qinput = qinput.view(-1, qinput.shape[-1])
+        # A fused producer on gfx94 may emit FNUZ. Re-encode the quantized
+        # values as OCP E4M3; its scale remains valid because conversion
+        # preserves represented values.
+        if qinput.dtype != torch.float8_e4m3fn:
+            qinput = qinput.to(torch.float8_e4m3fn)
+    else:
+        input_shape = input.shape
+        output_dtype = input.dtype
+        input_2d = input.view(-1, input.shape[-1]).contiguous()
+        qinput, x_scale = lightop_per_token_quant_fp8(
+            input_2d, dtype=torch.float8_e4m3fn
+        )
+
+    m, k = qinput.shape
+    n = weight.shape[0]
+    if weight.shape[1] != k:
+        raise ValueError(
+            f"LightOp channel-FP8 expects weight [N,K], got {weight.shape} "
+            f"for input [M,K]={qinput.shape}"
+        )
+
+    try:
+        _, output = hipblaslt_w8a8_channelwise_gemm(
+            qinput,
+            weight,
+            x_scale,
+            weight_scale,
+            m,
+            n,
+            k,
+            "NT",
+            output_dtype,
+            bias,
+        )
+    except RuntimeError:
+        # KME has a separate algorithm search/dispatch and covers some shapes
+        # not present in the ordinary hipBLASLt table.
+        _, output = hipblaslt_w8a8_channelwise_gemm_kme(
+            qinput,
+            weight,
+            x_scale,
+            weight_scale,
+            m,
+            n,
+            k,
+            "NT",
+            output_dtype,
+            bias,
+        )
+
+    output_shape = [*input_shape[:-1], n]
+    return output.reshape(m, n).view(*output_shape)
 
 
 def validate_fp8_block_shape(

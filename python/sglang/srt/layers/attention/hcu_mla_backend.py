@@ -299,6 +299,11 @@ class HCUMLABackend(AttentionBackend):
                 num_splits,
                 block_kv_indices
             )
+            if (
+                forward_batch.forward_mode.is_draft_extend_v2()
+                and not self.skip_prefill
+            ):
+                self.flashattn_backend.init_forward_metadata(forward_batch)
         else:
             if not self.skip_prefill:
                 # ===  DRAFT_EXTEND_V2  MLA metadata === nhb
@@ -852,11 +857,7 @@ class HCUMLABackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
-        if ((
-            forward_batch.forward_mode == ForwardMode.EXTEND
-            or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND_V2
-            )
-        ):
+        if forward_batch.forward_mode == ForwardMode.EXTEND:
             if not self.skip_prefill:
                 return self.flashattn_backend.forward_extend(
                             q, k, v, layer, forward_batch, save_kv_cache,

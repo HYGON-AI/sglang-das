@@ -111,5 +111,19 @@ class SlimQuantCompressedTensorsMarlinConfig(CompressedTensorsConfig):
             layer.scheme = scheme
             return CompressedTensorsLinearMethod(self)
         if isinstance(layer, FusedMoE):
+            # The minimax int8-marlin pack is numerically wrong for DeepSeek
+            # channel W8A8 on HCU. Use the compressed-tensors INT8 MoE path,
+            # which selects the HCU AITER/Triton kernel.
+            from sglang.srt.utils import is_hcu
+
+            if is_hcu():
+                from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                    CompressedTensorsFusedMoEMethod,
+                )
+
+                layer.scheme = self.get_moe_scheme(layer=layer, layer_name=prefix)
+                if layer.scheme is None:
+                    return UnquantizedEmbeddingMethod()
+                return CompressedTensorsFusedMoEMethod(self)
             return CompressedTensorsMarlinMoEMethod.get_moe_method(self, layer)
         return None

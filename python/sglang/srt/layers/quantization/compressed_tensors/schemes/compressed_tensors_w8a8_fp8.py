@@ -22,6 +22,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    apply_fp8_lightop_channelwise_linear,
     apply_fp8_linear,
     apply_fp8_ptpc_linear,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
@@ -37,6 +38,9 @@ __all__ = ["CompressedTensorsW8A8Fp8"]
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_lightop_channel_fp8 = (
+    get_bool_env_var("SGLANG_USE_LIGHTOP_CHANNEL_FP8") and _is_hip
+)
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 
@@ -167,7 +171,11 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         elif self.strategy == QuantizationStrategy.CHANNEL:
             weight = layer.weight
 
-            if is_fp8_fnuz():
+            if _use_lightop_channel_fp8:
+                # LightOp BW1100 kernels use OCP E4M3 in [N,K] layout. Keep
+                # checkpoint weights intact instead of converting to FNUZ.
+                weight_scale = layer.weight_scale.data
+            elif is_fp8_fnuz():
                 input_scale = getattr(layer, "input_scale", None)
 
                 weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
@@ -180,7 +188,9 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             else:
                 weight_scale = layer.weight_scale.data
 
-            if _use_aiter:
+            if _use_lightop_channel_fp8:
+                layer.weight = Parameter(weight.data.contiguous(), requires_grad=False)
+            elif _use_aiter:
                 # keep the weight as (N, K)
                 layer.weight = Parameter(
                     shuffle_weight(weight, (16, 16)), requires_grad=False
@@ -236,6 +246,14 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         input_quant_args: Optional[list[torch.Tensor]] = None,
         silu_quant_args: Optional[list[torch.Tensor]] = None,
     ) -> torch.Tensor:
+        if _use_lightop_channel_fp8 and self.strategy == QuantizationStrategy.CHANNEL:
+            return apply_fp8_lightop_channelwise_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                bias=bias,
+            )
+
         if isinstance(x, tuple):
             # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:
             # x = (fp8_input, per_tensor_input_scale[, orig_dtype]).

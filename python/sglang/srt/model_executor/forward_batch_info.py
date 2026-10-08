@@ -438,6 +438,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # (QSA's fill is 1, a legal real length); None outside replay.
     num_padding: Optional[int] = None
 
+    # === Forward-local HCU state ===
+    # Enables fused RMSNorm + quantization for the current layer.
+    rms_quant_flag: bool = False
+
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
     # For token embedding overrides (sparse replacement at specific positions)
@@ -454,6 +458,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Borrowed from ScheduleBatch: config / flags (by-value) ===
     # For logprob
     return_logprob: bool = False
+    # HCU fused RMSNorm+quant. Bailing sets this per layer; other models leave it off.
+    rms_quant_flag: bool = False
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
     spec_algorithm: SpeculativeAlgorithm = None
@@ -542,6 +548,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+    global_cp_num_tokens_cpu: Optional[List[int]] = None
+
     # For padding
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
     num_token_non_padded_cpu: int = None
@@ -549,6 +557,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Runtime-filled (set during the forward pass / cuda graph / managers; not at construction) ===
     # Preallocated piecewise-graph attention output, set by RadixAttention.
     _attn_output: Optional[torch.Tensor] = None
+
+    # Prefill body-CUDA-graph context limit. Attention backends that allocate
+    # context-shaped metadata use this fixed maximum instead of deriving a
+    # shape from the live batch. None preserves eager/default graph behavior.
+    max_seq_len_override: Optional[int] = None
 
     # For logits and logprobs post processing
     next_token_logits_buffer: torch.Tensor = None
@@ -576,6 +589,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # this will be recomputed in LogitsMetadata.from_forward_batch
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
+    # CP-v2 expands the DP buffer into one slot per (attention-DP, CP) shard.
+    dp_local_token_index: Optional[int] = None
+    cp_local_dp_layout: bool = False
     global_dp_buffer_len: Optional[int] = None
 
     # For Qwen2-VL
@@ -697,7 +713,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.mark_forward_metadata_ready()
 
     def init_mlp_sync_metadata(
-        self, batch: ScheduleBatch, device: Union[str, torch.device]
+        self,
+        batch: ScheduleBatch,
+        device: Union[str, torch.device],
+        *,
+        materialize_device_tensors: bool = True,
     ) -> None:
         """Populate per-rank token counts for DP-attention MLP synchronization."""
         if batch.global_num_tokens is None:
@@ -720,18 +740,59 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self.original_global_num_tokens_cpu = batch.global_num_tokens
         self.global_num_tokens_cpu = global_num_tokens
-        self.global_num_tokens_gpu = torch.tensor(
-            global_num_tokens,
-            dtype=torch.int64,
-            pin_memory=_pin_host_metadata(device),
-        ).to(device, non_blocking=True)
         self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
-        self.global_num_tokens_for_logprob_gpu = torch.tensor(
-            global_num_tokens_for_logprob,
-            dtype=torch.int64,
-            pin_memory=_pin_host_metadata(device),
-        ).to(device, non_blocking=True)
+        if materialize_device_tensors:
+            self.global_num_tokens_gpu = torch.tensor(
+                global_num_tokens,
+                dtype=torch.int64,
+                pin_memory=_pin_host_metadata(device),
+            ).to(device, non_blocking=True)
+            self.global_num_tokens_for_logprob_gpu = torch.tensor(
+                global_num_tokens_for_logprob,
+                dtype=torch.int64,
+                pin_memory=_pin_host_metadata(device),
+            ).to(device, non_blocking=True)
+        else:
+            # Draft-extend CUDA Graph replay consumes its own persistent token
+            # count buffers.  Building these transient tensors from pageable
+            # host memory can block the CPU behind the target stream and leave
+            # a launch bubble before replay.  Preserve the CPU values needed
+            # for graph selection and materialize the tensors only if the
+            # caller ultimately falls back to eager execution.
+            self.global_num_tokens_gpu = None
+            self.global_num_tokens_for_logprob_gpu = None
+        self.global_cp_num_tokens_cpu = batch.global_cp_num_tokens
         self.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
+
+    def materialize_deferred_device_metadata(
+        self, device: Union[str, torch.device]
+    ) -> None:
+        """Materialize device metadata deferred by a graph-first prepare path."""
+        if (
+            self.num_token_non_padded is None
+            and self.num_token_non_padded_cpu is not None
+            and enable_num_token_non_padded()
+        ):
+            self.num_token_non_padded = torch.tensor(
+                self.num_token_non_padded_cpu, dtype=torch.int32, device=device
+            )
+
+        if (
+            self.global_num_tokens_cpu is not None
+            and self.global_num_tokens_gpu is None
+        ):
+            self.global_num_tokens_gpu = torch.tensor(
+                self.global_num_tokens_cpu, dtype=torch.int64, device=device
+            )
+        if (
+            self.global_num_tokens_for_logprob_cpu is not None
+            and self.global_num_tokens_for_logprob_gpu is None
+        ):
+            self.global_num_tokens_for_logprob_gpu = torch.tensor(
+                self.global_num_tokens_for_logprob_cpu,
+                dtype=torch.int64,
+                device=device,
+            )
 
     @classmethod
     def init_new(
@@ -741,6 +802,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
         return_hidden_states_before_norm: bool,
+        defer_device_metadata: bool = False,
     ):
         # init_new must not mutate the input ScheduleBatch; per-forward
         # overrides go through explicit keyword arguments.
@@ -909,16 +971,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
         if enable_num_token_non_padded():
-            # A pageable hipMemcpyAsync blocks the host until prior work on the
-            # stream drains on HCU. Draft extend can otherwise stall here every step.
-            ret.num_token_non_padded = torch.tensor(
-                num_tokens,
-                dtype=torch.int32,
-                pin_memory=pin_host_metadata,
-            ).to(device, non_blocking=True)
+            if not defer_device_metadata:
+                ret.num_token_non_padded = torch.tensor(
+                    num_tokens,
+                    dtype=torch.int32,
+                    pin_memory=pin_host_metadata,
+                ).to(device, non_blocking=True)
         ret.num_token_non_padded_cpu = num_tokens
 
-        ret.init_mlp_sync_metadata(batch, device)
+        ret.init_mlp_sync_metadata(
+            batch,
+            device,
+            materialize_device_tensors=not defer_device_metadata,
+        )
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)

@@ -815,10 +815,19 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         raw_num_tokens = self.raw_num_tokens
         num_logit_rows = raw_bs if self.prune_draft_extend_logits else raw_num_tokens
         logits_output = LogitsProcessorOutput(
-            next_token_logits=out.next_token_logits[:num_logit_rows],
+            next_token_logits=(
+                out.next_token_logits[:num_logit_rows]
+                if out.next_token_logits is not None
+                else None
+            ),
             hidden_states=(
                 out.hidden_states[:raw_num_tokens]
                 if out.hidden_states is not None
+                else None
+            ),
+            draft_topk_index=(
+                out.draft_topk_index[:num_logit_rows]
+                if out.draft_topk_index is not None
                 else None
             ),
         )

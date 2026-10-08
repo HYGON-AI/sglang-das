@@ -148,3 +148,108 @@ def draft_topk1_postprocess(
         num_warps=1,
     )
     return topk_p, topk_index
+
+
+@triton.jit
+def _draft_topk1_value_finalize_kernel(
+    partial_vals,
+    partial_indices,
+    top_value,
+    top_index,
+    num_splits: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < num_splits
+    vals = tl.load(
+        partial_vals + row * num_splits + offsets,
+        mask=mask,
+        other=-float("inf"),
+    )
+    split = tl.argmax(vals, axis=0)
+    tl.store(top_value + row, tl.max(vals, axis=0))
+    tl.store(top_index + row, tl.load(partial_indices + row * num_splits + split))
+
+
+def draft_topk1_argmax(next_token_logits: torch.Tensor):
+    """Return deterministic row-wise maximum values and ids without side effects."""
+    assert next_token_logits.ndim == 2 and next_token_logits.stride(1) == 1
+    bs, vocab_size = next_token_logits.shape
+    values = torch.empty((bs,), dtype=torch.float32, device=next_token_logits.device)
+    indices = torch.empty((bs,), dtype=torch.int32, device=next_token_logits.device)
+    if bs == 0:
+        return values, indices
+    block = _DRAFT_TOPK1_BLOCK
+    num_splits = triton.cdiv(vocab_size, block)
+    partial_vals = torch.empty(
+        (bs, num_splits), dtype=torch.float32, device=next_token_logits.device
+    )
+    partial_indices = torch.empty(
+        (bs, num_splits), dtype=torch.int32, device=next_token_logits.device
+    )
+    _draft_topk1_partial_argmax_kernel[(bs, num_splits)](
+        next_token_logits,
+        partial_vals,
+        partial_indices,
+        next_token_logits.stride(0),
+        vocab_size,
+        num_splits,
+        BLOCK=block,
+        num_warps=8,
+    )
+    _draft_topk1_value_finalize_kernel[(bs,)](
+        partial_vals,
+        partial_indices,
+        values,
+        indices,
+        num_splits,
+        BLOCK=triton.next_power_of_2(num_splits),
+        num_warps=1,
+    )
+    return values, indices
+
+
+@triton.jit
+def _draft_topk1_select_candidates_kernel(
+    candidates,
+    output_ids,
+    candidates_row_stride,
+    num_candidates: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Select one ``(value, global_id)`` pair from TP-rank candidates."""
+    row = tl.program_id(0).to(tl.int64)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < num_candidates
+    base = candidates + row * candidates_row_stride
+    values = tl.load(base + offsets * 2, mask=mask, other=-float("inf"))
+    values = tl.where(values == values, values, -float("inf"))
+    winner = tl.argmax(values, axis=0, tie_break_left=True)
+    token_id = tl.load(base + winner * 2 + 1).to(tl.int64)
+    tl.store(output_ids + row, token_id)
+
+
+def draft_topk1_select_candidates(candidates: torch.Tensor) -> torch.Tensor:
+    """Reduce contiguous TP ``(value, global_id)`` candidates deterministically.
+
+    Candidate order must follow increasing TP rank (and therefore increasing
+    vocabulary shard).  Left-most tie breaking then matches full-vocabulary
+    argmax semantics without launching separate ``argmax`` and ``gather`` ops.
+    """
+    assert candidates.ndim == 3 and candidates.shape[-1] == 2
+    assert candidates.dtype == torch.float32
+    assert candidates.stride(-1) == 1 and candidates.stride(-2) == 2
+    rows, num_candidates, _ = candidates.shape
+    output_ids = torch.empty((rows, 1), dtype=torch.int64, device=candidates.device)
+    if rows == 0:
+        return output_ids
+    _draft_topk1_select_candidates_kernel[(rows,)](
+        candidates,
+        output_ids,
+        candidates.stride(0),
+        num_candidates,
+        BLOCK=triton.next_power_of_2(num_candidates),
+        num_warps=1,
+    )
+    return output_ids

@@ -140,6 +140,23 @@ SGL_DEVICE float coarse_bin_lower_bound(uint32_t bin) {
   return 0.5f * (to_val(key) + to_val(key - 1));
 }
 
+// HIP wave64 has no CUDA __*_sync warp intrinsics. Logical warps in this
+// kernel are 32 threads (kWarpThreads), which are the two 32-lane halves of
+// one wave. Shuffle width and ballot bits must stay inside that half.
+#ifdef USE_ROCM
+template <typename T>
+SGL_DEVICE T __shfl_up_sync(uint32_t /*mask*/, T val, uint32_t delta, int width = 32) {
+  return __shfl_up(val, delta, width);
+}
+
+SGL_DEVICE uint32_t __ballot_sync(uint32_t mask, bool pred) {
+  const unsigned long long wave = __ballot(pred);
+  const uint32_t group = static_cast<uint32_t>(__lane_id()) >> 5;
+  const uint32_t bits = static_cast<uint32_t>((wave >> (group * 32u)) & 0xFFFFFFFFu);
+  return bits & mask;
+}
+#endif
+
 SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
 #pragma unroll
   for (uint32_t offset = 1; offset < 32; offset *= 2) {
@@ -150,7 +167,16 @@ SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
 }
 
 SGL_DEVICE uint32_t warp_sum_bool(bool pred, uint32_t mask = 0xFFFFFFFF) {
+#ifdef USE_ROCM
+  // The ballot covers the whole hardware wave, which on wave64 holds two of
+  // these 32-lane logical warps, so a plain __popc would report the wave's
+  // lower half to both of them. Shift the caller's mask onto this warp's half
+  // and count all 64 bits. __lane_id() / kWarpSize is 0 on wave32.
+  const uint32_t half = __lane_id() / kWarpSize;
+  return __popcll(__ballot(pred) & (static_cast<uint64_t>(mask) << (kWarpSize * half)));
+#else
   return __popc(__ballot_sync(mask, pred));
+#endif
 }
 
 struct alignas(8) TieValue {

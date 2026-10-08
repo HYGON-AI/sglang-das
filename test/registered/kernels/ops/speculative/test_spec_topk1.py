@@ -6,7 +6,11 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.kernels.ops.speculative.topk1 import (
+    draft_topk1_argmax,
+    draft_topk1_postprocess,
+    draft_topk1_select_candidates,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -73,6 +77,33 @@ class TestSpecTopk1Triton(CustomTestCase):
                 torch.testing.assert_close(
                     positions, expected_positions, rtol=0, atol=0
                 )
+
+    def test_side_effect_free_argmax_returns_values_and_indices(self):
+        logits, expected_index = _make_logits_with_unique_argmax(
+            7,
+            25024,
+            dtype=torch.bfloat16,
+            device=self.device,
+            seed=25024,
+        )
+        values, indices = draft_topk1_argmax(logits)
+        expected_values = torch.gather(logits.float(), 1, expected_index).squeeze(1)
+        torch.testing.assert_close(indices.long(), expected_index[:, 0], rtol=0, atol=0)
+        torch.testing.assert_close(values, expected_values, rtol=0, atol=0)
+
+    def test_tp_candidate_select_matches_first_max(self):
+        candidates = torch.tensor(
+            [
+                [[1.0, 7.0], [4.0, 100.0], [3.0, 201.0]],
+                [[9.0, 4.0], [9.0, 104.0], [2.0, 204.0]],
+                [[-3.0, 2.0], [-2.0, 102.0], [-1.0, 202.0]],
+            ],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        selected = draft_topk1_select_candidates(candidates)
+        expected = torch.tensor([[100], [4], [202]], device=self.device)
+        torch.testing.assert_close(selected, expected, rtol=0, atol=0)
 
     def test_draft_topk1_postprocess_can_write_draft_token_column(self):
         batch_size = 17

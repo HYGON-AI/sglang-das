@@ -253,7 +253,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
-
         # --- DSA dense-decode dual-graph -------------------------------
         # Capture a "dense" (k-only, skip-indexer) and a "sparse" (full indexer)
         # decode graph per bs bucket, and dispatch on max_kv_len vs index_topk at
@@ -1467,6 +1466,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None
+                    else None
+                ),
+                draft_topk_index=(
+                    output.draft_topk_index[: self.raw_num_token]
+                    if output.draft_topk_index is not None
                     else None
                 ),
                 customized_info=output.customized_info,

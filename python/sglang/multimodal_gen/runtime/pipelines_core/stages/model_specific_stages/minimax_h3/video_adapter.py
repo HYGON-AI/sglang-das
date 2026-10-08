@@ -29,7 +29,23 @@ if TYPE_CHECKING:
 
 
 def _extra_value(request: VideoGenerationsRequest, name: str) -> Any:
+    """Read a model-task extension field, extra-channel fallback included.
+
+    The H3 fields are declared explicitly on ``VideoGenerationsRequest`` (so
+    they appear in the OpenAPI document), while legacy clients may still
+    send them via pydantic's ``extra="allow"`` channel.
+    """
+
+    value = getattr(request, name, None)
+    if value is not None:
+        return value
     return (request.model_extra or {}).get(name)
+
+
+def _has_extra(request: VideoGenerationsRequest, name: str) -> bool:
+    if getattr(request, name, None) is not None:
+        return True
+    return name in (request.model_extra or {})
 
 
 def _parse_extra_value(value: Any) -> Any:
@@ -195,8 +211,10 @@ class MiniMaxH3VideoModelAdapter:
         *,
         model_path: str | None,
     ) -> None:
-        extras = request.model_extra or {}
-        self.validate_task_gate(extras.get("task"), provided="task" in extras)
+        self.validate_task_gate(
+            _extra_value(request, "task"),
+            provided=_has_extra(request, "task"),
+        )
         del model_path
         self._positive_finite_extra(request, "audio_flow_shift")
         if _extra_value(request, "audio_guidance_scale") is not None:

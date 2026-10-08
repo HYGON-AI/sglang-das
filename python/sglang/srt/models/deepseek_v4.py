@@ -93,7 +93,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
@@ -3355,11 +3355,8 @@ class DeepseekV4Model(nn.Module):
         if dspark_layers_to_capture is None:
             dspark_layers_to_capture = self.dspark_layers_to_capture
         capture_dspark = dspark_layers_to_capture is not None
-        if capture_dspark and use_prefill_cp and cp_v2_active:
-            raise NotImplementedError(
-                "DSpark aux hidden-state capture does not yet support DeepSeek-V4 "
-                "CP-v2. Use the legacy prefill-CP path."
-            )
+        # Under CP-v2 the body returns rank-local hidden/aux rows; the CP runner
+        # gathers them and finishes through DeepseekV4ForCausalLM.logits_from_body_output.
         use_packed_pd_aux = capture_dspark and self.pp_group.world_size == 1
         pd_aux_hidden_states: AuxHiddenStateAccumulator = (
             AuxHiddenStatePacker(len(dspark_layers_to_capture))
@@ -3707,7 +3704,21 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
         if not self.pp_group.is_last_rank:
             return hidden_states
+        return self.logits_from_body_output(input_ids, hidden_states, forward_batch)
 
+    def logits_from_body_output(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states,
+        forward_batch: ForwardBatch,
+    ) -> LogitsProcessorOutput:
+        """Finish a forward from the (CP-gathered) body output.
+
+        Shared by the eager forward and the CP-v2 eager / breakable-graph
+        runners so all of them apply the same DSpark and PD aux contract.
+        ``hidden_states`` is ``(hidden, pre_hc_head)`` or, when aux capture is
+        on, ``((hidden, pre_hc_head), aux_hidden_states)``.
+        """
         aux_hidden_states = None
         pd_aux_hidden_states = None
         has_pd_hidden_capture = (

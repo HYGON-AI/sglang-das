@@ -44,6 +44,7 @@ from sglang.kernels.ops.attention.dsa.quant_k_cache import (
 )
 from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
+    set_kv_buffer_prefix_valid_hcu_fa,
     set_kv_buffer_prefix_valid_tiled,
     store_cache_4d,
 )
@@ -170,8 +171,11 @@ def _set_kv_buffer_impl(
     v_row_bytes = v_row_dim * store_dtype.itemsize
     if (_is_cuda or _is_hip) and can_use_store_cache(row_bytes, v_row_bytes):
         return store_cache(
-            k.view(-1, row_dim),
-            v.view(-1, v_row_dim),
+            # flatten(1) preserves a non-contiguous row stride when the
+            # trailing head/dim axes are contiguous. This lets the packed
+            # query-sharded CP gather feed the strided store kernel directly.
+            k.flatten(1),
+            v.flatten(1),
             k_cache.view(-1, row_dim),
             v_cache.view(-1, v_row_dim),
             indices,
@@ -194,16 +198,119 @@ def _set_kv_buffer_impl(
 
     from sglang.srt.model_executor.runner import get_is_capture_mode
 
-    if get_is_capture_mode() and alt_stream is not None:
-        current_stream = device_module.current_stream()
-        alt_stream.wait_stream(current_stream)
-        k_cache[indices] = k
-        with device_module.stream(alt_stream):
-            v_cache[indices] = v
-        current_stream.wait_stream(alt_stream)
-    else:  # fallback to naive implementation
-        k_cache[indices] = k
-        v_cache[indices] = v
+    k_cache[indices] = k
+    v_cache[indices] = v
+
+
+@triton.jit
+def _scaled_fp8_set_kv_buffer_kernel(
+    k_ptr,
+    v_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    indices_ptr,
+    n_rows,
+    k_src_stride,
+    v_src_stride,
+    k_scale,
+    v_scale,
+    size_limit,
+    K_ROW_DIM: tl.constexpr,
+    V_ROW_DIM: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    K_SCALE_IS_DEVICE_TENSOR: tl.constexpr,
+    V_SCALE_IS_DEVICE_TENSOR: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Scale, cast to FP8, and scatter K/V in one memory pass."""
+    row = tl.program_id(0).to(tl.int64)
+    tile = tl.program_id(1).to(tl.int64)
+    offs = tile * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
+    loc = tl.load(indices_ptr + row, mask=row < n_rows, other=0).to(tl.int64)
+    # Slot zero is the CUDA-graph padding slot, matching store_cache's default
+    # reserved_skip_index=0 contract.
+    row_valid = (row < n_rows) & (loc > 0) & (loc < size_limit)
+
+    k_mask = row_valid & (offs < K_ROW_DIM)
+    k = tl.load(k_ptr + row * k_src_stride + offs, mask=k_mask, other=0.0).to(
+        tl.float32
+    )
+    if K_SCALE_IS_DEVICE_TENSOR:
+        k_scale_value = tl.load(k_scale)
+    else:
+        k_scale_value = k_scale
+    k = tl.maximum(-FP8_MAX, tl.minimum(FP8_MAX, k / k_scale_value))
+    tl.store(
+        k_cache_ptr + loc * K_ROW_DIM + offs,
+        k,
+        mask=k_mask,
+    )
+
+    v_mask = row_valid & (offs < V_ROW_DIM)
+    v = tl.load(v_ptr + row * v_src_stride + offs, mask=v_mask, other=0.0).to(
+        tl.float32
+    )
+    if V_SCALE_IS_DEVICE_TENSOR:
+        v_scale_value = tl.load(v_scale)
+    else:
+        v_scale_value = v_scale
+    v = tl.maximum(-FP8_MAX, tl.minimum(FP8_MAX, v / v_scale_value))
+    tl.store(
+        v_cache_ptr + loc * V_ROW_DIM + offs,
+        v,
+        mask=v_mask,
+    )
+
+
+def _scaled_fp8_set_kv_buffer(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,
+    k_scale: Union[float, torch.Tensor],
+    v_scale: Union[float, torch.Tensor],
+    row_dim: int,
+    v_row_dim: int,
+    size_limit: int,
+) -> None:
+    """Fused static-scale FP8 quantization and NHD paged-cache scatter.
+
+    The generic path historically executed ``div_`` and ``to(fp8)`` before the
+    scatter, causing three full K/V memory passes per layer and mutating the QKV
+    projection views.  Static checkpoint scales need only one read and one
+    final-cache write.
+    """
+    k_flat = k.flatten(1)
+    v_flat = v.flatten(1)
+    if k_flat.stride(1) != 1 or v_flat.stride(1) != 1:
+        raise RuntimeError("scaled FP8 KV store requires contiguous row payloads")
+    block = min(1024, triton.next_power_of_2(max(row_dim, v_row_dim)))
+    grid = (k_flat.shape[0], triton.cdiv(max(row_dim, v_row_dim), block))
+    k_scale_is_device_tensor = isinstance(k_scale, torch.Tensor) and k_scale.is_cuda
+    v_scale_is_device_tensor = isinstance(v_scale, torch.Tensor) and v_scale.is_cuda
+    k_scale_arg = k_scale if k_scale_is_device_tensor else float(k_scale)
+    v_scale_arg = v_scale if v_scale_is_device_tensor else float(v_scale)
+    _scaled_fp8_set_kv_buffer_kernel[grid](
+        k_flat,
+        v_flat,
+        k_cache.view(-1, row_dim),
+        v_cache.view(-1, v_row_dim),
+        indices,
+        k_flat.shape[0],
+        k_flat.stride(0),
+        v_flat.stride(0),
+        k_scale_arg,
+        v_scale_arg,
+        size_limit,
+        K_ROW_DIM=row_dim,
+        V_ROW_DIM=v_row_dim,
+        FP8_MAX=float(torch.finfo(k_cache.dtype).max),
+        K_SCALE_IS_DEVICE_TENSOR=k_scale_is_device_tensor,
+        V_SCALE_IS_DEVICE_TENSOR=v_scale_is_device_tensor,
+        BLOCK=block,
+        num_warps=4,
+    )
 
 
 def _set_kv_buffer_prefix_valid_impl(
@@ -2531,11 +2638,55 @@ class MHATokenToKVPool(KVCache):
             )
             return
 
+        # Float8 pools are backed by uint8 because index_put is not implemented
+        # for float8.  The backing dtype is only a storage detail: view it as
+        # the logical FP8 dtype before launching the saturated writer.
+        fp8_store_compatible = self.store_dtype in (self.dtype, torch.uint8)
+        use_scaled_fp8_store = (
+            cache_k.dtype != self.dtype
+            and self.dtype == fp8_dtype
+            and fp8_store_compatible
+            and k_scale is not None
+            and v_scale is not None
+            and dcp_kv_mask is None
+            and not self.use_hnd
+        )
+        if use_scaled_fp8_store:
+            k_buffer = self.k_buffer[layer_id - self.start_layer]
+            v_buffer = self.v_buffer[layer_id - self.start_layer]
+            if k_buffer.dtype != self.dtype:
+                k_buffer = k_buffer.view(self.dtype)
+                v_buffer = v_buffer.view(self.dtype)
+            _scaled_fp8_set_kv_buffer(
+                cache_k,
+                cache_v,
+                k_buffer,
+                v_buffer,
+                loc,
+                k_scale,
+                v_scale,
+                self.row_dim,
+                self.v_row_dim,
+                self.size + self.page_size,
+            )
+            return
+
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
             if v_scale is not None:
                 cache_v.div_(v_scale)
+            if self.dtype in (
+                torch.float8_e5m2,
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+            ):
+                # PyTorch's E4M3FN cast maps finite out-of-range values to the
+                # 0x7f/0xff NaN encodings.  Saturate before every generic FP8
+                # conversion so alternate layouts cannot silently poison KV.
+                fp8_max = float(torch.finfo(self.dtype).max)
+                cache_k.clamp_(min=-fp8_max, max=fp8_max)
+                cache_v.clamp_(min=-fp8_max, max=fp8_max)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 
@@ -2548,25 +2699,12 @@ class MHATokenToKVPool(KVCache):
 
             page_idxs = loc // self.page_size
             offsets = loc % self.page_size
-            if get_is_capture_mode() and self.alt_stream is not None:
-                # Overlap the copy of K and V cache for small batch size
-                current_stream = self.device_module.current_stream()
-                self.alt_stream.wait_stream(current_stream)
-                self.k_buffer[layer_id - self.start_layer][
-                    page_idxs, :, offsets, :
-                ] = cache_k
-                with self.device_module.stream(self.alt_stream):
-                    self.v_buffer[layer_id - self.start_layer][
-                        page_idxs, :, :, offsets
-                    ] = cache_v
-                current_stream.wait_stream(self.alt_stream)
-            else:
-                self.k_buffer[layer_id - self.start_layer][
-                    page_idxs, :, offsets, :
-                ] = cache_k
-                self.v_buffer[layer_id - self.start_layer][
-                    page_idxs, :, :, offsets
-                ] = cache_v
+            self.k_buffer[layer_id - self.start_layer][
+                page_idxs, :, offsets, :
+            ] = cache_k
+            self.v_buffer[layer_id - self.start_layer][
+                page_idxs, :, :, offsets
+            ] = cache_v
             return
 
         if dcp_kv_mask is not None:
@@ -2958,6 +3096,37 @@ class MHATokenToKVPool(KVCache):
             loc_2d = loc_2d.to(torch.int64)
         if commit_lens.dtype != torch.int32:
             commit_lens = commit_lens.to(torch.int32)
+
+        # Gate prefix rows on device instead of materializing a dynamic nonzero
+        # result. Other layouts and the default-off path retain the old behavior.
+        if (
+            envs.SGLANG_ENABLE_HCU_FA_PREFIX_VALID.get()
+            and _kv_layout_hcu_fa
+            and not self.use_hnd
+            and (_is_cuda or _is_hip)
+        ):
+            if cache_k.dtype != self.dtype:
+                # The fallback scales index-selected copies, not the input KV.
+                if k_scale is not None:
+                    cache_k = cache_k / k_scale
+                if v_scale is not None:
+                    cache_v = cache_v / v_scale
+                cache_k = cache_k.to(self.dtype)
+                cache_v = cache_v.to(self.dtype)
+            if self.store_dtype != self.dtype:
+                cache_k = cache_k.contiguous().view(self.store_dtype)
+                cache_v = cache_v.contiguous().view(self.store_dtype)
+
+            set_kv_buffer_prefix_valid_hcu_fa(
+                self.k_buffer[layer_id - self.start_layer],
+                self.v_buffer[layer_id - self.start_layer],
+                cache_k,
+                cache_v,
+                loc_2d,
+                commit_lens,
+                page_size=self.page_size,
+            )
+            return
 
         # HND slots aren't contiguous ROW_BYTES spans — the tiled kernel's
         # `loc * row_bytes` walks off the buffer. Fall back to set_kv_buffer.

@@ -38,8 +38,13 @@ def _make_source_embedding(
         torch.empty((local_rows, embedding_dim), dtype=dtype, device="cuda"),
         requires_grad=False,
     )
+    scale_shape = (
+        (local_rows, 1)
+        if dtype in (torch.int8, torch.float8_e4m3fn)
+        else (1,)
+    )
     weight_scale = torch.ones(
-        (local_rows, 1) if dtype == torch.int8 else (1,),
+        scale_shape,
         dtype=torch.bfloat16,
         device="cuda",
     )
@@ -154,14 +159,17 @@ def test_qwen4_ple_pinned_gather_empty_input():
     assert actual.numel() == 0
 
 
-def test_qwen4_ple_pinned_gather_int8_per_row_scale():
+@pytest.mark.parametrize("weight_dtype", [torch.int8, torch.float8_e4m3fn])
+def test_qwen4_ple_pinned_gather_per_row_scale(weight_dtype):
     embedding_dim = 7
-    source = _make_source_embedding(dtype=torch.int8, embedding_dim=embedding_dim)
+    source = _make_source_embedding(dtype=weight_dtype, embedding_dim=embedding_dim)
     scales = torch.arange(1, 9, dtype=torch.bfloat16, device="cuda").reshape(8, 1)
     source.weight_scale.copy_(scales)
     offloaded = Qwen4ExpPinnedHostEmbedding(source)
-    rows = torch.arange(-28, 28, dtype=torch.int8, device="cuda").reshape(
-        8, embedding_dim
+    rows = (
+        torch.arange(-28, 28, dtype=torch.int8, device="cuda")
+        .reshape(8, embedding_dim)
+        .to(weight_dtype)
     )
     _load_rows(offloaded, rows)
 
@@ -171,7 +179,7 @@ def test_qwen4_ple_pinned_gather_int8_per_row_scale():
     ).index_select(0, ids.flatten()).reshape(*ids.shape, embedding_dim)
     actual = offloaded(ids)
 
-    assert offloaded.weight.dtype == torch.int8
+    assert offloaded.weight.dtype == weight_dtype
     assert offloaded.weight_scale.is_pinned()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 

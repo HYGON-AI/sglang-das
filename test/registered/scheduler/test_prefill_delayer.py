@@ -68,6 +68,11 @@ class NegotiateTestCase:
     queue_min_ratio: Optional[float] = None
     max_delay_ms: Optional[float] = None
     prefill_max_requests: Optional[int] = None
+    enable_idle_coalescing: bool = False
+    idle_coalesce_max_delay_ms: float = 50.0
+    idle_coalesce_settle_ms: float = 10.0
+    idle_coalesce_burst_max_delay_ms: float = 500.0
+    idle_coalesce_max_batch_size: int = 32
     # Expected accumulated wait surfaced on the final (release) outcome. When
     # set, asserts the wait histograms would observe this value instead of 0.
     expected_wait_forward_passes: Optional[int] = None
@@ -84,6 +89,7 @@ def _run_negotiate_test(rank, test_cases):
         delayer = PrefillDelayer(
             dp_size=world_size,
             attn_tp_size=1,
+            attn_cp_size=1,
             cpu_group=cpu_group,
             server_args=SimpleNamespace(
                 enable_dp_attention=True,
@@ -92,6 +98,15 @@ def _run_negotiate_test(rank, test_cases):
                 prefill_delayer_queue_min_ratio=case.queue_min_ratio,
                 prefill_delayer_max_delay_ms=case.max_delay_ms,
                 prefill_max_requests=case.prefill_max_requests,
+                enable_prefill_idle_coalescing=case.enable_idle_coalescing,
+                prefill_idle_coalesce_max_delay_ms=(case.idle_coalesce_max_delay_ms),
+                prefill_idle_coalesce_settle_ms=case.idle_coalesce_settle_ms,
+                prefill_idle_coalesce_burst_max_delay_ms=(
+                    case.idle_coalesce_burst_max_delay_ms
+                ),
+                prefill_idle_coalesce_max_batch_size=(
+                    case.idle_coalesce_max_batch_size
+                ),
             ),
             max_delay_passes=case.max_delay_passes,
             token_usage_low_watermark=case.token_usage_low_watermark,
@@ -133,6 +148,42 @@ def _run_negotiate_test(rank, test_cases):
                     result.wait_seconds > 0.0
                 ), f"Case {case.name} rank {rank}: wait_seconds not surfaced"
 
+        override.restore()
+
+    # Regression test for DP + context parallelism.  The gather group has
+    # dp_size * attn_tp_size * attn_cp_size ranks; the delayer must retain the
+    # CP dimension even though it only consumes one representative per DP.
+    override = get_context().override_server_args(enable_dp_attention=True)
+    override.install()
+    try:
+        delayer = PrefillDelayer(
+            dp_size=2,
+            attn_tp_size=1,
+            attn_cp_size=2,
+            cpu_group=cpu_group,
+            server_args=SimpleNamespace(
+                disable_overlap_schedule=False,
+                prefill_delayer_queue_min_ratio=None,
+                prefill_delayer_max_delay_ms=None,
+                enable_prefill_idle_coalescing=False,
+                prefill_idle_coalesce_max_delay_ms=50.0,
+                prefill_idle_coalesce_settle_ms=10.0,
+                prefill_idle_coalesce_burst_max_delay_ms=500.0,
+                prefill_idle_coalesce_max_batch_size=32,
+                prefill_max_requests=None,
+            ),
+            max_delay_passes=100,
+            token_usage_low_watermark=None,
+        )
+        result = delayer._negotiate_should_allow_prefill(
+            local_prefillable=rank < 2,
+            token_usage=0.9,
+        )
+        assert delayer._global_info_buffer.shape == (2, 2, 7)
+        assert not result.output_allow
+        assert result.output_reason == "delay"
+        assert result.num_prefillable == 1
+    finally:
         override.restore()
 
 
@@ -361,6 +412,151 @@ _NEGOTIATE_TEST_CASES = [
         ],
         expected_allow=True,
         expected_reason="no_wait",
+    ),
+    # Idle coalescing is intentionally limited to an idle engine with exactly
+    # one queued request. The very first request must delay immediately rather
+    # than being consumed by the legacy skip-first behavior.
+    NegotiateTestCase(
+        name="idle_coalesce_single_request",
+        max_delay_passes=100,
+        token_usage_low_watermark=None,
+        enable_idle_coalescing=True,
+        idle_coalesce_max_delay_ms=50,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[0, 0, 0, 0],
+                waiting_queue_len=[1, 1, 1, 1],
+                max_running_requests=32,
+            )
+        ],
+        expected_allow=False,
+        expected_reason="delay",
+    ),
+    # A burst larger than BS2 keeps waiting until the queue has been quiet for
+    # settle_ms, so nominal C4/C8/C16 can form one actual batch.
+    NegotiateTestCase(
+        name="idle_coalesce_delays_growing_larger_queue",
+        max_delay_passes=100,
+        token_usage_low_watermark=None,
+        enable_idle_coalescing=True,
+        idle_coalesce_max_delay_ms=50,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[0, 0, 0, 0],
+                waiting_queue_len=[8, 8, 8, 8],
+                max_running_requests=32,
+            )
+        ],
+        expected_allow=False,
+        expected_reason="delay",
+    ),
+    NegotiateTestCase(
+        name="idle_coalesce_releases_larger_queue_after_settle",
+        max_delay_passes=100,
+        token_usage_low_watermark=None,
+        enable_idle_coalescing=True,
+        idle_coalesce_max_delay_ms=50,
+        idle_coalesce_settle_ms=5,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[0, 0, 0, 0],
+                waiting_queue_len=[2, 2, 2, 2],
+                max_running_requests=32,
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[0, 0, 0, 0],
+                waiting_queue_len=[8, 8, 8, 8],
+                max_running_requests=32,
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[0, 0, 0, 0],
+                waiting_queue_len=[8, 8, 8, 8],
+                max_running_requests=32,
+                sleep_before_s=0.02,
+            ),
+        ],
+        expected_allow=True,
+        expected_reason="wait_success",
+        expected_wait_forward_passes=2,
+    ),
+    NegotiateTestCase(
+        name="idle_coalesce_releases_at_max_batch_size",
+        max_delay_passes=100,
+        token_usage_low_watermark=None,
+        enable_idle_coalescing=True,
+        idle_coalesce_max_delay_ms=50,
+        idle_coalesce_settle_ms=10,
+        idle_coalesce_max_batch_size=8,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[0, 0, 0, 0],
+                waiting_queue_len=[8, 8, 8, 8],
+                max_running_requests=32,
+            )
+        ],
+        expected_allow=True,
+        expected_reason="no_wait",
+    ),
+    # Refill behavior is untouched: a single queued request is not delayed by
+    # idle coalescing while any request is already running.
+    NegotiateTestCase(
+        name="idle_coalesce_does_not_delay_running_batch",
+        max_delay_passes=100,
+        token_usage_low_watermark=None,
+        enable_idle_coalescing=True,
+        idle_coalesce_max_delay_ms=50,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[1, 1, 1, 1],
+                waiting_queue_len=[1, 1, 1, 1],
+                max_running_requests=32,
+            )
+        ],
+        expected_allow=True,
+        expected_reason="no_wait",
+    ),
+    # A lone request is always released when its small coalescing window
+    # expires, bounding the C=1 latency penalty.
+    NegotiateTestCase(
+        name="idle_coalesce_wall_clock_timeout",
+        max_delay_passes=100,
+        token_usage_low_watermark=None,
+        enable_idle_coalescing=True,
+        idle_coalesce_max_delay_ms=20,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[0, 0, 0, 0],
+                waiting_queue_len=[1, 1, 1, 1],
+                max_running_requests=32,
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[0, 0, 0, 0],
+                waiting_queue_len=[1, 1, 1, 1],
+                max_running_requests=32,
+                sleep_before_s=0.1,
+            ),
+        ],
+        expected_allow=True,
+        expected_reason="wait_success",
+        expected_wait_forward_passes=1,
     ),
     # max_delay_ms wall-clock timeout: once a single queue-trigger delay
     # exceeds the cap, prefill must be force-released.

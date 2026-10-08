@@ -271,7 +271,7 @@ class GenerateReqInput:
     decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
 
     # For DP routing — external router assigns a specific DP worker
-    routed_dp_rank: Optional[int] = None
+    routed_dp_rank: Optional[Union[List[int], int]] = None
     # Deprecated alias for `routed_dp_rank`, still accepted because
     # sgl-model-gateway's dp-aware mode injects this spelling into every
     # request it forwards (DPAwareWorker::prepare_request), and the OpenAI
@@ -533,6 +533,22 @@ class GenerateReqInput:
         self._normalize_extra_key(num)
         self._normalize_cache_salt(num)
         self._normalize_bootstrap_params(num)
+        self._normalize_routed_dp_rank(num)
+
+    def _normalize_routed_dp_rank(self, num):
+        """Normalize optional per-item DP routing for native batch requests."""
+        if self.routed_dp_rank is None:
+            return
+        if isinstance(self.routed_dp_rank, list):
+            if len(self.routed_dp_rank) != self.batch_size:
+                raise ValueError(
+                    "The length of routed_dp_rank should equal the batch size."
+                )
+            self.routed_dp_rank = self.routed_dp_rank * self.parallel_sample_num
+        elif not isinstance(self.routed_dp_rank, int):
+            raise ValueError(
+                "routed_dp_rank should be an integer or a list of integers."
+            )
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -915,7 +931,11 @@ class GenerateReqInput:
             decode_tp_size=(
                 self.decode_tp_size[i] if self.decode_tp_size is not None else None
             ),
-            routed_dp_rank=self.routed_dp_rank,
+            routed_dp_rank=(
+                self.routed_dp_rank[i]
+                if isinstance(self.routed_dp_rank, list)
+                else self.routed_dp_rank
+            ),
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,

@@ -99,7 +99,6 @@ from sglang.srt.disaggregation.prefill import (
     trace_disagg_prefill,
 )
 from sglang.srt.disaggregation.utils import (
-    EXTERNAL_KV_LOAD_ERR_TYPE,
     DisaggregationMode,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -151,6 +150,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
+    FinishReasonDict,
     FlushCacheReqInput,
     FreezeGCReq,
     GetInternalStateReq,
@@ -1228,9 +1228,14 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
+        self._external_kv_chunked_abort_reqs = {}
         # Failed external-linker rids that matched no scheduled request on the
         # pass that drained them; retried once, see _mark_failed_linker_loads.
         self._deferred_linker_rids: Set[str] = set()
+        # Track requests marked for external KV abort and cleanup to ensure
+        # proper lifecycle and prevent duplicate releases.
+        self._external_kv_abort_rids: Set[str] = set()
+        self._external_kv_cleanup_rids: Set[str] = set()
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -1308,6 +1313,7 @@ class Scheduler(
                 self.prefill_delayer = PrefillDelayer(
                     dp_size=self.ps.dp_size,
                     attn_tp_size=self.ps.attn_tp_size,
+                    attn_cp_size=self.ps.attn_cp_size,
                     cpu_group=self.tp_cpu_group,
                     device_group=self.tp_group.device_group,
                     server_args=self.server_args,
@@ -3593,7 +3599,13 @@ class Scheduler(
 
     def _release_aborted_request(self, rid: str) -> None:
         """Drop the cache-side state an aborted request left behind."""
-        if self.enable_hicache_storage or self.enable_unified_cache_external_linker:
+        # enable_hierarchical_cache is included deliberately: HiRadixCache
+        # holds ongoing_prefetch state for an aborted request too.
+        if (
+            self.enable_hierarchical_cache
+            or self.enable_hicache_storage
+            or self.enable_unified_cache_external_linker
+        ):
             self.tree_cache.release_aborted_request(rid)
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
@@ -3623,8 +3635,6 @@ class Scheduler(
             )
             if abort_existing_req:
                 self._release_aborted_request(candidate_req.rid)
-                if self.enable_hierarchical_cache and not self.enable_hicache_storage:
-                    self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
@@ -3767,12 +3777,32 @@ class Scheduler(
         is excluded from streaming and its logprob offset is still accounted).
         Mirrors ``handle_bootstrap_failure``.
         """
+        pending = getattr(self, "_external_kv_chunked_abort_reqs", None)
+        if pending is None:
+            pending = self._external_kv_chunked_abort_reqs = {}
         req = self._pending_chunked_abort_req
-        if req is None:
+        if req is not None and (
+            req.external_kv_abort_requested or req.rid in self._external_kv_abort_rids
+        ):
+            req.external_kv_abort_response_via_chunked = True
+            pending[req.rid] = req
+        # A later chunk's abort must not replace the earlier response retry owner.
+        for aborted_req in tuple(pending.values()):
+            self._process_external_kv_chunked_abort(aborted_req)
+        req = self._pending_chunked_abort_req
+        if req is None or req.external_kv_abort_requested or req.rid in pending:
             return
-        if self.chunked_req is not req:
-            # Already past chunked prefill; the running-batch abort path handles
-            # it. Drop the marker once the request is actually gone.
+        if self.chunked_req is not req and not req.external_kv_abort_requested:
+            # Already past chunked prefill; check if still needs abort handling.
+            # If the request is still in external KV abort state, it might be in
+            # inflight or result queues and will be handled there.
+            if (
+                req.rid in self._external_kv_abort_rids
+                and not req.external_kv_abort_requested
+            ):
+                return
+
+            # Drop the marker once the request is actually gone
             if req.finished() or req.req_pool_idx is None:
                 self._pending_chunked_abort_req = None
             return
@@ -3793,16 +3823,66 @@ class Scheduler(
             )
             req.pending_bootstrap = False
         self._release_aborted_request(req.rid)
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+
+        # Ensure idempotent KV release
+        if req.rid not in self._external_kv_cleanup_rids:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+            self._external_kv_cleanup_rids.add(req.rid)
+
+        self._external_kv_abort_rids.discard(req.rid)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
         # Without the reason the tokenizer falls back to its generic "Abort in
         # waiting queue", which loses both the message and the status code.
         self.ipc_channels.send_to_tokenizer.send_output(
-            _make_abort_req(req, finished_reason=req.finished_reason.to_json()), req
+            AbortReq(
+                rid=req.rid,
+                finished_reason=req.finished_reason.to_json(),
+            ),
+            req,
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
+
+    def _process_external_kv_chunked_abort(self, req) -> None:
+        if self.chunked_req is req:
+            self.chunked_req = None
+        req.external_kv_abort_response_via_chunked = True
+        sender_terminal = self.prefill_abort_sender_terminal(req)
+        cleanup_done = self.abort_external_kv_request(
+            req,
+            forward_drained=self.prefill_abort_forward_drained(req),
+            sender_terminal=sender_terminal,
+            abort_message=getattr(
+                req.to_finish or req.finished_reason,
+                "message",
+                "External KV load failed",
+            ),
+            is_insert=False,
+            emit_response=False,
+        )
+        if not cleanup_done:
+            return
+        if not req.external_kv_response_sent:
+            try:
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(
+                        rid=req.rid,
+                        finished_reason=req.finished_reason.to_json(),
+                    ),
+                    req,
+                )
+            except Exception:
+                logger.exception(
+                    "Chunked abort response failed for %s; will retry", req.rid
+                )
+                return
+            req.external_kv_response_sent = True
+        self._external_kv_chunked_abort_reqs.pop(req.rid, None)
+        if self._pending_chunked_abort_req is req:
+            self._pending_chunked_abort_req = None
+        logger.debug(f"Abort chunked prefill request. {req.rid=}")
+        return
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
@@ -3913,6 +3993,22 @@ class Scheduler(
 
             if self.dllm_config is not None and last_batch.reqs:
                 chunked_req_to_exclude.update(last_batch.reqs)
+
+            # The overlap loop reaches here before the previous Prefill result
+            # is processed.  Its final chunk already sampled one token, so a
+            # max_new_tokens=1 request is complete in the pending result even
+            # though req.finished() is not set yet.  Do not merge such requests
+            # into running_batch and launch a needless one-token decode.  Apart
+            # from wasted work, that lookahead can pair with a CP Prefill on a
+            # different attention-DP replica and force an expensive mixed
+            # full-TP forward.
+            if self.enable_overlap and last_batch.contains_last_prefill_chunk:
+                chunked_req_to_exclude.update(
+                    req
+                    for req in last_batch.reqs
+                    if req.inflight_middle_chunks <= 0
+                    and req.finishes_after_pending_token()
+                )
 
             # Filter batch
             last_bs = last_batch.batch_size()
@@ -4987,6 +5083,55 @@ class Scheduler(
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
 
+    def _iter_external_linker_candidates(self, batch: ScheduleBatch):
+        """Yield all requests that might hold references to external linker loads.
+
+        This includes not just the current batch and running batch, but also:
+        - chunked_req (between chunks)
+        - disagg_prefill_inflight_queue (mid-transfer)
+        - waiting_queue (not yet scheduled)
+        - disagg_prefill_bootstrap_queue (bootstrapping)
+        - result_queue (under overlap, not yet processed)
+
+        The original code only checked batch.reqs, running_batch.reqs, and chunked_req,
+        missing owners in other queues. This caused pool leaks when a failed linker
+        load's second owner was in one of those locations.
+        """
+        groups = [batch.reqs]
+
+        if self.running_batch is not None and not self.running_batch.is_empty():
+            groups.append(self.running_batch.reqs)
+
+        if self.chunked_req is not None:
+            groups.append([self.chunked_req])
+
+        # Critical additions: requests can also live in these queues
+        if hasattr(self, "disagg_prefill_inflight_queue") and self.disagg_prefill_inflight_queue:
+            groups.append(self.disagg_prefill_inflight_queue)
+
+        if hasattr(self, "waiting_queue") and self.waiting_queue:
+            groups.append(self.waiting_queue)
+
+        # Bootstrap queue access depends on implementation
+        if hasattr(self, "disagg_prefill_bootstrap_queue") and self.disagg_prefill_bootstrap_queue is not None:
+            bootstrap_queue = getattr(self.disagg_prefill_bootstrap_queue, "queue", None)
+            if bootstrap_queue is not None:
+                groups.append(list(bootstrap_queue))
+
+        # Under overlap, unprocessed batches in result_queue also hold requests
+        if hasattr(self, "result_queue") and self.result_queue:
+            for queued_batch, _ in self.result_queue:
+                groups.append(queued_batch.reqs)
+
+        # Deduplicate: a request can appear in multiple groups
+        seen = set()
+        for reqs in groups:
+            for req in reqs:
+                if req.rid in seen:
+                    continue
+                seen.add(req.rid)
+                yield req
+
     def _mark_failed_linker_loads(self, batch: ScheduleBatch) -> None:
         """Mark requests whose external-linker KV load failed for this batch.
 
@@ -5006,39 +5151,48 @@ class Scheduler(
         if not failed and not sweep_chains:
             return
         message = "Aborted: external KV cache load failed."
-        # The MIN-reduced verdict can arrive a batch late on a lagging rank,
-        # by which point the request is already decoding. Sweep both lists.
-        candidates = list(batch.reqs)
-        if self.running_batch is not None and not self.running_batch.is_empty():
-            candidates.extend(self.running_batch.reqs)
+        # Collect candidates from all possible request holding locations
+        candidates = list(self._iter_external_linker_candidates(batch))
+
+        handled_rids = set()
+
         for req in candidates:
-            if req.rid in failed:
-                failed.discard(req.rid)
-            elif not (
-                sweep_chains
-                and self.tree_cache.is_on_failed_linker_chain(
-                    getattr(req, "last_node", None)
-                )
-            ):
-                continue
-            if req.finished() or req.to_finish is not None:
-                continue
-            # Never finished_reason here: a request finished ahead of the
-            # result processors is skipped by all of them, so it would leak its
-            # KV and never answer. update_finish_state promotes it instead.
-            req.skip_radix_cache_insert = True
-            req.to_finish = FINISH_ABORT(
-                message,
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                err_type=EXTERNAL_KV_LOAD_ERR_TYPE,
+            rid_match = req.rid in failed
+            chain_match = sweep_chains and self.tree_cache.is_on_failed_linker_chain(
+                getattr(req, "last_node", None)
             )
+
+            if not rid_match and not chain_match:
+                continue
+
+            # Already in cleanup phase - don't duplicate release
+            if req.rid in self._external_kv_cleanup_rids:
+                handled_rids.add(req.rid)
+                continue
+
             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
-            self._release_aborted_request(req.rid)
+            if req is self.chunked_req:
+                req.external_kv_abort_response_via_chunked = True
+                self._external_kv_chunked_abort_reqs[req.rid] = req
+            self.abort_external_kv_request(
+                req,
+                forward_drained=False,
+                sender_terminal=False,
+                abort_message=message,
+                is_insert=False,
+                emit_response=False,
+            )
+            handled_rids.add(req.rid)
+
             if req is self.chunked_req:
                 # A mid-chunk request never reaches update_finish_state, and
                 # freeing it here would leave self.chunked_req pointing at a
                 # freed request for the next step to stash and re-prefill.
                 self._pending_chunked_abort_req = req
+
+        # Only remove rids that were actually handled from the failed set
+        failed -= handled_rids
+
         if not failed:
             return
         # Under overlap the next batch is launched but not yet merged into
@@ -5219,6 +5373,10 @@ class Scheduler(
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
 
+                # Retry reclaiming stranded failed linker chains periodically
+                if self.enable_unified_cache_external_linker:
+                    self.tree_cache.retry_stranded_failed_linker_chains()
+
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
@@ -5244,6 +5402,12 @@ class Scheduler(
                         # storage writes still hold host staging
                         # (buffer-mode unified tree only).
                         idle &= tc.buffer_pipeline.is_idle()
+
+            # Wait for asynchronous linker loads and stores to drain.
+            if self.enable_unified_cache_external_linker:
+                linker = self.tree_cache.linker
+                if linker is not None:
+                    idle &= not linker.has_pending_operations()
 
         return idle
 
@@ -6000,6 +6164,12 @@ class Scheduler(
         pass
 
 
+def _make_abort_req(
+    req: Req, finished_reason: Optional[FinishReasonDict] = None
+) -> AbortReq:
+    return AbortReq(rid=req.rid, finished_reason=finished_reason)
+
+
 def dispatch_event_loop(scheduler: Scheduler):
     # The live PP property asserts before torch.distributed init (MLX stub).
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
@@ -6093,13 +6263,6 @@ def configure_scheduler_process(
             numa_bind_to_node(numa_node)
 
     return dp_rank
-
-
-def _make_abort_req(
-    req: Req, finished_reason: Optional[dict] = None
-) -> AbortReq:
-    """Build the tokenizer notification for an aborted request."""
-    return AbortReq(rid=req.rid, finished_reason=finished_reason)
 
 
 def run_scheduler_process(

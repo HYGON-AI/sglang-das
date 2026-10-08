@@ -413,7 +413,11 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
                 mock.patch.object(
                     comm,
                     "get_parallel",
-                    lambda: types.SimpleNamespace(tp_size=tp_world_size),
+                    lambda: types.SimpleNamespace(
+                        tp_size=tp_world_size,
+                        moe_ep_size=1,
+                        moe_tp_size=tp_world_size,
+                    ),
                 )
             )
             # the gate reads get_exec().comm.enable_aiter_allreduce_fusion
@@ -460,6 +464,19 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
         self.assertFalse(
             self._evaluate_gate(
                 dp_attention=False, a2a_is_none=True, aiter_enabled=False
+            )
+        )
+
+    def test_compute_aiter_flag_is_independent_from_custom_ar(self):
+        # LightOp can own dense FP8 GEMMs while AITER owns communication.
+        # SGLANG_USE_AITER=0 must therefore not disable the explicitly
+        # requested AITER custom-AR fusion.
+        self.assertTrue(
+            self._evaluate_gate(
+                dp_attention=False,
+                a2a_is_none=True,
+                use_aiter=False,
+                aiter_enabled=True,
             )
         )
 

@@ -185,6 +185,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         prefix: str,
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.radix_attention import RadixAttention
 
         if isinstance(layer, LinearBase):
             # If linear_fp8_config is set, use FP8 for linear layers
@@ -249,6 +250,13 @@ class CompressedTensorsConfig(QuantizationConfig):
                     use_triton_kernels, use_flashinfer_trtllm_moe, use_deep_gemm
                 )
             return CompressedTensorsFusedMoEMethod(self)
+        if isinstance(layer, RadixAttention) and self.kv_cache_scheme is not None:
+            # Static FP8 KV-cache scales are ordinary scalar parameters in the
+            # checkpoint.  The weight loader remaps HF k_scale/v_scale names to
+            # the RadixAttention parameters created by this method.
+            from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+
+            return BaseKVCacheMethod(self)
         return None
 
     def _add_fused_moe_to_target_scheme_map(self):
@@ -887,16 +895,41 @@ class CompressedTensorsConfig(QuantizationConfig):
             if _is_npu and self._is_dynamic_token_w4a8(weight_quant, input_quant):
                 logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoE")
                 return NPUCompressedTensorsW4A8Int8DynamicMoE(self)
+            # HIP packed INT4 + dynamic per-token INT8: this is W4A8 in
+            # compressed-tensors metadata, but the checkpoint is still
+            # pack-quantized (not ngram unpacked int8). NVIDIA CUTLASS
+            # W4AFP8 is unavailable; reuse Triton GPTQ MoE with
+            # use_int4_w4a8 so activations are quantized per token.
+            if (
+                _is_hip
+                and self._is_dynamic_token_w4a8(weight_quant, input_quant)
+                and input_quant is not None
+                and input_quant.type == QuantizationType.INT
+            ):
+                logger.info_once(
+                    "Using CompressedTensorsWNA16TritonMoE use_int4_w4a8 "
+                    "(packed INT4 + dynamic per-token INT8 activations)"
+                )
+                return CompressedTensorsWNA16TritonMoE(
+                    self, weight_quant=weight_quant, use_int4_w4a8=True
+                )
             logger.info_once("Using CompressedTensorsW4AFP8MoE")
             return CompressedTensorsW4AFP8MoE(self, weight_quant, input_quant)
         elif self._is_dynamic_token_w4a8(weight_quant, input_quant):
             if _is_npu:
                 logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoE")
                 return NPUCompressedTensorsW4A8Int8DynamicMoE(self)
-            else:
-                raise NotImplementedError(
-                    f"The W4A8Int8 Fused MoE scheme is implemented only for NPU for now."
+            if _is_hip and self.quant_format == CompressionFormat.pack_quantized.value:
+                logger.info_once(
+                    "Using CompressedTensorsWNA16TritonMoE use_int4_w4a8 "
+                    "(packed INT4 + dynamic per-token INT8 activations)"
                 )
+                return CompressedTensorsWNA16TritonMoE(
+                    self, weight_quant=weight_quant, use_int4_w4a8=True
+                )
+            raise NotImplementedError(
+                "The W4A8Int8 Fused MoE scheme is implemented only for NPU for now."
+            )
         else:
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"

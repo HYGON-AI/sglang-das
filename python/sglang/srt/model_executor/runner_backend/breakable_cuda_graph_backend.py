@@ -18,6 +18,7 @@ No torch.compile.
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -155,6 +156,13 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         if isinstance(output, PPProxyTensors):
             rows = [t.shape[0] for t in output.tensors.values()]
             return min([cap, *rows])
+        if dataclasses.is_dataclass(output) and not isinstance(output, type):
+            rows = [
+                self._output_rows(value, cap)
+                for field in dataclasses.fields(output)
+                if (value := getattr(output, field.name)) is not None
+            ]
+            return min(rows) if rows else cap
         if isinstance(output, (list, tuple)) and output:
             return min(self._output_rows(o, cap) for o in output if o is not None)
         return cap
@@ -172,6 +180,17 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                     for key, t in output.tensors.items()
                 }
             )
+        if dataclasses.is_dataclass(output) and not isinstance(output, type):
+            return dataclasses.replace(
+                output,
+                **{
+                    field.name: self._alloc_full_buffer(
+                        getattr(output, field.name), size
+                    )
+                    for field in dataclasses.fields(output)
+                    if field.init
+                },
+            )
         if isinstance(output, tuple):
             return tuple(self._alloc_full_buffer(o, size) for o in output)
         if isinstance(output, list):
@@ -185,6 +204,17 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return output[:num_tokens]
         if isinstance(output, PPProxyTensors):
             return output[:num_tokens]
+        if dataclasses.is_dataclass(output) and not isinstance(output, type):
+            return dataclasses.replace(
+                output,
+                **{
+                    field.name: self._slice_output(
+                        getattr(output, field.name), num_tokens
+                    )
+                    for field in dataclasses.fields(output)
+                    if field.init
+                },
+            )
         if isinstance(output, tuple):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
@@ -215,6 +245,18 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             for key, tensor in output.tensors.items():
                 self._copy_output_to_buffer(
                     tensor, output_buffer.tensors[key], num_tokens
+                )
+            return
+        if (
+            dataclasses.is_dataclass(output)
+            and not isinstance(output, type)
+            and type(output) is type(output_buffer)
+        ):
+            for field in dataclasses.fields(output):
+                self._copy_output_to_buffer(
+                    getattr(output, field.name),
+                    getattr(output_buffer, field.name),
+                    num_tokens,
                 )
             return
         if isinstance(output, (list, tuple)) and isinstance(

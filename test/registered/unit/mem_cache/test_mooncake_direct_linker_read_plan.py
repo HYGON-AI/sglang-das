@@ -117,6 +117,5 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         self.assertEqual(queued_transfers, [transfer])
         linker.host_prefetch_queue.task_done()
 
-
 if __name__ == "__main__":
     unittest.main()

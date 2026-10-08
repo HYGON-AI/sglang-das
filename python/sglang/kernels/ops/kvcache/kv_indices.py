@@ -6,6 +6,59 @@ FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON = tl.constexpr(_FLASHMLA_CREATE_KV_BLOCK_SI
 
 
 @triton.jit
+def create_draft_extend_kv_metadata_triton(
+    req_to_token_ptr,  # [max_batch, max_context_len]
+    req_pool_indices_ptr,  # [bs]
+    seq_lens_ptr,  # [bs], post draft-extend lengths
+    extend_seq_lens_ptr,  # [bs]
+    kv_indptr_ptr,  # [bs + 1]
+    qo_indptr_ptr,  # [bs + 1]
+    kv_indices_ptr,
+    req_to_token_ptr_stride: tl.constexpr,
+    NUM_TOKENS_PER_REQ: tl.constexpr,
+    BS_BLOCK: tl.constexpr,
+):
+    """Build all Triton draft-extend ragged metadata in one launch.
+
+    Draft extend has a fixed query width for a captured graph bucket.  The
+    prefix length is ``seq_len - extend_len``.  Computing its small exclusive
+    scan in each request program lets the same launch also materialize the KV
+    indices, replacing the former arange + cumsum + KV-index launch chain.
+    """
+    BLOCK_SIZE: tl.constexpr = 512
+    pid = tl.program_id(axis=0)
+
+    batch_offs = tl.arange(0, BS_BLOCK)
+    batch_mask = batch_offs < tl.num_programs(axis=0)
+    seq_lens = tl.load(seq_lens_ptr + batch_offs, mask=batch_mask, other=0).to(tl.int32)
+    extend_lens = tl.load(
+        extend_seq_lens_ptr + batch_offs, mask=batch_mask, other=0
+    ).to(tl.int32)
+    kv_lens = tl.maximum(seq_lens - extend_lens, 0)
+
+    kv_start = tl.sum(tl.where(batch_offs < pid, kv_lens, 0), axis=0)
+    kv_len = tl.sum(tl.where(batch_offs == pid, kv_lens, 0), axis=0)
+    tl.store(kv_indptr_ptr + pid, kv_start)
+    tl.store(qo_indptr_ptr + pid, pid * NUM_TOKENS_PER_REQ)
+    if pid == tl.num_programs(axis=0) - 1:
+        tl.store(kv_indptr_ptr + pid + 1, kv_start + kv_len)
+        tl.store(qo_indptr_ptr + pid + 1, (pid + 1) * NUM_TOKENS_PER_REQ)
+
+    req_pool_index = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
+    num_loop = tl.cdiv(kv_len, BLOCK_SIZE)
+    for i in range(num_loop):
+        offsets = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < kv_len
+        values = tl.load(
+            req_to_token_ptr
+            + req_pool_index * req_to_token_ptr_stride
+            + offsets.to(tl.int64),
+            mask=mask,
+        )
+        tl.store(kv_indices_ptr + kv_start + offsets, values, mask=mask)
+
+
+@triton.jit
 def create_flashinfer_kv_indices_triton(
     req_to_token_ptr,  # [max_batch, max_context_len]
     req_pool_indices_ptr,

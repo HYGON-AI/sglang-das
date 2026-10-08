@@ -239,6 +239,12 @@ def create_hcu_mla_backend(runner):
 
 @register_attention_backend("fa3")
 def create_flashattention_v3_backend(runner):
+    if _is_hcu:
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+
+        return FlashAttentionBackend(runner, fa_impl_ver=3)
 
     major, minor = get_device_capability()
     if not _is_musa:

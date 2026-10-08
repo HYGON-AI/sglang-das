@@ -38,6 +38,12 @@ class MoeRunnerConfig:
     # MoE parameters
     num_experts: Optional[int] = None
     num_local_experts: Optional[int] = None
+    # Some DeepEP layouts keep replicated shared experts out of the A2A while
+    # still appending them to the local grouped GEMM.  In that case the runner
+    # owns more expert weights than the dispatcher is allowed to communicate.
+    num_dispatch_experts: Optional[int] = None
+    num_dispatch_local_experts: Optional[int] = None
+    local_shared_experts_without_dispatch: bool = False
     hidden_size: Optional[int] = None
     intermediate_size_per_partition: Optional[int] = None
     layer_id: Optional[int] = None

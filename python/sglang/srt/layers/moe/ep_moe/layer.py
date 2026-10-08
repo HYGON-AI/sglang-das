@@ -19,9 +19,6 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
-from triton.language.extra import libdevice
 
 from sglang.kernels.ops.moe.ep_moe_kernels import (
     build_m_indices_triton,
@@ -47,7 +44,7 @@ from sglang.srt.layers.dp_attention import (
     get_is_extend_in_batch,
     set_is_extend_in_batch,
 )
-from sglang.srt.layers.moe import (  # should_use_flashinfer_trtllm_moe, # 找不到
+from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
@@ -57,8 +54,11 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import (
     moe_forward_piecewise_cuda_graph_impl,
 )
 from sglang.srt.layers.moe.moe_runner.deep_gemm import copy_list_to_gpu_no_ce
+from sglang.srt.layers.moe.token_dispatcher.aiter_utils import should_use_aiter_runner
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
+    DeepEPLLLocalSharedCombineInput,
+    DeepEPLLLocalSharedDispatchOutput,
     DeepEPNormalCombineInput,
 )
 from sglang.srt.layers.moe.token_dispatcher.moriep import (
@@ -124,15 +124,17 @@ from deepgemm import (
     m_grouped_w4a8_gemm_nt_masked,
     m_grouped_w4a8_gemm_nt_masked_hipc,
 )
+
 try:
     from deepgemm import m_grouped_w4a8_gemm_nt_contiguous_hipc
 except ImportError:
     m_grouped_w4a8_gemm_nt_contiguous_hipc = None
 
 from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
-from lightop import fuse_silu_mul_clamp_quant, moe as lightop_op
-# from lightop import fuse_situ_mul_quant_contiguous  as  fuse_situ_mul_quant
-# from lightop import fuse_situ_mul_quant_ep
+from lightop import fuse_silu_mul_clamp_quant
+from lightop import fuse_situ_mul_quant_contiguous as fuse_situ_mul_quant
+from lightop import fuse_situ_mul_quant_ep
+from lightop import moe as lightop_op
 from lightop.activation import (
     fuse_silu_and_mul,
     fuse_silu_mul_fp8_quant,
@@ -140,20 +142,6 @@ from lightop.activation import (
     fuse_silu_mul_quant,
     fuse_silu_mul_quant_ep,
 )
-
-
-# Dummy SiTU functions for Kimi K3 (not used by Qwen)
-def fuse_situ_mul_quant(input, gemm1_alpha, gemm1_clamp_limit):
-    raise NotImplementedError("SiTU activation not supported. This build only supports Qwen with SiLU.")
-
-def fuse_situ_mul_quant_ep(
-    input: torch.Tensor,
-    masked_m: torch.Tensor,
-    situ_beta: float,
-    situ_linear_beta: float,
-    expect_m: int = -1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    raise NotImplementedError("SiTU activation not supported. This build only supports Qwen with SiLU.")
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -163,13 +151,35 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
 _use_marlin_w4a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W4A16_MOE_OPT")
-_use_w4a8_contiguous_hipc = get_bool_env_var(
-    "SGLANG_USE_W4A8_CONTIGUOUS_HIPC"
-)
+_use_w4a8_contiguous_hipc = get_bool_env_var("SGLANG_USE_W4A8_CONTIGUOUS_HIPC")
 _use_w4a8_masked_hipc = get_bool_env_var("SGLANG_USE_W4A8_MASKED_HIPC")
 _use_lightop_ep_moe_align = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_MOE_ALIGN", "true")
 _use_lightop_ep_scatter = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_SCATTER", "true")
 _use_lightop_ep_gather = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_GATHER", "true")
+logger = logging.getLogger(__name__)
+_HCU_LL_GRAPH_BRIDGE_BUFFERS: dict[
+    tuple[torch.device, tuple[int, ...], torch.dtype], torch.Tensor
+] = {}
+
+
+def _get_hcu_ll_graph_bridge(
+    hidden_states: torch.Tensor, dtype: torch.dtype
+) -> torch.Tensor:
+    bridge_key = (hidden_states.device, tuple(hidden_states.shape), dtype)
+    bridge = _HCU_LL_GRAPH_BRIDGE_BUFFERS.get(bridge_key)
+    if bridge is None:
+        bridge = torch.empty_like(hidden_states, dtype=dtype)
+        _HCU_LL_GRAPH_BRIDGE_BUFFERS[bridge_key] = bridge
+    return bridge
+
+
+def _should_use_hcu_deepgemm_runner() -> bool:
+    """Route DTK/HCU DeepGEMM through the modern dispatcher/runner stack."""
+    return (
+        deep_gemm_wrapper.ENABLE_HCU_DEEPGEMM
+        and get_moe_runner_backend().is_deep_gemm()
+    )
+
 
 if _use_aiter and not _is_hcu:
     from aiter import ActivationType, QuantType
@@ -177,7 +187,19 @@ if _use_aiter and not _is_hcu:
 elif _is_npu:
     import torch_npu
 
-logger = logging.getLogger(__name__)
+
+def _should_break_only_hcu_deepgemm_core() -> bool:
+    """Keep DeepEP LL dispatch/combine captured and break only HCU GEMMs.
+
+    The DTK/HCU masked grouped GEMM works eagerly but segfaults when invoked
+    inside ``torch.cuda.graph``.  DeepEP low-latency dispatch/combine reaches
+    that GEMM successfully during full-graph capture, so under the breakable
+    backend the narrow safe boundary is the MoE core, not the whole A2A layer.
+    """
+    return (
+        _should_use_hcu_deepgemm_runner()
+        and get_deepep_mode().resolve(get_is_extend_in_batch()).is_low_latency()
+    )
 
 
 def _can_use_lightop_ep_scatter(
@@ -494,21 +516,21 @@ def fuse_silu_mul_quant_ep_fake(
     scales = torch.empty((E, T, 1), device=input.device, dtype=torch.float32)
     return output, scales
 
+
 def fuse_situ_mul_quant_ep_fake(
     input: torch.Tensor,
     masked_m: torch.Tensor,
     situ_beta: float,
     situ_linear_beta: float,
-    expect_m: int = -1
+    expect_m: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     experts, tokens, doubled_hidden = input.shape
     output = torch.empty(
         (experts, tokens, doubled_hidden // 2), dtype=torch.int8, device=input.device
     )
-    scales = torch.empty(
-        (experts, tokens, 1), dtype=torch.float32, device=input.device
-    )
+    scales = torch.empty((experts, tokens, 1), dtype=torch.float32, device=input.device)
     return output, scales
+
 
 direct_register_custom_op(
     op_name="m_grouped_w4a8_gemm_nt_masked",
@@ -606,9 +628,18 @@ class DeepEPMoE(FusedMoE):
         )
         if is_humming:
             self.deprecate_flag = True
-        elif _is_hcu and _use_aiter:
-            self.deprecate_flag = False
-        elif _use_aiter:
+        # Explicit --moe-runner-backend aiter must take the modern FusedMoE
+        # dispatcher/runner path too.  Checking only SGLANG_USE_AITER misses
+        # deployments (notably MiniMax-M3 channel-FP8 on BW1100) that keep the
+        # global AITER switch off to avoid selecting AITER for dense GEMMs but
+        # opt the MoE runner in explicitly.
+        elif should_use_aiter_runner():
+            self.deprecate_flag = True
+        elif _should_use_hcu_deepgemm_runner():
+            # The legacy DeepEPMoE core contains only old CUTLASS branches and
+            # deliberately rejects DeepGEMM normal/LL outputs.  The HCU
+            # channel-FP8 adapter lives in MoeRunner(DEEP_GEMM), so select the
+            # same modern FusedMoE dispatcher/runner flow used by AITER.
             self.deprecate_flag = True
         elif _is_npu:
             self.deprecate_flag = True
@@ -777,7 +808,20 @@ class DeepEPMoE(FusedMoE):
     ) -> None:
         # eager run under breakable cuda graph
         saved_is_extend_in_batch = get_is_extend_in_batch()
-        set_is_extend_in_batch(True)
+        # The legacy eager graph break forced NORMAL DeepEP because that was
+        # the only supported implementation.  MiniMax's AITER adapter supports
+        # low-latency decode and must preserve the decode phase here; otherwise
+        # ``deepep-mode=auto`` silently runs NORMAL during decode warmup/replay.
+        force_ll_decode = (
+            get_moe_runner_backend().is_aiter()
+            and get_deepep_mode().enable_low_latency()
+        )
+        # Breakable eager callbacks do not restore ForwardContext, so the
+        # thread-local flag can still contain the startup EXTEND value during
+        # decode replay.  This callback is the decode graph boundary; choose
+        # LL explicitly for the AITER adapter. Prefill graph is disabled for
+        # this path and ordinary eager prefill does not enter this callback.
+        set_is_extend_in_batch(False if force_ll_decode else True)
         try:
             output.copy_(
                 self.forward_impl(
@@ -804,6 +848,52 @@ class DeepEPMoE(FusedMoE):
         True, capture_stub=_a2a_forward_capture_stub
     )(_a2a_forward_with_output_impl)
 
+    def _hcu_ll_moe_core_impl(self, dispatch_output: DispatchOutput):
+        # Bypass this class's routing method so replay executes the real modern
+        # quant-method runner exactly once inside the eager graph break.
+        from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+            use_hcu_masked_output_buffer,
+        )
+
+        bridge = _get_hcu_ll_graph_bridge(
+            dispatch_output.hidden_states, self.params_dtype
+        )
+        with use_hcu_masked_output_buffer(bridge):
+            return super(DeepEPMoE, self).run_moe_core(dispatch_output)
+
+    def _hcu_ll_moe_core_capture_stub(
+        self, dispatch_output: DispatchOutput
+    ) -> DeepEPLLCombineInput:
+        if not dispatch_output.format.is_deepep_ll():
+            raise RuntimeError(
+                "HCU DeepGEMM core-only graph break requires DeepEP low-latency "
+                f"dispatch, got {dispatch_output.format}"
+            )
+        # Breakable replay is strictly segment -> eager break -> segment, so
+        # layers with the same LL capacity can share one bridge address.  A
+        # per-layer [E, M, K] BF16 buffer is ~192 MiB for MiniMax-M3 and would
+        # otherwise retain more than 10 GiB across its 57 MoE layers.
+        bridge = _get_hcu_ll_graph_bridge(
+            dispatch_output.hidden_states, self.params_dtype
+        )
+        local_shared_rows = getattr(dispatch_output, "local_shared_rows", 0)
+        if local_shared_rows:
+            return DeepEPLLLocalSharedCombineInput(
+                hidden_states=bridge[:-1],
+                topk_ids=dispatch_output.topk_ids,
+                topk_weights=dispatch_output.topk_weights,
+                local_shared_output=bridge[-1, :local_shared_rows],
+            )
+        return DeepEPLLCombineInput(
+            hidden_states=bridge,
+            topk_ids=dispatch_output.topk_ids,
+            topk_weights=dispatch_output.topk_weights,
+        )
+
+    hcu_ll_moe_core = eager_on_graph(True, capture_stub=_hcu_ll_moe_core_capture_stub)(
+        _hcu_ll_moe_core_impl
+    )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -813,6 +903,11 @@ class DeepEPMoE(FusedMoE):
     ):
         # DeepEP NORMAL mode is not capturable; run it as an eager node.
         if is_in_breakable_cuda_graph():
+            if _should_break_only_hcu_deepgemm_core():
+                # Low-latency DeepEP is graph-capturable on HCU.  Let the
+                # modern FusedMoE forward capture dispatch/combine and insert
+                # its eager break only around the vendor grouped GEMMs.
+                return self.forward_impl(hidden_states, topk_output)
             assert TopKOutputChecker.format_is_standard(
                 topk_output
             ), "Only standard topk output is supported for breakable cuda graph"
@@ -845,7 +940,10 @@ class DeepEPMoE(FusedMoE):
         topk_output: TopKOutput,
     ):
 
-        if self.deprecate_flag:
+        if (
+            self.deprecate_flag
+            and not self.moe_runner_config.local_shared_experts_without_dispatch
+        ):
             return super().forward_impl(
                 hidden_states,
                 topk_output,
@@ -855,12 +953,181 @@ class DeepEPMoE(FusedMoE):
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
+        normal_shared_output = None
+        if self.moe_runner_config.local_shared_experts_without_dispatch:
+            from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
+            if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+                normal_shared_output = self._run_hcu_local_shared_expert(hidden_states)
+            else:
+                dispatch_output = self._append_local_shared_group(
+                    dispatch_output, hidden_states
+                )
         combine_input = self.run_moe_core(dispatch_output)
-        hidden_states = self.dispatcher.combine(
-            combine_input=combine_input,
+        local_shared_output = getattr(combine_input, "local_shared_output", None)
+        if local_shared_output is not None:
+            if isinstance(combine_input, DeepEPLLLocalSharedCombineInput):
+                routed_combine_input = DeepEPLLCombineInput(
+                    combine_input.hidden_states,
+                    combine_input.topk_ids,
+                    combine_input.topk_weights,
+                )
+            else:
+                routed_combine_input = DeepEPNormalCombineInput(
+                    combine_input.hidden_states,
+                    combine_input.topk_ids,
+                    combine_input.topk_weights,
+                )
+            routed_output = self.dispatcher.combine(combine_input=routed_combine_input)
+            return routed_output + local_shared_output
+        routed_output = self.dispatcher.combine(combine_input=combine_input)
+        if normal_shared_output is not None:
+            routed_output = routed_output + normal_shared_output
+        return routed_output
+
+    def _run_hcu_local_shared_expert(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Evaluate the local shared slot outside normal-mode routed A2A."""
+        from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+            DeepGemmMoeQuantInfo,
+            DeepGemmRunnerInput,
         )
 
-        return hidden_states
+        if not _should_use_hcu_deepgemm_runner():
+            raise RuntimeError(
+                "DeepEP local shared grouping currently requires HCU DeepGEMM."
+            )
+        local_rows, hidden_size = hidden_states.shape
+        capacity = max(128, ((local_rows + 127) // 128) * 128)
+        shared_q, shared_s = sglang_per_token_group_quant_fp8(
+            hidden_states.contiguous(), hidden_size
+        )
+        packed_q = torch.zeros(
+            (1, capacity, hidden_size),
+            dtype=shared_q.dtype,
+            device=shared_q.device,
+        )
+        packed_s = torch.zeros(
+            (1, capacity, 1),
+            dtype=shared_s.dtype,
+            device=shared_s.device,
+        )
+        packed_q[0, :local_rows].copy_(shared_q)
+        packed_s[0, :local_rows].copy_(shared_s)
+        masked_m = torch.full(
+            (1,), local_rows, dtype=torch.int32, device=hidden_states.device
+        )
+        quant_info = DeepGemmMoeQuantInfo(
+            w13_weight=self.w13_weight[-1:],
+            w2_weight=self.w2_weight[-1:],
+            use_fp8=True,
+            w13_scale=self.w13_weight_scale[-1:],
+            w2_scale=self.w2_weight_scale[-1:],
+            block_shape=None,
+            logical_w13_shape=(
+                1,
+                *self._hcu_deepgemm_logical_w13_shape[1:],
+            ),
+            logical_w2_shape=(
+                1,
+                *self._hcu_deepgemm_logical_w2_shape[1:],
+            ),
+            hcu_packed=True,
+        )
+        runner_input = DeepGemmRunnerInput(
+            hidden_states=packed_q,
+            hidden_states_scale=packed_s,
+            use_masked_gemm=True,
+            masked_m=masked_m,
+            expected_m=max(1, local_rows),
+        )
+        runner_core = self.scheme.runner.runner_core
+        output = runner_core.run(runner_input, quant_info, {}).hidden_states
+        return output[0, :local_rows]
+
+    def _append_local_shared_group(
+        self, dispatch_output: DispatchOutput, hidden_states: torch.Tensor
+    ) -> DispatchOutput:
+        """Append the replicated shared expert only after routed A2A.
+
+        DeepEP low-latency on gfx938 accepts the native E16/rank layout but
+        rejects E17/rank.  Keep its dispatch/handle at E16, then append the
+        local request rows as the seventeenth DeepGEMM group.  Normal mode uses
+        the same semantic split and pads the local group to DeepEP's 256-row
+        expert alignment.
+        """
+        from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
+        if self.num_fused_shared_experts != 1:
+            raise RuntimeError(
+                "DeepEP local shared grouping currently requires exactly one "
+                f"shared expert, got {self.num_fused_shared_experts}."
+            )
+        if hidden_states.ndim != 2:
+            raise RuntimeError(
+                "DeepEP local shared grouping expects [M,K] input, got "
+                f"{tuple(hidden_states.shape)}"
+            )
+        local_rows, hidden_size = hidden_states.shape
+        hidden_states = hidden_states.contiguous()
+
+        if DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
+            routed = dispatch_output.hidden_states
+            routed_scale = dispatch_output.hidden_states_scale
+            if routed_scale is None or routed.ndim != 3 or routed_scale.ndim != 3:
+                raise RuntimeError(
+                    "DeepEP local shared grouping requires 3-D FP8 LL activations "
+                    "and scales."
+                )
+            capacity = routed.shape[1]
+            if local_rows > capacity:
+                raise RuntimeError(
+                    f"Local shared rows {local_rows} exceed LL capacity {capacity}."
+                )
+            scale_width = routed_scale.shape[-1]
+            if scale_width <= 0 or hidden_size % scale_width != 0:
+                raise RuntimeError(
+                    "Cannot infer DeepEP LL activation quant group from scale "
+                    f"shape {tuple(routed_scale.shape)} and K={hidden_size}."
+                )
+            shared_q, shared_s = sglang_per_token_group_quant_fp8(
+                hidden_states, hidden_size // scale_width
+            )
+            shared_q_padded = torch.zeros(
+                (1, capacity, hidden_size),
+                dtype=routed.dtype,
+                device=routed.device,
+            )
+            shared_s_padded = torch.zeros(
+                (1, capacity, scale_width),
+                dtype=routed_scale.dtype,
+                device=routed_scale.device,
+            )
+            shared_q_padded[0, :local_rows].copy_(shared_q)
+            shared_s_padded[0, :local_rows].copy_(shared_s)
+            return DeepEPLLLocalSharedDispatchOutput(
+                hidden_states=torch.cat((routed, shared_q_padded), dim=0),
+                hidden_states_scale=torch.cat((routed_scale, shared_s_padded), dim=0),
+                topk_ids=dispatch_output.topk_ids,
+                topk_weights=dispatch_output.topk_weights,
+                masked_m=torch.cat(
+                    (
+                        dispatch_output.masked_m,
+                        dispatch_output.masked_m.new_full((1,), local_rows),
+                    )
+                ),
+                expected_m=dispatch_output.expected_m,
+                local_shared_rows=local_rows,
+            )
+
+        if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+            raise RuntimeError(
+                "Normal DeepEP shared rows must use the separate local branch."
+            )
+
+        raise RuntimeError(
+            "DeepEP local shared grouping only supports normal or low-latency "
+            f"dispatch, got {dispatch_output.format}."
+        )
 
     def dispatch(
         self,
@@ -875,11 +1142,18 @@ class DeepEPMoE(FusedMoE):
     def run_moe_core(
         self,
         dispatch_output: DispatchOutput,
+        bias: Optional[torch.Tensor] = None,
+        i_q: Optional[torch.Tensor] = None,
+        i_s: Optional[torch.Tensor] = None,
     ):
-
         if self.deprecate_flag:
+            if is_in_breakable_cuda_graph() and _should_break_only_hcu_deepgemm_core():
+                return self.hcu_ll_moe_core(dispatch_output)
             return super().run_moe_core(
                 dispatch_output,
+                bias=bias,
+                i_q=i_q,
+                i_s=i_s,
             )
 
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
@@ -1066,8 +1340,8 @@ class DeepEPMoE(FusedMoE):
                     f"{num_recv_tokens_per_expert}"
                 )
 
-            # Both HIPC kernels consume the true scale restored by
-            # process_weights_after_loading; no forward-time rescaling is needed.
+            # HIPC kernels apply the checkpoint scale/16 factor internally.
+            # process_weights_after_loading must leave the stored scale unchanged.
 
             # DeepEP normal dispatch is token-major. Scatter it into contiguous
             # expert segments and retain output_index for the weighted gather.
@@ -1126,9 +1400,7 @@ class DeepEPMoE(FusedMoE):
             else:
                 # Apply the model-declared SwiGLU clamp when present. Models
                 # without swiglu_limit retain the original unclamped path.
-                swiglu_limit = getattr(
-                    self.moe_runner_config, "swiglu_limit", None
-                )
+                swiglu_limit = getattr(self.moe_runner_config, "swiglu_limit", None)
                 if swiglu_limit is None:
                     q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
                 else:
@@ -1319,9 +1591,6 @@ class DeepEPMoE(FusedMoE):
             N = w13_shape[1]
         else:
             N = self.w13_weight.size(1)
-        # from deepgemm.m_group_gemm import pack_int8_weight_enk_to_w6_low_latency
-        # w13_repacked = pack_int8_weight_enk_to_w6_low_latency(self.w13_weight)
-        # w2_repacked = pack_int8_weight_enk_to_w6_low_latency(self.w2_weight)
         w13_weight_fp8 = (
             self.w13_weight_deepgemm,
             # self.w13_weight,
@@ -2015,17 +2284,11 @@ class DeepEPMoE(FusedMoE):
         down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = getattr(
             self, "down_gemm_overlap_args", None
         )
-        meta_overlap_args: Optional[dict] = getattr(
-            self, "meta_overlap_args", None
-        )
+        meta_overlap_args: Optional[dict] = getattr(self, "meta_overlap_args", None)
         assert self.moe_runner_config.activation == "silu"
         # base shapes
         num_groups, m, k = hidden_states.size()
         expected_m = min(m, expected_m)
-
-        # from deepgemm.m_group_gemm import pack_int8_weight_enk_to_w6_low_latency
-        # w13_repacked = pack_int8_weight_enk_to_w6_low_latency(self.w13_weight)
-        # w2_repacked = pack_int8_weight_enk_to_w6_low_latency(self.w2_weight)
 
         # ---- weights & scales ----
         # w13_weight = self.w13_weight
@@ -2040,9 +2303,9 @@ class DeepEPMoE(FusedMoE):
             (num_groups, m, n1), device=hidden_states.device, dtype=torch.bfloat16
         )
 
-        from deepgemm.m_group_gemm import m_grouped_fp8_gemm_nt_masked_ll
+        from deepgemm import m_grouped_fp8_gemm_nt_masked
 
-        m_grouped_fp8_gemm_nt_masked_ll(
+        m_grouped_fp8_gemm_nt_masked(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scales),
             gateup_output,
@@ -2071,7 +2334,7 @@ class DeepEPMoE(FusedMoE):
         if enable_overlap:
             down_gemm_overlap_args.start_event.record()
 
-        m_grouped_fp8_gemm_nt_masked_ll(
+        m_grouped_fp8_gemm_nt_masked(
             (q_a2_all, q_a2_scale),
             (w2_weight, w2_scales),
             down_output,

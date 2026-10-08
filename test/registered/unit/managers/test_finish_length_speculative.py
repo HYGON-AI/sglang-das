@@ -75,6 +75,13 @@ def _make_req(
 
 
 class TestFinishLengthSpeculative(CustomTestCase):
+    def test_pending_prefill_token_reaches_length_cap(self):
+        self.assertTrue(_make_req([], max_new_tokens=1).finishes_after_pending_token())
+        self.assertTrue(
+            _make_req([10], max_new_tokens=2).finishes_after_pending_token()
+        )
+        self.assertFalse(_make_req([], max_new_tokens=2).finishes_after_pending_token())
+
     def test_eos_mid_run_beats_length_cap(self):
         # One spec step commits [12, EOS, 20], crossing max_new_tokens=5 in the
         # same step the EOS lands. Length-first ordering finished this as

@@ -14,7 +14,7 @@
 
 """Public import facade and runtime helpers for context parallel strategies."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from sglang.srt.layers.cp.base import (
@@ -33,6 +33,7 @@ from sglang.srt.layers.cp.zigzag import (
     ContextParallelMetadata,
     ZigzagContextParallelMetadata,
     ZigzagCPStrategy,
+    compute_zigzag_cp_physical_token_count,
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.runtime_context import get_parallel
@@ -160,7 +161,69 @@ def is_cp_v2_active(forward_batch) -> bool:
     if input_ids is None:
         return False
 
+    # DP attention synchronizes the CP layout before ForwardBatch reaches the
+    # model.  An all-zero list means that another non-idle DP replica cannot
+    # enter CP for this global forward (for example, a 1-token batch paired
+    # with a 16K Prefill).  Every replica must then use the ordinary full-TP
+    # layout; allowing only the locally eligible replica to shard would make
+    # the model-body collectives disagree.
+    global_cp_tokens = getattr(forward_batch, "global_cp_num_tokens_cpu", None)
+    if global_cp_tokens is not None and not any(global_cp_tokens):
+        return False
+
     return strategy.can_apply(len(input_ids), forward_batch)
+
+
+def normalize_dp_cp_token_counts(
+    global_num_tokens: list[int], global_cp_num_tokens: list[int]
+) -> list[int]:
+    """Select one collective layout for a synchronized attention-DP forward.
+
+    CP may coexist with an idle DP replica, which participates with zero local
+    rows.  It may not coexist with a non-idle replica that is ineligible for CP:
+    that replica needs the full-TP layout.  In the latter case disable CP for
+    the whole global forward so every rank executes matching collectives.
+    """
+    if len(global_num_tokens) != len(global_cp_num_tokens):
+        raise ValueError(
+            "DP/CP token-count width mismatch: "
+            f"num_tokens={global_num_tokens}, cp_tokens={global_cp_num_tokens}"
+        )
+    has_cp_batch = any(int(tokens) > 0 for tokens in global_cp_num_tokens)
+    has_non_cp_work = any(
+        int(tokens) > 0 and int(cp_tokens) == 0
+        for tokens, cp_tokens in zip(global_num_tokens, global_cp_num_tokens)
+    )
+    if has_cp_batch and has_non_cp_work:
+        return [0] * len(global_cp_num_tokens)
+    return [int(tokens) for tokens in global_cp_num_tokens]
+
+
+def get_cp_v2_physical_token_count(
+    *, num_tokens: int, extend_seq_lens, cp_size: int
+) -> int:
+    """Compute this DP replica's CP-local padded rows in the scheduler.
+
+    Zero means that CP-v2 is inactive for the local batch.  This function is
+    deliberately CPU-only because it runs before the scheduler's existing DP
+    metadata all-gather.
+    """
+    if not enable_cp_v2() or cp_size <= 1 or extend_seq_lens is None:
+        return 0
+    strategy = get_cp_strategy()
+    if not isinstance(strategy, ZigzagCPStrategy):
+        return 0
+
+    from types import SimpleNamespace
+
+    extend_seq_lens = [int(length) for length in extend_seq_lens]
+    probe = SimpleNamespace(
+        forward_mode=None,
+        extend_seq_lens_cpu=extend_seq_lens,
+    )
+    if not strategy.can_apply(int(num_tokens), probe):
+        return 0
+    return compute_zigzag_cp_physical_token_count(extend_seq_lens, cp_size)
 
 
 def prepare_cp_forward(forward_batch) -> None:
@@ -184,12 +247,22 @@ def prepare_cp_forward(forward_batch) -> None:
         )
         pad_logical_token_to_physical(forward_batch.attn_cp_metadata)
 
-    if getattr(forward_batch, "global_num_tokens_cpu", None) is not None:
-        from sglang.srt.layers.dp_attention import set_local_dp_buffer_len
-
-        set_local_dp_buffer_len(
-            sum(forward_batch.attn_cp_metadata.per_rank_actual_token)
+    global_cp_tokens = getattr(forward_batch, "global_cp_num_tokens_cpu", None)
+    if global_cp_tokens is not None:
+        dp_rank = get_parallel().attn_dp_rank
+        expected = int(global_cp_tokens[dp_rank])
+        actual = int(
+            forward_batch.attn_cp_metadata.per_rank_actual_token[
+                get_parallel().attn_cp_rank
+            ]
         )
+        if actual != expected:
+            raise RuntimeError(
+                "CP-v2 scheduler/model physical-token mismatch: "
+                f"dp_rank={dp_rank}, cp_rank={get_parallel().attn_cp_rank}, "
+                f"metadata={actual}, scheduled={expected}, "
+                f"global_cp_tokens={global_cp_tokens}"
+            )
 
     if getattr(forward_batch, "out_cache_loc", None) is not None:
         forward_batch.out_cache_loc = forward_batch.out_cache_loc[:num_tokens]
@@ -305,11 +378,125 @@ def cp_shard_model_inputs(
             spec_hidden_states, forward_batch
         )
 
+    # ``global_cp_num_tokens_cpu`` is populated only when attention-DP peers
+    # must agree on a CP-local model-body buffer.  Plain DP1/CP runs retain
+    # the legacy full-TP collective contract and do not need that remapping.
+    cp_dp_context = (
+        cp_local_dp_state(forward_batch)
+        if getattr(forward_batch, "global_cp_num_tokens_cpu", None) is not None
+        else nullcontext()
+    )
     try:
-        yield sharded_hidden_states, sharded_positions
+        with cp_dp_context:
+            yield sharded_hidden_states, sharded_positions
     finally:
         if spec_hidden_states_backup is not None:
             spec_info.hidden_states = spec_hidden_states_backup
+
+
+@contextmanager
+def cp_local_dp_state(forward_batch):
+    """Use the per-CP DP layout while a model body participates in CP prefill.
+
+    Active ranks enter through ``cp_shard_model_inputs``.  Idle DP peers must
+    enter the same state explicitly so their MLP collectives use the identical
+    per-CP communication group and buffer layout.
+    """
+    state = _enter_cp_local_dp_state(forward_batch)
+    try:
+        yield
+    finally:
+        _restore_cp_local_dp_state(forward_batch, state)
+
+
+def _enter_cp_local_dp_state(forward_batch):
+    """Expose CP-local token slots to DP-attention during the model body.
+
+    Each CP rank gathers only the corresponding shard across attention-DP
+    replicas.  MoE then gathers those DP-complete shards across CP.  After the
+    model body returns, logits processing sees the original full-sequence
+    per-DP layout again.
+    """
+    global_cp_tokens = getattr(forward_batch, "global_cp_num_tokens_cpu", None)
+    if global_cp_tokens is None:
+        raise RuntimeError(
+            "CP-v2 with DP attention requires scheduler-provided "
+            "global_cp_num_tokens_cpu"
+        )
+
+    import torch
+
+    from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
+
+    parallel = get_parallel()
+    cp_local_tokens = [int(tokens) for tokens in global_cp_tokens]
+    local_index = parallel.attn_dp_rank if len(cp_local_tokens) > 1 else 0
+    cp_local_gpu = torch.tensor(
+        cp_local_tokens,
+        dtype=forward_batch.global_num_tokens_gpu.dtype,
+        device=forward_batch.global_num_tokens_gpu.device,
+    )
+    state = (
+        forward_batch.global_num_tokens_cpu,
+        forward_batch.global_num_tokens_gpu,
+        forward_batch.global_dp_buffer_len,
+        forward_batch.dp_padding_mode,
+        forward_batch.dp_local_start_pos,
+        forward_batch.dp_local_num_tokens,
+        getattr(forward_batch, "dp_local_token_index", None),
+        getattr(forward_batch, "cp_local_dp_layout", False),
+    )
+
+    forward_batch.global_num_tokens_cpu = cp_local_tokens
+    forward_batch.global_num_tokens_gpu = cp_local_gpu
+    forward_batch.global_dp_buffer_len = sum(cp_local_tokens)
+    # Variable CP shards require SUM_LEN.  The full-TP all-reduce gathers the
+    # distinct slots; MAX_LEN reduce-scatter assumes one slot per attention DP.
+    forward_batch.dp_padding_mode = DpPaddingMode.SUM_LEN
+    forward_batch.dp_local_start_pos = None
+    forward_batch.dp_local_num_tokens = None
+    forward_batch.dp_local_token_index = local_index
+    forward_batch.cp_local_dp_layout = True
+    set_dp_buffer_len(
+        forward_batch.global_dp_buffer_len,
+        cp_local_tokens[local_index],
+        False,
+        cp_local_tokens,
+        cp_local_gpu,
+    )
+    return state
+
+
+def _restore_cp_local_dp_state(forward_batch, state) -> None:
+    from sglang.srt.layers.dp_attention import set_dp_buffer_len
+
+    (
+        global_num_tokens_cpu,
+        global_num_tokens_gpu,
+        global_dp_buffer_len,
+        dp_padding_mode,
+        dp_local_start_pos,
+        dp_local_num_tokens,
+        dp_local_token_index,
+        cp_local_dp_layout,
+    ) = state
+    forward_batch.global_num_tokens_cpu = global_num_tokens_cpu
+    forward_batch.global_num_tokens_gpu = global_num_tokens_gpu
+    forward_batch.global_dp_buffer_len = global_dp_buffer_len
+    forward_batch.dp_padding_mode = dp_padding_mode
+    forward_batch.dp_local_start_pos = dp_local_start_pos
+    forward_batch.dp_local_num_tokens = dp_local_num_tokens
+    forward_batch.dp_local_token_index = dp_local_token_index
+    forward_batch.cp_local_dp_layout = cp_local_dp_layout
+    parallel = get_parallel()
+    local_index = parallel.attn_dp_rank if len(global_num_tokens_cpu) > 1 else 0
+    set_dp_buffer_len(
+        global_dp_buffer_len,
+        int(global_num_tokens_cpu[local_index]),
+        dp_padding_mode.is_max_len(),
+        global_num_tokens_cpu,
+        global_num_tokens_gpu,
+    )
 
 
 def _to_int_list(values) -> Optional[list[int]]:
@@ -332,6 +519,8 @@ __all__ = [
     "ZigzagContextParallelMetadata",
     "CP_V2_DEFAULT_MODEL_CLASSES",
     "enable_cp_v2",
+    "get_cp_v2_physical_token_count",
+    "normalize_dp_cp_token_counts",
     "get_cp_strategy",
     "is_cp_v2_active",
     "cp_gather_after_forward",

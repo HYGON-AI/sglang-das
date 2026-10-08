@@ -157,6 +157,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -581,6 +584,37 @@ class MoEGate(nn.Module):
         return logits
 
 
+def _mega_moe_eager_body(
+    moe,
+    hidden_states: torch.Tensor,
+    forward_batch,
+    input_ids_global,
+) -> torch.Tensor:
+    from sglang.srt.layers.moe.mega_moe import forward_mega_moe
+
+    return forward_mega_moe(
+        moe, hidden_states, forward_batch, input_ids_global=input_ids_global
+    )
+
+
+def _mega_moe_capture_stub(
+    moe,
+    hidden_states: torch.Tensor,
+    forward_batch,
+    input_ids_global,
+) -> torch.Tensor:
+    # Capture pass only: record the bridge buffer's address and shape, skip the
+    # rank-coupled MegaMoE dispatch. Warmup and replay run the real body, which
+    # sees get_is_capture_mode() == False and therefore sizes its output by the
+    # live token count -- the shape this stub must match.
+    return torch.zeros_like(hidden_states)
+
+
+_bcg_forward_mega_moe = eager_on_graph(True, capture_stub=_mega_moe_capture_stub)(
+    _mega_moe_eager_body
+)
+
+
 class DeepseekV2MoE(nn.Module):
 
     def __init__(
@@ -823,7 +857,9 @@ class DeepseekV2MoE(nn.Module):
                 # generic HF config, that compatibility view intentionally has
                 # no quantization_config attribute.  Identify compressed-tensors
                 # from either source before accessing its block-size metadata.
-                config_quantization = getattr(config, "quantization_config", None)
+                config_quantization = getattr(
+                    config, "quantization_config", None
+                ) or getattr(config, "compression_config", None)
                 is_compressed_tensors = (
                     isinstance(config_quantization, dict)
                     and config_quantization.get("quant_method") == "compressed-tensors"
@@ -838,13 +874,28 @@ class DeepseekV2MoE(nn.Module):
                     # This path does not consume shared_experts_weight_block_size.
                     pass
                 else:
-                    assert (
-                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                        == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
+                    # Block FP8 stores weight_block_size on quant_config.
+                    # Channel-wise W8A8 FP8 (W8A8Fp8LinearMethod) has
+                    # quantization_config instead, and no block size.
+                    gate_up_quant_config = getattr(
+                        self.shared_experts.gate_up_proj.quant_method,
+                        "quant_config",
+                        None,
                     )
-                    self.shared_experts_weight_block_size = (
-                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                    down_proj_quant_config = getattr(
+                        self.shared_experts.down_proj.quant_method,
+                        "quant_config",
+                        None,
                     )
+                    gate_up_block = getattr(
+                        gate_up_quant_config, "weight_block_size", None
+                    )
+                    down_block = getattr(
+                        down_proj_quant_config, "weight_block_size", None
+                    )
+                    if gate_up_block is not None or down_block is not None:
+                        assert gate_up_block == down_block
+                        self.shared_experts_weight_block_size = gate_up_block
 
         self.top_k = config.num_experts_per_tok
 
@@ -926,6 +977,17 @@ class DeepseekV2MoE(nn.Module):
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
         if should_use_mega_moe(self, hidden_states):
+            if is_in_breakable_cuda_graph():
+                # MegaMoE drives rank-coupled symmetric-buffer collectives whose
+                # token count and expert routing change per batch, so capturing
+                # it bakes in one batch's dispatch (garbled replay output). Run
+                # it as an eager node, same as DeepEP NORMAL.
+                return _bcg_forward_mega_moe(
+                    self,
+                    hidden_states,
+                    forward_batch,
+                    input_ids_global,
+                )
             return forward_mega_moe(
                 self,
                 hidden_states,

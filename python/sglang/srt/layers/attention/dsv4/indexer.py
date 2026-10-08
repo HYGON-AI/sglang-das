@@ -77,6 +77,98 @@ IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
 _arange_cache = {}
 
+# Tuned on gfx936. Both producers read rows*actual*132B of index-K, but the
+# dense LightOp path also writes the full rows*capacity*4B logits buffer while
+# the persistent path writes only rows*actual*4B. The win therefore tracks the
+# capacity-to-actual ratio, not the query-row count: measured 1.42x at 6 rows
+# and 8.69x at 48 rows once the ratio is large, and a regression once capacity
+# approaches the real length and the prologue launch stops paying for itself.
+_PERSISTENT_MQA_MIN_CAPACITY_RATIO = 2.0
+_PERSISTENT_MQA_NUM_SMS = 320
+
+
+def _estimate_max_c4_seq_len(forward_batch: ForwardBatch) -> Optional[int]:
+    seq_lens_cpu = forward_batch.seq_lens_cpu
+    if (
+        seq_lens_cpu is None
+        or seq_lens_cpu.device.type != "cpu"
+        or seq_lens_cpu.numel() == 0
+    ):
+        return None
+
+    max_raw_seq_len = int(seq_lens_cpu.max().item())
+    extension_len = 1
+    spec_info = forward_batch.spec_info
+    if spec_info is not None:
+        ragged_layout = spec_info.ragged_verify_layout
+        if ragged_layout is not None and ragged_layout.verify_lens_cpu:
+            extension_len = max(int(length) for length in ragged_layout.verify_lens_cpu)
+        elif spec_info.num_tokens_per_req > 0:
+            extension_len = spec_info.num_tokens_per_req
+
+    extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+    if extend_seq_lens_cpu:
+        extension_len = max(
+            extension_len, max(int(length) for length in extend_seq_lens_cpu)
+        )
+
+    return (max_raw_seq_len + extension_len + 3) // 4
+
+
+def _can_use_persistent_int8_paged_mqa(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    max_seq_len: int,
+    estimated_max_c4_seq_len: Optional[int],
+    use_graph_route: bool,
+) -> bool:
+    if not envs.SGLANG_MQA_PERSISTENT.get():
+        return False
+    if not use_graph_route:
+        if estimated_max_c4_seq_len is None:
+            return False
+        if max_seq_len < _PERSISTENT_MQA_MIN_CAPACITY_RATIO * max(
+            estimated_max_c4_seq_len, 1
+        ):
+            return False
+
+    from sglang.srt.layers.attention.dsv4.hcu_int8_index_k_cache import (
+        is_hcu_gfx936,
+    )
+
+    if not is_hcu_gfx936():
+        return False
+    batch_size = q.shape[0]
+    return (
+        q.is_cuda
+        and q.dtype == torch.int8
+        and q.ndim == 4
+        and tuple(q.shape[1:]) == (1, 64, 128)
+        and q.is_contiguous()
+        and kv_cache.dtype == torch.int8
+        and kv_cache.ndim == 4
+        and tuple(kv_cache.shape[1:]) == (64, 1, 132)
+        and kv_cache.is_contiguous()
+        and weights.dtype == torch.float32
+        and tuple(weights.shape) == (batch_size, 64)
+        and weights.is_contiguous()
+        and seq_lens.dtype == torch.int32
+        and tuple(seq_lens.shape) == (batch_size,)
+        and seq_lens.is_contiguous()
+        and block_table.dtype == torch.int32
+        and block_table.ndim == 2
+        and block_table.shape[0] == batch_size
+        and block_table.is_contiguous()
+        and max_seq_len == block_table.shape[1] * 64
+        and all(
+            tensor.device == q.device
+            for tensor in (kv_cache, weights, seq_lens, block_table)
+        )
+    )
+
 
 def fp8_paged_mqa_logits_torch(
     q_fp8: torch.Tensor,
@@ -806,6 +898,19 @@ class C4IndexerBackendMixin:
             # Pre-LayerSplit invariant: backend builds indexer page table from
             # the same source as core_attn_metadata.page_table.
             assert indexer_metadata.page_table is core_metadata.page_table
+        persistent_mqa_enabled = envs.SGLANG_MQA_PERSISTENT.get()
+        graph_mqa_route = (
+            indexer_metadata.use_prefill_cuda_graph
+            or is_in_tc_piecewise_cuda_graph()
+            or is_in_breakable_cuda_graph()
+            or torch.cuda.is_current_stream_capturing()
+        )
+        estimated_max_c4_seq_len = (
+            _estimate_max_c4_seq_len(forward_batch)
+            if persistent_mqa_enabled and not graph_mqa_route
+            else None
+        )
+        persistent_mqa_selected = False
         if nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
             logits = self._forward_nonpaged_indexer(
@@ -847,16 +952,61 @@ class C4IndexerBackendMixin:
                         * q_scales.view(query_rows, -1)
                     ).contiguous()
 
-                logits = fn(
-                    q_int8,
-                    packed_cache,
-                    adjusted_weights,
-                    c4_seq_lens.reshape(-1).to(torch.int32).contiguous(),
-                    indexer_page_table.to(torch.int32).contiguous(),
-                    None,
-                    indexer_metadata.max_c4_seq_len,
-                    False,
-                    forward_batch.forward_mode == ForwardMode.EXTEND,
+                seq_lens_i32 = c4_seq_lens.reshape(-1).to(torch.int32).contiguous()
+                block_table_i32 = indexer_page_table.to(torch.int32).contiguous()
+                max_seq_len = indexer_metadata.max_c4_seq_len
+                persistent_mqa_selected = (
+                    not use_fp4_indexer
+                    and not _use_tilelang
+                    and not _use_aiter
+                    and _can_use_persistent_int8_paged_mqa(
+                        q_int8,
+                        packed_cache,
+                        adjusted_weights,
+                        seq_lens_i32,
+                        block_table_i32,
+                        max_seq_len,
+                        estimated_max_c4_seq_len,
+                        graph_mqa_route,
+                    )
+                )
+                if persistent_mqa_selected:
+                    if not hasattr(self, "_dsv4_persistent_mqa_path_logged"):
+                        logger.info(
+                            "DSV4 INT8 index-K consumer=Persistent JIT INT8 Paged MQA "
+                            "(route=%s, query_rows=%d, capacity_c4=%d, "
+                            "estimated_max_c4_seq_len=%s, num_sms=%d)",
+                            "graph-capture" if graph_mqa_route else "eager",
+                            query_rows,
+                            max_seq_len,
+                            estimated_max_c4_seq_len,
+                            _PERSISTENT_MQA_NUM_SMS,
+                        )
+                        self._dsv4_persistent_mqa_path_logged = True
+                    from sglang.srt.layers.attention.dsv4.paged_mqa_pers_jit import (
+                        persistent_int8_paged_mqa_logits,
+                    )
+
+                    logits = persistent_int8_paged_mqa_logits(
+                        q_int8,
+                        packed_cache,
+                        adjusted_weights,
+                        seq_lens_i32,
+                        block_table_i32,
+                        max_seq_len,
+                        num_sms=_PERSISTENT_MQA_NUM_SMS,
+                    )
+                else:
+                    logits = fn(
+                        q_int8,
+                        packed_cache,
+                        adjusted_weights,
+                        c4_seq_lens.reshape(-1).to(torch.int32).contiguous(),
+                        indexer_page_table.to(torch.int32).contiguous(),
+                        None,
+                        indexer_metadata.max_c4_seq_len,
+                        False,
+                        forward_batch.forward_mode == ForwardMode.EXTEND,
                 )
             else:
                 c4_indexer_kv_cache = (
@@ -896,10 +1046,15 @@ class C4IndexerBackendMixin:
                     False,
                 )
 
-            if use_int8_index_k_cache and not hasattr(
+            if use_int8_index_k_cache and not persistent_mqa_selected and not hasattr(
                 self, "_dsv4_int8_indexer_path_logged"
             ):
-                logger.info("DSV4 INT8 index-K consumer=LightOp dense INT8 Paged MQA")
+                logger.info(
+                    "DSV4 INT8 index-K consumer=LightOp dense INT8 Paged MQA "
+                    "(query_rows=%d, capacity_c4=%d)",
+                    query_rows,
+                    indexer_metadata.max_c4_seq_len,
+                )
                 self._dsv4_int8_indexer_path_logged = True
 
         if self.debug_use_external_c4_sparse_indices:

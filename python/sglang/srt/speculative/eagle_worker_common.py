@@ -7,7 +7,7 @@ import torch
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_draft_cache_locs_contiguous,
 )
-from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
+from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_from_predict_func
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
@@ -180,6 +180,11 @@ def prepare_for_draft_extend(
         draft_model_runner,
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=return_hidden_states_before_norm,
+        # The draft-extend graph runner owns persistent copies of the DP token
+        # counts and does not consume ForwardBatch.num_token_non_padded.  Avoid
+        # pageable host-to-device copies here; if graph selection fails, the
+        # eager path below materializes the same metadata before using it.
+        defer_device_metadata=True,
     )
     # Forward sees post-write length (draft extend writes num_draft_tokens
     # slots); mutation stays on forward_batch to preserve SB.seq_lens.
@@ -194,6 +199,8 @@ def prepare_for_draft_extend(
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
+    if not can_run_decode_cuda_graph:
+        forward_batch.materialize_deferred_device_metadata(draft_model_runner.device)
     if not batch.forward_mode.is_idle() and not can_run_decode_cuda_graph:
         draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
@@ -619,15 +626,12 @@ def run_eagle_verify(
     )
 
     if not batch.forward_mode.is_idle():
-        accept_tokens = predict[accept_index]
-        bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
-        # stride = accept_tokens per-req width = accept_index.shape[1]
-        # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
-        fill_bonus_tokens_func(
-            accept_tokens,
+        bonus_tokens = torch.empty((bs,), dtype=torch.int32, device=accept_lens.device)
+        fill_bonus_tokens_from_predict_func(
+            predict,
+            accept_index,
             accept_lens,
             bonus_tokens,
-            accept_index.shape[1],
             bs,
         )
     else:
