@@ -29,6 +29,15 @@ GRAPH_SETUP_PATH = (
 )
 
 
+def _calls_capture_cache_cleanup(source):
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "release_hcu_flashmla_decode_h16_capture_cache"
+        for node in ast.walk(ast.parse(source))
+    )
+
+
 def _load_method(path, class_name, method_name, namespace):
     tree = ast.parse(path.read_text())
     class_node = next(
@@ -196,10 +205,16 @@ class TestHcuFlashmlaDecodeH16Memory(unittest.TestCase):
         )
         for path in paths:
             with self.subTest(path=path):
-                self.assertIn(
-                    "release_hcu_flashmla_decode_h16_capture_cache(",
-                    (REPO_ROOT / path).read_text(),
+                self.assertTrue(
+                    _calls_capture_cache_cleanup((REPO_ROOT / path).read_text()),
+                    f"{path} has no executable capture cache cleanup call",
                 )
+
+    def test_cleanup_call_check_ignores_comments_and_strings(self):
+        name = "release_hcu_flashmla_decode_h16_capture_cache"
+        self.assertFalse(_calls_capture_cache_cleanup(f"# {name}(runner)\n"))
+        self.assertFalse(_calls_capture_cache_cleanup(f'"{name}(runner)"'))
+        self.assertTrue(_calls_capture_cache_cleanup(f"{name}(runner)"))
 
 
 if __name__ == "__main__":
