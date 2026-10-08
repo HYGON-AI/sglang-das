@@ -309,11 +309,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         w13 = layer.w13_weight
         w2 = layer.w2_weight
 
-        from deepgemm.m_group_gemm import pack_int8_weight_enk_to_w6_low_latency
+        from deepgemm import marlin_fp8_masked_weight
 
         with torch.no_grad():
-            w13_deepgemm = pack_int8_weight_enk_to_w6_low_latency(w13).detach()
-            w2_deepgemm = pack_int8_weight_enk_to_w6_low_latency(w2).detach()
+            w13_deepgemm = marlin_fp8_masked_weight(w13).detach()
+            w2_deepgemm = marlin_fp8_masked_weight(w2).detach()
 
         self._register_runtime_buffer(layer, "w13_weight_deepgemm", w13_deepgemm)
         self._register_runtime_buffer(layer, "w2_weight_deepgemm", w2_deepgemm)
@@ -556,18 +556,16 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     "channel-FP8 --moe-runner-backend deep_gemm requires the "
                     "DTK/HCU deepgemm runtime"
                 )
-            from deepgemm.m_group_gemm import (
-                pack_int8_weight_enk_to_w6_low_latency,
-            )
+            from deepgemm import marlin_fp8_masked_weight
 
             if not getattr(layer, "_hcu_deepgemm_channel_fp8_packed", False):
                 layer._hcu_deepgemm_logical_w13_shape = tuple(layer.w13_weight.shape)
                 layer._hcu_deepgemm_logical_w2_shape = tuple(layer.w2_weight.shape)
                 with torch.no_grad():
-                    w13_packed = pack_int8_weight_enk_to_w6_low_latency(
+                    w13_packed = marlin_fp8_masked_weight(
                         layer.w13_weight.data.contiguous()
                     )
-                    w2_packed = pack_int8_weight_enk_to_w6_low_latency(
+                    w2_packed = marlin_fp8_masked_weight(
                         layer.w2_weight.data.contiguous()
                     )
                 layer.w13_weight = torch.nn.Parameter(w13_packed, requires_grad=False)
