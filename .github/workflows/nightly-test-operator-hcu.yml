@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+name: test-docker-operator-daily
+
+on:
+  workflow_dispatch:
+    inputs:
+      docker_image:
+        description: 要测试的镜像全名, 例如 harbor.site/ns/sglang:0.5.18-xxx
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      docker_image:
+        description: 要测试的镜像全名, 例如 harbor.site/ns/sglang:0.5.18-xxx
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-operator-test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYPI_URL: ${{ vars.PYPI_URL }}
+
+jobs:
+  citest:
+    runs-on: [ci, bw1100]
+    timeout-minutes: 420
+    container:
+      image: ${{ inputs.docker_image }}
+      options: --privileged --cap-add=SYS_PTRACE --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri
+      volumes:
+        - /public/opendas/DL_DATA/llm-models:/models/public:ro
+        - /parastor/opendas/DL_DATA/llm-models:/models/parastor:ro
+        - /usr/bin/docker:/usr/local/bin/docker:ro
+        - /etc/docker/docker_env.conf:/etc/docker/docker_env.conf:ro
+        - /opt/hyhal:/opt/hyhal:ro
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 optest
+        run: |
+          PYPI_HOST=$(echo "${PYPI_URL}" | sed -E 's#^https?://##; s#:.*##')
+          pip install optest cinotificate \
+            -i "${PYPI_URL}/nightly/dtk2604/+simple/" \
+            --trusted-host "${PYPI_HOST}"
+
+      - name: 运行 optest
+        timeout-minutes: 360
+        run: |
+          optest --op_name all --test_mode all
+
+      - name: 汇总算子结果
+        if: always()
+        run: |
+          optest --json || true
+          if [ ! -f /op_test_output/total_output.json ]; then
+            mkdir -p /op_test_output
+            printf '{"generated": "%s", "operators": []}\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
+              > /op_test_output/total_output.json
+            echo "::warning::optest 未产出结果, 已写入空的 total_output.json 占位"
+          fi
+          ls -l /op_test_output/total_output.json
+
+      # 测试失败也要上报(if: always()), 否则失败时反而收不到结果
+      - name: 上报 DashHub 记录
+        if: always()
+        run: |
+          IMAGE_TAG=${{ inputs.docker_image }} CInotificate --notificate_type op_daily_display --record --ci_accelerators BW1100 --operator_result /op_test_output/total_output.json -l DEBUG
+
+      # 结果默认落在容器内的 /op_test_output, 先拷进 workspace 再归档
+      - name: 收集算子测试结果
+        if: always()
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/optest-output"
+          cp -a /op_test_output "${GITHUB_WORKSPACE}/optest-output/" || true
+
+      - name: 归档测试结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: optest-operator-output-${{ github.run_id }}-${{ github.run_attempt }}
+          path: optest-output/**
+          if-no-files-found: error
+
+      # 其他容器 job 会以 root 在共享 workspace 留下文件, 导致下次 checkout 清理失败
+      - name: 清理 workspace
+        if: always()
+        run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true
