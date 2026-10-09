@@ -31,7 +31,7 @@ def maybe_prepare_cp_cache_layer_split_forward(pool, forward_batch) -> None:
 def _get_core_attn_metadata():
     attn_backend = get_attn_backend()
     metadata = getattr(attn_backend, "forward_metadata", None)
-    core_metadata = getattr(metadata, "core_metadata", None)
+    core_metadata = getattr(metadata, "core_attn_metadata", None)
     if core_metadata is None:
         raise RuntimeError("CP Cache LayerSplit requires DSV4 core attention metadata")
     return core_metadata

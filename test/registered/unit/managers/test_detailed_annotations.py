@@ -4,9 +4,11 @@ The detailed-annotation aggregates are folded into SGLang's existing per-forward
 span (see ``sglang.srt.utils.profile_utils.build_step_span_name``): the
 per-phase ``sq``/``sqsq``/``sqsk``/``sk`` terms (with the context/generation split
 for MIXED) are appended and are self-contained, so ``sq`` is emitted even where it
-duplicates the base label's ``bs``/``toks``.
+duplicates the base label's ``bs``/``toks``. This also covers the
+``detailed_annotations`` plumbing on ``ProfileReq``.
 """
 
+import json
 import unittest
 from types import SimpleNamespace
 
@@ -15,6 +17,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.io_struct import ProfileReq
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.step_span_utils import (
     detailed_annotations_enabled,
@@ -212,6 +215,18 @@ class TestStepSpanGating(CustomTestCase):
             extend_prefix_lens_cpu=[0],
         )
         self.assertEqual(build_step_span_name(fb), "step[EXTEND bs=1 toks=4]")
+
+
+class TestDetailedAnnotationPlumbing(CustomTestCase):
+    def test_default_is_false(self):
+        self.assertFalse(ProfileReq().detailed_annotations)
+
+    def test_json_round_trip(self):
+        req = ProfileReq(output_dir="/tmp/x", detailed_annotations=True)
+        payload = {"detailed_annotations": req.detailed_annotations}
+        parsed = json.loads(json.dumps(payload))
+        self.assertTrue(parsed["detailed_annotations"])
+        self.assertTrue(ProfileReq(**parsed).detailed_annotations)
 
 
 class TestDetailedAnnotationsToggle(CustomTestCase):

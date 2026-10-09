@@ -221,9 +221,8 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
     ):
         architectures = ["QuantMixtralForCausalLM"]
 
-    is_native_supported = any(
-        ModelRegistry.is_arch_supported(arch) for arch in architectures
-    )
+    supported_archs = ModelRegistry.get_supported_archs()
+    is_native_supported = any(arch in supported_archs for arch in architectures)
 
     if model_config.model_impl == ModelImpl.MINDSPORE:
         architectures = ["MindSporeForCausalLM"]

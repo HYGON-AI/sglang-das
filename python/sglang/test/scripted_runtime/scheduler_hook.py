@@ -13,7 +13,6 @@ import zmq
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPoster
 from sglang.test.scripted_runtime.context import ScriptedContext
@@ -126,9 +125,9 @@ class ScriptedSchedulerHook:
     ) -> None:
         self.scheduler = scheduler
         self._is_driver = (
-            get_parallel().pp_rank == 0
-            and get_parallel().tp_rank == 0
-            and get_parallel().attn_cp_rank == 0
+            scheduler.ps.pp_rank == 0
+            and scheduler.ps.tp_rank == 0
+            and scheduler.ps.attn_cp_rank == 0
         )
         self._batch_log: List[ScriptedBatchRecord] = []
 
@@ -157,28 +156,28 @@ class ScriptedSchedulerHook:
             sock_send(socket, wrap_as_pickle(HookReady()))
             while True:
                 msg = sock_recv(socket)
-                if isinstance(msg, Shutdown):
-                    return
-                elif isinstance(msg, RunScript):
-                    fn_path, args = msg.fn_path, msg.args
-                    fn = resolve_fn(fn_path)
-                    ctx = self._context
-                    yield from _reset_engine_state(ctx)
-                    self._batch_log.clear()
-                    sub_gen = fn(ctx, *args)
-                    try:
-                        yield from sub_gen
-                    except Exception:
-                        sock_send(
-                            socket,
-                            wrap_as_pickle(
-                                ScriptFailed(traceback=traceback.format_exc())
-                            ),
-                        )
-                    else:
-                        sock_send(socket, wrap_as_pickle(ScriptSucceeded()))
-                else:
-                    raise ValueError(f"dispatch loop: unknown command {msg!r}")
+                match msg:
+                    case Shutdown():
+                        return
+                    case RunScript(fn_path=fn_path, args=args):
+                        fn = resolve_fn(fn_path)
+                        ctx = self._context
+                        yield from _reset_engine_state(ctx)
+                        self._batch_log.clear()
+                        sub_gen = fn(ctx, *args)
+                        try:
+                            yield from sub_gen
+                        except Exception:
+                            sock_send(
+                                socket,
+                                wrap_as_pickle(
+                                    ScriptFailed(traceback=traceback.format_exc())
+                                ),
+                            )
+                        else:
+                            sock_send(socket, wrap_as_pickle(ScriptSucceeded()))
+                    case _:
+                        raise ValueError(f"dispatch loop: unknown command {msg!r}")
         finally:
             close_zmq_socket(socket, ctx_zmq)
             self._http_poster.close()

@@ -18,16 +18,12 @@ import logging
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.hidden_state import (
-    get_pd_hidden_capture_layer_ids,
-    get_pd_hidden_req_state as pd_hidden_state,
-)
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
@@ -52,18 +48,14 @@ from sglang.srt.sampling.sampling_observer_pp import (
     add_auxiliary_output_to_pp_tensors,
     pop_auxiliary_output_from_pp_tensors,
 )
-from sglang.srt.utils import DynamicGradMode, is_hcu, point_to_point_pyobj
+from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
 from sglang.srt.utils.common import is_npu, is_xpu
 
 _is_npu = is_npu()
-_is_hcu = is_hcu()
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
-
-PPTransferStatus = Tuple[List[str], List[str]]
-PPReleasePayload = Union[List[str], PPTransferStatus]
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -76,50 +68,6 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
     )
-
-
-def _pp_exchange_outputs_before_forward(
-    cur_batch: Optional[ScheduleBatch],
-    spec_relay: bool,
-    is_last_rank: bool,
-    async_batch_depth: int,
-) -> bool:
-    """Extend microbatches launch first: they need nothing from the relay, and
-    exchanging first caps every stage at (pp_size - 1) / pp_size. A verify round
-    must exchange first or the ring deadlocks on its tree rebuild."""
-    if async_batch_depth > 0:
-        return True
-    if not spec_relay or is_last_rank or cur_batch is None:
-        return False
-    return not (cur_batch.forward_mode.is_extend() or cur_batch.is_extend_in_batch)
-
-def _pp_ordered_intersection(left: List[str], right: List[str]) -> List[str]:
-    right_set = set(right)
-    return [rid for rid in left if rid in right_set]
-
-
-def _pp_ordered_union(left: List[str], right: List[str]) -> List[str]:
-    seen = set(left)
-    merged = list(left)
-    for rid in right:
-        if rid not in seen:
-            seen.add(rid)
-            merged.append(rid)
-    return merged
-
-
-def _pp_merge_transfer_status(
-    previous: PPTransferStatus,
-    current: PPTransferStatus,
-) -> PPTransferStatus:
-    previous_success, previous_failed = previous
-    current_success, current_failed = current
-    failed = _pp_ordered_union(previous_failed, current_failed)
-    success = _pp_ordered_intersection(previous_success, current_success)
-    if failed:
-        failed_set = set(failed)
-        success = [rid for rid in success if rid not in failed_set]
-    return success, failed
 
 
 @dataclass
@@ -222,11 +170,15 @@ class SchedulerPPMixin:
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
-                exchange_outputs_before_forward = _pp_exchange_outputs_before_forward(
-                    cur_batch=cur_batch,
-                    spec_relay=self._pp_spec_relay,
-                    is_last_rank=self.pp_group.is_last_rank,
-                    async_batch_depth=get_parallel().pp_async_batch_depth,
+                # With zero async depth, non-last speculative ranks must
+                # exchange the previous outputs before launching the next batch.
+                # Tree planning synchronizes CUDA on the host; sending alone
+                # leaves the peer's return send unmatched and can block that
+                # synchronization while the peer waits for our next proxy.
+                # The last rank must launch first to produce its output.
+                exchange_outputs_before_forward = (
+                    get_parallel().pp_async_batch_depth > 0
+                    or (self._pp_spec_relay and not self.pp_group.is_last_rank)
                 )
                 if exchange_outputs_before_forward:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -320,8 +272,8 @@ class SchedulerPPMixin:
         bmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
         consensus_bootstrapped_rids: Optional[List[str]] = None
-        transferred_rids: PPTransferStatus = ([], [])
-        release_rids: Optional[PPTransferStatus] = None
+        transferred_rids: List[str] = []
+        release_rids: Optional[List[str]] = None
         send_bootstrapped_work = []
         send_transfer_work = []
         send_consensus_bootstrapped_work = []
@@ -725,38 +677,18 @@ class SchedulerPPMixin:
             # if ready_reqs:
             #     self._try_send_prefill_kv_ready_batch(ready_reqs)
             self.waiting_queue.extend(good_reqs)
-            return [
-                [req.rid for req in good_reqs],
-                _pp_ordered_union(
-                    bad_consensus_bootstrapped_rids,
-                    [req.rid for req in failed_reqs],
-                ),
-            ]
+            return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
         return None
-
-    def _pp_ordered_intersection(
-        self: Scheduler, left: List[str], right: List[str]
-    ) -> List[str]:
-        right_set = set(right)
-        return [rid for rid in left if rid in right_set]
-
-    def _pp_ordered_union(
-        self: Scheduler, left: List[str], right: List[str]
-    ) -> List[str]:
-        seen = set(left)
-        merged = list(left)
-        for rid in right:
-            if rid not in seen:
-                seen.add(rid)
-                merged.append(rid)
-        return merged
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
-            # Probe local credits without reserving resources before consensus.
-            good_bootstrapped_rids, bad_bootstrapped_rids = (
-                self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
+            # First rank, pop the bootstrap reqs from the bootstrap queue
+            good_bootstrapped_rids, bad_bootstrapped_rids = self.get_rids(
+                self.disagg_prefill_bootstrap_queue.queue,
+                True,
+                [KVPoll.WaitingForInput],
+                [KVPoll.Failed],
             )
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
@@ -764,14 +696,17 @@ class SchedulerPPMixin:
             prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
                 prev_bootstrapped_rids
             )
-            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = (
-                self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
+            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = self.get_rids(
+                self.disagg_prefill_bootstrap_queue.queue,
+                True,
+                [KVPoll.WaitingForInput],
+                [KVPoll.Failed],
             )
-            good_bootstrapped_rids = self._pp_ordered_intersection(
-                prev_good_bootstrapped_rids, curr_good_bootstrapped_rids
+            good_bootstrapped_rids = list(
+                set(prev_good_bootstrapped_rids) & set(curr_good_bootstrapped_rids)
             )
-            bad_bootstrapped_rids = self._pp_ordered_union(
-                prev_bad_bootstrapped_rids, curr_bad_bootstrapped_rids
+            bad_bootstrapped_rids = list(
+                set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
             )
         # Route locally-aborted reqs through the bad-union consensus so every PP
         # rank flushes them in the same consensus round, regardless of when the
@@ -787,21 +722,28 @@ class SchedulerPPMixin:
         )
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
-    def _pp_pd_get_prefill_transferred_ids(
-        self: Scheduler,
-    ) -> PPTransferStatus:
+    def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success
-        current_status = self.get_transferred_rids()
         if self.pp_group.is_first_rank:
-            transferred_rids = current_status
+            transferred_rids = self.get_rids(
+                self.disagg_prefill_inflight_queue,
+                True,
+                [KVPoll.Success, KVPoll.Failed],
+            )
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
-            previous_status = self._pp_recv_pyobj_from_prev_stage()
-            transferred_rids = _pp_merge_transfer_status(
-                previous=previous_status,
-                current=current_status,
+            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
+            # 2. get the current stage's transferred reqs info
+            curr_transferred_rids = self.get_rids(
+                self.disagg_prefill_inflight_queue,
+                True,
+                [KVPoll.Success, KVPoll.Failed],
+            )
+            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
+            transferred_rids = list(
+                set(prev_transferred_rids) & set(curr_transferred_rids)
             )
         return transferred_rids
 
@@ -830,10 +772,10 @@ class SchedulerPPMixin:
 
     def _pp_pd_send_consensus_release_ids(
         self: Scheduler,
-        tmbs: List[Optional[PPReleasePayload]],
+        tmbs: List[List[str]],
         next_first_rank_mb_id: int,
-        release_rids: Optional[PPReleasePayload],
-        transferred_rids: PPReleasePayload,
+        release_rids: List[str],
+        transferred_rids: List[str],
     ):
         send_release_work = []
         if self.pp_group.is_last_rank:
@@ -918,7 +860,7 @@ class SchedulerPPMixin:
         p2p_work = []
         if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
             dp_offset = (
-                get_parallel().attn_dp_rank
+                self.ps.attn_dp_rank
                 * get_parallel().attn_cp_size
                 * get_parallel().attn_tp_size
             )
@@ -937,7 +879,7 @@ class SchedulerPPMixin:
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
         if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
             dp_offset = (
-                get_parallel().attn_dp_rank
+                self.ps.attn_dp_rank
                 * get_parallel().attn_cp_size
                 * get_parallel().attn_tp_size
             )
@@ -989,11 +931,7 @@ class SchedulerPPMixin:
         # Draft extend runs only on the last stage, but every rank needs its relayed
         # output to fill PD auxiliary buffers.
         draft_input = result.next_draft_input
-        if (
-            draft_input is not None
-            and not batch.spec_algorithm.is_dspark()
-            and draft_input.topk_p is not None
-        ):
+        if draft_input is not None and draft_input.topk_p is not None:
             tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
             tensor_dict["draft_topk_index"] = draft_input.topk_index.contiguous()
             tensor_dict["draft_hidden_states"] = draft_input.hidden_states.contiguous()
@@ -1019,13 +957,6 @@ class SchedulerPPMixin:
             else None
         )
         add_auxiliary_output_to_pp_tensors(tensor_dict, auxiliary_output)
-        if (
-            get_pd_hidden_capture_layer_ids(batch.reqs)
-            and not self._pp_should_owner_direct_pd_hidden(batch)
-            and result.logits_output is not None
-            and result.logits_output.hidden_states is not None
-        ):
-            tensor_dict["pd_aux_hidden_states_0"] = result.logits_output.hidden_states
         return tensor_dict
 
     def _pp_prepare_proxy_tensor_dict_for_send(
@@ -1035,56 +966,6 @@ class SchedulerPPMixin:
         if not result.can_run_cuda_graph:
             return tensor_dict
         return {name: tensor.clone() for name, tensor in tensor_dict.items()}
-    def _pp_should_owner_direct_pd_hidden(
-        self: Scheduler, batch: ScheduleBatch
-    ) -> bool:
-        if batch and batch.spec_algorithm.is_dspark():
-            return False
-        if not hasattr(self, "disagg_prefill_bootstrap_queue"):
-            return False
-        if not batch or not get_pd_hidden_capture_layer_ids(batch.reqs):
-            return False
-        capture_reqs = [
-            req
-            for req in batch.reqs
-            if pd_hidden_state(req).capture_layer_ids
-        ]
-        if not capture_reqs:
-            return False
-        if any(req.pending_bootstrap for req in capture_reqs):
-            return False
-        return all(
-            bool((pd_hidden_state(req).meta or {}).get("streaming_hidden", False))
-            for req in capture_reqs
-        )
-
-    def _pp_strip_pd_aux_hidden_from_proxy(
-        self: Scheduler, result: GenerationBatchResult
-    ) -> None:
-        proxy = result.pp_hidden_states_proxy_tensors
-        if proxy is None:
-            return
-        tensors = proxy.tensors
-        aux_keys = [
-            key for key in tensors if key.startswith("pd_aux_hidden_states_")
-        ]
-        for key in aux_keys:
-            tensors.pop(key, None)
-
-    def _pp_maybe_send_dspark_owner_direct_hidden(
-        self: Scheduler,
-        batch: ScheduleBatch,
-        result: GenerationBatchResult,
-    ) -> None:
-        if not self._pp_should_owner_direct_pd_hidden(batch):
-            return
-        send_owner_direct = getattr(
-            self, "send_dspark_owner_direct_hidden_for_batch", None
-        )
-        if send_owner_direct is None:
-            return
-        if send_owner_direct(batch, result):
-            self._pp_strip_pd_aux_hidden_from_proxy(result)
 
     def _pp_send_dict_to_next_stage(
         self: Scheduler,
@@ -1203,6 +1084,7 @@ class SchedulerPPMixin:
         d2h_event = self.device_module.Event()
         d2h_event.record(self.device_module.current_stream())
         return None, batch_result, d2h_event
+
     def _pp_prep_batch_result(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -1292,6 +1174,7 @@ class SchedulerPPMixin:
             return output_result
 
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
+
         # Rebind the last stage's ring proposal as batch.spec_info so the PD result
         # processor sees the same object on every rank.
         next_draft_input = None
@@ -1306,22 +1189,6 @@ class SchedulerPPMixin:
                 num_tokens_per_req=1,
                 num_tokens_for_logprob_per_req=1,
                 dsa_topk_indices=pp_outputs.tensors.get("draft_dsa_topk_indices"),
-            )
-            batch.spec_info = next_draft_input
-        elif batch.spec_algorithm.is_dspark():
-            if _is_hcu:
-                # HCU PP/PD DSpark uses the local device bonus token to seed
-                # the next draft input after the last stage's relay.
-                next_token_ids = next_token_ids.to(
-                    device=batch.device, dtype=torch.int64, non_blocking=True
-                )
-            from sglang.srt.speculative.dspark_components.dspark_draft import (
-                make_next_draft_input,
-            )
-
-            next_draft_input = make_next_draft_input(
-                bonus_tokens=next_token_ids,
-                new_seq_lens=batch.seq_lens,
             )
             batch.spec_info = next_draft_input
 
@@ -1371,17 +1238,10 @@ class SchedulerPPMixin:
                     ),
                 ),
             )
-        pd_aux_hidden = {
-            key: value
-            for key, value in pp_outputs.tensors.items()
-            if key.startswith("pd_aux_hidden_states_")
-        }
         batch.input_ids = None
         output_result = GenerationBatchResult(
             logits_output=logits_output,
-            pp_hidden_states_proxy_tensors=(
-                PPProxyTensors(pd_aux_hidden) if pd_aux_hidden else None
-            ),
+            pp_hidden_states_proxy_tensors=None,
             next_token_ids=pp_outputs["next_token_ids"],
             next_draft_input=next_draft_input,
             extend_input_len_per_req=extend_input_len_per_req,
@@ -1891,16 +1751,7 @@ class SchedulerPPMixin:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
-                if cur_batch.spec_algorithm.is_dspark():
-                    self.model_worker.set_pp_proxy_tensors_for_next_forward(
-                        pp_proxy_tensors
-                    )
-                try:
-                    result = self.run_batch(cur_batch, pp_proxy_tensors)
-                finally:
-                    if cur_batch.spec_algorithm.is_dspark():
-                        self.model_worker.set_pp_proxy_tensors_for_next_forward(None)
-                self._pp_maybe_send_dspark_owner_direct_hidden(cur_batch, result)
+                result = self.run_batch(cur_batch, pp_proxy_tensors)
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_end_time",
@@ -1997,13 +1848,6 @@ class SchedulerPPMixin:
             bad_prealloc_rids = list(
                 set(prev_bad_prealloc_rids) | set(curr_bad_prealloc_rids)
             )
-        if _is_hcu:
-            aborted = self.disagg_decode_prealloc_queue.locally_aborted_rids
-            if aborted:
-                bad_prealloc_rids = sorted(set(bad_prealloc_rids) | set(aborted))
-                good_prealloc_rids = sorted(
-                    set(good_prealloc_rids) - set(bad_prealloc_rids)
-                )
         # Same abort routing as the prefill bootstrap consensus above.
         aborted_rids = {
             decode_req.req.rid
@@ -2029,47 +1873,30 @@ class SchedulerPPMixin:
         bad_rids = list(set(bad_rids) | set(aborted_rids))
         return good_rids, bad_rids
 
-    def _pp_pd_local_transfer_status(self: Scheduler):
-        success_rids, failed_rids = self.get_rids(
-            self.disagg_decode_transfer_queue.queue,
-            False,
-            [KVPoll.Success],
-            [KVPoll.Failed],
-        )
-        success_rids = self.disagg_decode_transfer_queue.filter_commit_ready_rids(
-            success_rids
-        )
-        aborted = self.disagg_decode_transfer_queue.locally_aborted_rids
-        failed_rids = sorted(set(failed_rids) | set(aborted))
-        success_rids = sorted(set(success_rids) - set(failed_rids))
-        return success_rids, failed_rids
-
     def _pp_pd_get_decode_transferred_ids(self: Scheduler):
-        if not _is_hcu:
-            if self.pp_group.is_first_rank:
-                return self.get_rids(
-                    self.disagg_decode_transfer_queue.queue,
-                    False,
-                    [KVPoll.Success, KVPoll.Failed],
-                )
-            prev_rids = self._pp_recv_pyobj_from_prev_stage()
-            curr_rids = self.get_rids(
+        # get the current stage transfer success
+        if self.pp_group.is_first_rank:
+            transferred_rids = self.get_rids(
                 self.disagg_decode_transfer_queue.queue,
                 False,
                 [KVPoll.Success, KVPoll.Failed],
             )
-            return list(set(prev_rids) & set(curr_rids))
-
-        # HCU: success requires every PP rank; Failed is a union and wins.
-        success_rids, failed_rids = self._pp_pd_local_transfer_status()
-        if self.pp_group.is_first_rank:
-            return [success_rids, failed_rids]
-
-        prev_success_rids, prev_failed_rids = self._pp_recv_pyobj_from_prev_stage()
-        success_rids = sorted(set(prev_success_rids) & set(success_rids))
-        failed_rids = sorted(set(prev_failed_rids) | set(failed_rids))
-        success_rids = sorted(set(success_rids) - set(failed_rids))
-        return [success_rids, failed_rids]
+        # if other ranks, do intersection with the previous rank's transferred rids
+        else:
+            # 2 (Release): Receive the transferred rids from the previous rank
+            # 1. recv previous stage's transferred reqs info
+            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
+            # 2. get the current stage's transferred reqs info
+            curr_transferred_rids = self.get_rids(
+                self.disagg_decode_transfer_queue.queue,
+                False,
+                [KVPoll.Success, KVPoll.Failed],
+            )
+            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
+            transferred_rids = list(
+                set(prev_transferred_rids) & set(curr_transferred_rids)
+            )
+        return transferred_rids
 
     def process_retract_queue(self: Scheduler, retract_rids: Optional[List[str]]):
         if retract_rids is not None:
@@ -2091,12 +1918,6 @@ class SchedulerPPMixin:
                 good_consensus_prealloc_rids,
                 bad_consensus_prealloc_rids,
             ) = prealloc_rids
-            if _is_hcu:
-                self.disagg_decode_prealloc_queue.drop_by_rids(
-                    bad_consensus_prealloc_rids
-                )
-                for rid in bad_consensus_prealloc_rids:
-                    self.disagg_decode_prealloc_queue.locally_aborted_rids.discard(rid)
             good_reqs, failed_reqs = self.disagg_decode_prealloc_queue.pop_preallocated(
                 pp_good_rids=good_consensus_prealloc_rids,
                 pp_bad_rids=bad_consensus_prealloc_rids,
@@ -2114,54 +1935,13 @@ class SchedulerPPMixin:
         # Resolve held deferred releases every call, independent of release_rids,
         # so ack/timeout-driven releases still fire when no rids are being polled.
         self.disagg_decode_transfer_queue.resolve_deferred_releases()
-        if not _is_hcu:
-            if release_rids is not None:
-                released_reqs = self.disagg_decode_transfer_queue.pop_transferred(
-                    release_rids
-                )
-                if self.enable_hisparse:
-                    for req in released_reqs:
-                        self.hisparse_coordinator.admit_request_direct(req)
-                self.waiting_queue.extend(released_reqs)
-                return [req.rid for req in released_reqs]
-            return None
-        if release_rids is None:
-            return None
-        if (
-            isinstance(release_rids, (list, tuple))
-            and len(release_rids) == 2
-            and not (release_rids and isinstance(release_rids[0], str))
-        ):
-            success_rids, failed_rids = release_rids
-        else:
-            success_rids, failed_rids = list(release_rids), []
-        if failed_rids:
-            failed_set = set(failed_rids)
-            poll_failed = []
-            force_drop = []
-            for decode_req in self.disagg_decode_transfer_queue.queue:
-                if decode_req.req.rid not in failed_set:
-                    continue
-                poll = (
-                    int(decode_req.kv_receiver.poll())
-                    if decode_req.kv_receiver is not None
-                    else int(KVPoll.Failed)
-                )
-                if poll == int(KVPoll.Failed):
-                    poll_failed.append(decode_req.req.rid)
-                else:
-                    force_drop.append(decode_req.req.rid)
-            self.disagg_decode_transfer_queue.drop_by_rids(
-                poll_failed, stream_error=True
+        if release_rids is not None:
+            released_reqs = self.disagg_decode_transfer_queue.pop_transferred(
+                release_rids
             )
-            self.disagg_decode_transfer_queue.drop_by_rids(
-                force_drop, stream_error=False
-            )
-            for rid in failed_rids:
-                self.disagg_decode_transfer_queue.locally_aborted_rids.discard(rid)
-        released_reqs = self.disagg_decode_transfer_queue.pop_transferred(success_rids)
-        if self.enable_hisparse:
-            for req in released_reqs:
-                self.hisparse_coordinator.admit_request_direct(req)
-        self.waiting_queue.extend(released_reqs)
-        return [req.rid for req in released_reqs]
+            if self.enable_hisparse:
+                for req in released_reqs:
+                    self.hisparse_coordinator.admit_request_direct(req)
+            self.waiting_queue.extend(released_reqs)
+            return [req.rid for req in released_reqs]
+        return None

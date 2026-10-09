@@ -12,7 +12,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
-from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
@@ -46,12 +45,11 @@ from sglang.srt.speculative.dflash_utils import (
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import is_hcu, is_hip, is_npu, set_weight_attrs
+from sglang.srt.utils import is_npu, set_weight_attrs
 from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
-_is_hcu = is_hcu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
@@ -60,20 +58,12 @@ try:
     from flashinfer import top_k as _flashinfer_top_k
 except ImportError:
     _flashinfer_top_k = None
-# flashinfer.top_k JIT-compiles a CUDA kernel via nvcc, which is unavailable on
-# HIP/ROCm images. Force the torch.topk fallback there.
-if _flashinfer_top_k is not None and is_hip():
-    _flashinfer_top_k = None
 
 
 def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
     # The selector's largest single cost: it reads the whole logits tensor.
     if _flashinfer_top_k is not None:
         return _flashinfer_top_k(scores, k, sorted=True, deterministic=True)
-    if _is_hcu:
-        from lightop import topk
-
-        return topk(scores, k, dim=-1)
     return torch.topk(scores, k, dim=-1)
 
 
@@ -109,56 +99,6 @@ def _project_candidate_logits(
     if logits.shape[-1] > num_org:
         logits[:, num_org:] = float("-inf")
     return logits
-
-
-def candidate_topk(
-    hidden: torch.Tensor,
-    lm_head: nn.Module,
-    k: int,
-    *,
-    with_partition: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Global top-k candidates from the target head: hidden [N, H] -> ids / vals [N, K].
-
-    Under TP (vocab-sharded lm_head): local top-k per shard, all-gather K logits/ids (not
-    the full vocab), then a global top-k -- identical candidates at O(tp*K) instead of
-    O(vocab) gather bandwidth. with_partition also returns the full-vocabulary lse [N] fp32.
-    """
-    # The worker screens the head before capture, but the eager fallbacks attach
-    # whatever the target has.
-    weight = getattr(lm_head, "weight", None)
-    quant_method = getattr(lm_head, "quant_method", None)
-    use_quant_head = should_apply_lm_head_quant_method(lm_head, quant_method)
-    if not use_quant_head and not is_dense_head_weight(weight):
-        raise RuntimeError(
-            "DFlash candidate top-k requires a dense FP16/BF16/FP32 target lm_head "
-            "or a supported lm_head.quant_method."
-        )
-    tp = get_parallel().tp_size == 1
-    num_org = (
-        int(lm_head.org_vocab_size)
-        if tp
-        else int(lm_head.shard_indices.num_org_elements)
-    )
-    logits = _project_candidate_logits(
-        hidden, lm_head, num_org=num_org, use_quant_head=use_quant_head
-    )
-    lse = None
-    if with_partition:
-        vals, ids, lse = lilicorr_topk_lse(logits, k)
-    else:
-        vals, ids = _radix_topk(logits, k)
-    if tp:
-        return ids.long(), vals, lse
-    global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
-    gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
-    gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
-    top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
-    if lse is not None:
-        lse = torch.logsumexp(
-            tensor_model_parallel_all_gather(lse.unsqueeze(-1), dim=-1), dim=-1
-        )
-    return torch.gather(gathered_ids, -1, sel).long(), top_vals, lse
 
 
 def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
@@ -310,8 +250,7 @@ class DFlashAttention(nn.Module):
             # Per-head sink bias; each TP rank owns its slice of the
             # all-heads checkpoint tensor.
             self.attention_sink_bias = nn.Parameter(
-                torch.empty(self.num_heads, dtype=torch.float32 if _is_npu else None),
-                requires_grad=False,
+                torch.empty(self.num_heads, dtype=torch.float32), requires_grad=False
             )
             set_weight_attrs(
                 self.attention_sink_bias,
@@ -631,7 +570,6 @@ class DFlashDraftModel(nn.Module):
 
     decoder_layer_cls = DFlashDecoderLayer
     supports_fused_context_kv = True
-    uses_own_vocab_modules = False
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
@@ -640,13 +578,11 @@ class DFlashDraftModel(nn.Module):
         hidden_size = int(config.hidden_size)
         num_layers = int(config.num_hidden_layers)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
-        self.rms_norm_eps = rms_norm_eps
         draft_config = self.draft_config = parse_dflash_draft_config(
             draft_hf_config=config
         )
         self.block_size = draft_config.resolve_block_size(default=16)
         self.candidate_selector: Optional[nn.Module] = None
-        self.lilicorr: Optional[nn.Module] = None
         self.is_nemotron_35_draft = is_nemotron_35_draft_config(config)
         self.embed_tokens: Optional[VocabParallelEmbedding] = None
         if self.is_nemotron_35_draft:
@@ -788,39 +724,6 @@ class DFlashDraftModel(nn.Module):
         if self.is_nemotron_35_draft:
             projected = projected[0]
         return self.hidden_norm(projected)
-
-    def project_target_hidden_partial(
-        self, target_hidden: torch.Tensor, feature_indices: list[int]
-    ) -> torch.Tensor:
-        if not feature_indices:
-            raise ValueError("feature_indices must be non-empty.")
-        feature_indices = [int(i) for i in feature_indices]
-        if (
-            min(feature_indices) < 0
-            or max(feature_indices) >= self.num_context_features
-        ):
-            raise ValueError(
-                "feature_indices out of range for DFLASH context projection: "
-                f"{feature_indices=} {self.num_context_features=}."
-            )
-        hidden_size = int(self.config.hidden_size)
-        expected = len(feature_indices) * hidden_size
-        if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
-            raise ValueError(
-                "DFLASH partial target_hidden feature dim mismatch. "
-                f"Expected shape [N, {expected}] for {feature_indices=}, "
-                f"but got shape={tuple(target_hidden.shape)}."
-            )
-
-        cols = []
-        for idx in feature_indices:
-            start = idx * hidden_size
-            cols.extend(range(start, start + hidden_size))
-        index = torch.tensor(cols, dtype=torch.long, device=self.fc.weight.device)
-        weight = self.fc.weight.index_select(1, index)
-        if target_hidden.dtype != weight.dtype:
-            target_hidden = target_hidden.to(weight.dtype)
-        return F.linear(target_hidden, weight)
 
     @torch.no_grad()
     def forward(
@@ -1116,35 +1019,6 @@ def _follow_maps(maps, initial_indices, edges: int):
         path.append(index)
     return torch.stack(path, dim=1)
 
-    def project_target_hidden_partial(
-        self, target_hidden: torch.Tensor, feature_indices: list[int]
-    ) -> torch.Tensor:
-        if not feature_indices:
-            raise ValueError("feature_indices must be non-empty.")
-        feature_indices = [int(i) for i in feature_indices]
-        hidden_size = int(self.config.hidden_size)
-        expected = len(feature_indices) * hidden_size
-        if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
-            raise ValueError(
-                "Laguna DFLASH partial target_hidden feature dim mismatch. "
-                f"Expected shape [N, {expected}] for {feature_indices=}, "
-                f"but got shape={tuple(target_hidden.shape)}."
-            )
-        slices = target_hidden.view(
-            target_hidden.shape[0], len(feature_indices), hidden_size
-        )
-        compute_dtype = self.fc.weight.dtype
-        if slices.dtype != compute_dtype:
-            slices = slices.to(compute_dtype)
-        normed = torch.empty_like(slices)
-        for out_idx, feature_idx in enumerate(feature_indices):
-            normed[:, out_idx, :] = self.aux_hidden_norms[feature_idx](
-                slices[:, out_idx, :]
-            )
-        return super().project_target_hidden_partial(
-            normed.reshape(target_hidden.shape[0], -1), feature_indices
-        )
-
 
 class CandidateSelector(nn.Module):
     """Scores the K x K transitions between adjacent proposal slots, then walks them.
@@ -1301,12 +1175,47 @@ class DFlash2DraftModel(DFlashDraftModel):
         self, hidden: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Top-k base candidates via the target lm_head: hidden [N, H] -> global
-        candidate_ids / unary_logits [N, K]."""
+        candidate_ids / unary_logits [N, K]. Under TP (vocab-sharded lm_head): local top-k
+        per shard, all-gather K logits/ids (not the full vocab), then a global top-k --
+        identical candidates at O(tp*K) instead of O(vocab) gather bandwidth."""
         assert self.lm_head is not None, "draft_model.lm_head unset before capture"
-        ids, vals, _ = candidate_topk(
-            hidden, self.lm_head, self.candidate_selector.top_k
+        k = self.candidate_selector.top_k
+        # The worker screens the head before capture, but its eager fallback
+        # (_propose_selector_block) attaches whatever the target has.
+        weight = getattr(self.lm_head, "weight", None)
+        quant_method = getattr(self.lm_head, "quant_method", None)
+        use_quant_head = should_apply_lm_head_quant_method(self.lm_head, quant_method)
+        if not use_quant_head and not is_dense_head_weight(weight):
+            raise RuntimeError(
+                "DFlash2 selector requires a dense FP16/BF16/FP32 target lm_head "
+                "or a supported lm_head.quant_method."
+            )
+        if get_parallel().tp_size == 1:
+            org = int(self.lm_head.org_vocab_size)
+            vals, ids = _radix_topk(
+                _project_candidate_logits(
+                    hidden, self.lm_head, num_org=org, use_quant_head=use_quant_head
+                ),
+                k,
+            )
+            return ids.long(), self._transform_unary_logits(vals)
+        shard = self.lm_head.shard_indices
+        vals, ids = _radix_topk(
+            _project_candidate_logits(
+                hidden,
+                self.lm_head,
+                num_org=int(shard.num_org_elements),
+                use_quant_head=use_quant_head,
+            ),
+            k,
         )
-        return ids, self._transform_unary_logits(vals)
+        global_ids = ids.long() + int(shard.org_vocab_start_index)
+        gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
+        gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
+        top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
+        return torch.gather(gathered_ids, -1, sel).long(), self._transform_unary_logits(
+            top_vals
+        )
 
 
 class MuseGlimmerAssistantModel(DFlashDraftModel):

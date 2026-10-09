@@ -129,7 +129,6 @@ def _warmup_update(
 ):
     """Run one update round to warm up RCCL before timing."""
     if backend == "Engine":
-        engine.begin_weight_update()
         engine.update_weights_from_distributed(
             names,
             dtypes=dtypes,
@@ -137,9 +136,7 @@ def _warmup_update(
             group_name="test_parameter_update_group",
             load_format=load_format,
         )
-        engine.end_weight_update()
     else:
-        requests.post(f"{url}/begin_weight_update", json={})
         requests.post(
             f"{url}/update_weights_from_distributed",
             json={
@@ -151,7 +148,6 @@ def _warmup_update(
                 "flush_cache": not (pause_generation_mode == "in_place"),
             },
         )
-        requests.post(f"{url}/end_weight_update", json={})
 
 
 def init_process(
@@ -475,7 +471,6 @@ def init_process_sgl(
 
     time_begin_update = time.perf_counter()
     if backend == "Engine":
-        engine.begin_weight_update()
         engine.update_weights_from_distributed(
             names,
             dtypes=dtypes,
@@ -483,9 +478,7 @@ def init_process_sgl(
             group_name="test_parameter_update_group",
             load_format=load_format,
         )
-        engine.end_weight_update()
     else:
-        requests.post(f"{url}/begin_weight_update", json={})
         requests.post(
             f"{url}/update_weights_from_distributed",
             json={
@@ -497,7 +490,6 @@ def init_process_sgl(
                 "flush_cache": not (pause_generation_mode == "in_place"),
             },
         )
-        requests.post(f"{url}/end_weight_update", json={})
     torch.cuda.synchronize()
     time_end_update = time.perf_counter()
     if pause_generation_mode in ["in_place", "retract"]:

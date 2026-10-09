@@ -22,22 +22,14 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.layers.attention.dsv4.candidate_stream import get_candidate_stream
 from sglang.kernels.ops.attention.dsv4 import lightop_indexer
 from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged
-from sglang.srt.layers.attention.dsv4.v41_indexer.types import CandidateMetadata
-
-
-@dataclass
-class IndexerInputs:
-    q_fp4: torch.Tensor
-    q_sf: torch.Tensor
-    k_cache: torch.Tensor
-    weights: torch.Tensor
-    metadata: object
-    request_ids: Optional[torch.Tensor] = None
-
-from sglang.kernels.ops.attention.dsv4.index_logits import (
+from sglang.srt.layers.attention.dsv4.candidate_indexer import (
+    CandidateMetadata,
+    IndexerInputs,
+    get_candidate_stream,
+)
+from sglang.srt.layers.attention.dsv4.indexer import (
     deep_gemm_fp4_paged_mqa_logits,
 )
 
@@ -175,33 +167,4 @@ class LightopCandidateIndexer:
             page_indices,
             self.block_size,
             None,
-        )
-
-
-class LightopDecodeCandidates:
-    """Adapt HCU paged candidates to main's split prefill/decode indexer protocol."""
-
-    def __init__(self, *, pool, topk_blocks, block_size):
-        self.pool = pool
-        self.indexer = LightopCandidateIndexer(topk_blocks, block_size)
-
-    def _inputs(self, inputs):
-        from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
-            get_deep_gemm_decode_data,
-        )
-
-        data = get_deep_gemm_decode_data(inputs, self.pool)
-        return IndexerInputs(
-            data.q_fp4, data.q_sf, data.k_cache, data.weights,
-            inputs.paged_metadata, inputs.req_rows,
-        )
-
-    def publish_decode(self, inputs, out):
-        return self.indexer.publish_decode(
-            self._inputs(inputs), out.page_indices, out.raw_indices,
-        )
-
-    def consume_decode(self, inputs, published, out):
-        self.indexer.select_decode(
-            published, self._inputs(inputs), out.page_indices, out.raw_indices,
         )

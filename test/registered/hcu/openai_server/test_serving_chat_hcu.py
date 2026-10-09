@@ -221,9 +221,6 @@ class ServingChatTestCase(unittest.TestCase):
             ],
         )
 
-        # OpenAIServingChat probes the chat template once at init; only count
-        # the calls made for this request.
-        self.tm.tokenizer.apply_chat_template.reset_mock()
         self.tm.tokenizer.apply_chat_template.side_effect = [
             RuntimeError("template expects flat tools format"),
             [1, 2, 3],

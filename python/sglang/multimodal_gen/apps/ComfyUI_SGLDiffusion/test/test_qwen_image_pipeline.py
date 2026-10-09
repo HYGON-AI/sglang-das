@@ -1,4 +1,4 @@
-"""Test for QwenImagePipeline with pass-through scheduler."""
+"""Test for ComfyUIQwenImagePipeline with pass-through scheduler."""
 
 import os
 import sys
@@ -12,7 +12,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 
 
 def test_comfyui_qwen_image_pipeline_direct() -> None:
-    """Test QwenImagePipeline with custom inputs."""
+    """Test ComfyUIQwenImagePipeline with custom inputs."""
     model_path = os.environ.get(
         "SGLANG_TEST_QWEN_IMAGE_MODEL_PATH",
         "Qwen/Qwen-Image",  # Supports both safetensors file and diffusers format
@@ -20,7 +20,7 @@ def test_comfyui_qwen_image_pipeline_direct() -> None:
 
     generator = DiffGenerator.from_pretrained(
         model_path=model_path,
-        pipeline_class_name="QwenImagePipeline",
+        pipeline_class_name="ComfyUIQwenImagePipeline",
         num_gpus=2,
         comfyui_mode=True,
         dit_layerwise_offload=False,

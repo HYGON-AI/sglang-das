@@ -131,6 +131,7 @@ class TestWaitingTimeout(CustomTestCase):
 
 class TestRunningTimeout(CustomTestCase):
     def setUp(self):
+        # The poll asks the context for the pipeline width.
         enter_scope(self, published_topology())
 
     def test_emits_only_stale_unfinished_reqs_without_marking(self):

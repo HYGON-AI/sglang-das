@@ -141,24 +141,18 @@ class LatentPreparationStage(PipelineStage):
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
 
-        # Apply the same preparation to generated and unpacked provided latents.
-        spec = self.get_latent_preparation_spec(
-            batch, server_args, batch_size, latent_num_frames, device
-        )
+        # Generate or use provided latents
         if latents is None:
+            spec = self.get_latent_preparation_spec(
+                batch, server_args, batch_size, latent_num_frames, device
+            )
             latents = randn_tensor(
                 spec.shape,
                 generator=generator,
                 device=spec.device,
                 dtype=spec.dtype,
             )
-            needs_preparation = True
-        else:
-            latents = latents.to(device)
-            # ComfyUI may provide already-packed [B, S, D] latents.
-            needs_preparation = tuple(latents.shape) == tuple(spec.shape)
 
-        if needs_preparation:
             latent_ids = (
                 server_args.pipeline_config.maybe_prepare_latent_ids(latents)
                 if spec.prepare_latent_ids
@@ -172,6 +166,8 @@ class LatentPreparationStage(PipelineStage):
                 latents = server_args.pipeline_config.maybe_pack_latents(
                     latents, batch_size, batch
                 )
+        else:
+            latents = latents.to(device)
 
         # Scale the initial noise if needed
         if self.should_scale_initial_noise(batch, server_args) and hasattr(

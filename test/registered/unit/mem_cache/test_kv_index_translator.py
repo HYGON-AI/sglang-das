@@ -27,7 +27,7 @@ import unittest
 from types import SimpleNamespace
 
 import torch
-from test_multi_ended_allocator import _FakeKVCache, _FakeUnifiedSWAKVPool
+from test_multi_ended_allocator import _FakeUnifiedSWAKVPool
 
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
@@ -673,10 +673,7 @@ class TestWriteLoc(CustomTestCase):
                 )
                 allocator = UnifiedMambaTokenToKVPoolAllocator(
                     unified_buffer=pool,
-                    kvcache=SimpleNamespace(
-                        full_kv_pool=_FakeKVCache(pool.max_slots("full")),
-                        mamba_pool=_FakeKVCache(pool.max_slots("mamba")),
-                    ),
+                    kvcache=SimpleNamespace(full_kv_pool=None, mamba_pool=None),
                     device="cpu",
                     page_size=4,
                 )

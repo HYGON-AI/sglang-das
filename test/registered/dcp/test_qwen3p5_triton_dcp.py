@@ -47,6 +47,7 @@ class TestQwen35TritonDCPGsm8k(CustomTestCase):
             "triton",
             "--context-length",
             "1048576",
+            "--disable-radix-cache",
             "--json-model-override-args",
             (
                 '{"rope_scaling":{"rope_type":"yarn","factor":4.0,'

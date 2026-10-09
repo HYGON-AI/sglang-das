@@ -28,8 +28,6 @@ class TestGLM52NVFP4TPMTP(
         "flashinfer_trtllm",
         "--quantization",
         "modelopt_fp4",
-        "--flashinfer-allreduce-fusion-backend",
-        "cutedsl",
     ]
 
 

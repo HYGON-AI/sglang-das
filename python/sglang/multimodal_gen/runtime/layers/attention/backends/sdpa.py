@@ -309,7 +309,7 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
             except RuntimeError as e:
                 # cuDNN raises "No available kernel" for some shapes; pin the
                 # FA fail-safe path for this layer and keep going.
-                logger.warning_once(
+                logger.warning(
                     "cuDNN SDPA failed (%s); falling back to FlashAttention for %s.",
                     e,
                     type(self).__name__,

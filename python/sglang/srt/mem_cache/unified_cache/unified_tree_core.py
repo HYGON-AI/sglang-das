@@ -367,6 +367,18 @@ class UnifiedLRUList:
             return None
         return x
 
+    def get_prev_leaf_no_lock(self, node: UnifiedTreeNode, check_id: bool = True):
+        if check_id:
+            assert node.id in self.cache
+        pt = self._pt
+        ct = self.component_type
+        x = node.lru_prev[pt]
+        while x.component_data[ct].lock_ref > 0 or len(x.children) > 0:
+            x = x.lru_prev[pt]
+        if x == self.head:
+            return None
+        return x
+
     def get_prev_no_host_lock(self, node: UnifiedTreeNode, check_id: bool = True):
         """Host-LRU walker: skip nodes whose component host_lock_ref > 0."""
         if check_id:
@@ -382,6 +394,9 @@ class UnifiedLRUList:
 
     def get_lru_no_lock(self):
         return self.get_prev_no_lock(self.tail, check_id=False)
+
+    def get_leaf_lru_no_lock(self):
+        return self.get_prev_leaf_no_lock(self.tail, check_id=False)
 
     def get_lru_no_host_lock(self):
         return self.get_prev_no_host_lock(self.tail, check_id=False)
@@ -739,25 +754,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         self._update_evictable_leaf_sets(node)
 
-    def dec_window_lock_only(
-        self,
-        node_id: NodeId,
-        component_type: ComponentType,
-        params: DecLockRefParams,
-    ) -> DecSwaLockOnlyResult:
-        result = DecSwaLockOnlyResult()
-        node = self.node_by_id(node_id)
-        self._assert_receipt_anchor(node, params)
-        if node is self.root_node or component_type in params.skipped_lock_components:
-            return result
-        self.components_by_type[component_type].release_window_lock(
-            node,
-            params.get_lock_uuid(component_type),
-            result.device_frees,
-            result.host_frees,
-        )
-        return result
-
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
@@ -768,16 +764,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = DecSwaLockOnlyResult()
         node = self.node_by_id(node_id)
         self._assert_receipt_anchor(node, params)
-        if node is self.root_node:
-            return result
         swa_component = self.components_by_type.get(ComponentType.SWA)
         if swa_component is None:
             return result
         swa_component.release_window_lock(
-            node,
-            params.get_lock_uuid(ComponentType.SWA),
-            result.device_frees,
-            result.host_frees,
+            node, params.swa_uuid_for_lock, result.device_frees, result.host_frees
         )
 
         # Drop strictly-lower-priority locks co-located on the node, skipping
@@ -825,9 +816,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_value_len,
             full_kv_hit_length,
             action,
-        ) = self._match_prefix_helper(
-            key, return_full_match=params.return_full_match
-        )
+        ) = self._match_prefix_helper(key)
         return self._match_post_processor(
             params,
             value,
@@ -838,71 +827,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             action,
         )
 
-    def _match_prefix_helper_readonly(
-        self, key: RadixKey
-    ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int]:
-        """Traverse fully matched nodes without splitting or updating LRU state."""
-        node = self.root_node
-        child_key = key.child_key(self.page_size)
-        value: list[torch.Tensor] = []
-        best_match_node = node
-        best_match_device_node = node
-        best_match_device_value_len = 0
-        separate_device_match = self.enable_hicache
-        if separate_device_match:
-            validators = tuple(
-                comp.create_match_validator() for comp in self.components
-            )
-            device_validators = tuple(
-                comp.create_match_validator(match_device_only=True)
-                for comp in self.components
-            )
-        else:
-            validators = tuple(
-                comp.create_match_validator(match_device_only=True)
-                for comp in self.components
-            )
-
-        def _all_valid(match_validators, match_node):
-            return all(validator(match_node) for validator in match_validators)
-
-        while len(key) > 0 and child_key in node.children:
-            child = node.children[child_key]
-            if child.evicted and not child.backuped:
-                break
-
-            prefix_len = child.key.match(key, page_size=self.page_size)
-            if prefix_len < len(child.key):
-                break
-
-            if not child.evicted:
-                value.append(child.component_data[BASE_COMPONENT_TYPE].value)
-            node = child
-
-            matched = _all_valid(validators, node)
-            if matched:
-                best_match_node = node
-            if not separate_device_match:
-                if matched:
-                    best_match_device_value_len = len(value)
-                    best_match_device_node = node
-            elif _all_valid(device_validators, node):
-                best_match_device_value_len = len(value)
-                best_match_device_node = node
-
-            key = key[prefix_len:]
-            if len(key):
-                child_key = key.child_key(self.page_size)
-
-        return (
-            value,
-            best_match_node,
-            best_match_device_node,
-            best_match_device_value_len,
-        )
-
     def _match_prefix_helper(
-        self, key: RadixKey, *, return_full_match: bool = False
+        self, key: RadixKey
     ) -> tuple[
         list[torch.Tensor],
         UnifiedTreeNode,
@@ -925,27 +851,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         full_kv_hit_length = 0
         action: Optional[CacheAction | ComponentAction] = None
         separate_device_match = self.enable_hicache
-        match_components = (
-            tuple(
-                component
-                for component in self.components
-                if component.component_type == BASE_COMPONENT_TYPE
-            )
-            if return_full_match
-            else self.components
-        )
         if separate_device_match:
             validators = tuple(
-                comp.create_match_validator() for comp in match_components
+                comp.create_match_validator() for comp in self.components
             )
             device_validators = tuple(
                 comp.create_match_validator(match_device_only=True)
-                for comp in match_components
+                for comp in self.components
             )
         else:
             validators = tuple(
                 comp.create_match_validator(match_device_only=True)
-                for comp in match_components
+                for comp in self.components
             )
 
         def _all_valid(validators, node):
@@ -1362,11 +1279,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 dup = value_slice[dup_start:consumed_from]
                 abs_start = state.total_prefix_length + dup_start
                 swa_already_freed = min(
-                    max(
-                        state.params.get_evicted_seqlen(ComponentType.SWA) - abs_start,
-                        0,
-                    ),
-                    dup.numel(),
+                    max(state.params.swa_evicted_seqlen - abs_start, 0), dup.numel()
                 )
                 if swa_already_freed > 0:
                     step_actions.append(FreeDeviceKVFullOnly([dup[:swa_already_freed]]))
@@ -2408,21 +2321,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 nodes_to_load=[],
             )
             return empty_kv, {}
-        # SWA can be evicted independently of FULL, including holes between
-        # resident SWA nodes. Describe precisely which full rows back it.
-        full_load_slices = {}
-        offset = 0
-        for nid in kv_xfer.nodes_to_load or ():
-            count = len(self.node_by_id(nid).key)
-            full_load_slices[nid] = slice(offset, offset + count)
-            offset += count
-        for xfer in comp_xfers.get(ComponentType.SWA, ()):
-            xfer.anchor_index_parts = [
-                full_load_slices[nid]
-                if nid in full_load_slices
-                else self.node_by_id(nid).component_data[BASE_COMPONENT_TYPE].value
-                for nid in xfer.nodes_to_load or ()
-            ]
         return kv_xfer, comp_xfers
 
     def prefetch_anchor_info(
@@ -3130,9 +3028,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def component_evictable_size(self, component_type: ComponentType) -> int:
         """Evictable token count for one component (0 if the component is absent)."""
         return self.component_evictable_size_.get(component_type, 0)
-
-    def component_protected_size(self, component_type: ComponentType) -> int:
-        return self.component_protected_size_.get(component_type, 0)
 
     def full_evictable_size(self) -> int:
         return self.evictable_size()

@@ -1,5 +1,4 @@
 import math
-from array import array
 from collections.abc import Iterable
 
 import einops
@@ -134,7 +133,9 @@ class JetVLMForConditionalGeneration(nn.Module):
                 )
                 weight_loader(param, loaded_weight)
 
-    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+    def pad_input_ids(
+        self, input_ids: list[int], mm_inputs: MultimodalInputs
+    ) -> list[int]:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

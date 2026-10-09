@@ -3,8 +3,8 @@
 This module exposes :class:`FlexKVRadixCache`, a subclass of
 :class:`sglang.srt.mem_cache.radix_cache.RadixCache` that delegates
 host-side prefix storage to a FlexKV ``KVManager``. The design mirrors
-the two-phase external-cache integration pattern, so the scheduler-side
-contract is:
+``LMCRadixCache`` (the LMCache integration) so the scheduler-side
+contract is identical:
 
 * MP (synchronous) mode — the default.
   ``match_prefix`` fires only a FlexKV LOOKUP and returns ``host_hit_length``;
@@ -118,7 +118,7 @@ class FlexKVRadixCache(RadixCache):
             # forward layer blocks on its own eventfd.
             self.flexkv_connector.register_layer_transfer_counter(kvcache)
 
-        # CUDA streams.
+        # CUDA streams (mirroring LMCRadixCache).
         self.load_stream = torch.cuda.Stream()
         self.store_stream = torch.cuda.Stream()
 
@@ -382,18 +382,19 @@ class FlexKVRadixCache(RadixCache):
         return fetched_slots, new_node
 
     # ------------------------------------------------------------------
-    # insert_req (STORE)
+    # cache_finished_req (STORE)
     # ------------------------------------------------------------------
 
-    def on_release(self, req: Req, *, inserted: bool) -> None:
-        if not inserted:
+    def cache_finished_req(  # type: ignore[override]
+        self, req: Req, is_insert: bool = True, *, owned_kv_len: int
+    ) -> None:
+        """Base cache_finished_req then fire an async FlexKV store."""
+        super().cache_finished_req(req, is_insert=is_insert, owned_kv_len=owned_kv_len)
+        if not is_insert:
             self._load_markers.pop(req.cache_request_handle, None)
+            return
 
-    def insert_req(self, req: Req, *, up_to: int) -> None:  # type: ignore[override]
-        """Base insert_req then fire an async FlexKV store."""
-        super().insert_req(req, up_to=up_to)
-
-        # Compute the committed prefix.
+        # Compute the committed prefix mirroring LMCRadixCache's logic.
         topk = get_spec().speculative_eagle_topk
         enable_kv_committed_len = topk is None or topk == 1
         if enable_kv_committed_len:

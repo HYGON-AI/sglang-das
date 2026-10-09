@@ -14,7 +14,6 @@ from sglang.srt.distributed import parallel_state as ps
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
-from sglang.test.test_utils import publish_build_topology
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
@@ -38,8 +37,7 @@ def group():
         local_rank=local_rank,
         distributed_init_method="env://",
     )
-    publish_build_topology(tp_size=world_size, world_rank=rank)
-    ps.initialize_model_parallel()
+    ps.initialize_model_parallel(tensor_model_parallel_size=world_size)
     yield ps.get_tp_group()
     ps.destroy_model_parallel()
     ps.destroy_distributed_environment()

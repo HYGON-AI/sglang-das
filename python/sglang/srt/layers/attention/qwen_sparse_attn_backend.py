@@ -32,14 +32,11 @@ from sglang.srt.layers.attention.qsa.metadata import (
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
-    qwen_sparse_kv_extraction_compact_hcu_fa_triton,
     qwen_sparse_valid_counts_triton,
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
-    sparse_gqa_packed_decode_triton,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import is_hcu, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -63,16 +60,6 @@ def _resolve_trtllm_sparse_decode():
     except ImportError:
         return None
     return trtllm_batch_decode_with_kv_cache
-
-
-@lru_cache(maxsize=1)
-def _resolve_sparse_gqa_attn_funcs():
-    try:
-        from flash_attn import sparse_gqa_attn_fp8_func, sparse_gqa_attn_func
-
-        return sparse_gqa_attn_func, sparse_gqa_attn_fp8_func
-    except ImportError:
-        return None, None
 
 
 @lru_cache(maxsize=1)
@@ -1362,43 +1349,16 @@ class QwenSparseAttnBackend(AttentionBackend):
             sequence_lens, dtype=torch.int32, device=q.device
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
-        k_packed = torch.cat(k_parts).contiguous()
-        v_packed = torch.cat(v_parts).contiguous()
-        sparse_gqa_attn_func, _ = _resolve_sparse_gqa_attn_funcs()
-        # HIP (HCU) flash_attn sparse GQA. FP8 KV stays on the Triton path: this
-        # pool stores FP8 without per-tensor scales and the kernel casts on load.
-        if (
-            sparse_gqa_attn_func is not None
-            and is_hip()
-            and k_packed.element_size() != 1
-        ):
-            if layer.head_dim != 256 or layer.scaling != 1.0 / 16:
-                raise ValueError(
-                    "FA sparse GQA requires head_dim=256 and scaling=1/16: "
-                    f"head_dim={layer.head_dim}, scaling={layer.scaling}"
-                )
-            output = sparse_gqa_attn_func(
-                q.contiguous(),
-                k_packed,
-                v_packed,
-                topk_indices,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                sequence_lens_tensor,
-                scale=1.0 / 16,
-                max_seqlen_q=max(extend_lens, default=1),
-            )
-        else:
-            output = sparse_gqa_fwd_interface_triton_ck(
-                q.contiguous(),
-                k_packed,
-                v_packed,
-                topk_indices,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                sequence_lens_tensor,
-                layer.scaling,
-            )
+        output = sparse_gqa_fwd_interface_triton_ck(
+            q.contiguous(),
+            torch.cat(k_parts),
+            torch.cat(v_parts),
+            topk_indices,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            sequence_lens_tensor,
+            layer.scaling,
+        )
         return self._pad_extend_output(output, num_output_rows)
 
     @staticmethod
@@ -1574,15 +1534,8 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = topk_indices.to(torch.int32).contiguous()
-        hcu_fa_layout = (
-            is_hcu()
-            and k_buffer.ndim == 4
-            and v_buffer.ndim == 4
-            and k_buffer.shape[2] == v_buffer.shape[3]
-            and k_buffer.shape[3] == v_buffer.shape[2]
-        )
         trtllm_decode = _resolve_trtllm_sparse_decode()
-        if trtllm_decode is not None and not hcu_fa_layout:
+        if trtllm_decode is not None:
             return self._forward_trtllm_sparse(
                 q,
                 k_buffer,
@@ -1594,6 +1547,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 trtllm_decode,
             )
 
+        flash_attn_varlen_func = _resolve_flash_attn_varlen_func()
         batch, topk = topk_indices.shape
         sequence_lens = metadata.sequence_lengths
         if metadata.is_cuda_graph:
@@ -1622,16 +1576,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         packed_k, packed_v = self._get_fa2_scratch(
             scratch_capacity,
             k_buffer.shape[1],
-            k_buffer.shape[3] if hcu_fa_layout else k_buffer.shape[2],
+            k_buffer.shape[2],
             q.dtype,
             k_buffer.device,
         )
-        compact_kv = (
-            qwen_sparse_kv_extraction_compact_hcu_fa_triton
-            if hcu_fa_layout
-            else qwen_sparse_kv_extraction_compact_triton
-        )
-        compact_args = (
+        qwen_sparse_kv_extraction_compact_triton(
             k_buffer,
             v_buffer,
             self.req_to_token_pool.req_to_token,
@@ -1648,30 +1597,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             batch,
             topk,
         )
-        if hcu_fa_layout:
-            compact_kv(*compact_args, int(k_buffer.shape[2]))
-        else:
-            compact_kv(*compact_args)
-        if is_hip():
-            relative_indices = torch.arange(
-                topk, dtype=torch.int32, device=q.device
-            ).expand(batch, -1)
-            relative_indices = relative_indices.masked_fill(
-                relative_indices >= valid_counts[:, None], -1
-            ).contiguous()
-            output = sparse_gqa_packed_decode_triton(
-                q.contiguous(),
-                packed_k,
-                packed_v,
-                relative_indices,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                valid_counts,
-                layer.scaling,
-            )
-            return output.reshape(q.shape[0], -1)
-
-        flash_attn_varlen_func = _resolve_flash_attn_varlen_func()
         output = flash_attn_varlen_func(
             q=q,
             k=packed_k,

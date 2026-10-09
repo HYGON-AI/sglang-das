@@ -1,4 +1,7 @@
-"""Config-time override declarations for gemma2_gemma3."""
+"""Config-time override declarations for gemma2_gemma3.
+
+Architectures: Gemma2ForCausalLM, Gemma3ForCausalLM, Gemma3ForConditionalGeneration, Gemma3nForCausalLM, Gemma3nForConditionalGeneration.
+"""
 
 import logging
 from typing import Any

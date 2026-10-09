@@ -1,4 +1,7 @@
-"""Config-time override declarations for minimax_m3."""
+"""Config-time override declarations for minimax_m3.
+
+Architectures: MiniMaxM3SparseForCausalLM, MiniMaxM3SparseForConditionalGeneration.
+"""
 
 import logging
 from typing import Any, Dict
@@ -10,7 +13,7 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import get_quantization_config, is_hcu
+from sglang.srt.utils.common import get_quantization_config
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +34,7 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
         overrides["quantization"] = quant_method
         quant_resolved = quant_method
 
-    if get_platform().is_hip and not is_hcu():
+    if get_platform().is_hip:
         if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "triton"
         if cfg.moe_runner_backend == "auto" and quant_resolved == "mxfp8":

@@ -19,22 +19,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _allow_dsv4_decode_radix_speculative(cfg: Any) -> bool:
-    """Allow only speculative paths covered by the experimental DSV4 cache."""
-    if not envs.SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE.get():
-        return False
-
-    algorithm = (cfg.speculative_algorithm or "").upper()
-    if algorithm == "DSPARK":
-        return True
-    return (
-        algorithm == "EAGLE"
-        and cfg.speculative_eagle_topk == 1
-        and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
-        and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
-    )
-
-
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     cfg = resolving_view(server_args)
@@ -66,24 +50,6 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "overhead without improving prefill performance."
         )
 
-    if not 0 <= cfg.disaggregation_decode_host_receive_threshold <= 1:
-        raise ValueError(
-            "--disaggregation-decode-host-receive-threshold must be between 0 and 1"
-        )
-    if cfg.disaggregation_decode_host_receive_threshold > 0:
-        if cfg.enable_hisparse or cfg.enable_pd_role_switch:
-            raise ValueError(
-                "Decode host receive does not yet support HiSparse or role switching"
-            )
-
-        if cfg.disaggregation_decode_retraction_backup == "cpu_tensor":
-            raise ValueError("Decode host KV buffering requires host_pool retraction")
-        declare_resolution(
-            server_args,
-            "handle_pd_disaggregation",
-            disaggregation_decode_retraction_backup="host_pool",
-        )
-
     if cfg.disaggregation_mode == "decode" and cfg.dcp_size > 1:
         # Fake transfer moves no KV and is only used for synthetic decode
         # benchmarks, so it does not need the DCP relayout from Mooncake/NIXL.
@@ -110,10 +76,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
-            if cfg.speculative_algorithm not in (
-                None,
-                "DSPARK",
-            ) and not _allow_dsv4_decode_radix_speculative(cfg):
+            if cfg.speculative_algorithm not in (None, "DSPARK"):
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with speculative decoding "
@@ -317,7 +280,6 @@ def handle_encoder_disaggregation(server_args: Any):
         "KimiK3ForConditionalGeneration",
         "MiMoV2ForCausalLM",
         "Glm5NextForConditionalGeneration",
-        "Glm5NextForCausalLM",
     ]:
         raise ValueError(
             f"Model type {model_arch} is not supported for encoder disaggregation. "

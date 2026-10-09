@@ -5,7 +5,6 @@
 """Inference-only Cohere2Vision (Command-A-Vision) multimodal model."""
 
 import math
-from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -152,7 +151,9 @@ class Cohere2VisionForConditionalGeneration(nn.Module):
         # walks ``model.model.layers``) can locate the transformer layers.
         self.model = self.language_model.model
 
-    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+    def pad_input_ids(
+        self, input_ids: List[int], mm_inputs: MultimodalInputs
+    ) -> List[int]:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

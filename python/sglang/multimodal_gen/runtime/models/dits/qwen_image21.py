@@ -102,7 +102,6 @@ def build_layout(image_slots, image_shapes, axes_dims, device):
     )
     rope = torch.polar(torch.ones_like(angles), angles)
     return dict(
-        encoder_seq_len=len(image_slots),
         text_indices=torch.tensor(indices, device=device, dtype=torch.long),
         image_indices=torch.tensor(image_indices, device=device, dtype=torch.long),
         prefix_rope=rope[:prefix_len],
@@ -308,7 +307,7 @@ class QwenImage21Attention(nn.Module):
             v,
         )
 
-    def attend_sample(self, q, k, v, rope, prefix, prefix_rope, segments, cache):
+    def forward(self, x, rope, prefix, prefix_rope, segments, cache):
         if cache:
             kp, vp = cache["key"], cache["value"]
             prefix_output = None
@@ -320,8 +319,8 @@ class QwenImage21Attention(nn.Module):
                 mask = None
                 if not is_image:
                     mask = (
-                        torch.arange(end, device=q.device)[None, :]
-                        <= torch.arange(start, end, device=q.device)[:, None]
+                        torch.arange(end, device=x.device)[None, :]
+                        <= torch.arange(start, end, device=x.device)[:, None]
                     )
                     mask = mask[None, None]
                 outputs.append(
@@ -332,6 +331,7 @@ class QwenImage21Attention(nn.Module):
             prefix_output = self.to_out[0](torch.cat(outputs, dim=1).flatten(2))[0]
             if cache is not None:
                 cache.update(key=kp, value=vp)
+        q, k, v = self.project_qkv(x)
         q = apply_qk_norm_rope(q, self.norm_q, rope)
         packed = None
         if (
@@ -358,32 +358,12 @@ class QwenImage21Attention(nn.Module):
         else:
             k = apply_qk_norm_rope(k, self.norm_k, rope)
             out = self.target_attn.forward_with_replicated_kv_prefix(q, kp, vp, k, v)
-        return out, prefix_output
-
-    def forward(self, x, ropes, prefixes, layouts, caches):
-        # batch target projections while retaining each sample's unpadded prefix
-        q, k, v = self.project_qkv(x)
-        outputs, prefix_outputs = [], []
-        for sample, layout in enumerate(layouts):
-            out, prefix_out = self.attend_sample(
-                q[sample : sample + 1],
-                k[sample : sample + 1],
-                v[sample : sample + 1],
-                ropes[sample],
-                prefixes[sample],
-                layout["prefix_rope"],
-                layout["segments"],
-                caches[sample],
-            )
-            outputs.append(out)
-            prefix_outputs.append(prefix_out)
-        return self.to_out[0](torch.cat(outputs).flatten(2))[0], prefix_outputs
+        return self.to_out[0](out.flatten(2))[0], prefix_output
 
 
 class QwenImage21TransformerBlock(nn.Module):
-    def __init__(self, ac, quant_config, prefix, layer_id):
+    def __init__(self, ac, quant_config, prefix):
         super().__init__()
-        self._layer_id = layer_id
         self.img_norm1 = nn.LayerNorm(
             ac.hidden_size, eps=ac.eps, elementwise_affine=False
         )
@@ -399,30 +379,25 @@ class QwenImage21TransformerBlock(nn.Module):
         self,
         hidden_states,
         modulation,
-        prefix_states,
+        prefix_state,
         prefix_modulation,
-        layouts,
-        ropes,
-        caches,
+        layout,
+        rope,
+        cache,
     ):
-        # Cache-DiT's UnifiedBlocks forwards the same args to every layer.
-        # Slice here so prefix KV stays per-layer after that wrap.
-        caches = [cache[self._layer_id] for cache in caches]
+        prefix = prefix_state.get("hidden_states")
         scale1, gate1, scale2, gate2 = modulation
-        prefixes = [
-            apply_modulation(
-                state["hidden_states"], self.img_norm1, prefix_modulation[0]
-            )
-            if not cache
-            else None
-            for state, cache in zip(prefix_states, caches, strict=True)
-        ]
-        attention, prefix_attentions = self.attn(
+        p = None
+        if not cache:
+            ps1, pg1, ps2, pg2 = prefix_modulation
+            p = apply_modulation(prefix, self.img_norm1, ps1)
+        attention, prefix_attention = self.attn(
             apply_modulation(hidden_states, self.img_norm1, scale1),
-            ropes,
-            prefixes,
-            layouts,
-            caches,
+            rope,
+            p,
+            layout["prefix_rope"],
+            layout["segments"],
+            cache,
         )
         hidden_states = residual_gate_add(hidden_states, attention, gate1)
         hidden_states = residual_gate_add(
@@ -430,15 +405,14 @@ class QwenImage21TransformerBlock(nn.Module):
             self.img_mlp(apply_modulation(hidden_states, self.img_norm2, scale2)),
             gate2,
         )
-        for state, attention in zip(prefix_states, prefix_attentions, strict=True):
-            if attention is not None:
-                _, pg1, ps2, pg2 = prefix_modulation
-                prefix = residual_gate_add(state["hidden_states"], attention, pg1)
-                state["hidden_states"] = residual_gate_add(
-                    prefix,
-                    self.img_mlp(apply_modulation(prefix, self.img_norm2, ps2)),
-                    pg2,
-                )
+        if prefix_attention is not None:
+            prefix = residual_gate_add(prefix, prefix_attention, pg1)
+            prefix = residual_gate_add(
+                prefix,
+                self.img_mlp(apply_modulation(prefix, self.img_norm2, ps2)),
+                pg2,
+            )
+        prefix_state["hidden_states"] = prefix
         return hidden_states
 
 
@@ -486,12 +460,9 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         self.modulation = nn.Sequential(
             nn.SiLU(), nn.Linear(ac.hidden_size, ac.hidden_size * 4, bias=False)
         )
-        self.num_layers = ac.num_layers
         self.transformer_blocks = nn.ModuleList(
             [
-                QwenImage21TransformerBlock(
-                    ac, quant_config, f"transformer_blocks.{i}", i
-                )
+                QwenImage21TransformerBlock(ac, quant_config, f"transformer_blocks.{i}")
                 for i in range(ac.num_layers)
             ]
         )
@@ -534,37 +505,39 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
                 timestep.new_zeros(1).to(images.dtype), images.dtype
             )
             prefix_modulation = self.prepare_modulation(zero_temb)
-        if prefix_caches is None:
-            prefix_caches = [[None] * self.num_layers for _ in layouts]
-        prefix_states, ropes = [], []
+        outputs = []
         for sample, layout in enumerate(layouts):
+            caches = (
+                prefix_caches[sample]
+                if prefix_caches is not None
+                else [None] * len(self.transformer_blocks)
+            )
             prefix = None
-            if not prefix_caches[sample][0]:
+            if not caches[0]:
                 prefix = self.txt_in(
-                    encoder_hidden_states[
-                        sample : sample + 1, : layout["encoder_seq_len"]
-                    ]
+                    encoder_hidden_states[sample : sample + 1]
                 ).index_select(1, layout["text_indices"])
                 if condition_latents is not None:
                     prefix[:, layout["image_indices"]] = self.img_in(
                         condition_latents[sample : sample + 1]
                     )
-            prefix_states.append({"hidden_states": prefix})
-            ropes.append(layout["target_rope"][start:end])
-        # Same extras for every block so Cache-DiT's UnifiedBlocks wrap is valid.
-        # Each block slices prefix_caches by _layer_id. Visit once per layer for
-        # layerwise offload.
-        for block in self.transformer_blocks:
-            images = block(
-                images,
-                modulation,
-                prefix_states,
-                prefix_modulation,
-                layouts,
-                ropes,
-                prefix_caches,
+            prefix_state = {"hidden_states": prefix}
+            x = images[sample : sample + 1]
+            sample_modulation = tuple(
+                value[sample : sample + 1] for value in modulation
             )
-        output = self.proj_out(self.norm_out(images, temb))
+            for i, block in enumerate(self.transformer_blocks):
+                x = block(
+                    x,
+                    sample_modulation,
+                    prefix_state,
+                    prefix_modulation,
+                    layout,
+                    layout["target_rope"][start:end],
+                    caches[i],
+                )
+            outputs.append(self.proj_out(self.norm_out(x, temb[sample : sample + 1])))
+        output = torch.cat(outputs)
         if sp > 1:
             output = sequence_model_parallel_all_gather(output, dim=1)
         return output

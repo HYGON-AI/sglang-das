@@ -18,8 +18,8 @@ from types import SimpleNamespace
 import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci, register_hcu_ci
+from sglang.test.run_eval import run_eval
 from sglang.test.send_one import BenchArgs, send_one_prompt
-from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -100,11 +100,12 @@ class TestDeepseekMTP(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
+            api="completion",
             max_tokens=512,
             num_examples=1200,
             num_threads=1200,
         )
-        metrics = run_sgl_eval(args)
+        metrics = run_eval(args)
         print(f"Eval accuracy of GSM8K: {metrics=}")
 
         self.assertGreater(metrics["score"], 0.92)
@@ -159,11 +160,12 @@ class TestDeepseekV32TBO(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
+            api="completion",
             max_tokens=512,
             num_examples=1200,
             num_threads=1200,
         )
-        metrics = run_sgl_eval(args)
+        metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.92)
 

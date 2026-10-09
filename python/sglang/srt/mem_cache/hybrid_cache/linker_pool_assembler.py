@@ -368,7 +368,7 @@ def _build_deepseek_v4_device_pool_group(
         )
     return DevicePoolGroup(
         entries,
-        mappings.transfer_layer_id_max,
+        mappings.transfer_layer_num,
         page_size,
         rank_replicated=True,
     )

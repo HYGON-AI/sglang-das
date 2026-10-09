@@ -1,7 +1,6 @@
 import torch
 
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
-from sglang.srt.utils.common import is_pin_memory_available
 
 
 class BatchedPresencePenalizer(_BatchedPenalizer):
@@ -16,7 +15,6 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
         )
 
     def _prepare(self):
-        pin_memory = is_pin_memory_available(self.orchestrator.device)
         self.cumulated_presence_penalties = torch.zeros(
             (len(self.orchestrator.reqs()), self.orchestrator.vocab_size),
             dtype=torch.float32,
@@ -30,11 +28,9 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
                     for req in self.orchestrator.reqs()
                 ],
                 dtype=torch.float32,
-                pin_memory=pin_memory,
+                device=self.orchestrator.device,
             )
-            .to(self.orchestrator.device, non_blocking=True)
-            .unsqueeze_(1)
-        )
+        ).unsqueeze_(1)
 
     def _cumulate_output_tokens(self, output_ids: torch.Tensor):
         self.cumulated_presence_penalties.scatter_(

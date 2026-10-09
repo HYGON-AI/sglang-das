@@ -1232,7 +1232,11 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             cur = parent;
         }
 
-        result.set_lock_uuid(SWA.idx() as u8, swa_uuid, lock_host);
+        if lock_host {
+            result.swa_uuid_for_host_lock = swa_uuid;
+        } else {
+            result.swa_uuid_for_lock = swa_uuid;
+        }
         result
     }
 
@@ -1243,10 +1247,11 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         params: &DecLockRefParams,
         lock_host: bool,
     ) {
-        if tree_core.arena.node(node_id).is_root() {
-            return;
-        }
-        let swa_uuid_for_lock = params.get_lock_uuid(SWA.idx() as u8, lock_host);
+        let swa_uuid_for_lock = if lock_host {
+            params.swa_uuid_for_host_lock
+        } else {
+            params.swa_uuid_for_lock
+        };
 
         let mut cur = node_id;
         loop {
@@ -1306,14 +1311,10 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         node_id: NodeIdx_,
-        params: &DecLockRefParams,
+        swa_uuid_for_lock: Option<i64>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
     ) {
-        if tree_core.arena.node(node_id).is_root() {
-            return;
-        }
-        let swa_uuid_for_lock = params.get_lock_uuid(SWA.idx() as u8, false);
         let ct = SWA;
         let mut cur = node_id;
         loop {

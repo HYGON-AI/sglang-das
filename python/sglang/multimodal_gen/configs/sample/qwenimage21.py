@@ -13,9 +13,3 @@ class QwenImage21SamplingParams(SamplingParams):
     guidance_scale: float = 1.0
     num_inference_steps: int = 40
     negative_prompt: str | None = None
-
-    @classmethod
-    def default_image_output_format(cls) -> str:
-        """Preserve Qwen-Image 2.1's RGBA outputs by default."""
-
-        return "png"

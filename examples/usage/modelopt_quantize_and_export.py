@@ -21,7 +21,6 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.model_loader.loader import get_model_loader
-from sglang.test.test_utils import publish_build_topology
 
 
 def _validate_export(export_dir: str) -> bool:
@@ -114,8 +113,10 @@ def quantize_and_export_model(
             local_rank=0,
             backend="nccl" if device == "cuda" else "gloo",
         )
-        publish_build_topology()
-        initialize_model_parallel()
+        initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+        )
 
     # Configure model loading with ModelOpt quantization and export
     model_config = ModelConfig(

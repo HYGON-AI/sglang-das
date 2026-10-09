@@ -29,7 +29,6 @@ from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore, TritonRunnerInput
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerCore
 from sglang.srt.layers.moe.utils import (
-    MoeRunnerBackend,
     MoeRunnerBackendLike,
     get_moe_a2a_backend,
     get_moe_runner_backend,
@@ -137,7 +136,7 @@ class MoeRunner:
                 self.runner_core = MarlinLoraRunnerCore(config)
             else:
                 self.runner_core = None  # Marlin only supports fused path
-        elif runner_backend.value == MoeRunnerBackend.LIGHTOP.value:
+        elif runner_backend.is_lightop():
             from sglang.srt.layers.moe.moe_runner.lightop import LightOpRunnerCore
 
             self.runner_core = LightOpRunnerCore(config)

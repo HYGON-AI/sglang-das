@@ -1,7 +1,4 @@
-from __future__ import annotations
-
 import weakref
-from typing import TYPE_CHECKING
 
 import torch
 
@@ -14,9 +11,6 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.utils.common import get_num_new_pages
 
-if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
-
 
 class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def __init__(
@@ -25,7 +19,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         page_size: int,
         dtype: torch.dtype,
         device: torch.device,
-        kvcache: HiSparseDSATokenToKVPool | MiniMaxSparseKVPool,
+        kvcache: HiSparseDSATokenToKVPool,
         need_sort: bool,
         host_to_device_ratio: int = 2,
     ):

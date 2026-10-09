@@ -1,6 +1,14 @@
-"""Field order preserving the ServerArgs positional constructor signature.
+"""The order ``ServerArgs`` presents its fields in, frozen.
 
-``collect_input_fields`` appends unlisted fields after these entries.
+A dataclass turns field order into a positional constructor signature, so
+``ServerArgs(model_path, tokenizer_path)`` has to keep meaning what it means.
+Grouping the declarations by namespace would move the second argument onto
+another field, silently.
+
+A compatibility record and nothing else -- a field's namespace is the module it
+is declared in, and only ``collect_input_fields`` reads this. A name that is not
+here sorts after every name that is, which is the only backward-compatible
+position for a new field anyway.
 """
 
 # fmt: off
@@ -55,6 +63,7 @@ POSITIONAL_FIELD_ORDER = (
     "page_size",
     "c128_page_size",
     "swa_full_tokens_ratio",
+    "swa_prefix_tails",
     "disable_hybrid_swa_memory",
     "radix_eviction_policy",
     "radix_eviction_policy_config",
@@ -88,11 +97,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_prefill_cp",
     "cp_strategy",
     "enable_dsa_cache_layer_split",
-    "mla_kv_prefetch_ring_size",
-    "enable_dsa_prefill_context_parallel",
-    "dsa_prefill_cp_mode",
-    "enable_prefill_context_parallel",
-    "prefill_cp_mode",
     "enable_cp_cache_layer_split",
     "enable_cp_decode_attn_tp",
     "enable_dp_attention",
@@ -101,6 +105,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_tp_lm_head_all_to_all",
     "enable_attn_tp_input_scattered",
     "enable_shared_experts_attn_tp",
+    "shared_experts_tp_size",
     "enable_dense_mlp_attn_tp",
     "enable_layernorm_sp",
     "disable_attn_tp_gather",
@@ -141,7 +146,6 @@ POSITIONAL_FIELD_ORDER = (
     "served_model_name",
     "weight_version",
     "chat_template",
-    "trust_request_chat_template",
     "hf_chat_template_name",
     "completion_template",
     "file_storage_path",
@@ -203,7 +207,6 @@ POSITIONAL_FIELD_ORDER = (
     "stat_loggers",
     "constrained_json_whitespace_pattern",
     "constrained_json_disable_any_whitespace",
-    "constrained_json_max_whitespace_cnt",
     "attention_backend",
     "decode_attention_backend",
     "enable_lean_attention",
@@ -228,8 +231,10 @@ POSITIONAL_FIELD_ORDER = (
     "cuda_graph_backend_prefill",
     "cuda_graph_max_bs_decode",
     "cuda_graph_max_bs_prefill",
+    "cuda_graph_max_seq_len_prefill",
     "cuda_graph_bs_decode",
     "cuda_graph_bs_prefill",
+    "cuda_graph_prefill_max_context",
     "cuda_graph_tc_compiler",
     "disable_prefill_cuda_graph",
     "disable_decode_cuda_graph",
@@ -250,7 +255,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_fused_moe_sum_all_reduce",
     "enable_deepseek_v4_fp4_indexer",
     "disable_custom_all_reduce",
-    "custom_all_reduce_backend",
     "enable_mscclpp",
     "enable_torch_symm_mem",
     "enable_scattered_sconv",
@@ -270,7 +274,6 @@ POSITIONAL_FIELD_ORDER = (
     "speculative_draft_load_format",
     "speculative_num_steps",
     "speculative_eagle_topk",
-    "speculative_draft_lm_head_vp_size",
     "speculative_num_draft_tokens",
     "speculative_dflash_block_size",
     "speculative_dspark_block_size",
@@ -318,7 +321,6 @@ POSITIONAL_FIELD_ORDER = (
     "deepep_dispatcher_output_dtype",
     "ep_num_redundant_experts",
     "ep_dispatch_algorithm",
-    "ep_static_dispatch_policy",
     "init_expert_location",
     "enable_eplb",
     "eplb_algorithm",
@@ -339,6 +341,7 @@ POSITIONAL_FIELD_ORDER = (
     "elastic_ep_initial_size",
     "max_ep_size",
     "elastic_ep_scale_timeout",
+    "elastic_ep_rejoin",
     "disable_flashinfer_cutlass_moe_fp4_allgather",
     "disable_shared_experts_fusion",
     "enforce_shared_experts_fusion",
@@ -392,6 +395,7 @@ POSITIONAL_FIELD_ORDER = (
     "mm_global_cache_backend",
     "disable_fast_image_processor",
     "mm_feature_transport",
+    "keep_mm_feature_on_device",
     "enable_lora",
     "enable_lora_overlap_loading",
     "max_lora_rank",
@@ -497,6 +501,9 @@ POSITIONAL_FIELD_ORDER = (
     "return_hidden_states_mode",
     "enable_return_routed_experts",
     "enable_return_indexer_topk",
+    "enable_encoder_swa_bounded_replay",
+    "enable_decoder_swa_bounded_replay",
+    "sampling_mask_max_tokens",
     "disable_outlines_disk_cache",
     "enable_mis",
     "weight_cache_mode",
@@ -504,32 +511,5 @@ POSITIONAL_FIELD_ORDER = (
     "weight_cache_timeout",
     "forward_hooks",
     "msprobe_dump_config",
-    "ple_offload_embedding",
-    "ple_offload_backend",
-    "ple_offload_dir",
-    "disaggregation_enable_kv_checksum",
-    "enable_pd_role_switch",
-    "speculative_domino_candidate_pool_size",
-    "flashinfer_a2a_dispatch_type",
-    "cuda_graph_max_seq_len_prefill",
-    "prefill_kv_cache_dequant_dtype",
-    "dsv4_attn_backend",
-    "otlp_service_name",
-    "_radix_eviction_policy_explicitly_set",
-    "hicache_host_memory_fraction",
-    "enable_linker_mla_dedup",
-    "_swa_full_tokens_ratio_explicitly_set",
-    "swa_prefix_tails",
-    "enable_encoder_swa_bounded_replay",
-    "enable_decoder_swa_bounded_replay",
-    "enable_response_store",
-    "disaggregation_decode_host_receive_threshold",
-    "glm_adaptive_max_tokens",
-    "glm_check_chat_prompt_length",
-    "glm_check_total_num_tokens",
-    "glm_decoding_constraint_module",
-    "glm_disable_nothink",
-    "glm_ignore_decoding_constraint_exception",
-    "glm_special_token_escape_seed",
 )
 # fmt: on

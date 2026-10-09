@@ -22,15 +22,6 @@ limitations under the License.
 #include "sgl_kernel_ops.h"
 
 TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
-  m.def(
-      "transfer_kv_per_layer_mla_lf_lf_H2D_hcu(Tensor src, Tensor dst, Tensor src_indices, Tensor dst_indices, "
-      "int item_size, int page_size, int num_warps_per_block) -> ()");
-  m.impl("transfer_kv_per_layer_mla_lf_lf_H2D_hcu", torch::kCUDA, &transfer_kv_per_layer_mla_lf_lf_H2D_hcu);
-  m.def(
-      "transfer_kv_all_layer_mla_lf_lf_D2H_hcu(Tensor src_layers, Tensor dst_layers, Tensor src_indices, "
-      "Tensor dst_indices, int item_size, int num_layers, int block_quota, int num_warps_per_block) -> ()");
-  m.impl("transfer_kv_all_layer_mla_lf_lf_D2H_hcu", torch::kCUDA, &transfer_kv_all_layer_mla_lf_lf_D2H_hcu);
-
   /*
    * From FlashMLA
    */
@@ -50,16 +41,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   m.def("gelu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
-
-  m.def(
-      "kpool_write_plan(Tensor write_start, Tensor req_pool_indices, Tensor real_page_table, Tensor! req_out, "
-      "Tensor! write_start_out, Tensor! tail_logical_start_out, Tensor! write_loc_out, "
-      "Tensor!? pool_seqlens_per_q_out, Tensor!? seqlens_per_q_out, int pool_size, int num_draft_tokens, "
-      "int slots_per_page) -> ()");
-  m.impl("kpool_write_plan", torch::kCUDA, &kpool_write_plan);
-
-  m.def("concat_mla_absorb_q(Tensor a, Tensor b, Tensor! out) -> ()");
-  m.impl("concat_mla_absorb_q", torch::kCUDA, &concat_mla_absorb_q);
 
   m.def("l2norm(Tensor input, float eps) -> Tensor");
   m.impl("l2norm", torch::kCUDA, &l2norm);
@@ -191,22 +172,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "topk_sigmoid(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, Tensor? "
       "correction_bias) -> ()");
   m.impl("topk_sigmoid", torch::kCUDA, &topk_sigmoid);
-
-  /*
-   * From csrc/speculative
-   */
-  m.def(
-      "verify_tree_greedy(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
-      "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
-      "Tensor target_predict) -> ()");
-  m.impl("verify_tree_greedy", torch::kCUDA, &verify_tree_greedy);
-
-  m.def(
-      "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
-      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, "
-      "Tensor! retrive_next_sibling, int topk, int depth, int draft_token_num, int tree_mask_mode) -> "
-      "()");
-  m.impl("build_tree_kernel_efficient", torch::kCUDA, &build_tree_kernel_efficient);
 
   /*
    * From csrc/kvcacheio

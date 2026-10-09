@@ -38,8 +38,8 @@ class TestAscendMhaHicache(CustomTestCase):
             "--attention-backend",
             "ascend",
             "--enable-hierarchical-cache",
-            "--hicache-size",
-            30,
+            "--hicache-ratio",
+            1.2,
         ]
 
     def test_a_gsm8k(self):
@@ -62,7 +62,7 @@ class TestAscendMhaHicache(CustomTestCase):
                             num_questions=1319,
                             max_new_tokens=512,
                             parallel=128,
-                            host=self.url.hostname,
+                            host=f"http://{self.url.hostname}",
                             port=int(self.url.port),
                         )
                         metrics = run_eval_few_shot_gsm8k(args)

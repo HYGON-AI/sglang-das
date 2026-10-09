@@ -18,12 +18,16 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cuda_ci,
-    register_hcu_ci,
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+
+# HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
+register_hcu_ci(
+    est_time=120,
+    suite="stage-b-test-1-hcu-small",
+    disabled="HCU Stage-B deferred: sliding-window cuda-graph subtest uses google/gemma-3-4b-it and failed with gated HF 401; needs local model mapping before enabling.",
 )
-from sglang.test.sgl_eval_utils import run_sgl_eval
+
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -35,13 +39,6 @@ from sglang.test.test_utils import (
 # Sliding window attention with Triton backend (Gemma-3 model)
 register_cuda_ci(est_time=80, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
-
-# HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
-register_hcu_ci(
-    est_time=120,
-    suite="stage-b-test-1-hcu-small",
-    disabled="HCU Stage-B deferred: sliding-window cuda-graph subtest uses google/gemma-3-4b-it and failed with gated HF 401; needs local model mapping before enabling.",
-)
 
 
 class TestSlidingWindowAttentionTriton(CustomTestCase):
@@ -84,7 +81,7 @@ class TestSlidingWindowAttentionTriton(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_sgl_eval(args)
+        metrics = run_eval(args)
         print(f"MMLU metrics with sliding window: {metrics}")
 
         # gemma-3-4b-it scores 0.59 over 256 questions under sgl-eval's grader,

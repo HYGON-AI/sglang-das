@@ -28,6 +28,10 @@ MODEL = os.environ.get(
     "INKLING_SMALL_TEST_MODEL_PATH", "thinkingmachines/Inkling-Small-NVFP4"
 )
 
+# The unified radix tree is what merges the three components into one tree, so
+# it is a precondition rather than a tuning knob here.
+ENV = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
+
 # Shared with the single-server Inkling recipe; TP is per role.
 COMMON_ARGS = [
     "--tp",
@@ -100,6 +104,7 @@ class TestDisaggregationInklingMXFP8(PDDisaggregationServerBase, GSM8KMixin):
             cls.prefill_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=prefill_args,
+            env={**os.environ, **ENV},
         )
 
     @classmethod
@@ -120,6 +125,7 @@ class TestDisaggregationInklingMXFP8(PDDisaggregationServerBase, GSM8KMixin):
             cls.decode_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=decode_args,
+            env={**os.environ, **ENV},
         )
 
 

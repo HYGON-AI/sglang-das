@@ -82,20 +82,6 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-def _resolve_weight_param_name(
-    name: str, params_dict: Dict[str, torch.Tensor]
-) -> Optional[str]:
-    if name in params_dict:
-        return name
-    if name.endswith("weight_scale"):
-        alternate_name = name + "_inv"
-    elif name.endswith("weight_scale_inv"):
-        alternate_name = name.removesuffix("_inv")
-    else:
-        return None
-    return alternate_name if alternate_name in params_dict else None
-
-
 def _get_indexer_weight_block_size(
     quant_config: Optional[QuantizationConfig],
 ) -> List[int]:
@@ -125,7 +111,7 @@ def _load_fused_indexer_wk(
         return False
 
     if ".indexer.weights_proj." in name:
-        is_scale = name.endswith((".weight_scale", ".weight_scale_inv"))
+        is_scale = name.endswith(".weight_scale_inv")
         if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
             w = _clone_if_runai_streamed_tensor(loaded_weight)
             fused_param.data[-w.shape[0] :].copy_(w)
@@ -145,7 +131,7 @@ def _load_fused_indexer_wk(
         return True
 
     # wk: a bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
-    is_scale = name.endswith((".weight_scale", ".weight_scale_inv"))
+    is_scale = name.endswith(".weight_scale_inv")
     if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
         w = _clone_if_runai_streamed_tensor(loaded_weight)
         fused_param.data[: w.shape[0]].copy_(w)
@@ -171,19 +157,18 @@ def _load_fused_expert_tensor(
     params_dict: Dict[str, torch.Tensor],
 ) -> bool:
     mappings = (
-        (".experts.gate_up_proj_scale", ".experts.w13_weight_scale", "w13"),
-        (".experts.down_proj_scale", ".experts.w2_weight_scale", "w2"),
+        (".experts.gate_up_proj_scale", ".experts.w13_weight_scale_inv", "w13"),
+        (".experts.down_proj_scale", ".experts.w2_weight_scale_inv", "w2"),
         (".experts.gate_up_proj", ".experts.w13_weight", "w13"),
         (".experts.down_proj", ".experts.w2_weight", "w2"),
     )
     for source, target, shard_id in mappings:
         if not name.endswith(source):
             continue
-        target_name = name[: -len(source)] + target
-        param_name = _resolve_weight_param_name(target_name, params_dict)
-        if param_name is None:
+        param_name = name[: -len(source)] + target
+        param = params_dict.get(param_name)
+        if param is None:
             return False
-        param = params_dict[param_name]
         weight_loader = param.weight_loader
         for expert_id, expert_weight in enumerate(loaded_weight):
             if shard_id == "w13":
@@ -309,31 +294,34 @@ class DeepseekV2WeightLoaderMixin:
 
                 weight_names.append(name)
 
-                if isinstance(nextn_conf, NextNEnabledConfig):
-                    layer_prefix = nextn_conf.nextn_layer_prefix
-                    spec_weight_names = nextn_conf.nextn_spec_weight_names
-                    if not name.startswith(layer_prefix):
-                        continue
+                match nextn_conf:
+                    case NextNEnabledConfig(
+                        nextn_layer_prefix=layer_prefix,
+                        nextn_spec_weight_names=spec_weight_names,
+                    ):
+                        if not name.startswith(layer_prefix):
+                            continue
 
-                    # Use shared head and embed weights from target model
-                    if "shared_head.head" in name or "embed_tokens" in name:
-                        continue
+                        # Use shared head and embed weights from target model
+                        if "shared_head.head" in name or "embed_tokens" in name:
+                            continue
 
-                    # Transform name: NextN-specific → "model.*", decoder → "model.decoder.*"
-                    if any(s in name for s in spec_weight_names):
-                        name = name.replace(layer_prefix, "model")
-                    else:
-                        name = name.replace(layer_prefix, "model.decoder")
-                elif isinstance(nextn_conf, NextNDisabledConfig):
-                    if hasattr(self.config, "num_nextn_predict_layers"):
-                        num_nextn_layers = self.config.num_nextn_predict_layers
-                        if num_nextn_layers > 0 and name.startswith("model.layers"):
-                            name_list = name.split(".")
-                            if (
-                                len(name_list) >= 3
-                                and int(name_list[2]) >= self.config.num_hidden_layers
-                            ):
-                                continue
+                        # Transform name: NextN-specific → "model.*", decoder → "model.decoder.*"
+                        if any(s in name for s in spec_weight_names):
+                            name = name.replace(layer_prefix, "model")
+                        else:
+                            name = name.replace(layer_prefix, "model.decoder")
+                    case NextNDisabledConfig():
+                        if hasattr(self.config, "num_nextn_predict_layers"):
+                            num_nextn_layers = self.config.num_nextn_predict_layers
+                            if num_nextn_layers > 0 and name.startswith("model.layers"):
+                                name_list = name.split(".")
+                                if (
+                                    len(name_list) >= 3
+                                    and int(name_list[2])
+                                    >= self.config.num_hidden_layers
+                                ):
+                                    continue
 
                 if _load_fused_expert_tensor(name, loaded_weight, params_dict):
                     continue
@@ -373,14 +361,11 @@ class DeepseekV2WeightLoaderMixin:
                     # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                     if ("mlp.experts." in name) and name not in params_dict:
                         continue
-                    mapped_name = name.replace(weight_name, param_name)
+                    name = name.replace(weight_name, param_name)
                     # Skip loading extra bias for GPTQ models.
-                    if mapped_name.endswith(".bias") and mapped_name not in params_dict:
+                    if name.endswith(".bias") and name not in params_dict:
                         continue
-                    resolved_name = _resolve_weight_param_name(mapped_name, params_dict)
-                    if resolved_name is None:
-                        continue
-                    param = params_dict[resolved_name]
+                    param = params_dict[name]
                     weight_loader = param.weight_loader
                     maybe_executor_submit(
                         executor=executor,
@@ -397,13 +382,10 @@ class DeepseekV2WeightLoaderMixin:
                             continue
                         if _is_npu:
                             name = name.replace("weight_packed", "weight")
-                        mapped_name = name.replace(weight_name, param_name)
-                        resolved_name = _resolve_weight_param_name(
-                            mapped_name, params_dict
-                        )
-                        if resolved_name is None:
+                        name = name.replace(weight_name, param_name)
+                        if name not in params_dict:
                             continue
-                        param = params_dict[resolved_name]
+                        param = params_dict[name]
                         weight_loader = param.weight_loader
                         maybe_executor_submit(
                             executor=executor,
@@ -413,7 +395,7 @@ class DeepseekV2WeightLoaderMixin:
                             func_args=(
                                 param,
                                 loaded_weight,
-                                resolved_name,
+                                name,
                             ),
                             func_kwargs={
                                 "shard_id": shard_id,
@@ -508,16 +490,13 @@ class DeepseekV2WeightLoaderMixin:
                                             f"{scale[0]}_proj", "attn_mqa"
                                         )
                                         break
-                            resolved_name = _resolve_weight_param_name(
-                                name, params_dict
-                            )
-                            if resolved_name is None:
+                            if name not in params_dict:
                                 # modelopt ckpt contains not needed weights for MTP module:
                                 # model.decoder.self_attn.attn_mqa.v_scale and
                                 # model.decoder.self_attn.attn_mqa.k_scale
                                 logger.warning(f"{name} not found in params_dict.")
                                 continue
-                            param = params_dict[resolved_name]
+                            param = params_dict[name]
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
@@ -885,28 +864,31 @@ class DeepseekV2WeightLoaderMixin:
         weight_block_size = [128, 128]
         partial_names = []
 
-        if isinstance(nextn_conf, NextNEnabledConfig):
-            layer_id = nextn_conf.nextn_layer_id
-            if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN.get():
-                for stem in attn_quant_modules:
-                    partial_names.append(f"model.layers.{layer_id}.self_attn.{stem}")
-
-            if enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
-                expert_sub_names = ["shared_experts"] + [
-                    f"experts.{i}" for i in range(self.config.n_routed_experts)
-                ]
-                for expert_sub_name in expert_sub_names:
-                    for stem in ["gate_proj", "up_proj", "down_proj"]:
-                        partial_names.append(
-                            f"model.layers.{layer_id}.mlp.{expert_sub_name}.{stem}"
-                        )
-        elif isinstance(nextn_conf, NextNDisabledConfig):
-            if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN.get():
-                for layer_id in range(self.config.num_hidden_layers):
+        match nextn_conf:
+            case NextNEnabledConfig(nextn_layer_id=layer_id):
+                if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN.get():
                     for stem in attn_quant_modules:
                         partial_names.append(
                             f"model.layers.{layer_id}.self_attn.{stem}"
                         )
+
+                if enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
+                    expert_sub_names = ["shared_experts"] + [
+                        f"experts.{i}" for i in range(self.config.n_routed_experts)
+                    ]
+                    for expert_sub_name in expert_sub_names:
+                        for stem in ["gate_proj", "up_proj", "down_proj"]:
+                            partial_names.append(
+                                f"model.layers.{layer_id}.mlp.{expert_sub_name}.{stem}"
+                            )
+
+            case NextNDisabledConfig():
+                if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN.get():
+                    for layer_id in range(self.config.num_hidden_layers):
+                        for stem in attn_quant_modules:
+                            partial_names.append(
+                                f"model.layers.{layer_id}.self_attn.{stem}"
+                            )
 
         # Early return if no quantization needed - avoid materializing all weights into memory
         if not partial_names:

@@ -17,26 +17,12 @@ import torch
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    get_device,
-    get_device_module,
-    is_cuda,
-    is_hip,
-    is_xpu,
-)
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import Range
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cuda_ci,
-    register_xpu_ci,
-)
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
-register_xpu_ci(est_time=60, suite="stage-b-test-1-gpu-xpu")
-
-DEVICE = get_device()
-
 
 # ---------------------------------------------------------------------------
 # Test configuration (small-scale for fast CI runs)
@@ -88,8 +74,12 @@ class TestHiSparseUnit(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not (is_cuda() or is_hip() or is_xpu()):
-            raise unittest.SkipTest("CUDA/ROCm/XPU not available.")
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is required for HiSparse tests.")
+        if is_npu() or is_xpu():
+            raise unittest.SkipTest("HiSparse tests only support CUDA/ROCm.")
+        if not (is_cuda() or is_hip()):
+            raise unittest.SkipTest("CUDA/ROCm not available.")
 
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", "29599")
@@ -102,8 +92,8 @@ class TestHiSparseUnit(unittest.TestCase):
             alloc_with_pin_memory,
         )
 
-        cls._original_alloc = ALLOC_MEMORY_FUNCS[DEVICE]
-        ALLOC_MEMORY_FUNCS[DEVICE] = alloc_with_pin_memory
+        cls._original_alloc = ALLOC_MEMORY_FUNCS["cuda"]
+        ALLOC_MEMORY_FUNCS["cuda"] = alloc_with_pin_memory
 
         if is_hip():
             from sglang.srt.layers.attention.dsa.utils import (
@@ -126,7 +116,7 @@ class TestHiSparseUnit(unittest.TestCase):
             dtype=torch.bfloat16,
             qk_rope_head_dim=QK_ROPE_HEAD_DIM,
             layer_num=LAYER_NUM,
-            device=DEVICE,
+            device="cuda",
             index_head_dim=128,
             enable_memory_saver=False,
             kv_cache_dim=KV_CACHE_DIM,
@@ -136,7 +126,7 @@ class TestHiSparseUnit(unittest.TestCase):
             size=SIZE,
             page_size=global_page_size,
             dtype=torch.bfloat16,
-            device=DEVICE,
+            device="cuda",
             kvcache=cls.device_pool,
             need_sort=False,
             host_to_device_ratio=HOST_TO_DEVICE_RATIO,
@@ -147,7 +137,7 @@ class TestHiSparseUnit(unittest.TestCase):
         cls.req_to_token_pool = ReqToTokenPool(
             size=MAX_NUM_REQS,
             max_context_len=MAX_CONTEXT_LEN,
-            device=DEVICE,
+            device="cuda",
             enable_memory_saver=False,
         )
 
@@ -159,7 +149,7 @@ class TestHiSparseUnit(unittest.TestCase):
             token_to_kv_pool_allocator=cls.allocator,
             top_k=TOP_K,
             device_buffer_size=DEVICE_BUFFER_SIZE,
-            device=DEVICE,
+            device="cuda",
             tp_group=cls.tp_group,
             host_to_device_ratio=HOST_TO_DEVICE_RATIO,
         )
@@ -168,7 +158,7 @@ class TestHiSparseUnit(unittest.TestCase):
     def tearDownClass(cls):
         from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 
-        ALLOC_MEMORY_FUNCS[DEVICE] = cls._original_alloc
+        ALLOC_MEMORY_FUNCS["cuda"] = cls._original_alloc
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
 
@@ -270,11 +260,11 @@ class TestHiSparseUnit(unittest.TestCase):
 
     def _populate_host_pool(self, req, fill_len):
         """Allocate host slots, write known patterns, register in coordinator.
-        Returns host_indices (device tensor)."""
+        Returns host_indices (cuda tensor)."""
         host_pool = self.coordinator.mem_pool_host
         host_indices = host_pool.alloc(fill_len)
         self.assertIsNotNone(host_indices, "Host alloc failed")
-        host_indices = host_indices.to(device=DEVICE)
+        host_indices = host_indices.to(device="cuda")
         self.coordinator.req_to_host_pool[req.kv.req_pool_idx, :fill_len] = host_indices
         self.coordinator.req_to_host_pool_allocated_len[req.kv.req_pool_idx] = fill_len
         for lid in range(LAYER_NUM):
@@ -283,7 +273,7 @@ class TestHiSparseUnit(unittest.TestCase):
         return host_indices
 
     def _build_topk_tokens(self, fill_len, *, include_newest=False):
-        """Build a 1-D [TOP_K] int32 device tensor of token positions.
+        """Build a 1-D [TOP_K] int32 cuda tensor of token positions.
 
         If include_newest=True, fill_len-1 is guaranteed as the last valid slot.
         Pads with -1 when fill_len (or fill_len-1) < TOP_K.
@@ -296,25 +286,25 @@ class TestHiSparseUnit(unittest.TestCase):
         """
         n = min(fill_len, TOP_K)
         if include_newest and n > 1:
-            tokens = torch.randperm(fill_len - 1, device=DEVICE)[: n - 1].to(
+            tokens = torch.randperm(fill_len - 1, device="cuda")[: n - 1].to(
                 torch.int32
             )
             tokens = torch.cat(
-                [tokens, torch.tensor([fill_len - 1], dtype=torch.int32, device=DEVICE)]
+                [tokens, torch.tensor([fill_len - 1], dtype=torch.int32, device="cuda")]
             )
         else:
-            tokens = torch.randperm(fill_len, device=DEVICE)[:n].to(torch.int32)
+            tokens = torch.randperm(fill_len, device="cuda")[:n].to(torch.int32)
         if n < TOP_K:
-            pad = torch.full((TOP_K - n,), -1, dtype=torch.int32, device=DEVICE)
+            pad = torch.full((TOP_K - n,), -1, dtype=torch.int32, device="cuda")
             tokens = torch.cat([tokens, pad])
         return tokens
 
     def _make_batch_tensors(self, reqs, fill_lens):
-        """Build (req_pool_indices [int64], seq_lens [int32]) on the active device."""
+        """Build (req_pool_indices [int64], seq_lens [int32]) on cuda."""
         rpi = torch.tensor(
-            [r.kv.req_pool_idx for r in reqs], dtype=torch.int64, device=DEVICE
+            [r.kv.req_pool_idx for r in reqs], dtype=torch.int64, device="cuda"
         )
-        sls = torch.tensor(fill_lens, dtype=torch.int32, device=DEVICE)
+        sls = torch.tensor(fill_lens, dtype=torch.int32, device="cuda")
         return rpi, sls
 
     def _assert_kv_correct(self, locs_row, tokens_row, layer_id, count, msg=""):
@@ -477,7 +467,7 @@ class TestHiSparseUnit(unittest.TestCase):
         # Step 1: load the first TOP_K positions from host (no newest token —
         # the reserved slot is only valid after map_last_loc_to_buffer which is
         # called during an actual decode step, not modelled here).
-        tokens_s1 = torch.arange(TOP_K, dtype=torch.int32, device=DEVICE)
+        tokens_s1 = torch.arange(TOP_K, dtype=torch.int32, device="cuda")
         locs1 = self._swap_in_selected_pages(
             rpi, sls, tokens_s1.unsqueeze(0), layer_id=0
         )
@@ -491,7 +481,7 @@ class TestHiSparseUnit(unittest.TestCase):
             [
                 tokens_s1[:half],  # hits
                 torch.arange(
-                    new_start, new_start + half, dtype=torch.int32, device=DEVICE
+                    new_start, new_start + half, dtype=torch.int32, device="cuda"
                 ),  # misses
             ]
         )
@@ -643,7 +633,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.admit_request_into_staging(req)
         self.assertTrue(req.hisparse_staging)
 
-        get_device_module().synchronize()
+        torch.cuda.synchronize()
         ready = self.coordinator.collect_ready_reqs()
         self.assertEqual(len(ready), 1)
         self.assertFalse(req.hisparse_staging)
@@ -679,7 +669,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self._write_device_patterns(kv_loc, fill_len)
 
         self.coordinator.admit_request_into_staging(req)
-        get_device_module().synchronize()
+        torch.cuda.synchronize()
         ready = self.coordinator.collect_ready_reqs()
         self.assertEqual(ready, [req])
 

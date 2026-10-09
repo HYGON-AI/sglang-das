@@ -7,8 +7,6 @@ import os
 
 import torch
 
-from sglang.test.test_utils import publish_build_topology
-
 
 def init_single_process_dist(master_port: int = 29632, backend: str = "gloo"):
     """world=1 dist + model-parallel groups; srt layers require them even
@@ -31,8 +29,12 @@ def init_single_process_dist(master_port: int = 29632, backend: str = "gloo"):
     if not model_parallel_is_initialized():
         # kwargs only: a positional backend would land in the
         # attention_data_parallel_size slot and explode on int // str.
-        publish_build_topology(tp_size=1, ep_size=1, pp_size=1)
-        initialize_model_parallel(backend=backend)
+        initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            backend=backend,
+        )
 
 
 def make_tp1_column_parallel_linear(

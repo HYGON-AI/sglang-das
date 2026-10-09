@@ -229,11 +229,6 @@ def process_content_for_template_format(
                             detail=image_obj.get("detail") or "auto",
                             max_dynamic_patch=mdp,
                             content_hash=image_obj.get("content_hash"),
-                            preprocess_kwargs=(
-                                {"max_image_tokens": image_obj["max_image_tokens"]}
-                                if image_obj.get("max_image_tokens") is not None
-                                else None
-                            ),
                         )
                     )
 
@@ -251,11 +246,8 @@ def process_content_for_template_format(
                     }
                     if mdp is not None:
                         preprocess_kwargs["max_dynamic_patch"] = mdp
-                    video_frames = chunk.get("video_frame_url")
-                    if isinstance(video_frames, list):
-                        video_data.append(video_frames)
-                    elif not preprocess_kwargs:
-                        video_data.append(video_obj["url"])
+                    if not preprocess_kwargs:
+                        video_data.append(chunk["video_url"]["url"])
                     else:
                         # VideoData survives load_video on every processor; a
                         # plain dict only the GLM consumer understands.

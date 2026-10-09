@@ -23,18 +23,13 @@ from flash_attn import (
     vllm_flash_attn_with_kvcache as vllm_flash_attn_with_kvcache_interface,
 )
 
-from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_spec
 from sglang.srt.utils import is_hcu
 from sglang.srt.utils.common import get_bool_env_var
 
 _use_triton_vllm_fa = get_bool_env_var("SGLANG_USE_TRITON_VLLM_FA")
 _is_hcu = is_hcu()
-_kv_layout_hcu_fa = _is_hcu and get_bool_env_var(
-    "SGLANG_KV_LAYOUT_HCU_FA", default="true"
-)
 
-if _is_hcu:
+if _is_hcu and _use_triton_vllm_fa:
     from sglang.srt.layers.attention.triton_vllm_flash_attn import (
         triton_vllm_flash_attn_varlen_func,
         triton_vllm_flash_attn_with_kvcache,
@@ -93,139 +88,7 @@ def flash_attn_with_kvcache(
     sinks=None,
     ver=3,
     out=None,
-    layout=None,
 ):
-    if layout == "bhsd":
-        if not _is_hcu:
-            raise ValueError("bhsd layout is reserved for HCU HND KV cache")
-        if qv is not None:
-            raise NotImplementedError("HND BHSD attention does not support qv")
-        if page_table is None or cu_seqlens_q is None or max_seqlen_q is None:
-            raise ValueError("HND BHSD attention requires paged varlen metadata")
-        if not torch.is_tensor(cache_seqlens):
-            cache_seqlens = torch.full(
-                (cu_seqlens_q.numel() - 1,),
-                int(cache_seqlens),
-                dtype=torch.int32,
-                device=q.device,
-            )
-        cu_seqlens_k = torch.cat(
-            [cache_seqlens.new_zeros(1), torch.cumsum(cache_seqlens, dim=0)]
-        )
-        if _is_hcu and _use_triton_vllm_fa and not return_softmax_lse:
-            result = triton_vllm_flash_attn_varlen_func(
-                q=q,
-                k=k_cache,
-                v=v_cache,
-                cu_seqlens_q=cu_seqlens_q,
-                max_seqlen_q=max_seqlen_q,
-                seqused_k=cache_seqlens,
-                max_seqlen_k=page_table.shape[1] * k_cache.shape[2],
-                softmax_scale=softmax_scale,
-                causal=causal,
-                window_size=window_size,
-                block_table=page_table,
-                fa_version=ver,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                layout="bhsd",
-            )
-            return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
-
-        result = flash_attn_varlen_func_interface(
-            q=q,
-            k=k_cache,
-            v=v_cache,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=page_table.shape[1] * k_cache.shape[2],
-            seqused_k=cache_seqlens,
-            block_table=page_table,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            softcap=softcap,
-            num_splits=num_splits,
-            return_softmax_lse=return_softmax_lse,
-            fa_version=ver,
-            layout="bhsd",
-        )
-        return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
-
-    # The ordinary HCU/NHD path also receives flattened variable-length
-    # queries when multiple requests are scheduled together.  Do not reshape
-    # them to ``(-1, max_seqlen_q, ...)``: the sum of sequence lengths is not
-    # generally divisible by the batch maximum.  Use the paged varlen
-    # interface directly, which consumes ``cu_seqlens_q`` and the page table.
-    if (
-        q.dim() == 3
-        and cu_seqlens_q is not None
-        and max_seqlen_q is not None
-        and page_table is not None
-        and cache_seqlens is not None
-    ):
-        if not torch.is_tensor(cache_seqlens):
-            cache_seqlens = torch.full(
-                (cu_seqlens_q.numel() - 1,),
-                int(cache_seqlens),
-                dtype=torch.int32,
-                device=q.device,
-            )
-        cu_seqlens_k = torch.cat(
-            [cache_seqlens.new_zeros(1), torch.cumsum(cache_seqlens, dim=0)]
-        )
-        k_cache = k_cache.to(q.dtype) if not is_nmz_fp8(k_cache.dtype) else k_cache
-        v_cache = v_cache.to(q.dtype) if not is_nmz_fp8(v_cache.dtype) else v_cache
-        # BSHD paged caches are [pages, page_size, heads, head_dim], whereas
-        # the HND/BHSD layout is [pages, heads, page_size, head_dim].
-        page_size = k_cache.shape[1] if layout != "bhsd" else k_cache.shape[2]
-        if (
-            _is_hcu
-            and _use_triton_vllm_fa
-            and is_nmz_fp8(k_cache.dtype)
-            and not return_softmax_lse
-        ):
-            result = triton_vllm_flash_attn_varlen_func(
-                q=q,
-                k=k_cache,
-                v=v_cache,
-                cu_seqlens_q=cu_seqlens_q,
-                max_seqlen_q=max_seqlen_q,
-                seqused_k=cache_seqlens,
-                max_seqlen_k=page_table.shape[1] * page_size,
-                softmax_scale=softmax_scale,
-                causal=causal,
-                window_size=window_size,
-                block_table=page_table,
-                fa_version=ver,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                layout="bshd" if layout is None else layout,
-            )
-            return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
-        result = flash_attn_varlen_func_interface(
-            q=q,
-            k=k_cache,
-            v=v_cache,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=page_table.shape[1] * page_size,
-            seqused_k=cache_seqlens,
-            block_table=page_table,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            softcap=softcap,
-            num_splits=num_splits,
-            return_softmax_lse=return_softmax_lse,
-            fa_version=ver,
-        )
-        return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
-
     if _is_hcu and _use_triton_vllm_fa and is_nmz_fp8(k_cache.dtype):
         result = triton_vllm_flash_attn_with_kvcache(
             q=q.contiguous().view(-1, max_seqlen_q, q.shape[-2], q.shape[-1]),
@@ -241,7 +104,6 @@ def flash_attn_with_kvcache(
             v_descale=v_descale,
             softcap=softcap,
             return_softmax_lse=return_softmax_lse,
-            layout=layout,
         )
         return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
 
@@ -297,7 +159,6 @@ def vllm_flash_attn_with_kvcache(
     return_softmax_lse=False,
     sinks=None,
     ver=3,
-    layout=None,
 ):
     if _is_hcu and _use_triton_vllm_fa:
         return triton_vllm_flash_attn_with_kvcache(
@@ -314,7 +175,6 @@ def vllm_flash_attn_with_kvcache(
             v_descale=v_descale,
             softcap=softcap,
             return_softmax_lse=return_softmax_lse,
-            layout=layout,
         )
 
     return vllm_flash_attn_with_kvcache_interface(
@@ -371,7 +231,6 @@ def flash_attn_varlen_func(
     sinks=None,
     ver=3,
     out=None,
-    layout=None,
 ):
     global _MODEL_CONFIG, IS_SLIMQUANT_W4A8, IS_KVCACHE_FP8_E4M3
 
@@ -399,7 +258,6 @@ def flash_attn_varlen_func(
             causal=causal,
             return_attn_probs=return_softmax_lse,
             softcap=softcap,
-            **({"layout": layout} if layout is not None else {}),
         )
         return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
 
@@ -415,7 +273,6 @@ def flash_attn_varlen_func(
         causal=causal,
         return_attn_probs=return_softmax_lse,
         softcap=softcap,
-        **({"layout": layout} if layout is not None else {}),
     )
     return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
 
@@ -436,128 +293,8 @@ def vllm_flash_attn_varlen_func(
     q_descale,
     k_descale,
     v_descale,
-    layout=None,
-    out=None,
 ):
-    use_hcu_fp8_swa_fallback = (
-        _is_hcu
-        and k.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-        and window_size is not None
-        and window_size[0] >= 0
-    )
-    # The dedicated model switch isolates vendor-specific behavior. The block
-    # size comes from published service configuration, including its alias.
-    use_dflash_native_block = (
-        _is_hcu
-        and not _use_triton_vllm_fa
-        and get_bool_env_var("SGLANG_USE_QWEN_DFLASH2")
-        and get_spec().speculative_algorithm == "DFLASH"
-        and (
-            get_spec().speculative_num_draft_tokens == max_seqlen_q
-            or get_spec().speculative_dflash_block_size == max_seqlen_q
-        )
-        and layout == "legacy_bhsd"
-        and block_table is not None
-        and seqused_k is not None
-        and max_seqlen_q in (4, 8, 16)
-        and q.shape[0] == (cu_seqlens_q.numel() - 1) * max_seqlen_q
-        and q.dtype == torch.bfloat16
-        and k.dtype == v.dtype
-        and k.dtype in (
-            torch.bfloat16,
-            torch.float8_e5m2,
-        )
-        and k.shape[2] == v.shape[3] == 64
-        and q.shape[2] == k.shape[3] == v.shape[2]
-        and "gfx936" in torch.cuda.get_device_properties(q.device).gcnArchName
-    )
-    use_dflash_native_draft = (
-        use_dflash_native_block
-        and q.shape[2] == 128
-        and q.shape[1] * max_seqlen_q <= k.shape[1] * 64
-        and window_size in ((-1, -1), (4095, 0), (4095, 4095))
-    )
-    use_dflash_native_target = (
-        use_dflash_native_block
-        and max_seqlen_q in (8, 16)
-        and q.shape[2] == 256
-        and q.shape[1] == 8
-        and k.shape[1] == v.shape[1] == 1
-        and causal
-        and window_size == (-1, -1)
-    )
-    if use_dflash_native_draft or use_dflash_native_target:
-        # Call the existing vendor kernel, without extending the installed
-        # flash_attn Python API. Keep all model/shape guards above local.
-        from flash_attn.flash_attn_interface import flash_attn_cuda
-
-        batch_size = cu_seqlens_q.numel() - 1
-        kv_bound = max(max_seqlen_k or 0, block_table.shape[1] * k.shape[2])
-        scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
-        if out is None:
-            out = torch.empty_like(q)
-        queries = q.reshape(batch_size, max_seqlen_q, *q.shape[1:])
-        if use_dflash_native_draft:
-            out.zero_()  # Native attention skips empty graph-padding rows.
-            flash_attn_cuda.paged_attention(
-                out, queries, k, v, scale, block_table, seqused_k,
-                None, "", q_descale, k_descale, v_descale, kv_bound,
-                None, 0, window_size[0], window_size[1], causal,
-            )
-        else:
-            outputs = out.reshape(batch_size, max_seqlen_q, *q.shape[1:])
-            for begin in range(0, max_seqlen_q, 4):
-                chunk_q = queries[:, begin:begin + 4].contiguous()
-                chunk_out = torch.zeros_like(chunk_q)
-                # Preserve bottom-right causal positions within the full block.
-                chunk_lengths = (seqused_k - (max_seqlen_q - 4 - begin)).clamp_min(0)
-                flash_attn_cuda.paged_attention(
-                    chunk_out, chunk_q, k, v, scale, block_table, chunk_lengths,
-                    None, "", q_descale, k_descale, v_descale, kv_bound,
-                    None, 0, -1, -1, True,
-                )
-                outputs[:, begin:begin + 4].copy_(chunk_out)
-        return out
-    if (
-        use_hcu_fp8_swa_fallback
-        and not use_dflash_native_draft
-        and not _use_triton_vllm_fa
-        and get_bool_env_var("SGLANG_USE_QWEN_DFLASH2")
-        and get_spec().speculative_algorithm == "DFLASH"
-        and layout == "legacy_bhsd"
-        and q.dtype == torch.bfloat16
-        and k.dtype == v.dtype == torch.float8_e5m2
-        and q.shape[-1] == k.shape[-1] == v.shape[-2] == 128
-        and k.shape[2] == v.shape[3] == 64
-        and 1 <= max_seqlen_q <= 16
-        and q.shape[0] == (cu_seqlens_q.numel() - 1) * max_seqlen_q
-        and 0 <= window_size[0] <= 8192
-    ):
-        from sglang.srt.layers.attention.hcu_native_swa import (
-            native_hcu_sliding_attention,
-        )
-
-        return native_hcu_sliding_attention(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            seqused_k=seqused_k,
-            window_size=window_size,
-            block_table=block_table,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            out=out,
-        )
-    if (
-        _is_hcu
-        and (_use_triton_vllm_fa or use_hcu_fp8_swa_fallback)
-        and not use_dflash_native_draft
-    ):
+    if _is_hcu and _use_triton_vllm_fa:
         return triton_vllm_flash_attn_varlen_func(
             q=q,
             k=k,
@@ -574,65 +311,8 @@ def vllm_flash_attn_varlen_func(
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
-            layout=layout,
-            out=out,
         )
 
-    # HCU paged MTP folds query tokens into heads and supports at most
-    # 64 query heads per KV head. Split uniform causal verification blocks
-    # without changing their bottom-right causal alignment or the KV cache.
-    if (
-        _is_hcu
-        and envs.SGLANG_USE_QWEN_DSPARK.get()
-        and get_spec().speculative_algorithm == "DSPARK"
-        and layout == "legacy_bhsd"
-        and k.shape[2] == 64
-        and q.shape[2] == v.shape[2]
-        and causal
-        and window_size == (-1, -1)
-        and 1 < max_seqlen_q <= 16
-        and q.shape[0] == (cu_seqlens_q.numel() - 1) * max_seqlen_q
-        and q.shape[1] * max_seqlen_q > k.shape[1] * 64
-        and q.shape[1] <= k.shape[1] * 64
-    ):
-        batch_size = cu_seqlens_q.numel() - 1
-        chunk_size = min(16, k.shape[1] * 64 // q.shape[1])
-        queries = q.reshape(batch_size, max_seqlen_q, *q.shape[1:])
-        chunks = []
-        for begin in range(0, max_seqlen_q, chunk_size):
-            end = min(begin + chunk_size, max_seqlen_q)
-            chunk_q = queries[:, begin:end].contiguous().flatten(0, 1)
-            chunk_cu = torch.arange(
-                batch_size + 1, device=cu_seqlens_q.device, dtype=cu_seqlens_q.dtype
-            ) * (end - begin)
-            chunk_lengths = (seqused_k - (max_seqlen_q - end)).clamp_min(0)
-            chunk_out = vllm_flash_attn_varlen_func_interface(
-                q=chunk_q,
-                k=k,
-                v=v,
-                cu_seqlens_q=chunk_cu,
-                max_seqlen_q=end - begin,
-                seqused_k=chunk_lengths,
-                max_seqlen_k=max_seqlen_k,
-                softmax_scale=softmax_scale,
-                causal=causal,
-                window_size=window_size,
-                block_table=block_table,
-                fa_version=fa_version,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
-            )
-            chunks.append(
-                chunk_out.reshape(batch_size, end - begin, *chunk_out.shape[1:])
-            )
-        result = torch.cat(chunks, dim=1).flatten(0, 1)
-        if out is not None:
-            out.copy_(result)
-            return out
-        return result
-
-    # Capture may leave the host bound at zero; live lengths remain on GPU.
     return vllm_flash_attn_varlen_func_interface(
         q=q,
         k=k,

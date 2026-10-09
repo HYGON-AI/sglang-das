@@ -19,7 +19,6 @@
 
 #include <bit>
 #include <cstdint>
-#include <type_traits>
 
 namespace sglang {
 
@@ -266,12 +265,6 @@ struct FusedKNormRopeFlashMLAParams {
   int64_t kv_stride_batch;
   uint32_t batch_size;
   float eps;
-  // kRopeQ (ROCm): (B, num_q_heads, kHeadDim) DType; the trailing kRopeDim of every head
-  // are rotated in place with this token's frequencies by the same launch.
-  void* __restrict__ q = nullptr;
-  int64_t q_stride_batch = 0;
-  int64_t q_stride_head = 0;
-  uint32_t num_q_heads = 0;
 };
 
 template <
@@ -281,8 +274,7 @@ template <
     typename PosT,
     int32_t kPageBits,
     deepseek_v4::KVLayout kLayout,
-    bool kUsePDL,
-    bool kRopeQ = false>
+    bool kUsePDL>
 K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeFlashMLAParams params) {
   using namespace device;
 
@@ -339,30 +331,6 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
       const auto x = cast<float>(input_vec[i]);
       const auto w = cast<float>(weight_vec[i]);
       data[i] = x * norm_factor * w;
-    }
-  }
-
-  // Before the out_loc check: a row without a KV slot still ropes its query heads.
-  if constexpr (kRopeQ) {
-    // Query rope, pair j of head h at q[h * stride + kHeadDim - kRopeDim + 2j]: the cross product
-    // is rounded, then one fma with the cosine, so the bf16 result is bitwise the Triton flat
-    // rope kernel's on gfx950.
-    static_assert(std::is_same_v<DType, bf16_t>, "the in-place query rope reads q as bf16 pairs");
-    constexpr uint32_t kPairsPerHead = kRopeDim / 2;
-    const auto q_row = static_cast<DType*>(params.q) + work_id * params.q_stride_batch + (kHeadDim - kRopeDim);
-    const auto n_pairs = params.num_q_heads * kPairsPerHead;
-    for (uint32_t p = tx; p < n_pairs; p += kFusedKBlockSize) {
-      const auto head = p / kPairsPerHead;
-      const auto pair = p % kPairsPerHead;
-      auto* ptr = reinterpret_cast<bf16x2_t*>(q_row + head * params.q_stride_head) + pair;
-      const auto qv = cast<fp32x2_t>(*ptr);
-      const auto cos_v = freqs_cis[2 * pair];
-      const auto sin_v = freqs_cis[2 * pair + 1];
-      const float rot_real = -__fmul_rn(qv.y, sin_v);
-      const float rot_imag = __fmul_rn(qv.x, sin_v);
-      const float out_real = fmaf(qv.x, cos_v, rot_real);
-      const float out_imag = fmaf(qv.y, cos_v, rot_imag);
-      *ptr = cast<bf16x2_t>(fp32x2_t{out_real, out_imag});
     }
   }
 
@@ -437,9 +405,9 @@ struct FusedKNormRopeFlashMLAKernel {
   static_assert(1 << kLogPageSize == kPageSize);
   static_assert(kHeadDim == 512 && kRopeDim == 64, "FlashMLA layout requires (512, 64)");
 
-  template <typename PosT, bool kRopeQ>
+  template <typename PosT>
   static constexpr auto kernel =
-      fused_k_norm_rope_flashmla<DType, kHeadDim, kRopeDim, PosT, kLogPageSize, kLayout, kUsePDL, kRopeQ>;
+      fused_k_norm_rope_flashmla<DType, kHeadDim, kRopeDim, PosT, kLogPageSize, kLayout, kUsePDL>;
 
   static void forward(
       const tvm::ffi::TensorView kv,
@@ -449,33 +417,6 @@ struct FusedKNormRopeFlashMLAKernel {
       const tvm::ffi::TensorView out_loc,
       const tvm::ffi::TensorView kvcache,
       float eps) {
-    forward_impl<false>(kv, kv_weight, freqs_cis, positions, out_loc, kvcache, eps, nullptr);
-  }
-
-  /// `forward` with the same tokens' query heads `q` (B, H, kHeadDim) roped in place (ROCm).
-  static void forward_with_q(
-      const tvm::ffi::TensorView kv,
-      const tvm::ffi::TensorView kv_weight,
-      const tvm::ffi::TensorView freqs_cis,
-      const tvm::ffi::TensorView positions,
-      const tvm::ffi::TensorView out_loc,
-      const tvm::ffi::TensorView kvcache,
-      float eps,
-      const tvm::ffi::TensorView q) {
-    forward_impl<true>(kv, kv_weight, freqs_cis, positions, out_loc, kvcache, eps, &q);
-  }
-
- private:
-  template <bool kRopeQ>
-  static void forward_impl(
-      const tvm::ffi::TensorView kv,
-      const tvm::ffi::TensorView kv_weight,
-      const tvm::ffi::TensorView freqs_cis,
-      const tvm::ffi::TensorView positions,
-      const tvm::ffi::TensorView out_loc,
-      const tvm::ffi::TensorView kvcache,
-      float eps,
-      const tvm::ffi::TensorView* q) {
     using namespace host;
 
     auto B = SymbolicSize{"batch_size"};
@@ -513,7 +454,7 @@ struct FusedKNormRopeFlashMLAKernel {
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
     if (batch_size == 0) return;
 
-    auto params = FusedKNormRopeFlashMLAParams{
+    const auto params = FusedKNormRopeFlashMLAParams{
         .kv = kv.data_ptr(),
         .kv_weight = kv_weight.data_ptr(),
         .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
@@ -524,22 +465,8 @@ struct FusedKNormRopeFlashMLAKernel {
         .batch_size = batch_size,
         .eps = eps,
     };
-    if constexpr (kRopeQ) {
-      auto H = SymbolicSize{"num_q_heads"};
-      TensorMatcher({B, H, kHeadDim})  //
-          .with_strides({-1, -1, 1})
-          .with_dtype<DType>()
-          .with_device(device_)
-          .verify(*q);
-      // The rope pairs are read and written as 4-byte packs.
-      RuntimeCheck(q->stride(1) % 2 == 0 && q->stride(0) % 2 == 0, "q strides must be even");
-      params.q = q->data_ptr();
-      params.q_stride_batch = q->stride(0);
-      params.q_stride_head = q->stride(1);
-      params.num_q_heads = static_cast<uint32_t>(H.unwrap());
-    }
-    const auto k_int32 = kernel<int32_t, kRopeQ>;
-    const auto k_int64 = kernel<int64_t, kRopeQ>;
+    const auto k_int32 = kernel<int32_t>;
+    const auto k_int64 = kernel<int64_t>;
     const auto k = pos_dtype.is_type<int32_t>() ? k_int32 : k_int64;
     LaunchKernel(batch_size, kFusedKBlockSize, device_.unwrap())  //
         .enable_pdl(kUsePDL)(k, params);
@@ -552,10 +479,10 @@ struct FusedKNormRopeFlashMLAKernel {
 
 struct FusedQIndexerRopeHadamardQuantParams {
   const void* __restrict__ q_input;  // (B, num_heads, 128) DType
-  void* __restrict__ q_output;       // (B, num_heads, 128) FP8 or unquantized DType
+  void* __restrict__ q_fp8;          // (B, num_heads, 128) fp8_e4m3
   // weights_out[b, h] = weight[b, h] * weight_scale * q_scale[b, h].
-  // Quantized output folds q_scale into weights_out. Unquantized output
-  // uses q_scale=1 and writes weight * weight_scale.
+  // q_scale is computed internally and not exposed -- the only consumer of
+  // it is `weights_out`.
   const void* __restrict__ weight;  // (B, num_heads) DType
   float* __restrict__ weights_out;  // (B, num_heads) fp32 (== (B, H, 1) flat)
   float weight_scale;               // scalar c4_indexer.weight_scale
@@ -570,8 +497,7 @@ struct FusedQIndexerRopeHadamardQuantParams {
   uint32_t num_heads;
 };
 
-template <typename DType, typename PosT, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true,
-          bool kQuantize = true>
+template <typename DType, typename PosT, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
 Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQIndexerRopeHadamardQuantParams params) {
   using namespace device;
 
@@ -682,20 +608,7 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
       data[i] *= kHadamardScale;
   }
 
-  if constexpr (!kQuantize) {
-    // Keep the same FP32 RoPE/Hadamard arithmetic, then materialize BF16 Q.
-    // There is no Q quantization scale to fold into the head weight.
-    Storage result;
-#pragma unroll
-    for (int i = 0; i < kVecSize; ++i) {
-      result[i] = cast<DType>(data[i]);
-    }
-    auto out_row = static_cast<DType*>(params.q_output) + work_id * kHeadDim;
-    result.store(out_row, lane_id);
-    if (lane_id == 0) {
-      params.weights_out[work_id] = weight_val * params.weight_scale;
-    }
-  } else {
+  {
     float local_max = math::abs(data[0]);
 #pragma unroll
     for (int i = 1; i < kVecSize; ++i) {
@@ -709,22 +622,20 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
     result[1] = pack_fp8(data[2] * inv_scale, data[3] * inv_scale);
 
     // q_fp8 row pointer: 128 fp8 / row = 32 OutStorage / row, one per lane.
-    auto out_row = static_cast<uint8_t*>(params.q_output) + work_id * kHeadDim;
+    auto out_row = static_cast<uint8_t*>(params.q_fp8) + work_id * kHeadDim;
     result.store(out_row, lane_id);
     params.weights_out[work_id] = weight_val * params.weight_scale * scale;
   }
 }
 
-template <typename DType, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true,
-          bool kQuantize = true>
+template <typename DType, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
 struct FusedQIndexerRopeHadamardQuantKernel {
   template <typename PosT>
-  static constexpr auto kernel =
-      fused_q_indexer_rope_hadamard_quant<DType, PosT, kUsePDL, kRopeFirst, kHadamard, kQuantize>;
+  static constexpr auto kernel = fused_q_indexer_rope_hadamard_quant<DType, PosT, kUsePDL, kRopeFirst, kHadamard>;
 
   static void forward(
       const tvm::ffi::TensorView q_input,
-      const tvm::ffi::TensorView q_output,
+      const tvm::ffi::TensorView q_fp8,
       const tvm::ffi::TensorView weight,
       const tvm::ffi::TensorView weights_out,
       double weight_scale,
@@ -740,7 +651,7 @@ struct FusedQIndexerRopeHadamardQuantKernel {
     device_.set_options<kDLCUDA>();
 
     // Caller path is `wq_b(q_lora).view(-1, H, D)` -> contiguous; the kernel
-    // assumes a flat `(B*H, kHeadDim)` layout for both q_input and q_output.
+    // assumes a flat `(B*H, kHeadDim)` layout for both q_input and q_fp8.
     // Pin the head/innermost strides; assert the batch stride below.
     TensorMatcher({B, H, kHeadDim})  //
         .with_strides({-1, kHeadDim, 1})
@@ -749,9 +660,9 @@ struct FusedQIndexerRopeHadamardQuantKernel {
         .verify(q_input);
     TensorMatcher({B, H, kHeadDim})  //
         .with_strides({-1, kHeadDim, 1})
-        .with_dtype<std::conditional_t<kQuantize, uint8_t, DType>>()
+        .with_dtype<uint8_t>()
         .with_device(device_)
-        .verify(q_output);
+        .verify(q_fp8);
     TensorMatcher({B, H})  //
         .with_strides({-1, 1})
         .with_dtype<DType>()
@@ -783,13 +694,13 @@ struct FusedQIndexerRopeHadamardQuantKernel {
         "q_input must be contiguous (B, H, kHeadDim); got stride[0]=",
         q_input.stride(0));
     RuntimeCheck(
-        q_output.stride(0) == expected_batch_stride,
-        "q_output must be contiguous (B, H, kHeadDim); got stride[0]=",
-        q_output.stride(0));
+        q_fp8.stride(0) == expected_batch_stride,
+        "q_fp8 must be contiguous (B, H, kHeadDim); got stride[0]=",
+        q_fp8.stride(0));
 
     const auto params = FusedQIndexerRopeHadamardQuantParams{
         .q_input = q_input.data_ptr(),
-        .q_output = q_output.data_ptr(),
+        .q_fp8 = q_fp8.data_ptr(),
         .weight = weight.data_ptr(),
         .weights_out = static_cast<float*>(weights_out.data_ptr()),
         .weight_scale = static_cast<float>(weight_scale),

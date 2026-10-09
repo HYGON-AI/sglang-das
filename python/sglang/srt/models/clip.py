@@ -1,7 +1,6 @@
 # Adapted from
 # https://github.com/huggingface/transformers/blob/af9b2eaa54c150741f298d6db939af6328e1dc38/src/transformers/models/clip/modeling_clip.py
 
-from array import array
 from functools import partial
 from typing import Iterable, List, Optional, Tuple, Type, Union
 
@@ -581,7 +580,7 @@ class CLIPModel(nn.Module):
                 embeddings=self.text_projection(pooled_output.embeddings)
             )
 
-    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
+    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
         # Clip embeddings models handle text/image separately, so we don't need to pad input ids
         return input_ids
 

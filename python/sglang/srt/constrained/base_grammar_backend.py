@@ -46,7 +46,6 @@ class GrammarStats:
     tree_traversal_time: List[float] = field(default_factory=list)
     dispatch_type: Optional[str] = None
     num_timeout: int = 0
-    first_mask_fill_time: Optional[float] = None
 
 
 class GrammarRow(NamedTuple):
@@ -295,10 +294,6 @@ class BaseGrammarBackend:
     def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
         self.cache[key] = value
 
-    def get_cache_stats(self) -> Tuple[int, int]:
-        """Return (num cached grammar objects, backend-native cache bytes)."""
-        return len(self.cache), 0
-
     def reset(self):
         self.cache.clear()
 
@@ -390,7 +385,6 @@ def create_grammar_backend(
                 vocab_size=vocab_size,
                 model_eos_token_ids=eos_list,
                 any_whitespace=not get_serving().constrained_json_disable_any_whitespace,
-                max_whitespace_cnt=get_serving().constrained_json_max_whitespace_cnt,
             )
         except TokenizerNotSupportedError as e:
             if get_serving().enable_strict_thinking:
@@ -429,11 +423,7 @@ def create_grammar_backend(
     else:
         raise ValueError(f"Invalid grammar backend: {name}")
 
-    if (
-        get_serving().reasoning_parser
-        and (think_end_ids or getattr(tokenizer, "think_end_id", None) is not None)
-        and not get_serving().glm_decoding_constraint_module
-    ):
+    if get_serving().reasoning_parser and think_end_ids:
         from sglang.srt.constrained.reasoner_grammar_backend import (
             ReasonerGrammarBackend,
         )

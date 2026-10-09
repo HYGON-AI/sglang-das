@@ -92,6 +92,7 @@ class TestUnifiedKimiLinearDcpHiCache(UnifiedRadixTreeTestMixin, CustomTestCase)
             ],
             env={
                 "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
             },
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18, trust_remote_code=True)

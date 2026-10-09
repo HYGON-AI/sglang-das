@@ -10,7 +10,7 @@ on:
 
 jobs:
   lint-hcu:
-    runs-on: [ci, bw1100]
+    runs-on: [self-hosted, hcu, nmz4]
     timeout-minutes: 30
 
     container:

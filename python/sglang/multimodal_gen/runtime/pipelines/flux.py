@@ -2,8 +2,6 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
-from sglang.multimodal_gen.configs.pipeline_configs.flux import FluxPipelineConfig
-from sglang.multimodal_gen.configs.sample.flux import FluxSamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -33,11 +31,6 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
 
 class FluxPipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "FluxPipeline"
-
-    # Used when the checkpoint is a single safetensors file with no
-    # model_index.json to derive these from.
-    pipeline_config_cls = FluxPipelineConfig
-    sampling_params_cls = FluxSamplingParams
 
     _required_config_modules = [
         "text_encoder",

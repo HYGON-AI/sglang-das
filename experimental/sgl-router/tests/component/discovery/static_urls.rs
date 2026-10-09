@@ -90,8 +90,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
     use axum::{routing::get, Json, Router};
     use serde_json::json;
     use sgl_router::config::{
-        Config, DiscoveryBackend, InflightLoadConfig, ObservabilityConfig, ProxyConfig,
-        ServerConfig,
+        ActiveLoadConfig, Config, DiscoveryBackend, ObservabilityConfig, ProxyConfig, ServerConfig,
     };
     use sgl_router::discovery::{spawn_discovery, WorkerId};
     use sgl_router::workers::{manager, WorkerRegistry};
@@ -142,13 +141,12 @@ async fn static_urls_pd_role_resolved_end_to_end() {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
-            default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec![url.clone()],
         }),
         proxy: ProxyConfig::default(),
-        router_inflight_load: InflightLoadConfig::default(),
+        active_load: ActiveLoadConfig::default(),
     };
 
     let registry = Arc::new(WorkerRegistry::default());

@@ -23,7 +23,7 @@ from sglang.test.ci.ci_register import (
     register_cuda_ci,
     register_hcu_ci,
 )
-from sglang.test.sgl_eval_utils import run_sgl_eval
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -68,7 +68,7 @@ class TestPyTorchSamplingBackend(CustomTestCase):
             temperature=0.1,
         )
 
-        metrics = run_sgl_eval(args)
+        metrics = run_eval(args)
         self.assertGreaterEqual(metrics["score"], 0.50)
 
     @unittest.skipIf(

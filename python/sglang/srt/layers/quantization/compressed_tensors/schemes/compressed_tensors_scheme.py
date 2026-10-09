@@ -99,9 +99,6 @@ class CompressedTensorsMoEScheme(BaseMoEScheme):
         """
         raise NotImplementedError
 
-    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
-        return
-
     @abstractmethod
     def apply_weights(
         self,

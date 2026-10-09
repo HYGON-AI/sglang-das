@@ -40,15 +40,14 @@ from sglang.srt.mem_cache.pool_host.npu_memfabric import (
     to_device_no_sync,
     track_pinned_staging,
 )
-from sglang.srt.utils import is_cuda, is_hcu, is_hip, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
-_is_hcu = is_hcu()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
-if _is_cuda or _is_hip or _is_xpu:
+if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_mla,
@@ -123,14 +122,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         # helpers in hicache.cuh are guarded by USE_ROCM and the staged
         # write-back kernel has a ROCm path, so enable them on HIP too. This
         # keeps the ROCm write-back path consistent with CUDA.
-        hcu_layer_sharded = _is_hcu and self._is_device_layer_sharded(device_pool)
-        self.can_use_jit = (
-            (_is_cuda or _is_hip)
-            and not hcu_layer_sharded
-            and can_use_hicache_jit_kernel(
-                page_size=self.page_size,
-                element_size=self.kv_cache_dim * self.dtype.itemsize,
-            )
+        self.can_use_jit = (_is_cuda or _is_hip) and can_use_hicache_jit_kernel(
+            element_size=self.kv_cache_dim * self.dtype.itemsize
         )
 
         if self.layout in ("page_first", "page_first_kv_split"):
@@ -191,10 +184,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 int(host_size * 1e9 // self.size_per_token), host_size
             )
         else:
-            self.size = int(
-                (getattr(device_pool, "host_capacity_tokens", None) or device_pool.size)
-                * host_to_device_ratio
-            )
+            self.size = int(device_pool.size * host_to_device_ratio)
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
         self.start_layer = device_pool.start_layer
@@ -659,12 +649,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         *,
         is_draft: bool = False,
     ):
-        device_layer_id = 0 if is_draft else layer_id
-        if _is_hcu and self._is_device_layer_sharded(device_pool):
-            absolute_layer_id = device_pool.start_layer + device_layer_id
-            device_pool.invalidate_remote_kv_buffer_for_layer(absolute_layer_id)
-            device_pool.invalidate_index_buffer_for_layer(absolute_layer_id)
-        if not self._is_device_layer_owned(device_pool, device_layer_id):
+        if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
             return
         assert not getattr(self, "_is_dummy", False), (
             "load on a dummy (non-src MLA) host pool"
@@ -675,19 +660,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device_indices = maybe_dcp_kernel_indices(
             device_indices, self.dcp_size, self.dcp_rank
         )
-        # Packed draft host offsets differ from the draft device layer (zero).
+        # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
-        hcu_layer_split_kwargs = (
-            {"num_warps_per_block": 4}
-            if _is_hcu and self._is_device_layer_sharded(device_pool)
-            else {}
-        )
+        device_layer_id = 0 if is_draft else layer_id
 
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
-                        page_size=self.page_size,
                         cache_dst=device_pool.kv_buffer[device_layer_id],
                         cache_src=self.kv_buffer[host_layer_id],
                         indices_dst=device_indices,
@@ -701,12 +681,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         src_indices=host_indices,
                         dst_indices=device_indices,
                         item_size=self.token_stride_size,
-                        **hcu_layer_split_kwargs,
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
-                        page_size=self.page_size,
                         cache_dst=device_pool.kv_buffer[device_layer_id],
                         cache_src=self.data_refs[host_layer_id],
                         indices_dst=device_indices,
@@ -722,7 +700,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         layer_id=host_layer_id,
                         item_size=self.token_stride_size,
                         src_layout_dim=self.layout_dim,
-                        **hcu_layer_split_kwargs,
                     )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -809,20 +786,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             "backup on a dummy (non-src MLA) host pool"
         )
         # Indices arrive already translated by backup_from_device_all_layer.
-        # Packed draft host offsets differ from the draft device layer (zero).
+        # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
-        hcu_layer_split_kwargs = (
-            {"num_warps_per_block": 4}
-            if _is_hcu and self._is_device_layer_sharded(device_pool)
-            else {}
-        )
 
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
-                        page_size=self.page_size,
                         cache_dst=self.kv_buffer[host_layer_id],
                         cache_src=device_pool.kv_buffer[device_layer_id],
                         indices_dst=host_indices,
@@ -836,32 +807,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         src_indices=device_indices,
                         dst_indices=host_indices,
                         item_size=self.token_stride_size,
-                        **hcu_layer_split_kwargs,
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
-                        page_size=self.page_size,
                         cache_dst=self.data_refs[host_layer_id],
                         cache_src=device_pool.kv_buffer[device_layer_id],
                         indices_dst=host_indices,
                         indices_src=device_indices,
                         element_dim=self.kv_cache_dim,
-                    )
-                elif _is_hcu:
-                    # There is no per-layer LF->PF AOT kernel. This synchronous
-                    # HCU fallback preserves correctness at lower throughput.
-                    host_layer = self.data_refs[host_layer_id].view(
-                        -1, self.kv_cache_dim
-                    )
-                    device_layer = device_pool.kv_buffer[device_layer_id].view(
-                        -1, self.kv_cache_dim
-                    )
-                    copied_rows = device_layer.index_select(
-                        0, device_indices.to(device_layer.device)
-                    ).to(host_layer.device)
-                    host_layer.index_copy_(
-                        0, host_indices.to(host_layer.device), copied_rows
                     )
                 else:
                     raise ValueError(
@@ -920,7 +874,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     draft_device_pool,
                     host_indices,
                     device_indices,
-                    self.target_layer_num + draft_layer_id,
+                    self.device_pool.layer_num + draft_layer_id,
                     io_backend,
                     is_draft=True,
                 )
@@ -939,7 +893,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_all_layer_mla(
-                        page_size=self.page_size,
                         ptr_dst=self.data_ptrs,
                         indices_dst=host_indices,
                         ptr_src=device_data_ptrs,

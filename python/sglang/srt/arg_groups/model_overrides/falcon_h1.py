@@ -1,4 +1,7 @@
-"""Config-time override declarations for falcon_h1."""
+"""Config-time override declarations for falcon_h1.
+
+Architectures: FalconH1ForCausalLM, JetNemotronForCausalLM, JetVLMForConditionalGeneration.
+"""
 
 from typing import Any
 

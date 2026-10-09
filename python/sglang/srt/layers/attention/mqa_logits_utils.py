@@ -56,38 +56,12 @@ def mqa_logits_static_budget_bytes(*, device_index: int) -> int:
     return max(1, budget)
 
 
-def mqa_logits_free_mem_bytes(
-    device_index: int, *, include_reusable_cache: bool = False
-) -> Tuple[int, int]:
-    """(free, total) device memory. With include_reusable_cache, also count
-    allocator-cached blocks that mem_get_info omits, excluding active
-    allocations and inactive split blocks."""
-    free_mem, total_mem = torch.cuda.mem_get_info(device_index)
-    if include_reusable_cache:
-        try:
-            stats = torch.cuda.memory_stats(device_index)
-            reusable_mem = max(
-                0,
-                int(stats["reserved_bytes.all.current"])
-                - int(stats["active_bytes.all.current"])
-                - int(stats["inactive_split_bytes.all.current"]),
-            )
-            free_mem = min(int(total_mem), int(free_mem) + reusable_mem)
-        except (KeyError, RuntimeError, TypeError, ValueError):
-            pass
-    return int(free_mem), int(total_mem)
-
-
-def mqa_logits_budget_bytes(
-    *, device_index: int, allow_sync: bool, include_reusable_cache: bool = False
-) -> int:
+def mqa_logits_budget_bytes(*, device_index: int, allow_sync: bool) -> int:
     """Static budget capped by current free memory; mem_get_info syncs, so
     callers pass allow_sync=False under CUDA graph capture."""
     budget = mqa_logits_static_budget_bytes(device_index=device_index)
     if allow_sync and not is_xpu():
-        free_mem, _ = mqa_logits_free_mem_bytes(
-            device_index, include_reusable_cache=include_reusable_cache
-        )
+        free_mem, _ = torch.cuda.mem_get_info(device_index)
         budget = min(int(free_mem * mqa_logits_free_mem_fraction()), budget)
     if is_hip():
         budget = min(budget, MQA_LOGITS_MAX_BYTES_ROCM)

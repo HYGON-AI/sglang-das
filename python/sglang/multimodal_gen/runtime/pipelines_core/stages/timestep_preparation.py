@@ -8,7 +8,6 @@ This module contains implementations of timestep preparation stages for diffusio
 """
 
 import inspect
-import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Tuple
 
@@ -162,14 +161,8 @@ class TimestepPreparationStage(PipelineStage):
         # Update batch with prepared timesteps
         batch.timesteps = timesteps
         batch.scheduler = scheduler
-        if not batch.is_warmup and logger.isEnabledFor(logging.DEBUG):
-            # format on cpu to avoid first-use cuda kernels in tensor repr
-            logger.debug(
-                "[%s] timesteps (%s): %s",
-                self.__class__.__name__,
-                timesteps.device,
-                timesteps.detach().cpu(),
-            )
+        if not batch.is_warmup:
+            self.log_debug("timesteps: %s", timesteps)
         return batch
 
     def build_dedup_fingerprint(

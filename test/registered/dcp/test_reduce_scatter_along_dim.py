@@ -25,7 +25,6 @@ import torch
 import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
-from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -131,7 +130,6 @@ def init_distributed():
         local_rank=local_rank,
         backend="nccl",
     )
-    get_parallel().override_permanently(world_group=coord)
 
     cpu_group = coord.cpu_group
     nccl_group = coord.device_group

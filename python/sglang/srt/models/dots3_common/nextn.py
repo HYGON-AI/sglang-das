@@ -118,9 +118,6 @@ class Dot3NoteModelNextN(nn.Module):
             hidden_states, residual = head.decoder(
                 positions, hidden_states, forward_batch, residual, zero_allocator
             )
-        hidden_states, residual = head.decoder.layer_communicator.finish_layer_stack(
-            hidden_states, residual, forward_batch
-        )
 
         if not forward_batch.forward_mode.is_idle():
             if residual is None:

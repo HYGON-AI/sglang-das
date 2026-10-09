@@ -40,7 +40,6 @@ from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_pha
 from sglang.srt.runtime_context import derive_attention_widths, get_platform
 from sglang.srt.utils.common import (
     get_quantization_config,
-    is_hcu,
     is_mps,
     parse_connector_type,
 )
@@ -53,18 +52,22 @@ def _validate_dsa_tbo_index_sharing(server_args: Any, hf_config: Any) -> None:
     if not cfg.enable_two_batch_overlap:
         return
 
-    from sglang.srt.configs.model_config import dsa_layer_skips_topk
-
-    has_shared_topk_layers = any(
-        dsa_layer_skips_topk(hf_config, layer_id)
-        for layer_id in range(hf_config.num_hidden_layers)
-    )
-    if has_shared_topk_layers:
+    index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
+    index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
+    indexer_types = getattr(hf_config, "indexer_types", None)
+    if (
+        index_topk_freq > 1
+        or (index_topk_pattern is not None and "S" in index_topk_pattern)
+        or (indexer_types is not None and "shared" in indexer_types)
+    ):
         raise ValueError(
             "--enable-two-batch-overlap is not supported with DSA "
             "index-topk sharing: the TBO op path does not propagate topk "
             "indices across layers, so shared layers would run sparse "
-            "attention without indices."
+            "attention without indices. Got "
+            f"index_topk_freq={index_topk_freq!r}, "
+            f"index_topk_pattern={index_topk_pattern!r}, and "
+            f"indexer_types={indexer_types!r}."
         )
 
 
@@ -134,6 +137,7 @@ def _configure_rocm_fp8_wo_a_gemm(model_config: Any, download_dir: str | None) -
 
 
 def handle_model_specific_adjustments(server_args: Any):
+
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
         get_mimo_v2_fused_qkv_expected_tp_size,
@@ -197,33 +201,6 @@ def handle_model_specific_adjustments(server_args: Any):
                 f"{sorted(CP_DECODE_ATTN_TP_SUPPORTED_ARCHS)}."
             )
 
-    if cfg.hy3_sp:
-        if model_arch != "HYV3ForCausalLM":
-            raise ValueError(
-                "--hy3-sp is only supported for HYV3ForCausalLM, "
-                f"but the loaded architecture is {model_arch}."
-            )
-        if cfg.dp_size != 1 or cfg.enable_dp_attention:
-            raise ValueError(
-                "--hy3-sp requires pure tensor parallelism: set --dp-size 1 "
-                "and remove --enable-dp-attention."
-            )
-        if cfg.pp_size != 1:
-            raise ValueError("--hy3-sp does not support pipeline parallelism.")
-        if cfg.moe_a2a_backend != "deepep":
-            raise ValueError(
-                "--hy3-sp requires --moe-a2a-backend deepep so routed experts "
-                "can process sequence-sharded tokens."
-            )
-        if cfg.moe_dense_tp_size not in (None, 1):
-            raise ValueError("--hy3-sp requires --moe-dense-tp-size 1.")
-        if cfg.moe_dense_tp_size is None:
-            declare_resolution(
-                server_args,
-                "_handle_model_specific_adjustments",
-                moe_dense_tp_size=1,
-            )
-
     _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
     if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
         handle_mamba_radix_cache(server_args, model_arch)
@@ -269,7 +246,6 @@ def handle_model_specific_adjustments(server_args: Any):
         "PixtralForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
         "Glm5NextForConditionalGeneration",
-        "Glm5NextForCausalLM",
         "HYV4ForCausalLM",
         "HYV4ForCausalLMNextN",
         "LongcatFlashForCausalLM",
@@ -277,11 +253,6 @@ def handle_model_specific_adjustments(server_args: Any):
     ]:
         # Set attention backend for DeepSeek
         if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
-            from sglang.srt.layers.attention.dsa.hcu_int8_index_k_cache import (
-                validate_hcu_int8_index_k_cache_server_args,
-            )
-
-            validate_hcu_int8_index_k_cache_server_args(server_args)
             if envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.is_set():
                 logger.warning(
                     f"Dense attention kv len threshold is manually set to {envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DSA. Caution: This may cause performance regression if the threshold is larger than the index topk of model."
@@ -397,22 +368,12 @@ def handle_model_specific_adjustments(server_args: Any):
                     f"{cfg.disaggregation_transfer_backend!r}. mori/nixl "
                     "support will be added later by the community."
                 )
-            if cfg.enable_dsa_cache_layer_split and cfg.pp_size > 1 and not is_hcu():
+            if cfg.enable_dsa_cache_layer_split and cfg.pp_size > 1:
                 raise ValueError(
                     "--enable-dsa-cache-layer-split is not supported with "
-                    "pipeline parallelism (pp_size > 1) on non-HCU devices "
-                    "yet. The PP + CP LayerSplit path is currently guarded "
-                    "to HCU because it has not been validated elsewhere."
-                )
-            if (
-                cfg.enable_dsa_cache_layer_split
-                and is_hcu()
-                and cfg.hicache_storage_backend is not None
-            ):
-                raise NotImplementedError(
-                    "HCU --enable-dsa-cache-layer-split currently supports "
-                    "HiCache L1/L2 only. --hicache-storage-backend (L3) is "
-                    "not layer-shard-aware yet."
+                    "pipeline parallelism (pp_size > 1) yet. It requires "
+                    "prefill context parallelism, and CP + PP has not been "
+                    "validated for this feature."
                 )
 
         else:
@@ -452,21 +413,7 @@ def handle_model_specific_adjustments(server_args: Any):
             if not resolved_view(server_args).enable_dp_attention and cfg.nnodes == 1:
                 # TODO (Hubert): Put this back later
                 # server_args.enable_aiter_allreduce_fusion = True
-
-                if model_arch == "GlmMoeDsaForCausalLM":
-                    declare_resolution(
-                        server_args,
-                        "_handle_model_specific_adjustments",
-                        enable_aiter_allreduce_fusion=True,
-                    )
-                    declare_resolution(
-                        server_args,
-                        "_handle_model_specific_adjustments",
-                        disable_aiter_allreduce_fusion_in_prefill=True,
-                    )
-                    logger.info(
-                        "Enable Aiter AllReduce Fusion on decode phase for GlmMoeDsaForCausalLM"
-                    )
+                logger.info("Enable Aiter AllReduce Fusion for DeepseekV3ForCausalLM")
 
             # The fp4-checkpoint draft spec-MoE resolution moved to the
             # resolution pipeline (arg_groups/overrides.py:
@@ -559,9 +506,7 @@ def handle_model_specific_adjustments(server_args: Any):
         ):
             # TODO (Hubert): Put this back later
             # server_args.enable_aiter_allreduce_fusion = True
-            # logger.info("Enable Aiter AllReduce Fusion for GptOssForCausalLM")
-            pass
-
+            logger.info("Enable Aiter AllReduce Fusion for GptOssForCausalLM")
         quantization_config = getattr(hf_config, "quantization_config", None)
         is_mxfp4_quant_format = (
             quantization_config is not None
@@ -1011,6 +956,7 @@ def handle_mamba_radix_cache(server_args: Any, model_arch: str):
 
 
 def handle_language_model_only(server_args: Any):
+
     cfg = resolving_view(server_args)
     if not cfg.language_model_only:
         return

@@ -255,31 +255,6 @@ def _extract_cache_from_sglext(data, output):
         output.cached_tokens_details = details
 
 
-def _record_server_prompt_len(data, output):
-    """Take the prompt length from the server, the only side that knows it.
-
-    ``RequestFuncOutput.prompt_len`` is seeded from the dataset row by
-    ``RequestFuncOutput.init_new``. That is correct for a single-turn row, where
-    one row is one request. A multi-turn row is instead replayed as one request
-    per round, and every round's output inherits the row's single value -- so
-    summing ``prompt_len`` across outputs counts one number once per round
-    rather than adding up each request's own prompt.
-
-    Two consumers divide by that sum: the ``--cache-report`` hit rate, and
-    ``input_lens`` in the JSON output.
-
-    The server reports the real figure as ``usage.prompt_tokens`` on the
-    OpenAI-compatible routes and ``meta_info.prompt_tokens`` on the native one.
-    It is the same quantity for a single-turn row, so preferring it needs no
-    per-dataset branch, and leaving the seeded value in place when the server
-    reports nothing keeps behaviour unchanged for any backend that does not.
-    """
-    reported = data.get("usage") or data.get("meta_info") or {}
-    prompt_tokens = reported.get("prompt_tokens")
-    if prompt_tokens:
-        output.prompt_len = prompt_tokens
-
-
 # set ignore_eos True by default
 async def async_request_openai_completions(
     request_func_input: RequestFuncInput,
@@ -352,7 +327,6 @@ async def async_request_openai_completions(
                             pass
                         else:
                             data = json.loads(chunk)
-                            _record_server_prompt_len(data, output)
 
                             if getattr(args, "cache_report", False):
                                 _extract_cache_from_sglext(data, output)
@@ -510,7 +484,6 @@ async def async_request_openai_chat_completions(
                         output.output_len = response_json.get("usage", {}).get(
                             "completion_tokens", output_len
                         )
-                        _record_server_prompt_len(response_json, output)
                         _meta_info = response_json["choices"][0].get("meta_info") or {}
                         output.spec_accept_length = (
                             _meta_info.get("spec_accept_length", 0.0) or 0.0
@@ -544,7 +517,6 @@ async def async_request_openai_chat_completions(
                                 output_len = (data.get("usage") or {}).get(
                                     "completion_tokens", output_len
                                 )
-                                _record_server_prompt_len(data, output)
 
                                 if getattr(args, "cache_report", False):
                                     _extract_cache_from_sglext(data, output)
@@ -762,8 +734,6 @@ async def async_request_sglang_generate(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            _record_server_prompt_len(data, output)
-
                             if getattr(args, "cache_report", False):
                                 _meta = data.get("meta_info") or {}
                                 output.cached_tokens = _meta.get("cached_tokens", 0)
@@ -1351,15 +1321,6 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
             inner_input = replace(
                 copy.deepcopy(request_func_input), prompt=copy.deepcopy(prev_messages)
             )
-            # Each round's prompt length comes from the server's usage block,
-            # which a streamed response only carries when asked for. Default the
-            # key rather than the object, so a user's stream_options still gets
-            # it, while an explicit include_usage=false is kept.
-            if not args.disable_stream:
-                body = inner_input.extra_request_body
-                options = body.get("stream_options") or {}
-                options.setdefault("include_usage", True)
-                body["stream_options"] = options
             output = await request_func(
                 inner_input, pbar=pbar if round_index == len(prompts) - 1 else None
             )
@@ -2704,11 +2665,6 @@ def cli_main():
         "--gsp-fast-prepare",
         action="store_true",
         help="Speedup preparing by removing statistics computation, which will make some output statistics inaccurate but suitable for pressure tests.",
-    )
-    group.add_argument(
-        "--gsp-input-ids",
-        action="store_true",
-        help="Send raw random token ids as input_ids instead of decoded text, so the server skips tokenization before prefill. Statistics are suppressed like --gsp-fast-prepare; use for pure prefill/decode pressure tests.",
     )
     group.add_argument(
         "--gsp-send-routing-key",

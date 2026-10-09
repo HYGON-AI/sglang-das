@@ -5,6 +5,7 @@ from functools import lru_cache
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -60,7 +61,7 @@ class DSANPUIndexerMixin:
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
-        input_on_attention_tp_slices: bool = False,
+        layer_scatter_modes=None,
         dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
         if get_attn_backend().forward_metadata.seq_lens_cpu_int is None:
@@ -140,7 +141,11 @@ class DSANPUIndexerMixin:
 
             k_proj = self.wk(x)[0]  # [b, s, 7168] @ [7168, 128] = [b, s, 128]
             k = self.k_norm(k_proj)
-            if _use_ag_after_qlora and input_on_attention_tp_slices:
+            if (
+                _use_ag_after_qlora
+                and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+                and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+            ):
                 k = scattered_to_tp_attn_full(k, forward_batch)
             k_pe, k_nope = torch.split(
                 k,
@@ -284,7 +289,11 @@ class DSANPUIndexerMixin:
             torch.npu.current_stream().wait_event(q_rope_event)
         if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
             torch.npu.current_stream().wait_event(weights_event)
-        if _use_ag_after_qlora and input_on_attention_tp_slices:
+        if (
+            _use_ag_after_qlora
+            and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+            and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+        ):
             weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = get_attn_backend().forward_metadata.block_tables
         if (

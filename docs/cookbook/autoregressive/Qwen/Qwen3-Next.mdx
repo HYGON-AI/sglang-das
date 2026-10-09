@@ -726,12 +726,8 @@ Max ITL (ms):                            486.38
 - **Benchmark Command:**
 
 ```shell Command
-sgl-eval run gsm8k \
-  --base-url http://127.0.0.1:8000/v1 \
-  --num-examples 200
+python3 -m sglang.test.few_shot_gsm8k --num-questions 200 --port 8000
 ```
-
-The command above uses sgl-eval. Historical scores from other harnesses are not directly comparable; rerun this command for a matching result.
 
 - **Results**:
 
@@ -757,12 +753,10 @@ The command above uses sgl-eval. Historical scores from other harnesses are not 
 - **Benchmark Command:**
 
 ```shell Command
-sgl-eval run mmlu \
-  --base-url http://127.0.0.1:30000/v1 \
-  --num-threads 64 --max-tokens 2048
+cd sglang
+bash benchmark/mmlu/download_data.sh
+python3 benchmark/mmlu/bench_sglang.py --nsub 10
 ```
-
-The command evaluates all 57 subjects. Historical results below use the removed 10-subject harness and are not measurements of the sgl-eval command above.
 
 - **Results**:
 

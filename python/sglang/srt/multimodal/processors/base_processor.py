@@ -35,7 +35,6 @@ from sglang.srt.multimodal.cache import (
     PreprocessFingerprintProvider,
     build_processor_fingerprint,
 )
-from sglang.srt.multimodal.embedding_chunks import EmbeddingChunks
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.multimodal.transport.cuda_ipc import (
     MM_FEATURE_CACHE_SIZE,
@@ -704,7 +703,7 @@ class BaseMultimodalProcessor(ABC):
             consumed_per_modality[item.modality] += num_rows
 
         for modality, embedding in embeddings.items():
-            if not isinstance(embedding, (torch.Tensor, EmbeddingChunks)):
+            if not isinstance(embedding, torch.Tensor):
                 raise RuntimeError(
                     "EPD encoder output must contain tensor embeddings; "
                     f"got {type(embedding).__name__} for {modality.name.lower()}"

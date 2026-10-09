@@ -76,7 +76,6 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
-    expert_distribution_metrics: object = None
 
 
 def candidate_request_length_bound(
@@ -229,7 +228,7 @@ class TargetVerifyExecutor:
         *,
         batch: ScheduleBatch,
         idle_layout: Optional[RaggedVerifyLayout],
-    ) -> TargetVerifyResult:
+    ) -> None:
         """Run a dummy target-verify forward so an idle DP rank joins the
         token-keyed collective ops of the busy ranks' verify step."""
         device = self.model_runner.device
@@ -268,16 +267,11 @@ class TargetVerifyExecutor:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
-        target_out = self.target_worker.forward_batch_generation(
+        self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True if not _is_npu else None,
-        )
-        return TargetVerifyResult(
-            logits_output=target_out.logits_output,
-            can_run_cuda_graph=target_out.can_run_cuda_graph,
-            expert_distribution_metrics=target_out.expert_distribution_metrics,
         )
 
     def run_non_compact(
@@ -355,7 +349,6 @@ class TargetVerifyExecutor:
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
-            expert_distribution_metrics=target_out.expert_distribution_metrics,
         )
 
     def commit_hidden(

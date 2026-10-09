@@ -1,4 +1,7 @@
-"""Config-time override declarations for minicpm."""
+"""Config-time override declarations for minicpm.
+
+Architectures: MiniCPMForCausalLM, MiniCPMSALAForCausalLM.
+"""
 
 from typing import Any, Dict
 
