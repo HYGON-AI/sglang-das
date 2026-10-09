@@ -160,8 +160,12 @@ from sglang.srt.utils import (
 from sglang.srt.utils.aio_rwlock import RWLock
 from sglang.srt.utils.cuda_vmm_transport_utils import CudaVmmFeatureTransport
 from sglang.srt.utils.cudacore_pyspy_dump_utils import (
+    CHILD_CLEANUP_SECONDS,
+    CRASH_DIAGNOSTICS_SECONDS,
+    CRASH_SETTLE_SECONDS,
     collect_scheduler_processes,
     pyspy_dump_schedulers,
+    run_fatal_exit,
     trigger_cuda_user_coredump,
 )
 from sglang.srt.utils.hf_transformers_utils import (
@@ -651,6 +655,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.dump_request_list: List[Tuple] = []
         self.crash_dump_request_list: deque[Tuple] = deque()
         self.crash_dump_performed = False  # Flag to ensure dump is only called once
+        self._fatal_exit_started = False
 
         # Initialize performance metrics loggers with proper skip names
         _, obj_skip_names, out_skip_names = self.request_logger.metadata
@@ -3288,8 +3293,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         asyncio.create_task(asyncio.to_thread(background_task))
 
     def dump_requests_before_crash(
-        self, hostname: str = os.getenv("HOSTNAME", socket.gethostname())
+        self,
+        hostname: str = os.getenv("HOSTNAME", socket.gethostname()),
+        *,
+        deadline=None,
+        cancel_event=None,
     ):
+        deadline = (
+            deadline
+            if deadline is not None
+            else time.monotonic() + CRASH_DIAGNOSTICS_SECONDS
+        )
+        cancel_event = cancel_event if cancel_event is not None else threading.Event()
         should_dump_pyspy = envs.SGLANG_PYSPY_DUMP_BEFORE_CRASH.get()
         should_dump_cuda_coredump = envs.SGLANG_CUDA_COREDUMP_BEFORE_CRASH.get()
         should_dump_diagnostics = should_dump_pyspy or should_dump_cuda_coredump
@@ -3376,28 +3391,65 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             logger.info(
                 "Sleeping 5 seconds before crash diagnostics to let GPU activity settle."
             )
-            time.sleep(5)
+            cancel_event.wait(
+                timeout=min(CRASH_SETTLE_SECONDS, max(0.0, deadline - time.monotonic()))
+            )
+            if cancel_event.is_set() or time.monotonic() >= deadline:
+                return
 
             scheduler_procs = collect_scheduler_processes()
             if scheduler_procs:
                 if should_dump_pyspy:
-                    pyspy_dump_schedulers(scheduler_only=True)
+                    pyspy_dump_schedulers(
+                        scheduler_only=True,
+                        deadline=deadline,
+                        cancel_event=cancel_event,
+                    )
 
                 if should_dump_cuda_coredump:
-                    trigger_cuda_user_coredump(scheduler_only=True)
+                    triggered = trigger_cuda_user_coredump(
+                        scheduler_only=True,
+                        deadline=deadline,
+                        cancel_event=cancel_event,
+                    )
                     cuda_coredump_wait_secs = (
                         envs.SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS.get()
                     )
-                    if cuda_coredump_wait_secs > 0:
+                    cuda_coredump_wait_secs = min(
+                        cuda_coredump_wait_secs, max(0.0, deadline - time.monotonic())
+                    )
+                    if triggered and cuda_coredump_wait_secs > 0:
                         logger.info(
                             "Waiting %.1f seconds for CUDA coredumps before exiting.",
                             cuda_coredump_wait_secs,
                         )
-                        time.sleep(cuda_coredump_wait_secs)
+                        cancel_event.wait(timeout=cuda_coredump_wait_secs)
             else:
                 logger.error(
                     "No live scheduler processes found; skipping py-spy and CUDA coredump."
                 )
+
+    def _fatal_shutdown(self, reason=None):
+        if self._fatal_exit_started:
+            return
+        self._fatal_exit_started = True
+        self.server_status = ServerStatus.UnHealthy
+
+        def diagnostics(deadline, cancel_event):
+            if reason is not None:
+                logger.error(reason)
+            if self._subprocess_watchdog is not None:
+                self._subprocess_watchdog.stop()
+            self.dump_requests_before_crash(
+                deadline=deadline, cancel_event=cancel_event
+            )
+
+        run_fatal_exit(
+            diagnostics,
+            lambda: kill_process_tree(
+                os.getpid(), include_parent=False, wait_timeout=CHILD_CLEANUP_SECONDS
+            ),
+        )
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
@@ -3410,12 +3462,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if self.server_status == ServerStatus.UnHealthy:
                 # if health check failed, we should exit immediately
-                logger.error(
+                self._fatal_shutdown(
                     "Signal SIGTERM received while health check failed. Force exiting."
                 )
-                self.dump_requests_before_crash()
-                self.force_exit_handler()
-                break
+                return
 
             elif get_bool_env_var("SGL_FORCE_SHUTDOWN"):
                 # if force shutdown flag set, exit immediately
@@ -3925,11 +3975,18 @@ async def print_exception_wrapper(func):
         await func()
     except Exception:
         traceback = get_exception_traceback()
-        logger.error(f"TokenizerManager hit an exception: {traceback}")
+        reason = f"TokenizerManager hit an exception: {traceback}"
         if hasattr(func, "__self__") and isinstance(func.__self__, TokenizerManager):
-            func.__self__.dump_requests_before_crash()
-        kill_process_tree(os.getpid(), include_parent=True)
-        sys.exit(1)
+            func.__self__._fatal_shutdown(reason)
+        else:
+            run_fatal_exit(
+                lambda deadline, cancel_event: logger.error(reason),
+                lambda: kill_process_tree(
+                    os.getpid(),
+                    include_parent=False,
+                    wait_timeout=CHILD_CLEANUP_SECONDS,
+                ),
+            )
 
 
 def get_processor_wrapper():
@@ -3956,15 +4013,9 @@ class SignalHandler:
         self.tokenizer_manager.gracefully_exit = True
 
     def running_phase_sigquit_handler(self, signum=None, frame=None):
-        logger.error(
+        self.tokenizer_manager._fatal_shutdown(
             f"SIGQUIT received. {signum=}, {frame=}. It usually means one child failed."
         )
-        # Stop subprocess watchdog before killing processes to prevent false-positive
-        # crash detection during normal shutdown
-        if self.tokenizer_manager._subprocess_watchdog is not None:
-            self.tokenizer_manager._subprocess_watchdog.stop()
-        self.tokenizer_manager.dump_requests_before_crash()
-        kill_process_tree(os.getpid())
 
 
 # Note: request abort handling logic

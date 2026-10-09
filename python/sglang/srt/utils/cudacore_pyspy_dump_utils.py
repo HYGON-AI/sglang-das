@@ -21,6 +21,7 @@ import platform
 import selectors
 import signal
 import subprocess
+import threading
 import time
 from errno import ENXIO
 from pathlib import Path
@@ -73,6 +74,9 @@ PYSPY_ATTEMPT_SECONDS = 5.0
 PYSPY_REAP_SECONDS = 1.0
 PYSPY_OUTPUT_LIMIT = 1024 * 1024
 CRASH_DIAGNOSTICS_SECONDS = 20.0
+CRASH_SETTLE_SECONDS = 5.0
+FATAL_EXIT_SECONDS = 30.0
+CHILD_CLEANUP_SECONDS = 5.0
 _PYSPY_PROCESSES = {}
 
 
@@ -219,28 +223,75 @@ def pyspy_dump_schedulers(scheduler_only=False, *, deadline=None, cancel_event=N
     return outcomes
 
 
-def trigger_cuda_user_coredump(scheduler_only=False):
+def run_fatal_exit(diagnostics, cleanup):
+    """Bound fatal diagnostics and cleanup independently of the event loop.
+
+    The fallback needs a runnable Python interpreter. A stopped process or a
+    native extension that holds the GIL indefinitely needs external supervision.
+    """
+    # Arm before logging or running diagnostics, either of which may block.
+    timer = threading.Timer(FATAL_EXIT_SECONDS, lambda: os._exit(1))
+    timer.daemon = True
+    timer.start()
+    logger.error("SGLANG_FATAL_EXIT_BEGIN pid=%s", os.getpid())
+    deadline = time.monotonic() + CRASH_DIAGNOSTICS_SECONDS
+    cancelled = threading.Event()
+
+    def work():
+        try:
+            diagnostics(deadline, cancelled)
+        except BaseException:
+            logger.exception("Crash diagnostics failed; fatal exit will continue")
+
+    worker = threading.Thread(target=work, name="fatal-diagnostics", daemon=True)
+    try:
+        worker.start()
+        worker.join(timeout=max(0.0, deadline - time.monotonic()))
+    finally:
+        cancelled.set()
+        try:
+            try:
+                stop_active_pyspy(time.monotonic() + PYSPY_REAP_SECONDS)
+            finally:
+                # A dumper cleanup error must not skip scheduler cleanup.
+                cleanup()
+        except BaseException:
+            logger.exception("Fatal child cleanup failed")
+        finally:
+            os._exit(1)
+
+
+def trigger_cuda_user_coredump(
+    scheduler_only=False, *, deadline=None, cancel_event=None
+):
     """Trigger CUDA user-induced GPU core dumps by writing to coredump pipes."""
     if os.environ.get("CUDA_ENABLE_USER_TRIGGERED_COREDUMP") != "1":
         logger.error(
             "CUDA user-triggered coredump is not enabled. Set "
             "CUDA_ENABLE_USER_TRIGGERED_COREDUMP=1 before CUDA initialization."
         )
+        return False
 
     if scheduler_only:
         procs = collect_scheduler_processes()
         if not procs:
             logger.error("No sglang scheduler processes found for CUDA coredump.")
-            return
+            return False
     else:
         procs = [psutil.Process()]
 
+    triggered = False
     for proc in procs:
+        if (deadline is not None and time.monotonic() >= deadline) or (
+            cancel_event is not None and cancel_event.is_set()
+        ):
+            break
         pipe_path = _resolve_cuda_coredump_pipe_path(proc)
         try:
             fd = os.open(pipe_path, os.O_WRONLY | os.O_NONBLOCK)
             try:
                 os.write(fd, b"1")
+                triggered = True
             finally:
                 os.close(fd)
             logger.error(
@@ -269,3 +320,4 @@ def trigger_cuda_user_coredump(scheduler_only=False):
                     proc.pid,
                     pipe_path,
                 )
+    return triggered
