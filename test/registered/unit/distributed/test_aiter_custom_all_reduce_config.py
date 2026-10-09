@@ -53,6 +53,32 @@ def test_hcu_glm52_uses_copy_in_for_aiter_graph(monkeypatch: pytest.MonkeyPatch)
     assert _aiter_enable_register_for_capturing(False, other)
 
 
+def test_hcu_deepseek_v3_uses_copy_in_for_aiter_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang.srt.distributed.device_communicators import custom_all_reduce
+
+    monkeypatch.setattr(custom_all_reduce, "_is_hcu", True)
+    monkeypatch.setenv("AITER_AR_ENABLE_REG_CAPTURE", "1")
+    deepseek_v3 = SimpleNamespace(model_type="deepseek_v3")
+    deepseek_v32 = SimpleNamespace(model_type="deepseek_v32")
+
+    assert not _aiter_enable_register_for_capturing(False, deepseek_v3)
+    assert _aiter_enable_register_for_capturing(False, deepseek_v32)
+
+
+def test_non_hcu_deepseek_v3_keeps_direct_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang.srt.distributed.device_communicators import custom_all_reduce
+
+    monkeypatch.setattr(custom_all_reduce, "_is_hcu", False)
+    monkeypatch.setenv("AITER_AR_ENABLE_REG_CAPTURE", "1")
+    deepseek_v3 = SimpleNamespace(model_type="deepseek_v3")
+
+    assert _aiter_enable_register_for_capturing(False, deepseek_v3)
+
+
 def test_aiter_max_size_bytes_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AITER_AR_MAX_SIZE_MB", raising=False)
     assert _aiter_max_size_bytes() is None
