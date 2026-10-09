@@ -29,7 +29,12 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_device_core_count, is_gfx95_supported, is_hip, get_bool_env_var
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_device_core_count,
+    is_gfx95_supported,
+    is_hip,
+)
 
 _is_hip = is_hip()
 # Mirrors the allocator gate in memory_pool.py. When on, MHATokenToKVPool
@@ -199,11 +204,11 @@ def _mla_launch_plan(
 
 def _extract_kv_strides(buf, page_size: int, is_value: bool = False):
     """Extract (slot, head, page, tok, d) strides for a KV buffer in any of:
-      - 3-D ``[N, head, dim]`` (legacy).
-      - 4-D page-major ``[pages, ps, head, dim]`` (shared pool).
-      - 4-D HND K ``[pages, head, ps, dim]`` (SGLANG_KV_LAYOUT_HCU_FA).
-      - 4-D HND V ``[pages, head, dim, ps]`` — page_size innermost, so
-        d_stride == page_size instead of 1.
+    - 3-D ``[N, head, dim]`` (legacy).
+    - 4-D page-major ``[pages, ps, head, dim]`` (shared pool).
+    - 4-D HND K ``[pages, head, ps, dim]`` (SGLANG_KV_LAYOUT_HCU_FA).
+    - 4-D HND V ``[pages, head, dim, ps]`` — page_size innermost, so
+      d_stride == page_size instead of 1.
     """
     if buf.ndim == 4:
         if _kv_layout_hcu_fa and is_value:
@@ -371,7 +376,8 @@ def _fwd_kernel_stage1(
                 mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
                 other=0.0,
             )
-            qk = tl.sum(q[None, :] * k, 1)
+            # FP32 reduction alone cannot recover products already rounded in BF16.
+            qk = tl.sum(q[None, :].to(tl.float32) * k.to(tl.float32), 1)
             qk *= sm_scale_withk
 
             if logit_cap > 0:
@@ -499,8 +505,8 @@ def _decode_att_m_fwd(
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride, _ = (
-        _extract_kv_strides(k_buffer, page_size, is_value=False)
+    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride, _ = _extract_kv_strides(
+        k_buffer, page_size, is_value=False
     )
     v_slot_stride, v_head_stride, v_page_stride, v_tok_stride, v_d_stride = (
         _extract_kv_strides(v_buffer, page_size, is_value=True)
@@ -877,8 +883,8 @@ def _decode_grouped_att_m_fwd(
     # Blocks at or above the split count return immediately, so the grid shrinks too.
     grid = (batch, head_tiles, forced_kv_splits or MAX_KV_SPLITS)
 
-    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride, _ = (
-        _extract_kv_strides(k_buffer, page_size, is_value=False)
+    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride, _ = _extract_kv_strides(
+        k_buffer, page_size, is_value=False
     )
     v_slot_stride, v_head_stride, v_page_stride, v_tok_stride, v_d_stride = (
         _extract_kv_strides(v_buffer, page_size, is_value=True)
