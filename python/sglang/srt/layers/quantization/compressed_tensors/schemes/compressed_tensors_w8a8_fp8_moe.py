@@ -118,6 +118,13 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         self.weight_quant = weight_quant
         self.input_quant = input_quant
         self.use_flashinfer_trtllm = get_moe_runner_backend().is_flashinfer_trtllm()
+        # This runner adapter is specific to HCU channel-FP8. Use the same
+        # selection for weight loading, runner creation, and execution.
+        self.use_hcu_deepgemm = (
+            _is_hcu
+            and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and get_moe_runner_backend().is_deep_gemm()
+        )
 
         per_tensor = (
             self.weight_quant.strategy == QuantizationStrategy.TENSOR
@@ -443,10 +450,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             build_hcu_w8a8_mega_moe_experts_weights(layer)
             return
 
-        if (
-            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-            and get_moe_runner_backend().is_deep_gemm()
-        ):
+        if self.use_hcu_deepgemm:
             from sglang.srt.layers import deep_gemm_wrapper
 
             if not (_is_hip and deep_gemm_wrapper.ENABLE_HCU_DEEPGEMM):
@@ -472,31 +476,36 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         if (
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL
             and _should_use_aiter_runner()
-            and layer.moe_runner_config.gemm1_alpha is None
-            and layer.moe_runner_config.gemm1_clamp_limit is None
         ):
-            # Keep this import lazy: explicit AITER MoE should not require the
-            # broad SGLANG_USE_AITER import surface during module import.
-            from aiter.ops.shuffle import shuffle_weight
+            if (
+                layer.moe_runner_config.gemm1_alpha is None
+                and layer.moe_runner_config.gemm1_clamp_limit is None
+            ):
+                # Keep this import lazy: explicit AITER MoE should not require the
+                # broad SGLANG_USE_AITER import surface during module import.
+                from aiter.ops.shuffle import shuffle_weight
 
-            with torch.no_grad():
-                # Pre-shuffle weights
-                layer.w13_weight = torch.nn.Parameter(
-                    shuffle_weight(layer.w13_weight.data, (16, 16)),
-                    requires_grad=False,
-                )
-                torch.cuda.empty_cache()
-                layer.w2_weight = torch.nn.Parameter(
-                    shuffle_weight(layer.w2_weight.data, (16, 16)),
-                    requires_grad=False,
-                )
-                torch.cuda.empty_cache()
+                with torch.no_grad():
+                    # Pre-shuffle weights
+                    layer.w13_weight = torch.nn.Parameter(
+                        shuffle_weight(layer.w13_weight.data, (16, 16)),
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
+                    layer.w2_weight = torch.nn.Parameter(
+                        shuffle_weight(layer.w2_weight.data, (16, 16)),
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
+            # AITER owns either the shuffled or alpha/clamp weight layout;
+            # legacy HCU env flags must not repack it for another runner.
+            return
+
         if (
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL
             and _use_deepgemm_moe
             and _is_hcu
             and self.use_deepep
-            and not get_moe_runner_backend().is_deep_gemm()
         ):
             # SGLANG_USE_DEEPGEMM_MOE is process-wide, but DSpark may use a
             # standalone draft MoE alongside a DeepEP target MoE.  Repacking
@@ -625,7 +634,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
         if (
             moe_runner_backend.is_aiter()
-            or moe_runner_backend.is_deep_gemm()
+            or self.use_hcu_deepgemm
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
@@ -650,7 +659,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         topk_output = getattr(dispatch_output, "topk_output", None)
         moe_runner_config = self.moe_runner_config
 
-        if self.runner.runner_backend.is_deep_gemm():
+        if self.use_hcu_deepgemm:
             from sglang.srt.layers.moe.moe_runner.deep_gemm import (
                 DeepGemmMoeQuantInfo,
             )
