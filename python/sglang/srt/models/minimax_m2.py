@@ -667,7 +667,7 @@ class MiniMaxM2MoE(nn.Module):
             not get_moe_a2a_backend().is_deepep()
             and not get_moe_a2a_backend().is_ascend_fuseep()
         ):
-            if get_server_args().minimax_opt:
+            if _is_hcu and get_server_args().minimax_opt:
                 return self.forward_normal_opt(hidden_states)
             return self.forward_normal(hidden_states)
         else:
@@ -890,7 +890,6 @@ class MiniMaxM2Attention(nn.Module):
         self.hidden_size = config.hidden_size
 
         # Use attention TP rank/size for dp-attention support
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         # Get dimensions from config
@@ -931,7 +930,7 @@ class MiniMaxM2Attention(nn.Module):
         self.use_qk_norm = getattr(config, "use_qk_norm", False)
         self.qk_norm_type = getattr(config, "qk_norm_type", "per_layer")
 
-        if get_server_args().minimax_opt:
+        if _is_hcu and get_server_args().minimax_opt:
             self.qkv_proj = QKVParallelLinear(
                 self.hidden_size,
                 self.head_dim,
@@ -939,8 +938,7 @@ class MiniMaxM2Attention(nn.Module):
                 self.total_num_kv_heads,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=0,
-                tp_size=1,
+                parallel_group="replicated",
                 prefix=add_prefix("qkv_proj", prefix),
             )
             self.o_proj = ReplicatedLinear(
@@ -958,8 +956,7 @@ class MiniMaxM2Attention(nn.Module):
                 self.total_num_kv_heads,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
                 prefix=add_prefix("qkv_proj", prefix),
             )
             self.o_proj = RowParallelLinear(
@@ -968,8 +965,7 @@ class MiniMaxM2Attention(nn.Module):
                 bias=False,
                 reduce_results=False,
                 quant_config=quant_config,
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
                 prefix=add_prefix("o_proj", prefix),
             )
 
@@ -1153,7 +1149,7 @@ class MiniMaxM2Attention(nn.Module):
         rms_weight: Optional[torch.Tensor] = None,
         residual: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if get_server_args().minimax_opt:
+        if _is_hcu and get_server_args().minimax_opt:
             s = self.forward_prepare_opt(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1180,7 +1176,7 @@ class MiniMaxM2Attention(nn.Module):
         return self.forward_core(s)
 
     def op_prepare(self, state):
-        if get_server_args().minimax_opt:
+        if _is_hcu and get_server_args().minimax_opt:
             state.attn_intermediate_state = self.forward_prepare_opt(
                 positions=state.positions,
                 hidden_states=state.pop("hidden_states_after_comm_pre_attn"),

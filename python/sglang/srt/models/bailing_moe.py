@@ -52,6 +52,7 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -131,11 +132,11 @@ class BailingMoEMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: Optional[bool] = True,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
-        self.tp_size = tp_size
+        self.is_replicated = parallel_group == "replicated"
 
         self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
@@ -143,8 +144,7 @@ class BailingMoEMLP(nn.Module):
             bias=config.use_bias,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -153,8 +153,7 @@ class BailingMoEMLP(nn.Module):
             reduce_results=reduce_results,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
 
         if config.hidden_act != "silu":
@@ -169,7 +168,7 @@ class BailingMoEMLP(nn.Module):
         hidden_states_tensor = (
             hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
         )
-        if (self.tp_size == 1) and hidden_states_tensor.shape[0] == 0:
+        if self.is_replicated and hidden_states_tensor.shape[0] == 0:
             return hidden_states
 
         gate_up, _ = self.gate_up_proj(hidden_states)
@@ -397,11 +396,9 @@ class BailingMoESparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
-                **(
-                    dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
-                    else {}
-                ),
+                parallel_group="replicated"
+                if get_moe_a2a_backend().is_deepep()
+                else "tp",
             )
         # dispatcher
         if get_moe_a2a_backend().is_deepep():
@@ -808,7 +805,6 @@ class BailingMoEAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
         self.total_kv_heads = config.num_key_value_heads
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
@@ -841,8 +837,7 @@ class BailingMoEAttention(nn.Module):
             bias=(config.use_bias or config.use_qkv_bias),
             quant_config=quant_config,
             prefix=add_prefix("query_key_value", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         if self.use_qk_norm:
@@ -856,8 +851,7 @@ class BailingMoEAttention(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("dense", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         if hasattr(config, "partial_rotary_factor"):
@@ -1022,17 +1016,13 @@ class BailingMoEBlock(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            if is_dense_ffn_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
-            else:
-                mlp_tp_rank, mlp_tp_size = None, None
+            mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
             self.mlp = BailingMoEMLP(
                 intermediate_size=config.intermediate_size,
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                parallel_group=mlp_parallel_group,
                 reduce_results=False,
             )
 

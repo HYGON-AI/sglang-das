@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from enum import Enum
 from functools import lru_cache, partial
-from typing import Callable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import torch
 
@@ -51,7 +51,6 @@ from lightop.gemm_ops import BlockSize
 from lightop.quant import per_token_group_quant_fp8 as per_token_group_quant_fp8_hcu
 from sglang.srt.runtime_context import (
     get_exec,
-    get_parallel,
     get_platform,
 )
 from sglang.srt.utils import (
@@ -74,6 +73,9 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.custom_op import register_custom_op
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.linear import LinearBase
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +252,10 @@ if _use_aiter:
     )
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
+    from sglang.kernels.ops.gemm.smallm_fp8_gfx950 import (
+        smallm_fp8_gemm,
+        smallm_fp8_gemm_supported,
+    )
 
 
 if _is_cuda:
@@ -1744,7 +1750,10 @@ def dequant_mxfp4(
 
 
 def input_to_float8(
-    x: torch.Tensor, dtype: torch.dtype = fp8_dtype
+    x: torch.Tensor,
+    dtype: torch.dtype = fp8_dtype,
+    *,
+    out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """This function quantizes input values to float8 values with tensor-wise quantization."""
     min_val, max_val = x.aminmax()
@@ -1758,6 +1767,12 @@ def input_to_float8(
         fp_max = finfo.max
 
     scale = fp_max / amax
+    if out is not None:
+        assert out.shape == x.shape and out.dtype == dtype
+        assert x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        # FP32 broadcast avoids a full input copy; absmax bounds the FP8 range.
+        torch.mul(x, scale.reshape((1,) * x.ndim), out=out)
+        return out, scale.float().reciprocal()
     x_scl_sat = (x.float() * scale).clamp(min=-fp_max, max=fp_max)
     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 
@@ -2323,7 +2338,9 @@ def apply_fp8_linear(
     )
 
     if input_prequantized:
-        assert input_scale is not None and input_scale.numel() == 1
+        assert input_scale is not None and (
+            input_scale.numel() == 1 or (_use_aiter and use_per_token_if_dynamic)
+        )
         qinput = input_2d
         if channelwise_cutlass and not native_scalar_a_scale:
             # Unsupported CUTLASS epilogues require one A scale per row.
@@ -2475,7 +2492,12 @@ def apply_fp8_linear(
             # x_scale -> input scale tensor, shape = (m, 1)
             # w_scale -> weight scale tensor, shape = (n ,1)
             # dtype -> output dtype
-            output = gemm_a8w8_bpreshuffle(
+            gemm = (
+                smallm_fp8_gemm
+                if smallm_fp8_gemm_supported(qinput, weight.T, x_scale, output_dtype)
+                else gemm_a8w8_bpreshuffle
+            )
+            output = gemm(
                 XQ=qinput,
                 WQ=weight.T,
                 x_scale=x_scale,
@@ -2602,7 +2624,7 @@ def apply_fp8_ptpc_linear(
 
 
 def validate_fp8_block_shape(
-    layer: torch.nn.Module,
+    layer: LinearBase,
     input_size: int,
     output_size: int,
     input_size_per_partition: int,
@@ -2611,9 +2633,9 @@ def validate_fp8_block_shape(
 ) -> None:
     """Validate block quantization shapes for tensor parallelism."""
 
-    # Lazy: a ``getattr`` default would read the published bag even for a
-    # layer that carries its own tp_size.
-    tp_size = layer.tp_size if hasattr(layer, "tp_size") else get_parallel().tp_size
+    tp_group = layer.tp_group
+
+    tp_size = tp_group.world_size if tp_group is not None else 1
     block_n, block_k = block_size[0], block_size[1]
 
     # Required by row parallel

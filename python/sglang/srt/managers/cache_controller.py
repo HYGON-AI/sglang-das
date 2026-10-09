@@ -618,6 +618,7 @@ class HiCacheController:
                     "simm",
                     "mori",
                     "tensorcast",
+                    "seaweedfs",
                 ]
             ) or (
                 self.storage_backend_type == "dynamic"

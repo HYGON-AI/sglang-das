@@ -142,7 +142,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         if self.block_quant:
             assert self.weight_block_size is not None
             layer.weight_block_size = self.weight_block_size
-            tp_size = get_parallel().tp_size
+            tp_size = layer.moe_tp_size
             block_n, block_k = (
                 self.weight_block_size[0],
                 self.weight_block_size[1],

@@ -171,8 +171,7 @@ class HYV3FeedForward(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group="replicated" if tp_size == 1 else "tp",
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -181,8 +180,7 @@ class HYV3FeedForward(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group="replicated" if tp_size == 1 else "tp",
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -562,8 +560,7 @@ class HYV3Attention(nn.Module):
                 self.total_num_kv_heads,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=0,
-                tp_size=1,
+                parallel_group="replicated",
                 prefix=f"{prefix}.qkv_proj",
             )
             self.o_proj = ReplicatedLinear(
@@ -581,8 +578,7 @@ class HYV3Attention(nn.Module):
                 self.total_num_kv_heads,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
                 prefix=f"{prefix}.qkv_proj",
             )
             self.o_proj = RowParallelLinear(
@@ -590,8 +586,7 @@ class HYV3Attention(nn.Module):
                 hidden_size,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
                 reduce_results=False,
                 prefix=f"{prefix}.o_proj",
             )

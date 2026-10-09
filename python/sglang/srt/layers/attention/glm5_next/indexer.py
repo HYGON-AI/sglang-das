@@ -21,7 +21,7 @@ from sglang.srt.layers.attention.glm5_next.utils import (
 )
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
-from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_req_to_token_pool,

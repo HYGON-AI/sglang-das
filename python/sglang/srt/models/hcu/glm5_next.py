@@ -254,8 +254,7 @@ class ModelNextLinearAttention(nn.Module):
                 self.fg_sizes,
                 quant_config=None,  # quant_config,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
+                parallel_group="attn_cp" if is_dsa_enable_prefill_cp() else "attn_tp",
             )
             self.split_sizes = [
                 3 * projection_size // head_shard_size,  # qkv
@@ -267,8 +266,7 @@ class ModelNextLinearAttention(nn.Module):
                 self.head_dim,
                 projection_size,
                 dtype=_get_config_dtype(config),
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
+                parallel_group="attn_cp" if is_dsa_enable_prefill_cp() else "attn_tp",
             )
         else:
             self.qkv_proj = QKVParallelLinear(
@@ -278,8 +276,7 @@ class ModelNextLinearAttention(nn.Module):
                 self.num_k_heads,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
+                parallel_group="attn_cp" if is_dsa_enable_prefill_cp() else "attn_tp",
                 prefix=f"{prefix}.qkv_proj",
             )
 
@@ -297,8 +294,7 @@ class ModelNextLinearAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.f_b_proj",
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
+                parallel_group="attn_cp" if is_dsa_enable_prefill_cp() else "attn_tp",
             )
 
             self.b_proj = ColumnParallelLinear(
@@ -307,8 +303,7 @@ class ModelNextLinearAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.b_proj",
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
+                parallel_group="attn_cp" if is_dsa_enable_prefill_cp() else "attn_tp",
             )
 
             self.g_a_proj = ReplicatedLinear(
@@ -324,8 +319,7 @@ class ModelNextLinearAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.g_b_proj",
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
+                parallel_group="attn_cp" if is_dsa_enable_prefill_cp() else "attn_tp",
             )
 
         self.dt_bias = nn.Parameter(
@@ -342,8 +336,7 @@ class ModelNextLinearAttention(nn.Module):
             bias=False,
             params_dtype=torch.float32,
             prefix=f"{prefix}.qkv_conv1d",
-            tp_rank=head_shard_rank,
-            tp_size=head_shard_size,
+            parallel_group="attn_cp" if is_dsa_enable_prefill_cp() else "attn_tp",
         )
         # unsqueeze to fit conv1d weights shape into the linear weights shape.
         # Can't do this in `weight_loader` since it already exists in
@@ -372,8 +365,7 @@ class ModelNextLinearAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
             reduce_results=reduce_results,
-            tp_rank=head_shard_rank,
-            tp_size=head_shard_size,
+            parallel_group="attn_cp" if is_dsa_enable_prefill_cp() else "attn_tp",
         )
 
         conv_weights = self.qkv_conv1d.weight.squeeze(1)

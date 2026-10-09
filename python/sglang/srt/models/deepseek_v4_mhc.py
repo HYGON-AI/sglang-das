@@ -37,7 +37,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import compile_in_capture_mode
 from sglang.srt.models.deepseek_v2 import MoEOutput, _is_hip, _is_npu, _is_xpu
 from sglang.srt.runtime_context import get_parallel, get_platform
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_hcu, get_bool_env_var
+
+_is_hcu = is_hcu()
+_use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC", default="false")
 
 _is_gfx95_supported = is_gfx95_supported()
 
@@ -471,6 +474,14 @@ def post(
         and x.shape[0] <= 384
     ):
         return mhc_post_split_h(x, residual, post_mix, comb)
+
+    if (
+        _is_hcu and _use_aiter_tilelang_mhc
+        and envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
+    ):
+        from aiter.ops.tilelang import mhc_post_fwd
+
+        return mhc_post_fwd(x, residual, post_mix, comb)
 
     if _is_hip:
         from sglang.srt.models.deepseek_common.amd import deepseek_v4_hip as _hip

@@ -69,6 +69,7 @@ _GEMMA4_MODEL_TYPES = (
     "gemma4_unified",
     "gemma4_unified_assistant",
     "diffusion_gemma",
+    "embedding_gemma2",
 )
 
 

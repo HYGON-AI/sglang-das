@@ -150,7 +150,7 @@ jobs:
 
             const [ptRun, peRun] = await Promise.all([
               findRun('pr-test.yml', hasCI ? labelOnOpts : labelOffOpts),
-              // pr-test-extra gates on BOTH labels (see check-changes there).
+              // pr-test-extra gates on BOTH labels (see call-gate there).
               findRun(
                 'pr-test-extra.yml',
                 (hasCI && hasExtra) ? labelOnOpts : labelOffOpts,

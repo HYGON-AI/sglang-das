@@ -140,6 +140,7 @@ def _configure_rocm_fp8_wo_a_gemm(model_config: Any, download_dir: str | None) -
 def handle_model_specific_adjustments(server_args: Any):
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
+        NONCAUSAL_FULL_ATTENTION,
         get_mimo_v2_fused_qkv_expected_tp_size,
         is_deepseek_dsa,
     )
@@ -228,6 +229,22 @@ def handle_model_specific_adjustments(server_args: Any):
                 "_handle_model_specific_adjustments",
                 moe_dense_tp_size=1,
             )
+    decision_config = model_config.decision_config
+    if (
+        decision_config is not None
+        and decision_config.get("attention_mode") == NONCAUSAL_FULL_ATTENTION
+    ):
+        # A cached prefix or a prefill chunk would attend to only part of its prompt.
+        logger.info(
+            "Radix cache and chunked prefill are disabled for a decision "
+            "checkpoint with noncausal full attention."
+        )
+        declare_resolution(
+            server_args,
+            "_handle_model_specific_adjustments",
+            disable_radix_cache=True,
+            chunked_prefill_size=-1,
+        )
 
     _hybrid_spec = get_linear_attn_spec(hf_config)
     if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
@@ -857,6 +874,24 @@ def handle_model_capability_adjustments(server_args: Any):
         )
         logger.info(
             "Embedding architecture detected: enabling embedding mode automatically."
+        )
+    if (
+        embedding_model_spec is not None
+        and embedding_model_spec.safe_disable_radix_cache
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_model_capability_adjustments",
+            disable_radix_cache=True,
+        )
+    if (
+        embedding_model_spec is not None
+        and embedding_model_spec.safe_disable_chunked_prefill
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_model_capability_adjustments",
+            chunked_prefill_size=-1,
         )
 
     is_embedding_gemma = (

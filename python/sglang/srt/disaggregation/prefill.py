@@ -1154,6 +1154,7 @@ class SchedulerDisaggregationPrefillMixin:
         cache = self.tree_cache
         if req.pending_bootstrap and _uses_write_through_cache(cache):
             cache.advance_unpublished_req(req)
+            req.prefix_len = req.extend_end
             return
 
         checkpoint_kv_cache(req, cache)
@@ -1880,12 +1881,12 @@ class SchedulerDisaggregationPrefillMixin:
                 req.inflight_middle_chunks -= 1
 
                 # Still chunking iff its next chunk was launched: either it is
-                # still self.chunked_req, or its final chunk (extend_range
+                # still self.chunked_req, or its final chunk (extend_end
                 # reaching the end of the input) is in flight. A yielded req
                 # is neither, so do its deferred release here.
                 still_chunking = self.chunked_req is req or (
-                    req.extend_range is not None
-                    and req.extend_range.end >= len(req.origin_input_ids)
+                    req.extend_end is not None
+                    and req.extend_end >= len(req.origin_input_ids)
                 )
                 # Abort is terminal. Do not requeue an aborted optimistic
                 # request merely because bootstrap is still pending.
@@ -2300,7 +2301,7 @@ class SchedulerDisaggregationPrefillMixin:
             elif self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 req.tmp_end_idx = min(
-                    req.extend_range.end,
+                    req.extend_end,
                     len(req.origin_input_ids),
                 )
             else:
@@ -2328,9 +2329,7 @@ class SchedulerDisaggregationPrefillMixin:
         # must stay stable across the request's batches: snapshot the at-rest
         # prefix on the first batch. Non-staging reads the live prefix.
         if self.enable_staging and req.early_send_prefix_end is None:
-            req.early_send_prefix_end = max(
-                0, len(req.prefix_indices) - req.host_hit_length
-            )
+            req.early_send_prefix_end = max(0, req.prefix_len - req.host_hit_length)
 
         if req.pending_bootstrap:
             return
@@ -2339,7 +2338,7 @@ class SchedulerDisaggregationPrefillMixin:
         cached_end = (
             req.early_send_prefix_end
             if self.enable_staging
-            else len(req.prefix_indices) - req.host_hit_length
+            else req.prefix_len - req.host_hit_length
         )
         if cached_end <= req.start_send_idx:
             return
@@ -2371,7 +2370,7 @@ class SchedulerDisaggregationPrefillMixin:
                 value = 0
             else:
                 if end_idx is None:
-                    end_idx = min(req.extend_range.end, len(req.origin_input_ids))
+                    end_idx = min(req.extend_end, len(req.origin_input_ids))
                 page_indices_gpu = page_indices_for_request(self, req, end_idx)
                 state_indices = state_indices_for_request(self, req, end_idx)
                 value = computer.compute(page_indices_gpu, state_indices)
@@ -2391,9 +2390,7 @@ class SchedulerDisaggregationPrefillMixin:
         start_idx = req.start_send_idx
         transfer_input_len = len(req.origin_input_ids)
         end_idx = (
-            end_idx
-            if end_idx is not None
-            else min(req.extend_range.end, transfer_input_len)
+            end_idx if end_idx is not None else min(req.extend_end, transfer_input_len)
         )
 
         if not last_chunk:
@@ -2441,7 +2438,7 @@ class SchedulerDisaggregationPrefillMixin:
             # range actually materialized on prefill. C128 state is request
             # scoped, so its transfer index must use the logical input length
             # that decode used to register the destination row.
-            seq_len = min(end_idx, transfer_input_len)
+            seq_len = min(req.extend_end, transfer_input_len)
             c128_seq_len = transfer_input_len
 
             def _mamba_payload():

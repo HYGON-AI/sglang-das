@@ -251,3 +251,56 @@
 | `python/sglang/srt/models/hunyuan_v3.py` | 补上 Step04 自动合并语义审查：HYV3 stage 构造使用官方 layer_stack 内的 append_stages 与 next_layer_sparse |
 
 功能验收范围为本次用户指定的 DSV4 纯 TP8；其他模型、PD、CP、MTP 只完成代码与静态审查。
+
+## Step 06：官方增量 531–657（最终终点）
+
+- 官方终点：`438df9a2a4645d39c87e33c4a27792e568ac2701`；初始冲突 34 文件。
+- 状态：compile、diff-check、相对双方 F821/F811/F722 通过；最终 DSV4 纯 TP8 运行精度 pending。
+- 证据：`/home/proj_sglang_open/sync-evidence/20261009/step-06/`。
+
+| 文件 | 决策与保留内容 |
+|---|---|
+| `.github/workflows/nightly-test-intel.yml` | 采用官方 CI trigger，保留其余 HCU suite 注册 |
+| `.github/workflows/pr-test-amd-extra.yml` | 采用官方 CI trigger，保留其余 HCU suite 注册 |
+| `.github/workflows/pr-test-extra.yml` | 采用官方 CI trigger，保留其余 HCU suite 注册 |
+| `python/sglang/kernels/ops/attention/fla/layernorm_gated.py` | 保留 HCU LightOp 非3D非量化 fused norm；官方 quant_heads 新 ABI 走 Triton |
+| `python/sglang/kernels/ops/kvcache/mla_buffer.py` | HCU 静态 masked BF16 scatter 与官方无 Triton naive scatter 并存 |
+| `python/sglang/kernels/ops/speculative/dspark/dspark_accept.py` | HCU JIT cache 隔离依赖与官方 partial 并存 |
+| `python/sglang/multimodal_gen/runtime/entrypoints/openai/video_api.py` | 保留按模型 contract 提取 video 请求额外字段的内部功能 |
+| `python/sglang/srt/arg_groups/model_hook.py` | 保留 HYV3 SP 拓扑校验；官方 noncausal decision checkpoint 禁用缓存/chunk |
+| `python/sglang/srt/disaggregation/decode.py` | prefix_len/extend_end 新请求接口；DSV4 prompt donation 状态及 full-only 匹配迁移 canonical match_kv_cache |
+| `python/sglang/srt/disaggregation/prefill.py` | 传输边界采用官方 extend_end |
+| `python/sglang/srt/layers/attention/flashmla_backend.py` | HCU page builder 保留，读地址翻译采用新 reads_are_translated/KVLocPlan |
+| `python/sglang/srt/layers/attention/linear/kda_backend.py` | HCU convolution/source Triton dispatch 保留；官方 FlashInfer prefill graph/chunk 校验并入 |
+| `python/sglang/srt/layers/linear.py` | HCU prequantized input迁移；GLM HCU CP head partition显式attn_cp group，仅_is_hcu解析 |
+| `python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_fp8_moe.py` | 保留 HCU fp8 MoE 路径所需 runtime_context/is_hcu imports |
+| `python/sglang/srt/managers/schedule_batch.py` | 使用 canonical match_kv_cache；SWA reprefill 限制现已集中到 common._req_radix_key |
+| `python/sglang/srt/managers/schedule_policy.py` | 删除旧 match_prefix_for_req；统一 canonical match_kv_cache |
+| `python/sglang/srt/managers/tp_worker.py` | 保留 HCU pre-head capture；新增 official return_kv_loc_plan 输出 contract |
+| `python/sglang/srt/mem_cache/allocator/paged.py` | 保留 HCU allocator extend 和 int32 decode ABI；支持官方无 Triton naive fallback，decode先检页预算 |
+| `python/sglang/srt/mem_cache/common.py` | 保留官方 prefix_len resume；DSV4 allow-insert-once 迁移新 checkpoint |
+| `python/sglang/srt/mem_cache/kv_cache_configurator.py` | 官方 DSA pool class policy保留；HCU GLM pool与 indexer layer mapping dispatch保留 |
+| `python/sglang/srt/mem_cache/memory_pool.py` | 官方 full_kv_pool_class override 与 HCU GLM 专用 pool 分派兼容 |
+| `python/sglang/srt/mem_cache/pool_host/dsa.py` | 官方平台 capabilities 与 destroy/unregister 生命周期保留；HCU BF16/INT8 index bytes/transfer保留 |
+| `python/sglang/srt/mem_cache/pool_host/mha.py` | 官方平台 capabilities 与 HCU host布局 dispatch 保留 |
+| `python/sglang/srt/mem_cache/pool_host/mla.py` | 官方平台 capabilities 与 HCU host布局 dispatch 保留 |
+| `python/sglang/srt/mem_cache/unified_radix_cache.py` | DSV4 full-only leaf 仍由 canonical _match_tree 返回长度，删除旧 device_indices 读取 |
+| `python/sglang/srt/model_executor/forward_batch_info.py` | HCU MainKVPagePlan 与官方 KVLocPlan 类型并存 |
+| `python/sglang/srt/models/bailing_moe.py` | ResidualStream hidden tuple zero-row 兼容；并行 policy 采用 is_replicated |
+| `python/sglang/srt/models/mimo_v2_nextn.py` | 官方 qkv weight loader 绑定投影模块 |
+| `python/sglang/srt/models/minimax_m2.py` | 内部 minimax_opt 复制投影保留；其余投影使用官方 parallel_group contract |
+| `python/sglang/srt/speculative/dspark_components/dspark_draft.py` | 保留内部 num_token_non_padded；绑定官方 draft/verify KVLocPlan |
+| `python/sglang/srt/speculative/dspark_components/dspark_kv_inject.py` | 保留 HCU DSV4 pool type检查；引入官方 KVLocPlan cols |
+| `python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py` | 官方 inject地址从计划取；投影predicate已在该函数上方计算，删除重复 |
+| `python/sglang/srt/speculative/eagle_worker_v2.py` | 保留 HCU pre-head capture；携带 canonical KVLocPlan/PP topology |
+| `test/registered/unit/managers/test_prefill_adder.py` | 保留 Range 测试与 HCU suite注册 |
+| `python/sglang/srt/layers/attention/qsa/dsa_indexer.py` | 旧 MultiPlatformOp import迁移官方兼容shim；保留内部 indexer后端 |
+| `python/sglang/srt/layers/attention/glm5_next/indexer.py` | 旧 MultiPlatformOp import迁移官方兼容shim；保留内部 indexer后端 |
+| `python/sglang/srt/models/glm5_next_vision.py` | 自动合并语义审查：保留原权重分片语义，迁移官方 parallel_group 构造接口 |
+| `python/sglang/srt/models/hunyuan_v3.py` | 自动合并语义审查：保留原权重分片语义，迁移官方 parallel_group 构造接口 |
+| `python/sglang/srt/models/kimi_k3.py` | 自动合并语义审查：保留原权重分片语义，迁移官方 parallel_group 构造接口 |
+| `python/sglang/srt/models/hcu/glm5_next.py` | 自动合并语义审查：保留原权重分片语义，迁移官方 parallel_group 构造接口 |
+| `test/registered/amd/test_smallm_fp8_proj_gfx950.py` | 测试构造迁移 replicated group |
+| `python/sglang/srt/models/deepseek_v4_mhc.py` | 自动合并语义审查：post空行检查后显式 HCU AITER TileLang dispatch，避免落入通用 TileLang CUDA实现 |
+
+功能验收范围为本次用户指定的 DSV4 纯 TP8；其他模型、PD、CP、MTP 只完成代码与静态审查。
