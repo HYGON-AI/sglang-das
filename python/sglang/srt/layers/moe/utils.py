@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import importlib.util
 import logging
 import os
@@ -7,7 +8,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from contextvars import ContextVar
 from enum import Enum, IntEnum
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 import torch
 from packaging import version as pkg_version
@@ -1254,3 +1255,45 @@ def _get_deepgemm_shuffle_unique() -> tuple[int, str]:
     except Exception:
         pass
     return 1, "ifb"
+
+
+def get_deepgemm_marlin_weight_pack_fn(
+    weight_dtype: str,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Return the DeepGEMM MoE weight packer for the P/D topology.
+
+    Decode uses the masked layout; prefill and IFB use the contiguous layout.
+    IFB shares one packed buffer between both GEMMs: INT8 uses
+    ``shuffle_unique=1``, and FP8 packers produce the same layout per arch.
+    """
+    if not _is_hcu:
+        raise RuntimeError("DeepGEMM marlin weight packing requires the HCU runtime")
+    shuffle_unique, mode = _get_deepgemm_shuffle_unique()
+    use_masked = mode == "decode"
+
+    if weight_dtype == "fp8":
+        from deepgemm import marlin_fp8_contiguous_weight, marlin_fp8_masked_weight
+
+        return marlin_fp8_masked_weight if use_masked else marlin_fp8_contiguous_weight
+
+    if weight_dtype == "int8":
+        try:
+            from deepgemm import (
+                marlin_int8_contiguous_weight,
+                marlin_int8_masked_weight,
+            )
+        except ImportError:
+            # Older DeepGEMM builds expose only the marlin_i8_* names.
+            from deepgemm import (
+                marlin_i8_contiguous_weight as marlin_int8_contiguous_weight,
+            )
+            from deepgemm import marlin_i8_masked_weight as marlin_int8_masked_weight
+
+        pack_fn = (
+            marlin_int8_masked_weight if use_masked else marlin_int8_contiguous_weight
+        )
+        return functools.partial(pack_fn, shuffle_unique=shuffle_unique)
+
+    raise ValueError(
+        f"Unsupported DeepGEMM weight dtype {weight_dtype!r}; expected 'fp8' or 'int8'"
+    )
