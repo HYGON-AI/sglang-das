@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from sglang.srt.distributed.device_communicators.custom_all_reduce import (
@@ -28,6 +30,27 @@ def test_aiter_register_capture_disabled_by_memory_saver(
 ) -> None:
     monkeypatch.setenv("AITER_AR_ENABLE_REG_CAPTURE", "1")
     assert not _aiter_enable_register_for_capturing(True)
+
+
+def test_hcu_glm52_uses_copy_in_for_aiter_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+    from sglang.srt.distributed.device_communicators import custom_all_reduce
+
+    monkeypatch.setattr(custom_all_reduce, "_is_hcu", True)
+    monkeypatch.setenv("AITER_AR_ENABLE_REG_CAPTURE", "1")
+    glm52 = SimpleNamespace(
+        model_type="glm_moe_dsa",
+        head_dim=64,
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+    )
+    glm51 = SimpleNamespace(model_type="glm_moe_dsa", head_dim=64)
+    other = SimpleNamespace(
+        model_type="other", index_topk_freq=4, index_skip_topk_offset=3
+    )
+
+    assert not _aiter_enable_register_for_capturing(False, glm52)
+    assert _aiter_enable_register_for_capturing(False, glm51)
+    assert _aiter_enable_register_for_capturing(False, other)
 
 
 def test_aiter_max_size_bytes_default(monkeypatch: pytest.MonkeyPatch) -> None:

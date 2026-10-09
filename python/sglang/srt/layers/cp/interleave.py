@@ -62,11 +62,26 @@ class InterleaveCPStrategy(ContextParallelStrategy):
     kind = ContextParallelStrategyKind.INTERLEAVE
 
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
+        from sglang.srt.environ import envs
+
         if not forward_batch.forward_mode.is_context_parallel_extend():
             return False
         cp_size = self.cp_size
-        seq_len = sum(forward_batch.extend_seq_lens_cpu)
-        return seq_len > 0 and seq_len >= cp_size and cp_size > 1
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        seq_len = sum(extend_lens)
+        min_tokens = int(envs.SGLANG_PREFILL_CP_MIN_TOKENS_PER_SEQUENCE.get())
+        # The threshold protects short requests, not short uncached tails of
+        # long requests. Prefix-cache hits can leave only one 64-token page
+        # to extend; applying the threshold to that page would disable CP for
+        # the whole prefill batch even though the request is long.
+        request_lens = getattr(forward_batch, "seq_lens_cpu", None)
+        if request_lens is None or len(request_lens) != len(extend_lens):
+            request_lens = extend_lens
+        return (
+            seq_len >= cp_size
+            and cp_size > 1
+            and all(int(length) >= min_tokens for length in request_lens)
+        )
 
     def build_metadata(
         self,

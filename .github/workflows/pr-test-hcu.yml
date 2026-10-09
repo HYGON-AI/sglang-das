@@ -410,11 +410,17 @@ jobs:
           echo "image=${image}" >> "${GITHUB_OUTPUT}"
           echo "continue_on_error_flag=${continue_on_error_flag}" >> "${GITHUB_OUTPUT}"
 
+      - name: Set up Python for HCU validation
+        if: github.event_name != 'workflow_dispatch'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
       - name: Verify HCU registration
         if: github.event_name != 'workflow_dispatch'
         run: |
           cd "${HCU_CI_CHECKOUT_DIR}"
-          python3.9 scripts/ci/hcu/verify_hcu_registration.py || python3 scripts/ci/hcu/verify_hcu_registration.py
+          python scripts/ci/hcu/verify_hcu_registration.py
 
       - name: Setup HCU validation container
         if: github.event_name == 'workflow_dispatch'

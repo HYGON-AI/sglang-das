@@ -48,13 +48,38 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    get_bool_env_var,
+    is_hcu,
+    log_info_on_rank0,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.runner.base_runner import BaseRunner
 
 logger = logging.getLogger(__name__)
+
+
+def release_hcu_flashmla_decode_h16_capture_cache(model_runner) -> bool:
+    """Release unused allocator fragments after an H16 graph capture."""
+
+    if not is_hcu() or not get_bool_env_var("SGLANG_HCU_FLASHMLA_DECODE_H16"):
+        return False
+
+    attn_backend = getattr(model_runner, "attn_backend", None)
+    if not getattr(attn_backend, "_hcu_flashmla_decode_h16_enabled", False):
+        return False
+
+    current_platform.synchronize()
+    current_platform.empty_cache()
+    log_info_on_rank0(
+        logger,
+        "HCU H16 FlashMLA decode released unused allocator cache after "
+        "CUDA graph capture.",
+    )
+    return True
 
 
 class GraphCapture(msgspec.Struct, frozen=True, kw_only=True):
@@ -216,6 +241,9 @@ def capture_cuda_graphs(
 
     if model_runner.canary_manager is not None and not model_runner.is_draft_worker:
         model_runner.canary_manager.mark_init_finished()
+
+    if capture_decode_cuda_graph:
+        release_hcu_flashmla_decode_h16_capture_cache(model_runner)
 
     return CudaGraphsCapture(eager_runner=eager_runner, prefill=prefill, decode=decode)
 

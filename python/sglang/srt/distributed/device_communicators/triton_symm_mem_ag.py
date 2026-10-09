@@ -16,6 +16,8 @@ import torch.distributed._symmetric_memory as symm_mem
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_cuda
+
 logger = logging.getLogger(__name__)
 
 # Each thread moves _NUMEL_PER_THREAD bf16 via one 128-bit multimem op; the
@@ -24,6 +26,11 @@ _BLOCK_THREADS = 1024
 _NUMEL_PER_THREAD = 8
 _MIN_BLOCKS = 4
 _MAX_BLOCKS = 32
+
+
+def _supports_multimem_all_gather(enabled: bool) -> bool:
+    """Return whether the CUDA-only multimem implementation may be used."""
+    return enabled and is_cuda()
 
 
 # ------------------------------------------------------------------------------
@@ -461,7 +468,9 @@ class MultimemAllGatherer:
         self._max_tokens = int(max_tokens)
         self._skip_entry_sync = skip_entry_sync
         # None => always NCCL; _UNINIT => build on first eager call.
-        self._state = self._UNINIT if enabled else None
+        self._state = (
+            self._UNINIT if _supports_multimem_all_gather(enabled) else None
+        )
         if self._state is self._UNINIT:
             # Lazy import avoids a module-load dependency on the distributed facade.
             from sglang.srt.distributed import get_tp_group

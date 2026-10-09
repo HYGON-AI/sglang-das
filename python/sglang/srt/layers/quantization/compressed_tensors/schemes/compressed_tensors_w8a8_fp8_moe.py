@@ -91,6 +91,27 @@ def is_moe_prefill_or_normal():
     return args.disaggregation_mode == "prefill" or args.deepep_mode == "normal"
 
 
+def _should_use_hcu_fp8_w8a8_moe(
+    *,
+    enabled: bool,
+    in_speculative_a2a_scope: bool,
+    speculative_algorithm: Optional[str],
+    use_deepep: bool,
+) -> bool:
+    """Keep the HCU LightOp path for non-DSpark speculative workers.
+
+    DSpark can intentionally pair a DeepEP target with a standalone draft that
+    needs canonical weights.  EAGLE and the other speculative workers do not
+    have that constraint and must retain the configured HCU W8A8 fast path.
+    """
+    is_standalone_dspark_draft = (
+        in_speculative_a2a_scope
+        and (speculative_algorithm or "").upper() == "DSPARK"
+        and not use_deepep
+    )
+    return enabled and not is_standalone_dspark_draft
+
+
 class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
     def __init__(self, weight_quant, input_quant):
@@ -115,10 +136,14 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         self.block_quant = self.weight_block_size is not None
         self.use_deepep = get_moe_a2a_backend().is_deepep()
         # The target and DSpark draft share process-wide HCU env flags, but
-        # may intentionally use different MoE backends.  Keep the standalone
-        # draft on its canonical/AITER-fallback layout.
-        self.use_hcu_fp8_w8a8_moe = _use_fp8_w8a8_moe and not (
-            get_flags().moe.in_speculative_a2a_scope and not self.use_deepep
+        # may intentionally use different MoE backends. Keep only a standalone
+        # DSpark draft on its canonical/AITER-fallback layout; EAGLE and other
+        # speculative workers use the configured HCU LightOp path.
+        self.use_hcu_fp8_w8a8_moe = _should_use_hcu_fp8_w8a8_moe(
+            enabled=_use_fp8_w8a8_moe,
+            in_speculative_a2a_scope=get_flags().moe.in_speculative_a2a_scope,
+            speculative_algorithm=get_global_server_args().speculative_algorithm,
+            use_deepep=self.use_deepep,
         )
 
         self.static_input_scales = not self.input_quant.dynamic
