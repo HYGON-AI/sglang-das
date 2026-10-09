@@ -39,6 +39,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.cp.utils import enable_cp_v2
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -285,32 +286,26 @@ class DeepseekModelNextN(nn.Module):
             # temporary Main-KV tensor aliases the target's LayerSplit scratch.
             # Configure it before the decoder/indexer can read historical KV.
             if get_parallel().enable_dsa_cache_layer_split:
-                from sglang.srt.layers.communicator_dsa_cp import (
+                from sglang.srt.layers.layer_boundary.adapters.context_parallel import (
                     maybe_prefetch_full_attention_kv as maybe_prefetch_dsa_full_kv,
                 )
 
                 maybe_prefetch_dsa_full_kv(forward_batch, 0)
-            residual = None
+            residual_batch.start(forward_batch)
             index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
             with get_global_expert_distribution_recorder().disable_this_region():
-                hidden_states, residual, topk_indices = self.decoder(
+                (hidden_states, topk_indices) = self.decoder(
                     positions,
                     hidden_states,
                     forward_batch,
-                    residual,
                     zero_allocator,
                     prev_topk_indices=index_topk_share.topk_indices,
                 )
-            hidden_states, residual = (
-                self.decoder.layer_communicator.finish_layer_stack(
-                    hidden_states, residual, forward_batch
-                )
-            )
+            hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                if residual is not None:
-                    hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-                else:
-                    hidden_states = self.shared_head.norm(hidden_states)
+                hidden_states = residual_batch.norm(
+                    hidden_states, forward_batch, self.shared_head.norm
+                )
 
                 if use_platform_cp:
                     local_num_tokens = hidden_states.shape[0]

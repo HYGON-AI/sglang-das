@@ -8,7 +8,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
 )
-from sglang.srt.layers.communicator.legacy import (
+from sglang.srt.layers.layer_boundary.hcu_legacy import (
     CommunicateContext,
     CommunicateSimpleFn,
     CommunicateSummableTensorPairFn,

@@ -22,7 +22,7 @@ import logging
 import os
 from contextlib import nullcontext
 from functools import lru_cache
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -32,18 +32,24 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
-from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
-from sglang.srt.distributed import get_tp_group
+from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerFacts,
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStateList,
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import (
+    declare_attn,
+    declare_ffn,
+    make_stages,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -124,7 +130,7 @@ if not _is_xpu:
         get_fused_parallel_qknorm_max_occupancy,
     )
 
-_use_fused_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
+_use_fused_rms_quant = _is_hcu and get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
 
 from lightop.quant import per_token_quant_int8
 
@@ -625,6 +631,7 @@ class MiniMaxM2MoE(nn.Module):
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
+            layer_id=layer_id,
             renormalize=True,
             scoring_func=config.scoring_func,
             correction_bias=self.e_score_correction_bias,
@@ -1233,19 +1240,22 @@ class MiniMaxM2DecoderLayer(nn.Module):
 
         is_previous_layer_sparse = True
         is_next_layer_sparse = True
-        self.layer_facts = LayerFacts.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
 
-        self.layer_communicator = LayerCommunicator(
-            layer_facts=self.layer_facts,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
+        self.attn_boundary, self.ffn_boundary = make_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(
+                    sparse=self.is_layer_sparse,
+                    next_sparse=is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+            ),
+            previous=declare_ffn(
+                sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+            )
+            if layer_id != 0
+            else None,
+            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
@@ -1253,28 +1263,26 @@ class MiniMaxM2DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
     ) -> torch.Tensor:
-        if get_server_args().minimax_opt:
-            return self.forward_opt(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                residual=residual,
+        if _is_hcu and get_server_args().minimax_opt:
+            stream = residual_batch.stream_of(forward_batch)
+            hidden_states, residual = stream.finish(hidden_states)
+            hidden_states, residual = self.forward_opt(
+                positions, hidden_states, forward_batch, residual
             )
+            stream.write(residual)
+            return hidden_states
 
         if _use_fused_rms_quant:
+            stream = residual_batch.stream_of(forward_batch)
+            hidden_states, residual = stream.finish(hidden_states)
             pre_norm = hidden_states.clone() if residual is None else residual
-            hidden_states, _ = self.layer_communicator.prepare_attn(
-                hidden_states, residual, forward_batch, skip_layernorm=True
+            hidden_states = self.attn_boundary.prepare(
+                hidden_states, forward_batch, hcu_skip_layernorm=True
             )
-            if residual is not None:
-                assert residual.shape[0] == hidden_states.shape[0], (
-                    f"Fused RMS quant requires hidden_states ({hidden_states.shape[0]}) "
-                    f"and residual ({residual.shape[0]}) to have the same token count. "
-                    f"Set SGLANG_USE_FUSED_RMS_QUANT=0 or disable --moe-a2a-backend."
-                )
+            if residual is not None and residual.shape[0] != hidden_states.shape[0]:
+                raise ValueError("HCU fused RMS quant requires matching token rows")
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1282,37 +1290,36 @@ class MiniMaxM2DecoderLayer(nn.Module):
                 rms_weight=self.input_layernorm.weight,
                 residual=residual,
             )
-            hidden_states, residual = self.layer_communicator.prepare_mlp(
-                hidden_states, pre_norm, forward_batch
-            )
-        else:
-            # Self Attention
-            hidden_states, residual = (
-                self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                    hidden_states,
-                    residual,
-                    forward_batch,
-                    captured_last_layer_outputs=captured_last_layer_outputs,
-                )
-            )
-            if not forward_batch.forward_mode.is_idle():
-                hidden_states = self.self_attn(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    forward_batch=forward_batch,
-                )
+            stream.write(pre_norm)
+            hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+            hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+            with self.ffn_boundary.exit(forward_batch) as ffn_exit:
+                hidden_states = self.block_sparse_moe(hidden_states, forward_batch)
+            return ffn_exit.finish(hidden_states)
 
-            # Fully Connected (MLP or MoE)
-
-            hidden_states, residual = self.layer_communicator.prepare_mlp(
-                hidden_states, residual, forward_batch
+        # Self Attention
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            captured_last_layer_outputs=captured_last_layer_outputs,
+        )
+        if not forward_batch.forward_mode.is_idle():
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
             )
 
-        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+        # Fully Connected (MLP or MoE)
+
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.block_sparse_moe(hidden_states, forward_batch)
-        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
+        hidden_states = ffn_exit.finish(hidden_states)
 
-        return hidden_states, residual
+        return hidden_states
 
     def forward_opt(
         self,
@@ -1362,6 +1369,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
         hidden_states = self.block_sparse_moe(hidden_states, forward_batch)
         return hidden_states, residual
 
+
     # TBO Operations for MiniMax Decoder Layer
     def op_comm_prepare_attn(
         self,
@@ -1369,13 +1377,12 @@ class MiniMaxM2DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
         tbo_subbatch_index: Optional[int] = None,
     ):
         """Communication prepare for attention - TBO operation"""
-        state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
-            self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
+        state.hidden_states_after_comm_pre_attn = self.attn_boundary.prepare(
+            hidden_states, forward_batch
         )
         state.update(
             dict(
@@ -1388,26 +1395,22 @@ class MiniMaxM2DecoderLayer(nn.Module):
 
     def op_comm_prepare_mlp(self, state):
         """Communication prepare for MLP - TBO operation"""
-        state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
-            self.layer_communicator.prepare_mlp(
-                state.pop("hidden_states_after_attn"),
-                state.pop("residual_after_input_ln"),
-                state.forward_batch,
-            )
+        hidden_states = self.attn_boundary.finish(
+            state.pop("hidden_states_after_attn"), state.forward_batch
+        )
+        state.hidden_states_mlp_input = self.ffn_boundary.prepare(
+            hidden_states, state.forward_batch
         )
 
     def op_comm_postprocess_layer(self, state):
         """Communication postprocess for layer - TBO operation"""
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            state.pop("hidden_states_mlp_output"),
-            state.pop("residual_after_comm_pre_mlp"),
-            state.forward_batch,
+        hidden_states = self.ffn_boundary.postprocess(
+            state.pop("hidden_states_mlp_output"), state.forward_batch
         )
 
         output = dict(
             positions=state.positions,
             hidden_states=hidden_states,
-            residual=residual,
             forward_batch=state.forward_batch,
             zero_allocator=state.zero_allocator,
             tbo_subbatch_index=state.tbo_subbatch_index,
@@ -1478,13 +1481,14 @@ class MiniMaxM2Model(nn.Module):
                 hidden_states = self.get_input_embeddings(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
-        use_minimax_sp = get_server_args().minimax_opt
+        use_minimax_sp = _is_hcu and get_server_args().minimax_opt
         if use_minimax_sp:
             attn_tp_group = get_parallel().attn_tp_group
             attn_tp_size = attn_tp_group.world_size
@@ -1494,18 +1498,15 @@ class MiniMaxM2Model(nn.Module):
             start = attn_tp_rank * tokens_per_rank
             hidden_states = hidden_states[start : start + tokens_per_rank]
             positions = positions[start : start + tokens_per_rank]
-            if residual is not None:
-                residual = residual[start : start + tokens_per_rank]
 
-        aux_hidden_states = []
-        if forward_batch.can_run_tbo and not get_server_args().minimax_opt:
-            hidden_states, residual = model_forward_maybe_tbo(
+        aux_hidden_states = AuxHiddenStateList()
+        if forward_batch.can_run_tbo and not use_minimax_sp:
+            hidden_states = model_forward_stages(
                 layers=self.layers,
                 enable_tbo=True,
                 positions=positions,
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
-                residual=residual,
             )
         else:
             for i in range(self.start_layer, self.end_layer):
@@ -1516,30 +1517,21 @@ class MiniMaxM2Model(nn.Module):
                 )
                 with ctx:
                     layer = self.layers[i]
-                    hidden_states, residual = layer(
+                    hidden_states = layer(
                         positions=positions,
                         forward_batch=forward_batch,
                         hidden_states=hidden_states,
-                        residual=residual,
-                        captured_last_layer_outputs=(
-                            aux_hidden_states if i in self.layers_to_capture else None
-                        ),
+                        captured_last_layer_outputs=aux_hidden_states
+                        if i in self.layers_to_capture
+                        else None,
                     )
 
-        last_layer = self.layers[self.end_layer - 1]
-        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
-            hidden_states, residual, forward_batch
-        )
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
 
         if hidden_states.shape[0] != 0:
-            if residual is not None:
-                hidden_states, _ = self.norm(hidden_states, residual)
-            else:
-                hidden_states = self.norm(hidden_states)
+            hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm)
 
         if use_minimax_sp:
             attn_tp_group = get_parallel().attn_tp_group

@@ -8,7 +8,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
-from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
+from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.hy4_ihc_tilelang import (
     try_tilelang_ihc_head,
     try_tilelang_ihc_post,

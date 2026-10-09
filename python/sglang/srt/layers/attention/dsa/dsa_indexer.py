@@ -268,8 +268,20 @@ def _hcu_mqa_logits(
     )
 
 
+def _make_eager_idle_topk_result(
+    x: torch.Tensor, index_topk: int, return_indices: bool
+) -> Optional[torch.Tensor]:
+    if not return_indices:
+        return None
+    return torch.full(
+        (x.shape[0], index_topk),
+        -1,
+        dtype=torch.int32,
+        device=x.device,
+    )
+
+
 def rotate_activation(x: torch.Tensor, apply_scale: bool = True) -> torch.Tensor:
-    # from sgl_kernel import hadamard_transform
     if _is_hip and not _is_hcu:
         from fast_hadamard_transform import hadamard_transform
     elif _is_xpu:
@@ -787,6 +799,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         forward_batch: ForwardBatch,
         apply_hadamard_scale: bool = True,
     ):
+        # fused_rms_fp8_group_quant with output_unquantized_inp1=True produces a
+        # (fp8, scale, bf16) 3-tuple; extract the bf16 for the unquantized wk layer.
+        if isinstance(x, tuple):
+            if len(x) >= 3:
+                x = x[2]
+            else:
+                raise ValueError(
+                    f"_get_q_k_bf16 received a {len(x)}-tuple; expected a plain tensor "
+                    "or a 3-tuple (fp8, scale, bf16) from fused_rms_fp8_group_quant."
+                )
         weights_raw = None
         if _is_hcu:
             query, _ = self.wq_b(q_lora)
@@ -936,6 +958,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         *,
         apply_hadamard: bool = True,
     ):
+        # fused_rms_fp8_group_quant with output_unquantized_inp1=True produces a
+        # (fp8, scale, bf16) 3-tuple; extract the bf16 for the unquantized wk layer.
+        if isinstance(x, tuple):
+            if len(x) >= 3:
+                x = x[2]
+            else:
+                raise ValueError(
+                    f"_get_k_bf16 received a {len(x)}-tuple; expected a plain tensor "
+                    "or a 3-tuple (fp8, scale, bf16) from fused_rms_fp8_group_quant."
+                )
         # Non-fusion path only; self.wk does not exist when fusion is on.
         key, _ = self.wk(x)
         key = self.k_norm(key)
@@ -2394,6 +2426,21 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
+        # A padded eager IDLE rank has no real requests and therefore no valid
+        # DSA page-table rows to index. Return invalid rows with the physical DP
+        # shape so later MLP/EP collectives still agree across ranks.
+        x_meta = x[0] if isinstance(x, tuple) else x
+        if (
+            _is_cuda
+            and forward_batch.forward_mode.is_idle()
+            and not get_is_capture_mode()
+        ):
+            topk_result = _make_eager_idle_topk_result(
+                x_meta, self.index_topk, return_indices
+            )
+            topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+            return maybe_capture_indexer_topk(layer_id, topk_result)
+
         act_quant = None
         if _is_hip and not _is_hcu:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
@@ -2402,10 +2449,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
-
-        # When upstream uses fused FP8 RMSNorm+quant, activations may be passed as
-        # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
-        x_meta = x[0] if isinstance(x, tuple) else x
 
         in_piecewise_or_breakable_cuda_graph = (
             not _is_hcu and _is_in_piecewise_or_breakable_cuda_graph()

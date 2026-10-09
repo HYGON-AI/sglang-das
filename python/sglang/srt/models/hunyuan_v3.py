@@ -37,11 +37,13 @@ from sglang.srt.eplb.expert_distribution import (
 )
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerFacts,
-    enable_moe_dense_fully_dp,
+from sglang.srt.layers.layer_boundary import (
+    declare_attn, declare_ffn, make_stages,
 )
+from sglang.srt.layers.layer_boundary.residual.add_norm import ADD
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
+
+from sglang.srt.layers.layer_boundary import enable_moe_dense_fully_dp
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -267,6 +269,7 @@ class HYV3MoEFused(nn.Module):
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
+            layer_id=layer_id,
             use_grouped_topk=True,
             num_expert_group=1,
             topk_group=1,
@@ -872,18 +875,13 @@ class HYV3DecoderLayer(nn.Module):
                 and layer_id + 1 >= first_k_dense_replace
             )
 
-        self.layer_facts = LayerFacts.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
-        self.layer_communicator = LayerCommunicator(
-            layer_facts=self.layer_facts,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
+        self.attn_boundary, self.ffn_boundary = make_stages(
+            (declare_attn(), self.input_layernorm),
+            (declare_ffn(sparse=is_layer_sparse, next_sparse=is_next_layer_sparse),
+             self.post_attention_layernorm),
+            previous=declare_ffn(sparse=is_previous_layer_sparse, next_sparse=is_layer_sparse)
+            if layer_id != 0 else None,
+            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
@@ -898,11 +896,11 @@ class HYV3DecoderLayer(nn.Module):
                 positions, hidden_states, forward_batch, residual
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states,
-            residual,
-            forward_batch,
+        hidden_states, stream = ResidualStream.arrive(
+            hidden_states, residual, ADD
         )
+        forward_batch.residual_stream = stream
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -911,13 +909,10 @@ class HYV3DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
-        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if self.block_type == "moe":
                 hidden_states = self.mlp(
                     hidden_states,
@@ -931,8 +926,9 @@ class HYV3DecoderLayer(nn.Module):
                     should_allreduce_fusion=ffn_exit.fuse_mlp_allreduce,
                     use_reduce_scatter=ffn_exit.mlp_reduce_scatter,
                 )
-        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
-
+        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states, residual = stream.finish(hidden_states)
+        forward_batch.residual_stream = None
         return hidden_states, residual
 
     def forward_sp(

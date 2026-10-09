@@ -106,6 +106,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     prepare_for_draft_extend,
     run_eagle_verify,
 )
+from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
@@ -370,7 +371,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_lm_head(self):
         from sglang.srt.lora.layers import unwrap_lora_layer
 
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        embed, head = self._resolve_shared_embed_and_head()
         target_lm_head = unwrap_lora_layer(
             getattr(self.target_worker.model_runner.model, "lm_head", None)
         )
@@ -433,6 +434,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 max_rows_per_rank=self.draft_runner.req_to_token_pool.size,
             )
             logits_processor.set_draft_lm_head_vp(draft_lm_head_vp)
+
+    def _resolve_shared_embed_and_head(self):
+        target_runner = self.target_worker.model_runner
+        return resolve_draft_embed_and_head(
+            target_model=target_runner.model,
+            draft_model=self.draft_runner.model,
+            model_path=target_runner.model_config.model_path,
+            revision=target_runner.model_config.revision,
+            load_config=target_runner.load_config,
+        )
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -1109,6 +1120,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
             dsa_topk_indices=prefill_dsa_topk,
+            cuda_graph_compatible=not (seed_from_extend and prefill_dsa_topk is None),
         )
 
     def _get_dsa_extend_topk_buf(self, num_tokens: int) -> torch.Tensor:
@@ -1277,6 +1289,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             next_draft_input.draft_probs = ret_draft_probs
         if self.seed_dsa_topk_from_draft_extend:
             next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
+        next_draft_input.cuda_graph_compatible = not (
+            self.seed_dsa_topk_from_draft_extend and dsa_seed_topk_indices is None
+        )
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
@@ -1548,7 +1563,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         """Run draft, target, and draft-extend with each rank's local mode."""
         rank = get_parallel().attn_dp_rank
         target_local_only = len(batch.global_num_tokens) == 1
-        draft_local_only = target_local_only or self.draft_worker.draft_owns_attention
+        # The draft MoE A2A backend may gather differently from the target.
+        draft_local_only = (
+            target_local_only
+            if batch.draft_global_num_tokens is None
+            else len(batch.draft_global_num_tokens) == 1
+        ) or self.draft_worker.draft_owns_attention
         is_prefill = batch.forward_mode.is_extend()
         draft_batch = batch
         if is_prefill:

@@ -661,6 +661,8 @@ class TopK(BaseFusedOp):
     """
     Parameters:
     --top_k: The all number of top experts selected per token, including the fused shared expert(s).
+    --layer_id: global index of the owning layer. Required: routed-experts capture and
+      per-layer EPLB state are keyed by it.
     --num_fused_shared_experts: num of shared experts, can be activate both in TP or EP mode.
     --routed_scaling_factor: the scaling factor for routed experts in topk_weights.
     --fused_shared_experts_scaling_factor: scaling factor applied to the fused shared experts'
@@ -672,7 +674,7 @@ class TopK(BaseFusedOp):
         self,
         top_k: int,
         *,
-        layer_id: Optional[int] = None,
+        layer_id: int,
         use_grouped_topk: bool = False,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
@@ -2380,9 +2382,12 @@ def biased_grouped_topk_gpu(
             and experts_per_group <= 32
             and is_power_of_two(num_experts)
         ):
-            from sgl_kernel import moe_fused_gate
+            # aliased: a plain `import moe_fused_gate` here makes the name local
+            # to the whole function, and the MUSA branch above, which reads the
+            # module-level mate import, raised UnboundLocalError (ruff F823)
+            from sgl_kernel import moe_fused_gate as _sgl_kernel_moe_fused_gate
 
-            return moe_fused_gate(
+            return _sgl_kernel_moe_fused_gate(
                 gating_output.to(torch.float32),
                 correction_bias.to(torch.float32),
                 num_expert_group,
@@ -2945,7 +2950,7 @@ def select_experts(
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
-                num_fused_shared_experts=num_fused_shared_experts,
+                num_fused_shared_experts=num_fused_shared_experts_for_gate,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 scoring_func=scoring_func,
@@ -2959,7 +2964,7 @@ def select_experts(
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
-                num_fused_shared_experts=num_fused_shared_experts,
+                num_fused_shared_experts=num_fused_shared_experts_for_gate,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 num_token_non_padded=num_token_non_padded,

@@ -34,7 +34,15 @@ from sglang.srt.mem_cache.kv_index_translator import KVReadTables
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    get_model,
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
+from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -570,6 +578,23 @@ class FlashAttentionBackend(AttentionBackend):
         else:
             self._init_full_cg_decode_metadata(forward_batch, in_capture)
 
+    def _get_swa_write_locations(self, forward_batch: ForwardBatch):
+        locations = getattr(forward_batch, "out_cache_loc", None)
+        if (
+            locations is not None
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.spec_info is not None
+            and self.topk > 0
+            and self.speculative_num_steps > 1
+        ):
+            locations = per_step_draft_out_cache_loc(
+                locations,
+                forward_batch.batch_size,
+                self.topk,
+                self.speculative_num_steps,
+            )[self.speculative_step_id]
+        return locations
+
     def _init_full_cg_decode_metadata(
         self, forward_batch: ForwardBatch, in_capture: bool
     ):
@@ -586,13 +611,21 @@ class FlashAttentionBackend(AttentionBackend):
         # Refill the SWA write-target buffer (bound as a metadata view in
         # _bind_metadata_buffers) from the live out_cache_loc before replay.
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
-            n = out_cache_loc.shape[0]
+            swa_out_cache_loc = self._get_swa_write_locations(forward_batch)
+            n = swa_out_cache_loc.shape[0]
+            assert_buffer_fits(
+                n,
+                self.cuda_graph_swa_out_cache_loc.shape[0],
+                "full decode SWA write locations",
+            )
             self.cuda_graph_swa_out_cache_loc[n:].zero_()
             if in_capture:
                 self.cuda_graph_swa_out_cache_loc[:n].zero_()
             else:
                 self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                    self.kv_index_translator.sliding_window_write_loc_for(out_cache_loc)
+                    self.kv_index_translator.sliding_window_write_loc_for(
+                        swa_out_cache_loc
+                    )
                 )
 
         if in_capture:
@@ -1191,18 +1224,23 @@ class FlashAttentionBackend(AttentionBackend):
         _unified_read = (
             self.kv_index_translator.is_translating and metadata.page_table is not None
         )
+        swa_out_cache_loc = (
+            self._get_swa_write_locations(forward_batch)
+            if self.use_sliding_window_kv_pool
+            else None
+        )
         if _unified_read:
             kv_view = self.kv_index_translator.index_table_for_batch(forward_batch)
             metadata.page_table = kv_view.ids
             if self.use_sliding_window_kv_pool:
                 metadata.swa_page_table = kv_view.sliding_window_ids
-                if forward_batch.out_cache_loc is not None:
+                if swa_out_cache_loc is not None:
                     # The swa write loc was computed from the still-VIRTUAL
                     # loc at ForwardBatch construction; re-running the
                     # full->swa map on the kernel-facing loc would be garbage.
                     metadata.swa_out_cache_loc = (
                         self.kv_index_translator.sliding_window_write_loc_for(
-                            forward_batch.out_cache_loc
+                            swa_out_cache_loc
                         )
                     )
         elif self.use_sliding_window_kv_pool:
@@ -1212,10 +1250,10 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.page_table
                 ).to(torch.int32)
             )
-            if forward_batch.out_cache_loc is not None:
+            if swa_out_cache_loc is not None:
                 metadata.swa_out_cache_loc = (
                     self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        forward_batch.out_cache_loc
+                        swa_out_cache_loc
                     )
                 )
 
@@ -1365,9 +1403,13 @@ class FlashAttentionBackend(AttentionBackend):
         aux_tensors=None,
         rel_bias=None,
         rel_bias_event=None,
+        return_lse: bool = False,
     ):
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
+        if return_lse and self.use_mla:
+            raise NotImplementedError("MLA extend does not return an LSE.")
+        extend_lse = None
         cp_active = is_cp_active(forward_batch)
 
         if k is not None:
@@ -1738,7 +1780,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False if use_cascade_attn else causal,
                     window_size=window_size,
                     softcap=layer.logit_cap,
-                    return_softmax_lse=use_cascade_attn,
+                    return_softmax_lse=use_cascade_attn or return_lse,
                     num_splits=self.num_splits,
                     ver=self.fa_impl_ver,
                 )
@@ -1818,6 +1860,12 @@ class FlashAttentionBackend(AttentionBackend):
                 lse = torch.transpose(lse, 0, 1).contiguous()
                 return output, lse
 
+            if return_lse and not use_cascade_attn:
+                if not isinstance(result, tuple):
+                    raise RuntimeError("This extend path does not return an LSE.")
+                o, softmax_lse, *_ = result
+                extend_lse = softmax_lse.T.contiguous()
+                result = o
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
             if (
@@ -2090,7 +2138,12 @@ class FlashAttentionBackend(AttentionBackend):
                     else:
                         o = result
 
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        o = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        if return_lse:
+            if extend_lse is None:
+                raise RuntimeError("This extend path does not return an LSE.")
+            return o, extend_lse
+        return o
 
     def forward_decode(
         self,
@@ -2111,9 +2164,13 @@ class FlashAttentionBackend(AttentionBackend):
         aux_tensors=None,
         rel_bias=None,
         rel_bias_event=None,
+        return_lse: bool = False,
     ) -> torch.Tensor:
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
+        if return_lse and self.use_mla:
+            raise NotImplementedError("MLA decode does not return an LSE.")
+        decode_lse = None
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -2345,7 +2402,7 @@ class FlashAttentionBackend(AttentionBackend):
                         causal=False if use_cascade_attn else causal,
                         window_size=window_size,
                         softcap=layer.logit_cap,
-                        return_softmax_lse=use_cascade_attn,
+                        return_softmax_lse=use_cascade_attn or return_lse,
                         num_splits=self.num_splits,
                         ver=self.fa_impl_ver,
                     )
@@ -2379,10 +2436,12 @@ class FlashAttentionBackend(AttentionBackend):
                             if self.kv_cache_dtype_str != "auto"
                             else None
                         ),
-                        return_softmax_lse=use_cascade_attn,
+                        return_softmax_lse=use_cascade_attn or return_lse,
                         s_aux=kwargs.get('sinks', None)
                     )
                 else:
+                    if self._decode_uses_static_max_seqlen_k:
+                        kwargs["max_seqlen_k"] = metadata.max_seq_len_k
                     result = flash_attn_with_kvcache(
                         q=q_reshaped,
                         k_cache=key_cache,
@@ -2395,14 +2454,24 @@ class FlashAttentionBackend(AttentionBackend):
                         causal=False if use_cascade_attn else causal,
                         window_size=window_size,
                         softcap=layer.logit_cap,
-                        return_softmax_lse=use_cascade_attn,
-                        num_splits=self.num_splits,
+                        return_softmax_lse=use_cascade_attn or return_lse,
+                        num_splits=(
+                            self.decode_num_splits
+                            if not is_swa_layer
+                            and not use_cascade_attn
+                            and not pa_swa_active
+                            else self.num_splits
+                        ),
                         out=_fa_out,
                         ver=self.fa_impl_ver,
                         scheduler_metadata=sched_meta,
                         **({"layout": "bhsd"} if self._use_hcu_bhsd else {}),
                         **kwargs,
                     )
+                if return_lse and not use_cascade_attn:
+                    o, softmax_lse, *_ = result
+                    decode_lse = softmax_lse.T.contiguous()
+                    result = o
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     if self._use_hcu_legacy_layout:
@@ -2534,7 +2603,12 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 o = result
 
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        o = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        if return_lse:
+            if decode_lse is None:
+                raise RuntimeError("This decode path does not return an LSE.")
+            return o, decode_lse
+        return o
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
