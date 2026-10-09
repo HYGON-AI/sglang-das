@@ -892,10 +892,17 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
 
-        # Normal combine inputs are already in dispatch-token order: the
-        # runner's post-permute or legacy DeepEPMoE core handles the gather.
-        # Preserve this contract independently of the platform/backend.
-        output = hidden_states
+        # Legacy HCU groupgemm/Marlin paths also gather their expert outputs
+        # back into dispatch-token order before normal combine.
+        if (
+            _deepgemm_is_selected()
+            or should_use_aiter_runner()
+            or _is_npu
+            or (_is_hcu and use_groupgemm)
+        ):
+            output = hidden_states
+        else:
+            raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
 
         previous_event = Buffer.capture() if self.async_finish else None
         return output, previous_event
