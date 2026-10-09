@@ -223,7 +223,7 @@ class ConfidenceRelay(msgspec.Struct):
         self.confidence_buf = torch.empty(
             (self.req_pool_size, gamma), dtype=torch.float32, device=self.device
         )
-        if _is_cuda:
+        if _is_cuda or _is_hcu:
             depth = CONFIDENCE_RELAY_RING_DEPTH
             self.conf_ring = torch.empty(
                 (depth, self.req_pool_size, gamma),
@@ -325,10 +325,11 @@ class FutureMap:
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
         # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
-        # D2H pulls (gated only on publish, off the schedule stream). CUDA-only:
-        # recovers occupancy lost to the WAR barrier (also CUDA-only); other
-        # platforms have no barrier and use the plain .cpu() bootstrap path.
-        if _is_cuda:
+        # D2H pulls (gated only on publish, off the schedule stream). CUDA:
+        # recovers occupancy lost to the WAR barrier. HCU: keeps the schedule
+        # stream's device-side publish wait from turning into a host stall.
+        # Other platforms use the plain .cpu() bootstrap path.
+        if _is_cuda or _is_hcu:
             self.new_seq_lens_cpu_pinned = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, pin_memory=True
             )
@@ -566,10 +567,12 @@ class FutureMap:
                 # forward publish; a stale consume means a publish went missing.
                 assert self._publish_fresh, "resolve without a fresh forward publish"
                 self._publish_fresh = False
-            if _is_hip:
+            if _is_hip and not _is_hcu:
                 # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
                 self.publish_ready.synchronize()
             else:
+                # Device-side wait: on HCU a host sync here stalls the draft
+                # launch behind the previous verify's GPU tail (13-20ms measured).
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
