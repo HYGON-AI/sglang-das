@@ -892,7 +892,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
 
-        if _deepgemm_is_selected() or should_use_aiter_runner() or _is_npu:
+        # Legacy HCU groupgemm/Marlin runners already gather their expert
+        # outputs into dispatch-token order in DeepEPMoE.run_moe_core.
+        if _is_hcu or _deepgemm_is_selected() or should_use_aiter_runner() or _is_npu:
             output = hidden_states
         else:
             raise NotImplementedError()  # triton runner was supported but it's temporarily disabled

@@ -445,6 +445,32 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
         if (
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and get_moe_runner_backend().is_deep_gemm()
+        ):
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            if not (_is_hip and deep_gemm_wrapper.ENABLE_HCU_DEEPGEMM):
+                raise RuntimeError(
+                    "channel-FP8 --moe-runner-backend deep_gemm requires the "
+                    "DTK/HCU deepgemm runtime"
+                )
+            pack_fn = get_deepgemm_marlin_weight_pack_fn("fp8")
+
+            # The explicit runner owns the weight layout. Pack canonical
+            # weights before any legacy env-driven shuffle or Marlin packing.
+            if not getattr(layer, "_hcu_deepgemm_channel_fp8_packed", False):
+                layer._hcu_deepgemm_logical_w13_shape = tuple(layer.w13_weight.shape)
+                layer._hcu_deepgemm_logical_w2_shape = tuple(layer.w2_weight.shape)
+                with torch.no_grad():
+                    w13_packed = pack_fn(layer.w13_weight.data.contiguous())
+                    w2_packed = pack_fn(layer.w2_weight.data.contiguous())
+                layer.w13_weight = torch.nn.Parameter(w13_packed, requires_grad=False)
+                layer.w2_weight = torch.nn.Parameter(w2_packed, requires_grad=False)
+                layer._hcu_deepgemm_channel_fp8_packed = True
+            return
+
+        if (
+            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
             and _should_use_aiter_runner()
             and layer.moe_runner_config.gemm1_alpha is None
             and layer.moe_runner_config.gemm1_clamp_limit is None
@@ -570,29 +596,6 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     layer.w13_weight = new_w1
                     layer.w2_weight = new_w2
                     layer._w8a8_fp8_packed = True
-
-        if (
-            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-            and get_moe_runner_backend().is_deep_gemm()
-        ):
-            from sglang.srt.layers import deep_gemm_wrapper
-
-            if not (_is_hip and deep_gemm_wrapper.ENABLE_HCU_DEEPGEMM):
-                raise RuntimeError(
-                    "channel-FP8 --moe-runner-backend deep_gemm requires the "
-                    "DTK/HCU deepgemm runtime"
-                )
-            pack_fn = get_deepgemm_marlin_weight_pack_fn("fp8")
-
-            if not getattr(layer, "_hcu_deepgemm_channel_fp8_packed", False):
-                layer._hcu_deepgemm_logical_w13_shape = tuple(layer.w13_weight.shape)
-                layer._hcu_deepgemm_logical_w2_shape = tuple(layer.w2_weight.shape)
-                with torch.no_grad():
-                    w13_packed = pack_fn(layer.w13_weight.data.contiguous())
-                    w2_packed = pack_fn(layer.w2_weight.data.contiguous())
-                layer.w13_weight = torch.nn.Parameter(w13_packed, requires_grad=False)
-                layer.w2_weight = torch.nn.Parameter(w2_packed, requires_grad=False)
-                layer._hcu_deepgemm_channel_fp8_packed = True
 
         if (
             self.weight_quant.strategy == QuantizationStrategy.BLOCK
