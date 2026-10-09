@@ -18,6 +18,8 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import selectors
+import signal
 import subprocess
 import time
 from errno import ENXIO
@@ -67,29 +69,154 @@ def collect_scheduler_processes() -> List[psutil.Process]:
     ]
 
 
-def pyspy_dump_schedulers(scheduler_only=False):
-    """py-spy dump on all scheduler in a local node."""
-    if scheduler_only:
-        procs = collect_scheduler_processes()
-        if not procs:
-            logger.error("No sglang scheduler processes found for py-spy dump.")
-            return
-        pids = [proc.pid for proc in procs]
-    else:
-        pids = [psutil.Process().pid]
-    for pid in pids:
-        for attempt, native_flag in enumerate(["--native", ""]):
-            try:
-                cmd = f"py-spy dump {native_flag} --pid {pid}".strip()
-                result = subprocess.run(
-                    cmd, shell=True, capture_output=True, text=True, check=True
-                )
-                logger.error(f"Pyspy dump for PID {pid} ({cmd}):\n{result.stdout}")
+PYSPY_ATTEMPT_SECONDS = 5.0
+PYSPY_REAP_SECONDS = 1.0
+PYSPY_OUTPUT_LIMIT = 1024 * 1024
+CRASH_DIAGNOSTICS_SECONDS = 20.0
+_PYSPY_PROCESSES = {}
+
+
+def _kill_dump_process(proc, deadline):
+    # Each dumper owns a separate session. Never signal the target scheduler.
+    # Kill the group even if its leader exited: descendants can retain the pipe.
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(
+            timeout=max(0.0, min(PYSPY_REAP_SECONDS, deadline - time.monotonic()))
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("py-spy PID %s did not reap before cleanup deadline", proc.pid)
+
+
+def stop_active_pyspy(deadline):
+    for proc in list(_PYSPY_PROCESSES.values()):
+        _kill_dump_process(proc, deadline)
+
+
+def _run_pyspy(cmd, deadline, cancel_event=None):
+    attempt_deadline = min(deadline, time.monotonic() + PYSPY_ATTEMPT_SECONDS)
+    if time.monotonic() >= attempt_deadline or (
+        cancel_event is not None and cancel_event.is_set()
+    ):
+        return dict(returncode=None, timed_out=True, output="", truncated=False)
+
+    # Reserve part of the attempt's budget for killing/reaping the dumper.
+    execution_deadline = attempt_deadline - min(
+        PYSPY_REAP_SECONDS, max(0.0, attempt_deadline - time.monotonic()) / 2
+    )
+    proc = subprocess.Popen(
+        cmd,
+        shell=False,
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+    )
+    _PYSPY_PROCESSES[proc.pid] = proc
+    captured = bytearray()
+    truncated = False
+    timed_out = False
+    selector = None
+    try:
+        selector = selectors.DefaultSelector()
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = execution_deadline - time.monotonic()
+            if remaining <= 0 or (cancel_event is not None and cancel_event.is_set()):
+                timed_out = True
                 break
-            except subprocess.CalledProcessError as e:
-                logger.error(f"Pyspy failed ({cmd}). Error: {e.stderr}")
-                if attempt == 1:
-                    logger.error(f"All pyspy dump attempts failed for PID {pid}.")
+            for key, _ in selector.select(min(remaining, 0.1)):
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                room = PYSPY_OUTPUT_LIMIT - len(captured)
+                captured.extend(chunk[:room])
+                truncated |= len(chunk) > room
+        if not timed_out:
+            try:
+                proc.wait(timeout=max(0.0, execution_deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+        return dict(
+            returncode=proc.returncode,
+            timed_out=timed_out,
+            output=captured.decode(errors="replace"),
+            truncated=truncated,
+        )
+    finally:
+        try:
+            _kill_dump_process(proc, attempt_deadline)
+        finally:
+            if selector is not None:
+                selector.close()
+            proc.stdout.close()
+            _PYSPY_PROCESSES.pop(proc.pid, None)
+
+
+def pyspy_dump_schedulers(scheduler_only=False, *, deadline=None, cancel_event=None):
+    """Dump stacks with a shared deadline and bounded output per attempt.
+
+    A non-native retry is allowed only after an ordinary command failure and
+    when a full attempt still fits in the remaining diagnostics budget.
+    """
+    deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + CRASH_DIAGNOSTICS_SECONDS
+    )
+    procs = collect_scheduler_processes() if scheduler_only else [psutil.Process()]
+    if not procs:
+        logger.error("No sglang scheduler processes found for py-spy dump.")
+    targets = []
+    for proc in procs:
+        try:
+            if proc.status() != psutil.STATUS_ZOMBIE:
+                targets.append((proc.pid, proc.create_time()))
+        except psutil.Error:
+            pass
+    outcomes = []
+    for pid, birth in targets:
+        for native in (True, False):
+            if not native and deadline - time.monotonic() < PYSPY_ATTEMPT_SECONDS:
+                return outcomes
+            if time.monotonic() >= deadline or (
+                cancel_event is not None and cancel_event.is_set()
+            ):
+                return outcomes
+            try:
+                target = psutil.Process(pid)
+                if (
+                    target.create_time() != birth
+                    or target.status() == psutil.STATUS_ZOMBIE
+                ):
+                    break
+                cmd = (
+                    ["py-spy", "dump"]
+                    + (["--native"] if native else [])
+                    + ["--pid", str(pid)]
+                )
+                result = _run_pyspy(cmd, deadline, cancel_event)
+                outcomes.append(dict(pid=pid, native=native, **result))
+                logger.error(
+                    "Pyspy dump PID %s: rc=%s timeout=%s truncated=%s\n%s",
+                    pid,
+                    result["returncode"],
+                    result["timed_out"],
+                    result["truncated"],
+                    result["output"],
+                )
+                if result["timed_out"]:
+                    return outcomes
+                if result["returncode"] is not None and result["returncode"] <= 0:
+                    break
+            except (OSError, psutil.Error):
+                logger.exception("Unable to run py-spy for PID %s", pid)
+                break
+    return outcomes
 
 
 def trigger_cuda_user_coredump(scheduler_only=False):
