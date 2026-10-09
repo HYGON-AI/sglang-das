@@ -453,8 +453,27 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
         stack.enter_context(
             patch.object(torch.cuda, "is_current_stream_capturing", return_value=False)
         )
-        stack.enter_context(patch.dict(os.environ, {"SGLANG_HCU_OPT_DSV41_MQA_PREP": flag}))
+        stack.enter_context(
+            patch.dict(
+                os.environ,
+                {} if flag is None else {"SGLANG_HCU_OPT_DSV41_MQA_PREP": flag},
+            )
+        )
+        if flag is None:
+            os.environ.pop("SGLANG_HCU_OPT_DSV41_MQA_PREP", None)
         return stack, lightop
+
+    def test_hcu_mqa_prep_defaults_on_and_can_be_disabled(self):
+        for flag in (None, "0", "1"):
+            with self.subTest(flag=flag):
+                backend, batch, _, pos, q_cpu, _, _ = self._mqa_prep_fixture()
+                stack, _ = self._mqa_prep_context(backend, flag=flag)
+                with stack:
+                    result = backend._low_ratio_hcu_query_lens(batch, pos, q_cpu)
+                    if flag == "0":
+                        self.assertIsNone(result)
+                    else:
+                        self.assertEqual(result.tolist(), [0, 0, 2])
 
     def test_hcu_mqa_prep_requires_python_and_native_api(self):
         names = (
@@ -820,7 +839,7 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
                 else:
                     self.assertIsNone(selected)
 
-    def test_candidate_logits_defaults_off_and_requires_explicit_opt_in(self):
+    def test_candidate_logits_defaults_on_and_respects_explicit_override(self):
         backend, indexer, lc_per_req, q_lens_cpu, blocks = self._candidate_fixture()
         attention = ModuleType("lightop.attention")
         attention.fp8_fp4_mqa_logits = SimpleNamespace(supports_candidate_blocks=True)
@@ -829,12 +848,14 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
             patch.dict("sys.modules", {"lightop.attention": attention}),
             patch.dict(os.environ),
         ):
-            for flag in (None, "0", "invalid", "true", "2", ""):
+            os.environ.pop("SGLANG_HCU_OPT_DSV41_CANDIDATE_LOGITS", None)
+            self.assertIs(
+                backend._hcu_prefill_candidate_blocks(indexer, lc_per_req, q_lens_cpu),
+                blocks,
+            )
+            for flag in ("0", "invalid", "true", "2", ""):
                 with self.subTest(flag=flag):
-                    if flag is None:
-                        os.environ.pop("SGLANG_HCU_OPT_DSV41_CANDIDATE_LOGITS", None)
-                    else:
-                        os.environ["SGLANG_HCU_OPT_DSV41_CANDIDATE_LOGITS"] = flag
+                    os.environ["SGLANG_HCU_OPT_DSV41_CANDIDATE_LOGITS"] = flag
                     self.assertIsNone(
                         backend._hcu_prefill_candidate_blocks(
                             indexer, lc_per_req, q_lens_cpu
@@ -1241,13 +1262,14 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
 
     def test_candidate_publisher_respects_enable_and_performance_cutoff(self):
         cases = (
-            ([65537, 0, 65539], None, False),
+            ([65537, 0, 65539], None, True),
             ([65537, 0, 65539], False, False),
             ([65537, 0, 65539], "invalid", False),
             ([65537, 0, 65539], "true", False),
             ([65537, 0, 65539], "2", False),
             ([65537, 0, 65539], "", False),
             ([4096, 0, 8192], True, False),
+            ([4096, 0, 8192], None, False),
             ([32768, 0, 32768], True, False),
             ([32768, 0, 65535], True, False),
             ([32768, 0, 65536], True, True),

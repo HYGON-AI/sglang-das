@@ -53,7 +53,7 @@ from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 logger = logging.getLogger(__name__)
 
 _use_hcu_fused_engram_gate = is_hcu() and get_bool_env_var(
-    "SGLANG_HCU_OPT_ENGRAM_GATE"
+    "SGLANG_HCU_OPT_ENGRAM_GATE", default="true"
 )
 
 
