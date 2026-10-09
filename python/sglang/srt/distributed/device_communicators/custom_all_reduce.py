@@ -49,15 +49,20 @@ def _aiter_enable_register_for_capturing(
     honor AITER's documented environment switch instead of forcing direct
     registration unconditionally.
     """
-    # The GLM-5.2 DSA checkpoint shares TopK every four layers. Its raw
-    # head_dim=192 is normalized to 64 by HF config loading, so identify it
-    # by the indexer topology instead. On HCU, registering the
-    # AITER all-reduce input directly into its decode graph changes generated
-    # tokens, while AITER's copy-in mode and eager execution agree. Preserve
-    # direct registration for other models and use copy-in for this layout.
+    # On HCU, registering the AITER all-reduce input directly into the decode
+    # graph replays the capture warmup instead of the live residual. Copy-in
+    # uses the pre-registered workspace and matches eager execution.
+    #
+    # DeepSeek-V3 / V3.1 uses model_type deepseek_v3. GLM-5.2 DSA shares TopK
+    # every four layers; its raw head_dim=192 is normalized to 64 by HF config
+    # loading, so identify that checkpoint by the indexer topology instead.
+    # Other models keep direct registration.
+    model_type = getattr(hf_config, "model_type", None)
+    if _is_hcu and model_type == "deepseek_v3":
+        return False
     if (
         _is_hcu
-        and getattr(hf_config, "model_type", None) == "glm_moe_dsa"
+        and model_type == "glm_moe_dsa"
         and getattr(hf_config, "index_topk_freq", None) == 4
         and getattr(hf_config, "index_skip_topk_offset", None) == 3
     ):

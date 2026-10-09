@@ -409,8 +409,25 @@ def flash_attn_varlen_func(
         IS_SLIMQUANT_W4A8 = _MODEL_CONFIG.quantization == "slimquant_w4a8_marlin"
         IS_KVCACHE_FP8_E4M3 = _MODEL_CONFIG.kv_cache_dtype == "fp8_e4m3"
 
-    if is_nmz_fp8(k.dtype) and not IS_SLIMQUANT_W4A8 and not IS_KVCACHE_FP8_E4M3:
-        q_descale = torch.ones_like(k_descale)
+    # gfx938 FP8 varlen attention dequantizes with these scales. The kernel
+    # requires shape (batch, num_kv_heads); a missing or 1-element scale makes
+    # it treat the FP8 prefill K/V as unscaled bits and the logits collapse.
+    if _is_hcu and is_nmz_fp8(k.dtype) and not IS_SLIMQUANT_W4A8:
+        descale_shape = (cu_seqlens_q.shape[0] - 1, k.shape[-2])
+
+        def _as_descale(scale):
+            if scale is None:
+                return torch.ones(descale_shape, dtype=torch.float32, device=k.device)
+            # Preserve calibrated values when expanding scalar/per-head scales.
+            # Replacing a mismatched non-unit scale with ones corrupts FP8 data.
+            scale = scale.to(device=k.device, dtype=torch.float32)
+            if scale.numel() == 1:
+                scale = scale.reshape(1, 1)
+            return torch.broadcast_to(scale, descale_shape).contiguous()
+
+        q_descale = _as_descale(q_descale)
+        k_descale = _as_descale(k_descale)
+        v_descale = _as_descale(v_descale)
         result = flash_attn_varlen_func_interface(
             q=q,
             k=k,
