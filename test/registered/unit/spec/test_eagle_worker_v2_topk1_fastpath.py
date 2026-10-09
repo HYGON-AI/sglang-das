@@ -183,6 +183,33 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
 
+    def test_hcu_glm_dsa_recomputes_first_draft_index(self):
+        worker = object.__new__(EagleDraftWorker)
+        worker.topk = 1
+        hf_config = SimpleNamespace(
+            model_type="glm_moe_dsa",
+            index_share_for_mtp_iteration=True,
+            index_topk=2048,
+        )
+        worker.draft_runner = SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=hf_config)
+        )
+
+        with patch("sglang.srt.speculative.eagle_worker_v2._is_hcu", True):
+            worker._init_dsa_index_share_state()
+        self.assertTrue(worker.index_share_for_mtp_iteration)
+        self.assertFalse(worker.seed_dsa_topk_from_draft_extend)
+
+        hf_config.model_type = "deepseek_v3"
+        with patch("sglang.srt.speculative.eagle_worker_v2._is_hcu", True):
+            worker._init_dsa_index_share_state()
+        self.assertTrue(worker.seed_dsa_topk_from_draft_extend)
+
+        hf_config.model_type = "glm_moe_dsa"
+        with patch("sglang.srt.speculative.eagle_worker_v2._is_hcu", False):
+            worker._init_dsa_index_share_state()
+        self.assertTrue(worker.seed_dsa_topk_from_draft_extend)
+
     def test_missing_seed_cuda_graph_fallback(self):
         graph_result = (
             [],

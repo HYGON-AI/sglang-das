@@ -803,7 +803,7 @@ def sample_mtp_target_ids(
         sampling_info.top_ps, draft_token_num, dim=0
     )
 
-    # LightOp implements the common top-k-first/top-p path. Keep SGLang's
+    # LightOp implements the common joint top-k/top-p path. Keep SGLang's
     # existing compatibility path for min-p and request-specific RNG seeds.
     if (
         lightop_top_k_top_p_sampling_from_probs is None
@@ -834,7 +834,7 @@ def sample_mtp_target_ids(
         target_probs.contiguous(),
         expanded_top_ks,
         expanded_top_ps,
-        filter_apply_order="top_k_first",
+        filter_apply_order="joint",
         deterministic=True,
     ).to(torch.long)
 

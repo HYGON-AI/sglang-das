@@ -21,6 +21,16 @@ _FLASHINFER_TIE_BREAK_VALUES = {
 }
 
 
+def _supports_topk_v2_ragged_layout(logits: torch.Tensor) -> bool:
+    """Return whether the score rows satisfy the v2 vector-load ABI."""
+    return (
+        logits.dtype == torch.float32
+        and logits.ndim == 2
+        and logits.stride(1) == 1
+        and logits.stride(0) % 4 == 0
+    )
+
+
 class TopkTransformMethod(IntEnum):
     # Transform topk indices to indices to the page table (page_size = 1)
     PAGED = auto()
@@ -54,9 +64,12 @@ class DSATopKBackend(Enum):
         return self == DSATopKBackend.FLASHINFER
 
     def should_use_topk_v2(self) -> bool:
-        # topk_v2 has no HCU kernel; it stays on the paged transform.
-        return (
-            self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get() and not _is_hcu
+        # The current HIP kernel supports HCU as well as the existing ROCm path.
+        return self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get()
+
+    def should_use_topk_v2_paged(self) -> bool:
+        return self.should_use_topk_v2() and (
+            not _is_hcu or envs.SGLANG_HCU_TOPK_V2_PAGED.get()
         )
 
     def topk_func(
@@ -125,7 +138,7 @@ class DSATopKBackend(Enum):
         # matches we commit to v2 and never silently fall back to the legacy
         # page_size=1 path from here.
         if (
-            self.should_use_topk_v2()
+            self.should_use_topk_v2_paged()
             and topk_transform_method == TopkTransformMethod.PAGED
             and row_starts is None
             and batch_idx_list is None
@@ -142,7 +155,10 @@ class DSATopKBackend(Enum):
         # the cluster path never applies), just a per-row window and an additive
         # output transform. `batch_idx_list` is not None only on the prefill-CP
         # path, whose `topk_indices_offset` is built from cu_seqlens_q rather
-        # than the KV bases -- leave that one on the legacy kernel.
+        # than the KV bases -- leave that one on the legacy kernel. The v2
+        # kernel also vector-loads four fp32 values from each row, so an HCU MQA
+        # score buffer whose row width is not 16-byte aligned must use the
+        # legacy LightOp transform instead of failing the v2 runtime check.
         if (
             self.should_use_topk_v2()
             and topk_transform_method == TopkTransformMethod.RAGGED
@@ -150,6 +166,7 @@ class DSATopKBackend(Enum):
             and batch_idx_list is None
             and 0 < topk <= 2048
             and lengths.shape[0] == logits.shape[0] == topk_indices_offset.shape[0]
+            and _supports_topk_v2_ragged_layout(logits)
         ):
             return _topk_transform_v2_ragged(
                 logits, lengths, topk, topk_indices_offset, row_starts
@@ -469,8 +486,10 @@ def _topk_transform_v2_ragged(
     after the top-k (see ``DSAIndexer._get_topk_ragged``).
 
     Preconditions match the paged helper: fp32 scores with unit row stride and a
-    16B-aligned row stride (DeepGEMM's contiguous-KV output satisfies this by
-    construction), int32 non-negative lengths, and ``0 < topk <= 2048``.
+    16B-aligned row stride, int32 non-negative lengths, and ``0 < topk <= 2048``.
+    The caller checks the score layout because HCU MQA may use the exact active
+    KV width as the row stride; widths that are not multiples of four stay on
+    the legacy LightOp transform.
     """
     from sglang.kernels.ops.attention.dsv4.topk import topk_transform_ragged_v2
 

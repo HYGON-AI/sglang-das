@@ -25,9 +25,13 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.utils.common import (
     parse_connector_type,
+    get_bool_env_var,
+    get_int_env_var,
+    is_hcu,
 )
 
 logger = logging.getLogger(__name__)
+_is_hcu = is_hcu()
 
 
 def parse_cuda_graph_config(server_args: Any):
@@ -577,3 +581,47 @@ def apply_cuda_graph_disaggregation_roles(server_args: Any):
                     cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
                 ),
             )
+
+
+def apply_hcu_flashmla_decode_h16_memory_budget(server_args: Any) -> None:
+    """Bound graph metadata for the opt-in GLM TP8/CP8 H16 profile."""
+    cfg = resolving_view(server_args)
+    if not (
+        _is_hcu
+        and get_bool_env_var("SGLANG_HCU_FLASHMLA_DECODE_H16")
+        and cfg.enable_cp_decode_attn_tp
+        and cfg.tp_size == 8
+        and cfg.attn_cp_size == 8
+    ):
+        return
+    if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
+        return
+    architectures = model_config_of(server_args).hf_config.architectures or []
+    if not architectures or not architectures[0].startswith("GlmMoeDsaForCausalLM"):
+        return
+    graph_limit = get_int_env_var("SGLANG_HCU_MLA_DECODE_TP_SHARD_GRAPH_LIMIT", 16)
+    if graph_limit <= 0:
+        raise ValueError("SGLANG_HCU_MLA_DECODE_TP_SHARD_GRAPH_LIMIT must be positive")
+    decode = cfg.cuda_graph_config.decode
+    old_graph_max_bs = decode.max_bs
+    old_max_running_requests = cfg.max_running_requests
+    max_bs = min(decode.max_bs, graph_limit)
+    sizes = sorted({bs for bs in decode.bs if 0 < bs <= max_bs} | {max_bs})
+    request_limit = min(old_max_running_requests or 64, 64)
+    declare_resolution(
+        server_args,
+        "apply_hcu_flashmla_decode_h16_memory_budget",
+        cuda_graph_config=with_phase(
+            cfg.cuda_graph_config, Phase.DECODE, max_bs=max_bs, bs=sizes
+        ),
+        max_running_requests=request_limit,
+    )
+    if max_bs != old_graph_max_bs or request_limit != old_max_running_requests:
+        logger.warning(
+            "HCU H16 FlashMLA decode memory budget: graph max_bs %s -> %s, "
+            "max_running_requests %s -> %s",
+            old_graph_max_bs,
+            max_bs,
+            old_max_running_requests,
+            request_limit,
+        )

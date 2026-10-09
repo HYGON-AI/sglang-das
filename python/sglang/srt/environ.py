@@ -787,10 +787,8 @@ class Envs:
     # Distributed and model-parallel runtime
     # ===================================================================
     # Minimum extend length of every request before CP-v2 shards the batch.
-    # Small requests are both slower and more fragile on highly partitioned
-    # attention layouts; zero preserves the historical cp_size * 2 threshold.
-    # HCU keeps its legacy CP by default; strategy CP is an explicit opt-in.
-    SGLANG_ENABLE_CP_V2 = EnvBool(False)
+    # Zero preserves each strategy's historical admission threshold.
+    # HCU keeps CP-v2 opt-in; CUDA retains its main default.
     SGLANG_PREFILL_CP_MIN_TOKENS_PER_SEQUENCE = EnvInt(0)
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
     # Comma-separated bundle indices for Ray Custom PG mode (e.g., "0,1,2,7").
@@ -1494,6 +1492,9 @@ class Envs:
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    # HCU's paged v2 path may fault on GLM decode workloads. Keep the ragged
+    # prefill v2 path available when paged decode falls back to LightOp.
+    SGLANG_HCU_TOPK_V2_PAGED = EnvBool(False)
 
     # ===================================================================
     # Kernel selection and fused backends

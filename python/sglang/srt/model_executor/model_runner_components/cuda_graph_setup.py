@@ -54,7 +54,12 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    get_bool_env_var,
+    is_hcu,
+    log_info_on_rank0,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -166,6 +171,26 @@ def index_attention_layers_by_global_id(
     if has_reused_layers:
         return attention_layers, mha_companion_layers
     return indexed_attention, indexed_companions
+
+
+def release_hcu_flashmla_decode_h16_capture_cache(model_runner) -> bool:
+    """Release unused allocator fragments after an H16 graph capture."""
+
+    if not is_hcu() or not get_bool_env_var("SGLANG_HCU_FLASHMLA_DECODE_H16"):
+        return False
+
+    attn_backend = getattr(model_runner, "attn_backend", None)
+    if not getattr(attn_backend, "_hcu_flashmla_decode_h16_enabled", False):
+        return False
+
+    current_platform.synchronize()
+    current_platform.empty_cache()
+    log_info_on_rank0(
+        logger,
+        "HCU H16 FlashMLA decode released unused allocator cache after "
+        "CUDA graph capture.",
+    )
+    return True
 
 
 class GraphCapture(msgspec.Struct, frozen=True, kw_only=True):
@@ -454,6 +479,9 @@ def capture_cuda_graphs(
 
     if finalize:
         finalize_cuda_graph_capture(model_runner)
+
+    if capture_decode_cuda_graph:
+        release_hcu_flashmla_decode_h16_capture_cache(model_runner)
 
     return CudaGraphsCapture(eager_runner=eager_runner, prefill=prefill, decode=decode)
 

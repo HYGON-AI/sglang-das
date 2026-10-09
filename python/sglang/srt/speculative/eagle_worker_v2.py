@@ -342,8 +342,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             getattr(hf_config, "index_share_for_mtp_iteration", False)
             and self.topk == 1
         )
-        # GLM-5.2 MTP IndexShare: seed reused indexer top-k from draft-extend
-        # (last verified token), not draft-decode step 0.
+        # Carrying draft-extend's indexer top-k into GLM DSA's first draft
+        # step lowers EAGLE acceptance on HCU. Recompute that first top-k and
+        # still share it across the remaining draft steps.
         self.dsa_index_topk = getattr(hf_config, "index_topk", None)
         self.dsa_seed_topk_width = (
             get_dsa_mtp_topk_width(hf_config)
@@ -351,7 +352,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else None
         )
         self.seed_dsa_topk_from_draft_extend = (
-            self.index_share_for_mtp_iteration and self.dsa_seed_topk_width is not None
+            self.index_share_for_mtp_iteration
+            and self.dsa_seed_topk_width is not None
+            and not (
+                _is_hcu and getattr(hf_config, "model_type", None) == "glm_moe_dsa"
+            )
         )
 
     def init_token_map(self):
@@ -723,6 +728,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"mem usage={(before_mem - after_mem):.2f} GB, "
                 f"avail mem={after_mem:.2f} GB.",
             )
+
+        from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
+            release_hcu_flashmla_decode_h16_capture_cache,
+        )
+
+        release_hcu_flashmla_decode_h16_capture_cache(self.target_worker.model_runner)
 
     def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
         draft_input: EagleDraftInput = batch.spec_info

@@ -263,6 +263,13 @@ def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
     )
 
 
+def _can_dsa_cp_v2_split_uneven(forward_batch: "ForwardBatch") -> bool:
+    # Import lazily: CP strategy initialization loads the DSA metadata helper.
+    from sglang.srt.layers.cp.utils import is_cp_v2_active
+
+    return is_cp_v2_active(forward_batch)
+
+
 def can_dsa_prefill_cp_interleave(forward_batch: "ForwardBatch"):
     if not forward_batch.forward_mode.is_context_parallel_extend():
         return False
@@ -285,6 +292,10 @@ def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
         is_dsa_prefill_cp_round_robin_split()
         and seq_len > 0
         and seq_len >= cp_size
+        # CP-v2 interleave shards uneven batches and the DSA indexer metadata
+        # must follow that same layout. The divisibility guard only protects
+        # the legacy model-level split, which requires equal rank lengths.
+        and (seq_len % cp_size == 0 or _can_dsa_cp_v2_split_uneven(forward_batch))
         and cp_size > 1
     )
 
@@ -374,10 +385,15 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
     ):
         return False
     if is_dsa_prefill_cp_round_robin_split():
+        # Keep model-level and attention-level CP admission in sync. Uneven
+        # token counts cannot use this model-level round-robin path safely;
+        # fall back to the unsharded prefill for this batch.
+        if (
+            seq_len % cp_size != 0
+            or sum(forward_batch.extend_seq_lens_cpu) % cp_size != 0
+        ):
+            return False
         cur_cp_seq_len = seq_len // cp_size
-        assert seq_len % cp_size == 0, (
-            f"Expect seq len can divided by cp size, but got seq len {seq_len}, cp size {cp_size}"
-        )
     else:
         cur_cp_seq_len = seq_len // (cp_size * 2)
     return cur_cp_seq_len != 0

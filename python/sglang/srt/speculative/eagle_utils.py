@@ -69,6 +69,52 @@ elif _is_cpu:
     from sgl_kernel import verify_tree_greedy_cpu as sgl_verify_tree_greedy_cpu
 
 
+def _allocate_eagle_verify_outputs(
+    predict_shape: List[int],
+    batch_size: int,
+    max_tree_depth: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate all scheduler-visible verifier outputs in one buffer."""
+    predict_size = math.prod(predict_shape)
+    accept_index_size = batch_size * max_tree_depth
+    verify_state = torch.empty(
+        predict_size + accept_index_size + batch_size,
+        dtype=torch.int32,
+        device=device,
+    )
+    predict = verify_state[:predict_size].view(predict_shape)
+    accept_index = verify_state[predict_size : predict_size + accept_index_size].view(
+        batch_size, max_tree_depth
+    )
+    num_correct_drafts = verify_state[predict_size + accept_index_size :]
+    predict.zero_()
+    accept_index.fill_(-1)
+    return verify_state, predict.flatten(), accept_index, num_correct_drafts
+
+
+def _sync_eagle_verify_outputs(verify_state: torch.Tensor) -> None:
+    """Broadcast one packed verifier state across every rank in a DP replica."""
+    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+    if not is_dp_attention_enabled() or get_parallel().dp_size == 1:
+        # With one DP replica the full TP group contains exactly the ranks
+        # whose scheduler state must agree. Reuse its proven fast communicator
+        # instead of serializing decode behind the CP attention communicator.
+        groups = (get_tp_group(),)
+    else:
+        # Fan out across both orthogonal factors of each DP replica so
+        # CP0/TP0 remains authoritative for every verifier output.
+        groups = (
+            get_parallel().attn_tp_group,
+            get_parallel().attn_cp_group,
+        )
+    for group in groups:
+        if group.world_size > 1:
+            group.broadcast(verify_state, src=0)
+
+
 def per_step_draft_out_cache_loc(
     out_cache_loc: torch.Tensor,
     batch_size: int,
@@ -756,10 +802,6 @@ def eagle_sample(
     """
     import torch.nn.functional as F
 
-
-    from sglang.srt.layers.dp_attention import (
-        is_dp_attention_enabled,
-    )
     from sglang.srt.sampling.penaltylib.repetition_penalty import (
         apply_scaling_penalties,
     )
@@ -853,11 +895,14 @@ def eagle_sample(
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
-    predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
-    accept_index = torch.full(
-        (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
+    verify_state, predict, accept_index, num_correct_drafts = (
+        _allocate_eagle_verify_outputs(
+            predict_shape,
+            bs,
+            verify_input.max_tree_depth,
+            device,
+        )
     )
-    num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
     # HCU top-1 MTP samples the target distribution before greedy tree matching,
     # retaining source temperature/top-k/top-p/min-p and per-request RNG semantics.
@@ -903,20 +948,6 @@ def eagle_sample(
             topk=verify_input.tree_topk,
         )
 
-        if _is_hip:
-            # On ROCm, the per-rank draft tokens can differ, so ranks accept a
-            # different number of drafts, desynchronize the committed seq_lens, and
-            # deadlock the next TP collective. Broadcast from rank 0 to ensure
-            # consistency, the same way the sampling branch below does.
-            tp_group = (
-                get_parallel().attn_tp_group
-                if is_dp_attention_enabled()
-                else get_parallel().tp_group
-            )
-            if tp_group.world_size > 1:
-                tp_group.broadcast(predict, src=0)
-                tp_group.broadcast(accept_index, src=0)
-                tp_group.broadcast(num_correct_drafts, src=0)
     elif _can_use_sparse_uno_tree_target_sampling(
         uno_target_max_top_k,
         sampling_info,
@@ -944,27 +975,26 @@ def eagle_sample(
             topk=verify_input.tree_topk,
         )
 
-        tp_group = (
-            get_parallel().attn_tp_group
-            if is_dp_attention_enabled()
-            else get_parallel().tp_group
-        )
-        if tp_group.world_size > 1:
-            tp_group.broadcast(predict, src=0)
-            tp_group.broadcast(accept_index, src=0)
-            tp_group.broadcast(num_correct_drafts, src=0)
     else:
         from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+
         if use_rejection_sampling:
-            from sglang.kernels.ops.speculative.reject_sampling import chain_speculative_sampling_triton
+            from sglang.kernels.ops.speculative.reject_sampling import (
+                chain_speculative_sampling_triton,
+            )
+
             sampling_fn = chain_speculative_sampling_triton
             if get_spec().speculative_use_block_verification:
                 sampling_fn = partial(sampling_fn, block_verification=True)
         elif _is_cuda:
-            from sglang.kernels.ops.speculative.sampling import tree_speculative_sampling_target_only
+            from sglang.kernels.ops.speculative.sampling import (
+                tree_speculative_sampling_target_only,
+            )
+
             sampling_fn = tree_speculative_sampling_target_only
         else:
             from sgl_kernel import tree_speculative_sampling_target_only
+
             sampling_fn = tree_speculative_sampling_target_only
 
         expanded_temperature = torch.repeat_interleave(
@@ -1040,20 +1070,6 @@ def eagle_sample(
             coins_for_final_sampling,
         )
 
-        # Sync sampling results across TP ranks: different GPUs may
-        # produce slightly different target_probs due to floating-point
-        # non-determinism in softmax/top_k/top_p, causing different
-        # sampled tokens. Broadcast from rank 0 to ensure consistency.
-        tp_group = (
-            get_parallel().attn_tp_group
-            if is_dp_attention_enabled()
-            else get_parallel().tp_group
-        )
-        if tp_group.world_size > 1:
-            tp_group.broadcast(predict, src=0)
-            tp_group.broadcast(accept_index, src=0)
-            tp_group.broadcast(num_correct_drafts, src=0)
-
     if SIMULATE_ACC_LEN > 0:
         # Do simulation. The helper builds (and returns) a replacement
         # accept_index of width spec_steps + 1, so pass max_tree_depth - 1
@@ -1077,7 +1093,7 @@ def eagle_sample(
                 target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
                     bs, verify_input.draft_token_num
                 )
-        accept_index = generate_simulated_accept_index(
+        simulated_accept_index = generate_simulated_accept_index(
             accept_index=accept_index,
             predict=predict,  # mutable
             num_correct_drafts=num_correct_drafts,  # mutable
@@ -1088,6 +1104,13 @@ def eagle_sample(
             bs=bs,
             spec_steps=verify_input.max_tree_depth - 1,
         )
+        accept_index.copy_(simulated_accept_index)
+
+    # Draft and target logits can drift independently across accelerator
+    # ranks. Synchronize every scheduler-visible verifier output after all
+    # local verification and simulation work, before request and KV state
+    # mutate. One packed collective replaces three serialized broadcasts.
+    _sync_eagle_verify_outputs(verify_state)
 
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the
