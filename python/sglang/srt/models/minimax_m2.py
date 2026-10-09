@@ -45,9 +45,9 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -111,6 +111,7 @@ from sglang.srt.utils import (
     is_xpu,
     make_pp_layers,
 )
+from sglang.srt.utils.common import is_building_neighbour_layer
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -465,6 +466,7 @@ class MiniMaxM2QKRMSNorm:
             and self._world_size > 1
             and _is_cuda
             and use_fused_norm
+            and not is_building_neighbour_layer()
         ):
             occupancy = get_fused_parallel_qknorm_max_occupancy(
                 q_norm.weight.dtype,
@@ -1235,10 +1237,9 @@ class MiniMaxM2DecoderLayer(nn.Module):
             config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6)
         )
 
-        is_previous_layer_sparse = True
         is_next_layer_sparse = True
 
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -1247,12 +1248,6 @@ class MiniMaxM2DecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(

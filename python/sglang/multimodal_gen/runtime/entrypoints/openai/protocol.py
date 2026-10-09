@@ -161,6 +161,7 @@ class VideoGenerationsRequest(BaseModel):
     upscaling_scale: Optional[int] = 4
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
+    x264_preset: Optional[str] = None
     output_path: Optional[str] = None
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # Model-task extensions (consumed by task-specific pipeline adapters, e.g.

@@ -187,3 +187,36 @@
 | `python/sglang/srt/layers/cp/utils.py` | 官方 generic ROCm CP 生效；仅 HCU 保留 legacy batch layout，避免双重 shard |
 
 功能验收范围为本次用户指定的 DSV4 纯 TP8；其他模型、PD、CP、MTP 只完成代码与静态审查。
+
+## Step 04：第 331–430 笔
+
+- 官方终点：`61ba98443d2a9e67b79b06b01ee227515bf3c9ea`；初始冲突 20 文件。
+- 状态：compile、diff-check、相对双方 F821/F811/F722 通过；最终 DSV4 纯 TP8 运行精度 pending。
+- 证据：`/home/proj_sglang_open/sync-evidence/20261009/step-04/`。
+
+| 文件 | 决策与保留内容 |
+|---|---|
+| `python/sglang/multimodal_gen/runtime/models/dits/wanvideo.py` | HCU fused temb table 保留；新增官方 fused linear GELU |
+| `python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/stages/denoising.py` | 平台支持提示跟随官方 ROCm 支持 |
+| `python/sglang/srt/disaggregation/decode.py` | 官方在 match 前限制可复用 full prefix；HCU full-only radix leaf 匹配标志保留 |
+| `python/sglang/srt/disaggregation/encoder/receiver.py` | 新的 scoped placement 初始化；保留 attention-DP encoder 集合通信组 |
+| `python/sglang/srt/disaggregation/mooncake/conn.py` | 官方先校验后发布 peer registration；HCU state ABI 校验在发布前仍生效 |
+| `python/sglang/srt/layers/attention/deepseek_v4_backend.py` | 官方 RequestWindow sparse-prefill 与 HCU sparse-kernel 排除条件 |
+| `python/sglang/srt/layers/attention/dsv4/compressor.py` | 官方 AITER tuned BF16 compressor GEMM；local HIP/HCU capability 保留 |
+| `python/sglang/srt/layers/attention/dsv4/sparse_prefill_utils.py` | HCU 真实 query 长度与官方 RequestWindow workspace 同时支持 |
+| `python/sglang/srt/layers/moe/topk.py` | HCU DeepEP int64/-1 padding 合并 remap 保留；其他平台采用官方 append+权重 zero 融合 |
+| `python/sglang/srt/managers/schedule_policy.py` | max_prefix_len 与 HCU full-only prefix match 控制分别保留 |
+| `python/sglang/srt/mem_cache/memory_pool.py` | 采用官方单次 dtype/scale 转换；DSA 物理页拆分并保留活跃 indexer 层映射，HCU 不进入 AITER preshuffle |
+| `python/sglang/srt/mem_cache/pool_host/dsa.py` | 官方 pooled Index-K 字节预算，HCU BF16/INT8/GLM 保留真实 storage bytes |
+| `python/sglang/srt/model_executor/pool_configurator.py` | 保留 HCU BF16/INT8 workspace 与活跃层计数；generic pooled index 采用压缩后 bytes/token |
+| `python/sglang/srt/models/deepseek_nextn.py` | 官方 layer_stack 与 HCU legacy CP gate 并存 |
+| `python/sglang/srt/models/dflash.py` | DFlash quantization 声明与内部 vocab-sharing 声明独立保留 |
+| `python/sglang/srt/models/hunyuan_v4.py` | 官方 IHCState residual/stage 契约；保留 HCU TileLang iHC operator dispatch |
+| `python/sglang/srt/layers/hy4_ihc_tilelang.py` | HCU 专属 BoltOps TileLang iHC 入口增加 _is_hcu 保护 |
+| `python/sglang/srt/models/minimax_m2.py` | 保留 HCU MiniMax opt 排除；官方相邻层构造阶段不选择 fused norm |
+| `python/sglang/srt/models/qwen4_exp.py` | 保留 PLE INT8/FP8 per-row scale；官方邻层构造禁用 offload |
+| `python/sglang/srt/server_args.py` | 保留内部 dataclass resolved-copy 生命周期；新增官方 MLX/MPS runtime 与 deprecated attn-DP readback |
+| `python/sglang/srt/speculative/eagle_utils.py` | 官方 block-verification sampling_fn 与 HCU Triton rejection sampling import 合并 |
+| `python/sglang/multimodal_gen/runtime/layers/attention/layer.py` | 自动合并审查：清理重复 envs import，保留内部 ring-overlap 选择 |
+
+功能验收范围为本次用户指定的 DSV4 纯 TP8；其他模型、PD、CP、MTP 只完成代码与静态审查。

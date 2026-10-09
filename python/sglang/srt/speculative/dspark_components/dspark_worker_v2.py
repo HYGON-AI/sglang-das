@@ -10,6 +10,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
@@ -297,9 +298,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
 
         parallel = get_parallel()
-        self._tp_sync = SpecTpSync(
-            parallel.attn_tp_group if parallel.attn_dp_enabled else parallel.tp_group
-        )
+        self._tp_sync = SpecTpSync(get_dp_tp_group())
         self._draft_graph_group = (
             parallel.attn_tp_group
             if self._draft_dp_context_enabled

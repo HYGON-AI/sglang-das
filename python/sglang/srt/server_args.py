@@ -38,14 +38,21 @@ from sglang.srt.arg_groups.argparse_actions import (
 )
 from sglang.srt.arg_groups.model_override_base import ep_joiner_of, ep_scale_joiner_of
 from sglang.srt.arg_groups.overrides import (
+    model_config_of,
     remote_instance_transfer_engine_of,
     resolution_projection,
     resolving_view,
+)
+from sglang.srt.arg_groups.validation_hook import (
+    validate_mps_model_config,
+    validate_standard_mps_server_args,
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.hardware_backend.mps.runtime import validate_mps_runtime
 from sglang.srt.runtime_context import (
     attn_dp_enabled_of,
     get_context,
@@ -54,7 +61,11 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
-from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    get_free_port_below_ephemeral,
+    wait_port_available,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -276,8 +287,38 @@ class ServerArgs:
         # that still writes the record (`declare_direct_writes`, for
         # out-of-tree platform plugins) asks for the seal to be lifted by name.
         self._input_frozen = True
+
         try:
+            # Validate Torch MPS before model resolution; MLX has its own gate.
+            # Platform detection covers the usual omitted --device on macOS.
+            if not use_mlx():
+                requested_device = getattr(self, "device", None)
+                explicitly_mps = (
+                    requested_device is not None
+                    and str(requested_device).split(":", 1)[0] == "mps"
+                )
+                if explicitly_mps or (
+                    requested_device is None and get_platform().is_mps
+                ):
+                    validate_mps_runtime()
+
             run_resolution_pipeline(self)
+
+            # Validate resolved arguments and checkpoint-derived constraints.
+            cfg = resolving_view(self)
+            if (
+                cfg.device == "mps"
+                and not use_mlx()
+                and str(cfg.model_path).lower() not in ("none", "dummy")
+            ):
+                validate_standard_mps_server_args(self)
+                lora_enabled = bool(cfg.enable_lora) or (
+                    cfg.enable_lora is None and bool(cfg.lora_paths)
+                )
+                validate_mps_model_config(
+                    model_config_of(self),
+                    lora_enabled=lora_enabled,
+                )
         except BaseException:
             self._resolution_failed = True
             raise
@@ -302,7 +343,9 @@ class ServerArgs:
         `model_config` memo are not fields and do not appear.
         """
 
-        return resolution_projection(self)
+        resolved = resolution_projection(self)
+        resolved["enable_dp_attention"] = resolving_view(self).attn_dp_size > 1
+        return resolved
 
     def replace_resolved(self, source: str, **changes: Any) -> ServerArgs:
         """A copy of this record that stays resolved, and says what it changed.
@@ -537,7 +580,7 @@ class ServerArgs:
             help="Deprecated. Use --cuda-graph-backend-{decode,prefill}=disabled instead.",
         )
         # `enable_dp_attention` is `no_cli=True` too; resolution turns it into
-        # `attn_dp_size`.
+        # `attn_dp_size`. TODO: remove the flag and the field after 2026-12-31.
         parser.add_argument(
             "--enable-dp-attention",
             action=DeprecatedStoreTrueAction,
@@ -944,7 +987,8 @@ class PortArgs:
     ) -> PortArgs:
         cfg = resolving_view(server_args)
         if server_args.nccl_port is None:
-            nccl_port = get_free_port()
+            # The scheduler child binds this later; keep it out of the ephemeral range.
+            nccl_port = get_free_port_below_ephemeral()
         else:
             nccl_port = server_args.nccl_port
 

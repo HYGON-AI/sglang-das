@@ -62,7 +62,7 @@ try:
     ):
         if simulated_ep != 1:
             raise NotImplementedError(
-                "simulated_ep routing is not supported with triton_kernels 3.7.1"
+                "simulated_ep routing is not supported with triton_kernels"
             )
 
         if sm_first:
@@ -2619,6 +2619,11 @@ def _post_process_topk_ids(
     )
     capture_routed_experts_if_allowed(topk_config, layer_id, routed_topk_ids)
     recorder_topk_ids = None
+    _aiter_append = (
+        num_fused_shared_experts > 0
+        and _use_aiter
+        and topk_ids.shape[-1] < topk_config.top_k
+    )
     _fold_pad_into_append = False
     recorder_was_fused = False
     # HCU W8A8 deployments can select DeepGEMM through the legacy env while
@@ -2629,6 +2634,7 @@ def _post_process_topk_ids(
         and (get_moe_runner_backend().is_deep_gemm() or _use_deepgemm_moe)
     )
     hip_deepep_postprocessed = False
+    _fold_pad_weights_into_append = False
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
@@ -2679,6 +2685,7 @@ def _post_process_topk_ids(
         # omit padded tokens, matching the pre-forward-port behavior.
         # Regression: skipping this mask when EPLB is disabled caused garbage
         # MoE routing for models like DeepSeek-R1-MXFP4 (accuracy ~0.09 vs 0.94+).
+        eplb_remap_enabled = _eplb_remap_enabled()
         remap_info = expert_location_dispatch_info if _eplb_remap_enabled() else None
         if skip_deepep_padded_tokens and not use_per_rank_shared_slots:
             # DeepEP disables shared-expert fusion by default. On that main HCU
@@ -2716,20 +2723,20 @@ def _post_process_topk_ids(
             )
             hip_deepep_postprocessed = True
         else:
-            # The fused append+remap kernel can fold the padded fill into its
-            # existing launch on the aiter per-rank shared-slot path.
+            # Let append kernels materialize padded ids when remapping is disabled.
+            eplb_remap_enabled = _eplb_remap_enabled()
             _fold_pad_into_append = (
-                not skip_deepep_padded_tokens
-                and num_fused_shared_experts > 0
-                and _use_aiter
-                and use_per_rank_shared_slots
-                and remap_info is None
+                _aiter_append
+                and not eplb_remap_enabled
+                and (use_per_rank_shared_slots or not _skip_hip_pad_mask)
+            )
+            _fold_pad_weights_into_append = (
+                _fold_pad_into_append and not use_per_rank_shared_slots
             )
         if not skip_deepep_padded_tokens and not _fold_pad_into_append:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         if (
-            _is_hip
-            and envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
+            envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
             and envs.SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD.get()
             and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
             and layer_id is not None
@@ -2765,14 +2772,6 @@ def _post_process_topk_ids(
         recorder_topk_ids = (
             topk_ids[:, :-num_fused_shared_experts] if _gate_appended else topk_ids
         )
-
-    # The JIT grouped router and the ROCm decode gate emit the shared slots themselves;
-    # appending again would write the shared id twice and evict a real routed expert.
-    _aiter_append = (
-        num_fused_shared_experts > 0
-        and _use_aiter
-        and topk_ids.shape[-1] < topk_config.top_k
-    )
 
     if _aiter_append and use_per_rank_shared_slots:
         # Fused path: append shared experts AND apply the per-rank shared-slot
@@ -2816,7 +2815,7 @@ def _post_process_topk_ids(
             ),
         )
     elif _aiter_append:
-        M, N = router_logits.shape
+        N = router_logits.shape[1]
         scale_factor = (
             1.0
             if fused_shared_experts_scaling_factor is None
@@ -2834,6 +2833,9 @@ def _post_process_topk_ids(
             num_fused_shared_experts,
             scale_factor,
             N,  # base id for shared experts
+            num_token_non_padded=(
+                num_token_non_padded if _fold_pad_weights_into_append else None
+            ),
         )
 
     elif use_per_rank_shared_slots:
@@ -2864,7 +2866,7 @@ def _post_process_topk_ids(
         # Apply this after shared-expert remapping so every padded route,
         # including appended shared slots, is omitted by DeepEP dispatch.
         _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=-1)
-    elif _is_hip and not skip_deepep_padded_tokens and not _skip_hip_pad_mask:
+    elif _is_hip and not skip_deepep_padded_tokens and not _skip_hip_pad_mask and not _fold_pad_weights_into_append:
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.

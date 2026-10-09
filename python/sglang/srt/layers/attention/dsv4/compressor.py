@@ -50,6 +50,7 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.models.deepseek_v2 import _use_aiter
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     add_prefix,
@@ -69,6 +70,9 @@ _use_dpskv4_lightop_quant_k_cache = get_bool_env_var(
 if _is_hcu:
     from lightop import op
 
+
+if _use_aiter:
+    from aiter.tuned_gemm import tgemm
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -687,6 +691,9 @@ class Compressor(BaseFusedOp):
     def _compute_wkv_gate(self, x: torch.Tensor) -> torch.Tensor:
         weight = getattr(self.wkv_gate, "weight", None)
         if weight is not None:
+            if _use_aiter and weight.dtype == torch.bfloat16:
+                # aiter's tuned GEMM for these shapes; kv_score is bf16-rounded
+                return tgemm.mm(x, weight, otype=x.dtype).float()
             return linear_bf16_fp32(x, weight)
 
         from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf

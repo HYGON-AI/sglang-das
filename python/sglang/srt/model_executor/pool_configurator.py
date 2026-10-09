@@ -22,6 +22,7 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     get_dsa_full_indexer_layer_ids,
     get_dsa_index_head_dim,
+    get_dsa_index_kpool,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
@@ -616,6 +617,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             index_head_dim,
         )
         index_k_bytes = index_k_cache_bytes_per_token(cache_mode)
+        if not _is_hcu:
+            index_k_bytes = ceil_div(index_k_bytes, get_dsa_index_kpool(kvc.model_config.hf_config))
         if _is_npu:
             from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
@@ -740,9 +743,10 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             )
             if is_deepseek_dsa(model_config.hf_config):
                 index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
-                index_elements = (
+                index_elements = ceil_div(
                     index_head_dim
-                    + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+                    + index_head_dim // DSATokenToKVPool.quant_block_size * 4,
+                    get_dsa_index_kpool(model_config.hf_config),
                 )
                 self._full_per_token += index_elements * torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype

@@ -28,10 +28,11 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
     is_dense_ffn_fully_dp,
-    make_stages,
+    layer_stack,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -101,7 +102,6 @@ class MiMoV2MTPLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
         )
         self.is_layer_sparse = False
-        is_previous_layer_sparse = True
         is_next_layer_sparse = False
 
         if is_dense_ffn_fully_dp():
@@ -123,7 +123,7 @@ class MiMoV2MTPLayer(nn.Module):
             config.hidden_size, eps=config.layernorm_epsilon
         )
 
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -132,12 +132,6 @@ class MiMoV2MTPLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == 1 - 1,
         )
 
     def forward(
@@ -188,12 +182,13 @@ class MiMoV2ModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
-        self.mtp_block = MiMoV2MTPLayer(
-            config,
-            0,
-            quant_config=quant_config,
-            prefix=add_prefix("decoder", prefix),
-        )
+        with layer_stack():
+            self.mtp_block = MiMoV2MTPLayer(
+                config,
+                0,
+                quant_config=quant_config,
+                prefix=add_prefix("decoder", prefix),
+            )
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
 
     def forward(

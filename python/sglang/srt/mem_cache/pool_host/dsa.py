@@ -109,9 +109,15 @@ def make_dsa_indexer_pool_decl(
     pool: DSATokenToKVPool, *, name: PoolName = PoolName.INDEXER
 ) -> HostPoolDecl:
     """Index key buffers riding on the full-KV pages: indices and layout both follow KV."""
-    storage_bytes = dsa_indexer_bytes_per_token_per_layer(
-        index_head_dim=pool.index_head_dim, quant_block_size=pool.quant_block_size
+    index_page_bytes = pool.slots_per_page * dsa_indexer_bytes_per_token_per_layer(
+        index_head_dim=pool.index_head_dim,
+        quant_block_size=pool.quant_block_size,
     )
+    assert index_page_bytes % pool.page_size == 0, (
+        f"index page of {index_page_bytes} bytes does not split over "
+        f"page_size={pool.page_size} tokens"
+    )
+    storage_bytes = index_page_bytes // pool.page_size
     if _is_hcu:
         from sglang.srt.mem_cache.pool_host.glm5_next import is_hcu_glm_pool, index_bytes_per_page
         if is_hcu_glm_pool(pool):
