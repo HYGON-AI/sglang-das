@@ -1165,7 +1165,7 @@ class SchedulerDisaggregationPrefillMixin:
             sender.abort()
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, is_insert=False)
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
         req.pending_bootstrap = False
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
@@ -2043,7 +2043,8 @@ class SchedulerDisaggregationPrefillMixin:
             elif poll == KVPoll.Success:  # transfer done
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
+                # unlock the tree
+                release_kv_cache(req, self.tree_cache, checkpoint=True)
                 self.tree_cache.finish(
                     req.cache_request_handle, CacheRequestOutcome.SUCCESS
                 )
@@ -2125,7 +2126,8 @@ class SchedulerDisaggregationPrefillMixin:
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if req.finished_reason is None:
             req.finished_reason = FINISH_LENGTH(length=0)
-        release_kv_cache(req, self.tree_cache)  # unlock the tree
+        # unlock the tree
+        release_kv_cache(req, self.tree_cache, checkpoint=True)
         self._release_aborted_request(req)
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
@@ -2196,7 +2198,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.pending_bootstrap = False
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, is_insert=False)
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
         return True
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
@@ -2218,7 +2220,7 @@ class SchedulerDisaggregationPrefillMixin:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, is_insert=False)
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
         maybe_release_metadata_buffer(
             req,
             self.req_to_metadata_buffer_idx_allocator,
@@ -2662,7 +2664,7 @@ class SchedulerDisaggregationPrefillMixin:
         self._release_aborted_request(req)
         # The checkpoint above already handed the prefill KV to the tree; the
         # request is not finished, so the release only frees the rest.
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        release_kv_cache(req, self.tree_cache, checkpoint=False)
         req.reset_for_retract()
         req.output_ids = array("q")
         req.start_send_idx = 0

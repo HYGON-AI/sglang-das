@@ -53,7 +53,7 @@ _W4A8_OVERLAP_STREAMS: dict = {}
 _MEGA_MOE_DG_ENV_APPLIED = False
 _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT: Optional[Any] = None
 _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT_CHECKED = False
-_IS_HCU = is_hcu()
+_is_hcu = is_hcu()
 
 _HCU_MEGA_MOE_RUNTIME_DEEP_GEMM = "deep_gemm"
 _HCU_MEGA_MOE_RUNTIME_MEGAMOE = "megamoe"
@@ -80,7 +80,7 @@ def _disable_hcu_megamoe_asm_tail_reduce_default() -> None:
     setting it from the later CP dispatch selection is too late for decode graph
     capture. An explicit user value retains precedence.
     """
-    if not _IS_HCU:
+    if not _is_hcu:
         return
     if get_hcu_mega_moe_runtime() != _HCU_MEGA_MOE_RUNTIME_MEGAMOE:
         return
@@ -101,7 +101,7 @@ _disable_hcu_megamoe_asm_tail_reduce_default()
 
 
 def _is_standalone_megamoe_runtime() -> bool:
-    return _IS_HCU and get_hcu_mega_moe_runtime() == _HCU_MEGA_MOE_RUNTIME_MEGAMOE
+    return _is_hcu and get_hcu_mega_moe_runtime() == _HCU_MEGA_MOE_RUNTIME_MEGAMOE
 
 
 def _is_pd_prefill_instance() -> bool:
@@ -275,13 +275,19 @@ def _use_amd_flydsl_mega_moe() -> bool:
     # aiter MegaMoEv2 exists only on ROCm; the platform check keeps the env from
     # diverting a CUDA run into a path whose kernels it does not have. HCU reports
     # as HIP but has neither those kernels; it runs its own MegaMoE runtimes.
-    return _is_hip and not _IS_HCU and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
+    return _is_hip and not _is_hcu and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
 
 
-def _mega_moe_mma_type(experts=None) -> str:
-    if experts is not None and experts._mega_moe_nvfp4:
+def _mega_moe_mma_type(experts) -> str:
+    if _is_hcu:
+        # HCU W4A8 experts predate upstream per-layer NVFP4/W4A4 flags.
+        return "nvfp4xnvfp4" if getattr(experts, "_mega_moe_nvfp4", False) else (
+            "mxf4xmxf4" if getattr(experts, "_mega_moe_w4a4", False) else "fp8xfp4"
+        )
+    if experts._mega_moe_nvfp4:
         return "nvfp4xnvfp4"
-    return "mxf4xmxf4" if get_exec().moe.enable_w4a4_mxfp4_megamoe else "fp8xfp4"
+    # Per layer: a draft may differ from the target (draft_model_build_scope).
+    return "mxf4xmxf4" if experts._mega_moe_w4a4 else "fp8xfp4"
 
 
 @functools.lru_cache(maxsize=1)
@@ -343,16 +349,13 @@ def _get_mega_moe_symm_buffer(
     hidden: int,
     intermediate_hidden: int,
     num_shared_experts: int = 0,
-    mma_type: Optional[str] = None,
     *,
+    mma_type: str,
     runtime: str = _HCU_MEGA_MOE_RUNTIME_DEEP_GEMM,
     cuda_graph_max_tokens_per_rank: Optional[int] = None,
     quant_mode: str = "fp8",
 ) -> SymmBuffer:
-    if mma_type is None:
-        mma_type = _mega_moe_mma_type()
-
-    if _IS_HCU and runtime == _HCU_MEGA_MOE_RUNTIME_MEGAMOE:
+    if _is_hcu and runtime == _HCU_MEGA_MOE_RUNTIME_MEGAMOE:
         import megamoe
 
         package_key = _HCU_MEGA_MOE_RUNTIME_MEGAMOE
@@ -414,7 +417,7 @@ def _get_mega_moe_symm_buffer(
 def is_mega_moe_experts_ready(experts) -> bool:
     if not getattr(experts, "_mega_moe_weights_built", False):
         return False
-    if _IS_HCU:
+    if _is_hcu:
         # The HCU runtimes are not gated on a CUDA compute capability;
         # should_use_mega_moe() checks the built runtime instead.
         return True
@@ -436,7 +439,7 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         return False
     if not is_mega_moe_experts_ready(moe.experts):
         return False
-    if _IS_HCU:
+    if _is_hcu:
         runtime = get_hcu_mega_moe_runtime()
         built_runtime = getattr(moe.experts, "_mega_moe_hcu_runtime", None)
         if built_runtime != runtime:
@@ -448,7 +451,7 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     if get_is_capture_mode():
         if getattr(moe.experts, "_mega_moe_hcu_int4_weights", False):
             raise RuntimeError("HCU INT4 MegaMoE requires --disable-cuda-graph")
-        return not _IS_HCU or _is_standalone_megamoe_runtime()
+        return not _is_hcu or _is_standalone_megamoe_runtime()
 
     global_num_tokens = get_dp_global_num_tokens()
     if global_num_tokens and not is_dsa_enable_prefill_cp():
@@ -491,7 +494,7 @@ def forward_mega_moe(
     is_w4a8 = getattr(moe.experts, "_mega_moe_hcu_w4a8_weights", False)
     eager_w4a8_overlap = (
         is_w4a8
-        and _IS_HCU
+        and _is_hcu
         and hidden_states.is_cuda
         and os.getenv("SGLANG_HCU_W4A8_SHARED_OVERLAP", "0") == "1"
         and forward_batch is not None
@@ -506,7 +509,7 @@ def forward_mega_moe(
             _W4A8_OVERLAP_STREAMS[device] = torch.cuda.Stream(device=device)
         overlap_stream = _W4A8_OVERLAP_STREAMS[device]
 
-    fused_shared = not _IS_HCU and moe.mega_shared_l1_weights is not None
+    fused_shared = not _is_hcu and moe.mega_shared_l1_weights is not None
     fork_mega_moe = (
         overlap_stream is not None
         and (fused_shared or moe.num_fused_shared_experts == 0)
@@ -590,7 +593,7 @@ def _run_mega_routed(
         topk_weights = None
 
     activation_clamp = moe.experts.moe_runner_config.swiglu_limit
-    if _IS_HCU and activation_clamp is None:
+    if _is_hcu and activation_clamp is None:
         activation_clamp = getattr(moe.config, "swiglu_limit", None)
 
     return run_mega_routed_experts(
@@ -647,7 +650,7 @@ def run_mega_routed_experts(
         f"--cuda-graph-max-bs-decode / --chunked-prefill-size accordingly"
     )
 
-    if _IS_HCU:
+    if _is_hcu:
         runtime = get_hcu_mega_moe_runtime()
         # The a2a is sized by the widest rank, not by our own row count. CP has
         # already split the padded prefill batch across attention ranks, so the
@@ -695,7 +698,7 @@ def run_mega_routed_experts(
         ),
     )
 
-    if _IS_HCU:
+    if _is_hcu:
         is_w4a8 = getattr(experts, "_mega_moe_hcu_w4a8_weights", False)
         if is_w4a8:
             y = _run_standalone_hcu_w4a8_mega_moe(
@@ -979,7 +982,7 @@ def build_hcu_w4a8_mega_moe_experts_weights(experts) -> None:
 
     if getattr(experts, "_mega_moe_weights_built", False):
         return
-    if not _IS_HCU or get_hcu_mega_moe_runtime() != "megamoe":
+    if not _is_hcu or get_hcu_mega_moe_runtime() != "megamoe":
         raise ValueError("W4A8 MegaMoE requires HCU and SGLANG_HCU_MEGA_MOE_RUNTIME=megamoe")
     if get_exec().moe.enable_eplb:
         raise ValueError("W4A8 MegaMoE supports offline EPLB via --init-expert-location; online EPLB is unsupported")
@@ -1074,7 +1077,7 @@ def build_mega_moe_experts_weights(experts) -> None:
     if getattr(experts, "_mega_moe_weights_built", False):
         return
 
-    mma_type = _mega_moe_mma_type()
+    mma_type = _mega_moe_mma_type(experts)
     w13 = experts.w13_weight.data
     w13_sf_fp32 = experts.w13_weight_scale_inv.data
     w2 = experts.w2_weight.data

@@ -32,7 +32,7 @@ from sglang.srt.eplb.expert_distribution import (
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layer_boundary import (
-    declare_attn, declare_ffn, make_stages,
+    declare_attn, declare_ffn, append_stages,
 )
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
@@ -866,13 +866,10 @@ class HYV3DecoderLayer(nn.Module):
                 and layer_id + 1 >= first_k_dense_replace
             )
 
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
-            (declare_ffn(sparse=is_layer_sparse, next_sparse=is_next_layer_sparse),
+            (declare_ffn(sparse=is_layer_sparse, next_layer_sparse=is_next_layer_sparse),
              self.post_attention_layernorm),
-            previous=declare_ffn(sparse=is_previous_layer_sparse, next_sparse=is_layer_sparse)
-            if layer_id != 0 else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(

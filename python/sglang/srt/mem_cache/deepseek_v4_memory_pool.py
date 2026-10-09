@@ -34,6 +34,9 @@ from sglang.kernels.ops.attention.dsv4.kv_layout import (
     KVLayout,
     is_valid_kv_layout_pair,
 )
+from sglang.kernels.ops.attention.dsv4.kv_norm_rope_store import (
+    fused_k_norm_rope_uniform_fp8,
+)
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import layout
 from sglang.kernels.ops.kvcache.mla_buffer import (
     set_mla_kv_buffer_triton,
@@ -52,11 +55,12 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.runtime_context import get_exec, get_platform, get_spec
-from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
+from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hcu, is_hip
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
+_is_hcu = is_hcu()
 
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
@@ -189,6 +193,11 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     AITER attention."""
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
+    if get_exec().kernel.dsv4_attn_backend == "trtllm":
+        assert mode in ("auto", "v4") and option in ("auto", "fp8"), (
+            "trtllm uses uniform FP8 pools, not the packed V4.1 KV layouts"
+        )
+        return KVLayout.V4, None
     if mode == "v4":
         return KVLayout.V4, None if option == "auto" else option
     assert mode in ("v41", "auto"), f"unknown SGLANG_DSV4_KV_LAYOUT={mode!r}"
@@ -626,6 +635,7 @@ class DeepSeekV4IndexerPool(KVCache):
             end_layer,
         )
         self.index_head_dim = index_head_dim
+        self.index_page_size = self.page_size
         self.global_page_size = global_page_size or page_size
         if use_fp4_indexer is None:
             use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
@@ -2230,9 +2240,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         q: Optional[torch.Tensor] = None,
     ) -> None:
         """q ([B, H, head_dim]): rope its query heads in the same launch."""
-        if self.uniform_fp8:
-            assert q is None, "uniform FP8 store does not fuse query RoPE"
-        if self.is_bf16_attention_kv_cache or self.uniform_fp8:
+        if _is_hcu and self.is_bf16_attention_kv_cache:
             # Uniform-FP8 (trtllm-gen): in-place norm + RoPE (kv is not read again),
             # then an e4m3 cast + scatter with per-tensor scale 1.0.
             from sglang.kernels.ops.attention.deepseek_v4_rope import (
@@ -2248,6 +2256,18 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             )
             self.swa_kv_pool.set_key_buffer_fused(
                 self._swa_local_layer_id(layer_id), swa_loc, kv
+            )
+            return
+        if self.uniform_fp8:
+            assert q is None, "uniform FP8 store does not fuse query RoPE"
+            fused_k_norm_rope_uniform_fp8(
+                kv,
+                kv_weight,
+                eps,
+                freqs_cis,
+                positions,
+                swa_loc,
+                self.swa_kv_pool.get_key_buffer(self._swa_local_layer_id(layer_id)),
             )
             return
         fused_k_norm_rope_flashmla(

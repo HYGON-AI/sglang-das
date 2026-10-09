@@ -3,6 +3,9 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Optional, Protocol
+from sglang.srt.utils import is_hcu
+
+_is_hcu = is_hcu()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -34,8 +37,7 @@ class DsaGraphVariants:
         if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
             # Plain decode maintains this host mirror without a D2H sync.
             max_kv_len = int(seq_lens_cpu.max().item())
-        elif forward_batch.seq_lens is not None and forward_batch.seq_lens.numel() > 0:
-            # Fallback: a single scalar reduction d2h (cheap, per-step).
+        elif not _is_hcu and forward_batch.seq_lens is not None and forward_batch.seq_lens.numel() > 0:
             max_kv_len = int(forward_batch.seq_lens.max().item())
         else:
             # No length info: be safe and use the correct-for-all sparse graph.
@@ -49,7 +51,12 @@ def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariant
         get_dsa_index_topk,
         is_deepseek_dsa,
     )
-    from sglang.srt.utils import is_hip
+    from sglang.srt.utils import is_hcu, is_hip
+    _is_hcu = is_hcu()
+    if _is_hcu:
+        from sglang.srt.layers.attention.glm5_next import is_glm5_next_hcu
+        if is_glm5_next_hcu(hf_config):
+            return None
 
     if is_hip() and is_deepseek_dsa(hf_config):
         # KPool has no dense-skip path: both variants run the full indexer.

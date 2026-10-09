@@ -220,3 +220,34 @@
 | `python/sglang/multimodal_gen/runtime/layers/attention/layer.py` | 自动合并审查：清理重复 envs import，保留内部 ring-overlap 选择 |
 
 功能验收范围为本次用户指定的 DSV4 纯 TP8；其他模型、PD、CP、MTP 只完成代码与静态审查。
+
+## Step 05：官方增量 431–530
+
+- 官方终点：`c389cbaf99e1b1ddd77005c9107bb3dae7bb89d7`；初始冲突 18 文件。
+- 状态：compile、diff-check、相对双方 F821/F811/F722 通过；最终 DSV4 纯 TP8 运行精度 pending。
+- 证据：`/home/proj_sglang_open/sync-evidence/20261009/step-05/`。
+
+| 文件 | 决策与保留内容 |
+|---|---|
+| `.codespellrc` | 合并拼写白名单 |
+| `.github/workflows/release-docker-amd-miles-rocm10-nightly.yml` | 采用官方 nightly 工作流手动构建参数 |
+| `docs/src/snippets/configs/zai-org/glm-5.2.jsx` | 采用官方 ROCm GLM 配方并统一 LF |
+| `python/sglang/srt/arg_groups/fields/spec.py` | 内部 Annotated 元数据与官方 argparse 兼容 action 并存 |
+| `python/sglang/srt/disaggregation/decode.py` | 采用官方 lazy Mamba 初始 slot 计数；保留释放 prefix lock 后重置 root receipt；排队重试释放迁移 TreeLock/unlock，清空 req.lock 防重复释放 |
+| `python/sglang/srt/disaggregation/mooncake/conn.py` | 保留 HCU PD hidden source_event 与 packet metadata，加入官方早发 cached-prefix wait_event |
+| `python/sglang/srt/disaggregation/prefill.py` | 采用 release checkpoint=False；保留 HCU hidden pool metadata 释放 |
+| `python/sglang/srt/layers/attention/dsa/dsa_indexer.py` | gfx1250 wave32 官方路径与 HCU BF16/INT8 专属 writer 都跳过不适用 act_quant |
+| `python/sglang/srt/layers/attention/dsa_backend.py` | 新增官方 Triton sparse MLA backend；保留 HCU sorted topk 复用 |
+| `python/sglang/srt/layers/moe/mega_moe.py` | 保留显式 HCU standalone/deep_gemm 双 runtime 和 buffer key；官方 MMA type 接口由调用者传入 |
+| `python/sglang/srt/managers/scheduler_components/dp_attn.py` | 保留 PD decode epoch callback；加入官方 sync-wait carry 指标 |
+| `python/sglang/srt/mem_cache/common.py` | 官方 skip-insert prefix resume 与内部 DSV4 prompt-once donation 共用 checkpoint |
+| `python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py` | 官方 uniform FP8 fused norm/rope/store；HCU BF16 独立保持现有 two-step 写入 |
+| `python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py` | 保留 HCU packed-draft layer map 与 GLM Mamba page_first host layout；generic kv_split 用 direct；声明工厂统一拥有 packed draft 映射及 indexer entry，移除重复旧拼装，预算读取 root.packed_draft_device_pools |
+| `python/sglang/srt/mem_cache/memory_pool.py` | HCU 活跃索引层及物理 page 维持；slots_per_page 随官方改名 index_page_size |
+| `python/sglang/srt/mem_cache/unified_radix_cache.py` | 插入时采用官方 tree-only walk；保留 DSV4 full-only leaf 匹配 |
+| `python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py` | 完整核对 current-vs-base 差异后迁移官方 AttentionGraphVariants/graph ABI；保留 _is_hcu pre-head capture、MegaMoE token count 与 output info |
+| `python/sglang/srt/layers/attention/graph_variants.py` | HCU GLM 排除 AMD DSA dual graph；无 CPU 长度镜像时选择 sparse，避免 replay D2H 同步 |
+| `python/sglang/srt/models/deepseek_v4.py` | 官方 mHC state machine/post dispatch；HCU TileLang post、deferred repeat/CP split 与 local capture 层集保留 |
+| `python/sglang/srt/models/hunyuan_v3.py` | 补上 Step04 自动合并语义审查：HYV3 stage 构造使用官方 layer_stack 内的 append_stages 与 next_layer_sparse |
+
+功能验收范围为本次用户指定的 DSV4 纯 TP8；其他模型、PD、CP、MTP 只完成代码与静态审查。

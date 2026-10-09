@@ -89,12 +89,14 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
+from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
-    DecLockRefParams,
     EvictParams,
+    TreeLock,
 )
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
@@ -158,7 +160,7 @@ def _bind_root_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
     req.last_node = tree_cache.root_node_handle(req.extra_key)
     req.last_host_node = req.last_node
     req.best_match_node = req.last_node
-    req.lock_receipt = DecLockRefParams()
+    req.lock = None
     req.kv.cache_protected_len = 0
     req.kv.cache_inserted_len = 0
     req.num_matched_prefix_tokens = 0
@@ -306,15 +308,20 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             pre_alloc_size=pre_alloc_size,
         )
 
-        self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
+        self.mamba_ping_pong_track_buffer_size = get_mamba_tracking_slots(
+            extra_buffer=True, overlap=enable_overlap_schedule
+        )
+        self.mamba_initial_tracking_slots = get_mamba_tracking_slots(
+            extra_buffer=enable_mamba_extra_buffer,
+            overlap=enable_overlap_schedule,
+            lazy=False,
+        )
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
         _pre_alloc = pre_alloc_size if pre_alloc_size is not None else 0
         # Each request needs 1 main mamba slot + ping-pong slots when extra_buffer is enabled.
         # Cap the pool at max concurrent requests * slots_per_req to avoid allocating failed.
-        slots_per_req = 1 + (
-            self.mamba_ping_pong_track_buffer_size if enable_mamba_extra_buffer else 0
-        )
+        slots_per_req = 1 + self.mamba_initial_tracking_slots
         max_slots_needed = (size + _pre_alloc) * slots_per_req
         if mamba_size is not None:
             effective_mamba_size = max(mamba_size, max_slots_needed)
@@ -375,9 +382,8 @@ class DecodeRequest:
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
     hicache_restored_kv_indices: Optional[torch.Tensor] = None
-    hicache_restored_node: Any = None
-    # Receipt for the inc_lock_ref held on hicache_restored_node.
-    hicache_restore_lock_receipt: Optional[DecLockRefParams] = None
+    # The lock held on the restored node until the commit hands it to the req.
+    hicache_restore_lock: Optional[TreeLock] = None
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
 
@@ -531,25 +537,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     def _release_matched_prefix_lock(self, req: Req) -> None:
-        if req.swa_prefix_lock_released:
-            self.tree_cache.dec_lock_ref(req.last_node, req.lock_receipt, skip_swa=True)
-            req.swa_prefix_lock_released = False
-        else:
-            self.tree_cache.dec_lock_ref(req.last_node, req.lock_receipt)
-
-        # Capacity backpressure releases the match but keeps the request queued
-        # for a later retry, which does not re-match. Anything that later walks
-        # this request's lock (cache_unfinished_req, incl. the DSV4 prompt
-        # donation) would then drop a lock the request no longer owns. Repoint
-        # it at the root -- the same node a miss yields -- so that dec is a
-        # no-op, and clear the lock metadata that described the released node.
-        if not self.tree_cache.is_chunk_cache():
-            req.last_node = self.tree_cache.root_node_handle(
-                extra_key=getattr(req, "extra_key", None)
-            )
-        # The target branch stores the exact acquire receipt on the request.
-        # A later cache path must not try to release the old matched node again.
-        req.lock_receipt = DecLockRefParams()
+        # TreeLock owns the receipt, including any already released SWA tail.
+        self.tree_cache.unlock(req.lock)
+        req.lock = None
+        # A queued retry may still donate the prefix; it no longer owns a match.
+        req.last_node = self.tree_cache.root_node_handle(
+            extra_key=getattr(req, "extra_key", None)
+        )
 
     def _reclaim_swa_tail_capacity(
         self, swa_tail_len: int, req_id: str, *, full_len: int = 0
@@ -943,7 +937,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 pass
         req = decode_req.req
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, is_insert=False)
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
         transfer_queue = getattr(self, "transfer_queue", None)
         if transfer_queue is not None:
             transfer_queue._release_pd_hidden_rows(decode_req)
@@ -1041,12 +1035,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return_full_match=self._uses_dsv4_decode_radix_cache(),
             max_prefix_len=max_prefix_len,
         )
-        # Keep aggregated scheduling semantics while preserving the SWA lock
-        # boundary needed for the matching dec_lock_ref; the full receipt
-        # travels on the req so every later release mirrors this acquire.
-        req.lock_receipt = self.tree_cache.inc_lock_ref(
-            result.last_device_node
-        ).to_dec_params()
+        req.lock = self.tree_cache.lock(result.last_device_node)
         return self._build_decode_prefix_match(
             req, result, max_prefix_len=max_prefix_len
         )
@@ -1220,6 +1209,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 continue
 
             if self.req_to_token_pool.available_size() <= 0:
+                break
+
+            if not ensure_mamba_capacity(
+                self.req_to_token_pool, [req], self.tree_cache
+            ):
                 break
 
             full_required, swa_required = self._prealloc_required_tokens(req)
@@ -1642,16 +1636,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
-            # Hybrid models (e.g. K3 with KDA): guard against prealloc
-            # draining the mamba pool before the KV pool (would assert "Not
-            # enough space for mamba cache"). Evict a cached mamba slot from
-            # the radix tree first (a no-op with the radix cache disabled),
-            # else stop.
-            mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
-            if mamba_allocator is not None and mamba_allocator.available_size() <= 0:
-                self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                if mamba_allocator.available_size() <= 0:
-                    break
+            # Reserve enough Mamba capacity for radix COW and tracking buffers
+            # before prefix matching can bind state or lock cached entries.
+            if not ensure_mamba_capacity(
+                self.req_to_token_pool, [decode_req.req], self.tree_cache
+            ):
+                break
 
             if hisparse_req_budget <= 0:
                 break
@@ -1693,12 +1683,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if (
                     uses_swa_tail_prealloc
                     and prefix_match.l1_prefix_len > 0
-                    and hasattr(self.tree_cache, "dec_swa_lock_only")
+                    and hasattr(self.tree_cache, "release_swa")
                 ):
-                    self.tree_cache.dec_swa_lock_only(
-                        decode_req.req.last_node, decode_req.req.lock_receipt
-                    )
-                    decode_req.req.swa_prefix_lock_released = True
+                    self.tree_cache.release_swa(decode_req.req.lock)
 
                 dsv4_safe_prefix_len = self._dsv4_safe_prefix_len(prefix_len)
                 if dsv4_safe_prefix_len < prefix_len:
@@ -1771,7 +1758,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 swa_allocatable_tokens=swa_allocatable_tokens,
             ):
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
-                    self._release_matched_prefix_lock(decode_req.req)
+                    self.tree_cache.unlock(decode_req.req.lock)
+                    decode_req.req.lock = None
                 break
 
             if swa_allocatable_tokens is not None:
@@ -1782,7 +1770,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
                 if reclaim_error is not None:
                     if prefix_match is not None and prefix_match.l1_prefix_len > 0:
-                        self._release_matched_prefix_lock(decode_req.req)
+                        self.tree_cache.unlock(decode_req.req.lock)
+                        decode_req.req.lock = None
                     logger.error(reclaim_error)
                     prepare_abort(
                         decode_req.req,
@@ -2321,7 +2310,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ]
             for decode_req in failed_reqs:
                 if decode_req.req.kv.holds_mamba and not decode_req.req.kv.holds_kv:
-                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                    release_kv_cache(decode_req.req, self.tree_cache, checkpoint=False)
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -2832,6 +2821,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             prefix_indices if prefix_len > 0 else torch.empty((0,), dtype=torch.int64)
         )
         req.set_extend_range(total_prefix_len, req.kv.kv_committed_len)
+        self.tree_cache.maybe_hand_to_session(req)
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:
@@ -3157,7 +3147,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.kv_receiver = None
         req = decode_req.req
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, is_insert=False)
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
         self._release_pd_hidden_rows(decode_req)
         self._free_metadata_buffer(decode_req)
 
@@ -3600,7 +3590,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             discard_kv_cache_backup(decode_req.req, self.tree_cache, "host_pool")
             if decode_req.host_staged:
                 return
-        release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+        release_kv_cache(decode_req.req, self.tree_cache, checkpoint=False)
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
@@ -4138,7 +4128,7 @@ class SchedulerDisaggregationDecodeMixin:
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
         )
         self.output_streamer.stream_output([req], req.return_logprob)
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        release_kv_cache(req, self.tree_cache, checkpoint=False)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
 
