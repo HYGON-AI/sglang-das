@@ -98,7 +98,6 @@ def _run_tp4_parity(local_rank: int, world_size: int, master_port: int) -> None:
             actual = offloaded(ids)
 
             assert not offloaded.weight.is_pinned()
-            assert not offloaded._use_uva_gather
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
         embedding_dim = 7

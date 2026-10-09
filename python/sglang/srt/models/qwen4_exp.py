@@ -890,9 +890,91 @@ def _drop_module_weight(embedding) -> None:
             pass
 
 
+def _cuda_error_ok(err) -> bool:
+    if err is None or err == 0:
+        return True
+    value = getattr(err, "value", err)
+    if value == 0:
+        return True
+    return "Success" in str(err)
+
+
+def _try_host_register(tensor: torch.Tensor) -> bool:
+    """Map existing pageable CPU pages for UVA without a second hipHostMalloc.
+
+    Full-table pin_memory=True OOMs BF16 PLE on HCU (~12.8GB/rank GTT).
+    hostRegister reuses the pageable allocation so the Triton UVA gather
+    stays CUDA-graph-safe.
+    """
+    if tensor.device.type != "cpu" or tensor.numel() == 0:
+        return False
+    if tensor.is_pinned():
+        return True
+    if not tensor.is_contiguous():
+        return False
+    if not torch.cuda.is_available():
+        return False
+    register = getattr(torch.cuda.cudart(), "cudaHostRegister", None)
+    if register is None:
+        return False
+    nbytes = tensor.numel() * tensor.element_size()
+    ptr = int(tensor.data_ptr())
+    # Prefer Mapped so device kernels can dereference the host pointer.
+    # Fall back to Default if the platform rejects Mapped.
+    for flags in (0x02, 0x00):
+        try:
+            err = register(ptr, nbytes, flags)
+        except Exception as exc:
+            logger.warning(
+                "PLE BF16 hostRegister raised flags=%s nbytes=%s: %s",
+                flags,
+                nbytes,
+                exc,
+            )
+            continue
+        if _cuda_error_ok(err):
+            logger.info(
+                "PLE BF16 hostRegister ok flags=%s nbytes=%.2fGB",
+                flags,
+                nbytes / (1024**3),
+            )
+            return True
+        logger.warning(
+            "PLE BF16 hostRegister failed flags=%s nbytes=%s err=%s",
+            flags,
+            nbytes,
+            err,
+        )
+    return False
+
+
+def _register_bf16_table_for_uva(tensor: torch.Tensor) -> bool:
+    if tensor.is_pinned():
+        return True
+    try:
+        tp_group = get_tp_group()
+        rank = tp_group.rank_in_group
+        world = tp_group.world_size
+    except Exception:
+        return _try_host_register(tensor)
+    success = False
+    # Serialize the map so 8 ranks do not hit GTT at once.
+    for r in range(world):
+        if r == rank:
+            success = _try_host_register(tensor)
+        try:
+            tp_group.barrier()
+        except Exception:
+            return success if r == rank else False
+    return success
+
+
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
-    """CPU-resident PLE table. INT8/FP8 stay pinned for UVA gathers; BF16
-    stays pageable to avoid a multi-GB hipHostMalloc / GTT OOM on HCU.
+    """CPU-resident PLE table.
+
+    INT8/FP8 allocate pinned host memory for UVA gathers. BF16 reuses a
+    pageable CPU table and hostRegister-maps it so the same UVA kernel is
+    CUDA-graph-safe without a second multi-GB hipHostMalloc.
 
     The table stays in its checkpoint storage dtype (int8/fp8 with per-row
     channel scales, fp8/bf16 with a scalar scale, or bf16); gathers emit bf16.
@@ -950,10 +1032,9 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             if name != "data"
         }
         if source_weight.dtype == torch.bfloat16:
-            # BF16 ngram tables are ~12.8GB/rank at TP8. hipHostMalloc of the
-            # full table (UVA / GTT) OOMs on HCU even after dropping the
-            # pageable twin. Keep one pageable CPU copy and gather through a
-            # small pinned scratch instead. INT8/FP8 stay on the pin path.
+            # BF16 ngram tables are ~12.8GB/rank at TP8. hipHostMalloc of a
+            # pinned twin OOMs on HCU GTT. Keep the pageable CPU copy and
+            # hostRegister it below for graph-safe UVA. INT8/FP8 stay pinned.
             if source_weight.device.type == "cpu" and not source_weight.is_pinned():
                 cpu_weight = source_weight
             else:
@@ -1019,7 +1100,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             )
         if (not released_source_weight) and cpu_weight is not source_weight:
             del embedding.weight
-        self._use_uva_gather = cpu_weight.is_pinned()
+        if cpu_weight.dtype == torch.bfloat16 and not cpu_weight.is_pinned():
+            self._use_uva_gather = _register_bf16_table_for_uva(cpu_weight)
+        else:
+            self._use_uva_gather = cpu_weight.is_pinned()
         self._pageable_id_scratch = None
         self._pageable_row_scratch = None
         self._block_d = triton.next_power_of_2(self.embedding_dim)
