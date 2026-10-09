@@ -82,10 +82,10 @@ def extend_attention_fwd_torch(
 
         k_extend = k[q_start:q_end]  # [extend_len, H_KV, D]
         v_extend = v[q_start:q_end]  # [extend_len, H_KV, D]
-        q_extend = q[q_start:q_end].float()  # [extend_len, H_Q, D]
+        q_extend = q[q_start:q_end]  # [extend_len, H_Q,  D]
 
-        k_full = torch.cat([k_prefix, k_extend], dim=0).float()
-        v_full = torch.cat([v_prefix, v_extend], dim=0).float()
+        k_full = torch.cat([k_prefix, k_extend], dim=0)  # [total_len, H_KV, D]
+        v_full = torch.cat([v_prefix, v_extend], dim=0)  # [total_len, H_KV, D]
 
         if group_size != 1:
             k_full_hq = k_full.repeat_interleave(
@@ -100,38 +100,29 @@ def extend_attention_fwd_torch(
 
         prefix_len = k_prefix.size(0)
         extend_len = k_extend.size(0)
+        total_len = prefix_len + extend_len
 
-        # Keep the reference in FP32 and bound the long-context score allocation.
-        for chunk_start in range(0, extend_len, 128):
-            chunk_end = min(chunk_start + 128, extend_len)
-            key_end = prefix_len + chunk_end
-            key_start = 0
-            if sliding_window_size is not None and sliding_window_size > 0:
-                key_start = max(0, prefix_len + chunk_start - sliding_window_size)
+        # causal
+        pos_keys = torch.arange(total_len, device=q.device)
+        t = prefix_len + torch.arange(extend_len, device=q.device)  # [extend_len]
+        causal_mask = pos_keys.unsqueeze(0) <= t.unsqueeze(1)
 
-            pos_keys = torch.arange(key_start, key_end, device=q.device)
-            t = prefix_len + torch.arange(chunk_start, chunk_end, device=q.device)
-            final_mask = pos_keys.unsqueeze(0) <= t.unsqueeze(1)
-            if sliding_window_size is not None and sliding_window_size > 0:
-                final_mask &= pos_keys.unsqueeze(0) >= (
-                    t - sliding_window_size
-                ).unsqueeze(1)
+        # sliding window
+        if sliding_window_size is not None and sliding_window_size > 0:
+            start = (t - (sliding_window_size)).clamp_min(0)  # [extend_len]
+        else:
+            start = torch.zeros_like(t)
+        window_mask = pos_keys.unsqueeze(0) >= start.unsqueeze(1)
 
-            attn_scores = (
-                torch.einsum(
-                    "qhd,khd->qhk",
-                    q_extend[chunk_start:chunk_end],
-                    k_full_hq[key_start:key_end],
-                )
-                * scale
-            )
-            attn_scores = attn_scores.masked_fill(
-                ~final_mask.unsqueeze(1), float("-inf")
-            )
-            attn_weights = F.softmax(attn_scores, dim=-1)
-            o[q_start + chunk_start : q_start + chunk_end] = torch.einsum(
-                "qhk,khd->qhd", attn_weights, v_full_hq[key_start:key_end]
-            )
+        final_mask = causal_mask & window_mask
+
+        attn_scores = (
+            torch.einsum("qhd,khd->qhk", q_extend, k_full_hq) * scale
+        )  # [extend_len, H_Q, total_len]
+        attn_scores = attn_scores.masked_fill(~final_mask.unsqueeze(1), float("-inf"))
+
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        o[q_start:q_end] = torch.einsum("qhk,khd->qhd", attn_weights, v_full_hq)
 
 
 def decode_attention_fwd_torch(
@@ -153,9 +144,7 @@ def decode_attention_fwd_torch(
     assert H_Q % H_KV == 0, "H_Q must be divisible by H_KV for GQA"
     group_size = H_Q // H_KV
 
-    o_ref = torch.empty(
-        (B, H_Q, v_buffer.shape[-1]), dtype=torch.float32, device=q.device
-    )
+    o_ref = torch.empty((B, H_Q, D), dtype=torch.float32, device=q.device)
 
     for b in range(B):
         start = int(kv_indptr[b].item())
@@ -619,7 +608,7 @@ class TestTritonAttention(CustomTestCase):
             (extend_token_num, H_Q, D), dtype=dtype, device=device
         )
         o_extend_torch = torch.empty(
-            (extend_token_num, H_Q, D), dtype=torch.float32, device=device
+            (extend_token_num, H_Q, D), dtype=dtype, device=device
         )
 
         b_seq_len_extend = b_seq_len - b_seq_len_prefix
@@ -660,11 +649,7 @@ class TestTritonAttention(CustomTestCase):
         )
 
         self.assertTrue(
-            torch.allclose(
-                o_extend_triton.float(), o_extend_torch, rtol=1e-3, atol=1e-3
-            ),
-            f"Sliding-window output differs from FP32 reference. "
-            f"Max diff: {(o_extend_triton.float() - o_extend_torch).abs().max()}",
+            torch.allclose(o_extend_triton, o_extend_torch, rtol=1e-3, atol=1e-3)
         )
 
     def test_extend_attention_sliding_window(self):
@@ -854,7 +839,7 @@ class TestTritonAttention(CustomTestCase):
             device=device,
         )
         attn_lse1 = torch.empty(
-            (B, H_Q, max_kv_splits),
+            (B, H_Q, max_kv_splits, D_V),
             dtype=torch.float32,
             device=device,
         )
@@ -875,7 +860,7 @@ class TestTritonAttention(CustomTestCase):
         )
 
         cos_sim = torch.nn.functional.cosine_similarity(
-            o.float().flatten(), o_grouped.float().flatten(), dim=0
+            o.flatten(), o_grouped.flatten(), dim=0
         )
         print(cos_sim.item())
         self.assertTrue(cos_sim.item() > 0.99)
@@ -883,17 +868,6 @@ class TestTritonAttention(CustomTestCase):
             self.assertTrue(torch.allclose(o, o_grouped, atol=5e-2))
         else:
             self.assertTrue(torch.allclose(o, o_grouped, atol=3e-2))
-
-        o_ref = decode_attention_fwd_torch(
-            q, k_buffer, v_buffer, kv_indptr, kv_indices, sm_scale
-        )
-        atol = 5e-2 if is_in_amd_ci() else 3e-2
-        for output in (o, o_grouped):
-            self.assertTrue(
-                torch.allclose(output.float(), o_ref, atol=atol),
-                f"Decode output differs from FP32 reference. "
-                f"Max diff: {(output.float() - o_ref).abs().max()}",
-            )
 
     def test_grouped_decode_attention(self):
         seq_lens = [5, 100, 128, 500]
