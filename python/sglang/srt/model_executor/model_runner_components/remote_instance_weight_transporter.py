@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 import torch
@@ -24,8 +24,7 @@ logger = logging.getLogger(__name__)
 @dataclass(slots=True, kw_only=True)
 class RemoteInstanceWeightTransporter:
     get_model: Callable[[], torch.nn.Module]
-    # Registration may run after the runner's construction scope has exited.
-    tp_rank: int = field(init=False, default_factory=lambda: get_parallel().tp_rank)
+    tp_rank: int
     gpu_id: int
     engine: Optional[Any] = None
     session_id: str = ""

@@ -23,13 +23,17 @@ from typing import List
 import torch
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cuda_ci,
-    register_hcu_ci,
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+
+# HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
+register_hcu_ci(
+    est_time=120,
+    suite="stage-b-test-1-hcu-small",
+    disabled="HCU PR baseline deferred: model matrix path needs local model mapping and BW1100 repeat validation.",
 )
+
+from sglang.test.run_eval import run_eval
 from sglang.test.runners import DEFAULT_PROMPTS, SRTRunner, check_close_model_outputs
-from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -41,13 +45,6 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=217, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=320, suite="stage-b-test-1-gpu-small-amd")
-
-# HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
-register_hcu_ci(
-    est_time=120,
-    suite="stage-b-test-1-hcu-small",
-    disabled="HCU PR baseline deferred: model matrix path needs local model mapping and BW1100 repeat validation.",
-)
 
 
 class TestTransformersFallbackEndpoint(CustomTestCase):
@@ -76,7 +73,7 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
             num_examples=256,
             num_threads=32,
         )
-        metrics = run_sgl_eval(args)
+        metrics = run_eval(args)
         self.assertGreaterEqual(metrics["score"], self.mmlu_lower_bound)
 
     def test_gsm8k(self):
@@ -84,11 +81,12 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
+            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_sgl_eval(args)
+        metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], self.gsm8k_lower_bound)
 

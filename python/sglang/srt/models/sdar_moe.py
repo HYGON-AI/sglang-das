@@ -10,13 +10,13 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.distributed import (
+    tensor_model_parallel_all_reduce,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerFacts,
-)
+from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -29,7 +29,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    reduce_moe_output,
+    should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -56,7 +56,7 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
 from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
@@ -146,7 +146,10 @@ class SDARMoeSparseMoeBlock(nn.Module):
         topk_output = self.topk(hidden_states, router_logits)
         out = self.experts(hidden_states, topk_output)  # (T, H)
 
-        out = reduce_moe_output(out)
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+        ):
+            out = tensor_model_parallel_all_reduce(out)
 
         return out.view(num_tokens, hidden_dim)
 
@@ -156,7 +159,7 @@ class SDARMoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
+                num_token_non_padded=forward_batch.num_token_non_padded,
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id
                 ),
@@ -355,7 +358,7 @@ class SDARMoeBlock(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
-        self.layer_facts = LayerFacts.init_new(
+        self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=True,
@@ -364,10 +367,11 @@ class SDARMoeBlock(nn.Module):
         )
 
         self.layer_communicator = LayerCommunicator(
-            layer_facts=self.layer_facts,
+            layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
+            is_last_layer=(layer_id == config.num_hidden_layers - 1),
         )
 
     def forward(
@@ -393,12 +397,30 @@ class SDARMoeBlock(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+        fuse_mlp_allreduce = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+        )
+        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+
+        with get_forward().scoped(
+            fuse_mlp_allreduce=fuse_mlp_allreduce,
+            mlp_reduce_scatter=mlp_reduce_scatter,
+        ):
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch=forward_batch,
             )
-        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
+
+        if fuse_mlp_allreduce:
+            hidden_states._sglang_needs_allreduce_fusion = True
+        else:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
 
         return hidden_states, residual
 
@@ -482,10 +504,6 @@ class SDARMoeModel(nn.Module):
                     positions, hidden_states, forward_batch, residual
                 )
 
-        last_layer = self.layers[self.end_layer - 1]
-        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
-            hidden_states, residual, forward_batch
-        )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}

@@ -2,14 +2,11 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
 
-import numpy as np
 import torch
 from diffusers import AutoencoderKL as DiffusersAutoencoderKL
 from diffusers import LCMScheduler, UNet2DConditionModel
 
-from sglang.kernels.ops.diffusion.ext import mesh_processor
 from sglang.multimodal_gen.configs.models.vaes.stable_diffusion import (
     StableDiffusionVAEConfig,
 )
@@ -188,19 +185,9 @@ class TestHunyuan3DWarmupOutput(unittest.TestCase):
 
     def test_paint_postprocess_skips_export_during_warmup(self):
         stage = Hunyuan3DPaintPostprocessStage(Hunyuan3D2PipelineConfig())
-        kernel = Mock()
-        with (
-            patch.object(mesh_processor, "_mesh_processor_kernel", None),
-            patch.object(
-                mesh_processor, "load_extension_with_recovery", return_value=kernel
-            ) as build,
-        ):
-            output = stage.forward(self._batch(), SimpleNamespace())
-            build.assert_called_once()
-            array = np.zeros((1, 3), dtype=np.float32)
-            mesh_processor.meshVerticeInpaint(array, array, array, array, array, array)
-            build.assert_called_once()
-            kernel.meshVerticeInpaint.assert_called_once()
+
+        output = stage.forward(self._batch(), SimpleNamespace())
+
         self.assertEqual(output.output_file_paths, [])
 
 

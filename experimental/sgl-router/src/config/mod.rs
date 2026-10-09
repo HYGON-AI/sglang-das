@@ -5,29 +5,51 @@ pub use cli::Cli;
 pub use sampling::*;
 pub use types::*;
 
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{anyhow, Result};
 
-/// Default pod termination grace period when none is declared.
+/// The k8s default `terminationGracePeriodSeconds`, assumed when the operator
+/// has not declared the pod's real one. A `shutdown_drain_secs` at or above the
+/// grace period leaves no time for the in-flight drain, so the pod is SIGKILLed
+/// before it finishes — the opposite of what the drain is for.
 pub const K8S_DEFAULT_GRACE_SECS: u64 = 30;
 
-/// Maximum shutdown pause; deployments must also allow time to drain in-flight requests.
-/// This is the hard typo gate (an extra digit, seconds confused with milliseconds);
-/// whether a legal drain fits a particular grace period is [`shutdown_drain_advisory`]'s
-/// job, because the operator can raise the budget.
+/// Ceiling on `shutdown_drain_secs`, enforced by [`Config::validate`]. Sized
+/// for the workload rather than for the k8s default grace period: a single
+/// streaming completion can hold the router for many minutes, so a deployment
+/// that does not want terminations cutting one off runs a
+/// `terminationGracePeriodSeconds` in the tens of minutes and a drain to match.
+/// Deciding whether a particular drain fits a particular grace period is
+/// [`shutdown_drain_advisory`]'s job — advice, because the operator can raise
+/// the budget. This constant is the separate, harder gate: it rejects a value
+/// that is not a drain at all, an extra digit or seconds confused with
+/// milliseconds, which no grace period could ever service.
 pub const MAX_SHUTDOWN_DRAIN_SECS: u64 = 1800;
 
-/// A shutdown pause that exhausts the declared or assumed pod grace period.
+/// A `shutdown_drain_secs` that leaves no room under the grace period for the
+/// in-flight drain that follows the pause. Carries the compared values as
+/// fields so the caller logs a static message with structured data rather than
+/// interpolating the numbers into the message text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShutdownDrainAdvisory {
     pub shutdown_drain_secs: u64,
     /// The budget the drain was compared against.
     pub termination_grace_secs: u64,
-    /// Whether the operator declared the grace period.
+    /// Whether that budget came from the operator or from
+    /// [`K8S_DEFAULT_GRACE_SECS`]. An assumed budget makes the advisory a
+    /// guess; a declared one makes it a fact.
     pub grace_declared: bool,
 }
 
-/// Warn when the pause leaves no time for in-flight draining.
-/// An undeclared grace period uses the Kubernetes default.
+/// Advisory (not a hard error: the drain may well be right and the grace period
+/// raised to match) for a drain that leaves no room for the in-flight drain.
+/// The bound is `>=`, not `>`: a drain of exactly the grace period already
+/// consumes all of it.
+///
+/// `termination_grace_secs` is the pod's real `terminationGracePeriodSeconds`
+/// when the operator declared it. The router cannot read its own pod spec, so
+/// `None` falls back to the k8s default — which is why declaring the real value
+/// is the way to silence this on a deployment that raised the grace period
+/// deliberately, rather than lowering a drain that was correct.
 pub fn shutdown_drain_advisory(
     shutdown_drain_secs: u64,
     termination_grace_secs: Option<u64>,
@@ -41,39 +63,51 @@ pub fn shutdown_drain_advisory(
 }
 
 impl Config {
-    /// Validate invariants not enforced by the CLI parser.
+    /// Check invariants the type system and `clap` don't already enforce.
+    /// Called by [`cli::Cli::into_config`] after assembling the `Config`
+    /// from flags. Unknown policy names and `--cb-threshold 0` are
+    /// rejected at parse time (`ValueEnum` / `NonZeroU32`); only the
+    /// remaining value-level invariants are checked here.
     pub(crate) fn validate(&self) -> Result<()> {
-        ensure!(!self.model.id.is_empty(), "model id must be non-empty");
+        if self.model.id.is_empty() {
+            return Err(anyhow!("model id must be non-empty"));
+        }
         if let Some(bucket_config) = self.model.bucket_config.as_ref() {
             validate_bucket_config(bucket_config)?;
         }
         self.model.sampling_overrides.validate()?;
-        ensure!(
-            self.proxy.stream_idle_timeout_secs > 0,
-            "stream_idle_timeout_secs must be greater than zero"
-        );
-        ensure!(
-            self.server.shutdown_drain_secs <= MAX_SHUTDOWN_DRAIN_SECS,
-            "shutdown_drain_secs must be at most {MAX_SHUTDOWN_DRAIN_SECS} (got {}); \
-             past the ceiling a value is a typo rather than a drain. A long but \
-             deliberate drain is fine — declare --termination-grace-secs so startup \
-             can check it against the pod's real budget",
-            self.server.shutdown_drain_secs,
-        );
+        if self.server.shutdown_drain_secs > MAX_SHUTDOWN_DRAIN_SECS {
+            return Err(anyhow!(
+                "shutdown_drain_secs must be at most {MAX_SHUTDOWN_DRAIN_SECS} (got {}); \
+                 past the ceiling a value is a typo rather than a drain, and the pod \
+                 would be SIGKILLed long before the pause elapsed. A long but deliberate \
+                 drain is fine — declare --termination-grace-secs so startup can check \
+                 it against the pod's real budget",
+                self.server.shutdown_drain_secs,
+            ));
+        }
         match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {
-                ensure!(
-                    !s.urls.is_empty(),
-                    "discovery.static_urls.urls must be a non-empty list"
-                );
-                // Normalize URLs before deduplication so trailing slashes cannot register a worker twice.
+                if s.urls.is_empty() {
+                    return Err(anyhow!(
+                        "discovery.static_urls.urls must be a non-empty list"
+                    ));
+                }
+                // Validate every entry up front so typos surface at
+                // startup with a precise diagnostic instead of as
+                // per-worker introspect failures or as two registry
+                // entries pointing at the same SGLang (trailing-slash
+                // near-duplicates). Dedupe runs against a normalized
+                // form (trimmed + trailing `/` stripped) so
+                // `"http://x:30000"` and `"http://x:30000/"` collide.
                 let mut seen = std::collections::HashSet::new();
                 for raw in &s.urls {
                     let trimmed = raw.trim();
-                    ensure!(
-                        !trimmed.is_empty(),
-                        "discovery.static_urls.urls contains an empty or whitespace-only entry"
-                    );
+                    if trimmed.is_empty() {
+                        return Err(anyhow!(
+                            "discovery.static_urls.urls contains an empty or whitespace-only entry"
+                        ));
+                    }
                     let parsed = url::Url::parse(trimmed).map_err(|e| {
                         anyhow!("discovery.static_urls.urls entry {raw:?} is not a valid URL: {e}")
                     })?;
@@ -86,13 +120,17 @@ impl Config {
                         }
                     }
                     let normalized = parsed.as_str().trim_end_matches('/').to_string();
-                    ensure!(
-                        seen.insert(normalized.clone()),
-                        "discovery.static_urls.urls contains duplicate entry {raw:?} (normalized: {normalized:?})"
-                    );
+                    if !seen.insert(normalized.clone()) {
+                        return Err(anyhow!(
+                            "discovery.static_urls.urls contains duplicate entry {raw:?} (normalized: {normalized:?})"
+                        ));
+                    }
                 }
             }
-            // Kubernetes selector combinations are validated by `resolve_mode` during construction.
+            // K8s selector validity is resolved at construction time
+            // (`resolve_mode` in `Cli::build_discovery`), so the stored
+            // `K8sDiscoveryMode` is already valid here. Any namespace
+            // (including empty, for a cluster-wide watch) is accepted.
             DiscoveryBackend::K8s(_) => {}
         }
         Ok(())
@@ -100,44 +138,50 @@ impl Config {
 }
 
 fn validate_bucket_config(bucket_config: &BucketConfig) -> Result<()> {
-    ensure!(
-        !bucket_config.buckets.is_empty(),
-        "bucket_config.buckets must be non-empty when configured"
-    );
+    if bucket_config.buckets.is_empty() {
+        return Err(anyhow!(
+            "bucket_config.buckets must be non-empty when configured"
+        ));
+    }
     let mut ids = std::collections::HashSet::new();
     let mut ranks = std::collections::HashSet::new();
     let mut stage_workers = std::collections::HashSet::new();
     let mut has_prefill_bucket = false;
     for bucket in &bucket_config.buckets {
         has_prefill_bucket |= bucket.stage == BucketStage::Prefill;
-        ensure!(
-            !bucket.id.is_empty() && ids.insert(bucket.id.as_str()),
-            "bucket_config bucket id must be non-empty and unique: {:?}",
-            bucket.id
-        );
-        ensure!(
-            ranks.insert((bucket.stage, bucket.rank)),
-            "bucket_config rank must be unique within each stage: {}",
-            bucket.rank
-        );
-        ensure!(
-            !bucket.worker_ids.is_empty(),
-            "bucket_config bucket {:?} has no worker_ids",
-            bucket.id
-        );
+        if bucket.id.is_empty() || !ids.insert(bucket.id.as_str()) {
+            return Err(anyhow!(
+                "bucket_config bucket id must be non-empty and unique: {:?}",
+                bucket.id
+            ));
+        }
+        if !ranks.insert((bucket.stage, bucket.rank)) {
+            return Err(anyhow!(
+                "bucket_config rank must be unique within each stage: {}",
+                bucket.rank
+            ));
+        }
+        if bucket.worker_ids.is_empty() {
+            return Err(anyhow!(
+                "bucket_config bucket {:?} has no worker_ids",
+                bucket.id
+            ));
+        }
         let mut worker_ids = std::collections::HashSet::new();
         for worker_id in &bucket.worker_ids {
-            ensure!(
-                !worker_id.is_empty() && worker_ids.insert(worker_id.as_str()),
-                "bucket_config bucket {:?} has an empty or duplicate worker id",
-                bucket.id
-            );
-            ensure!(
-                stage_workers.insert((bucket.stage, worker_id.as_str())),
-                "bucket_config worker {:?} belongs to more than one {:?} bucket",
-                worker_id,
-                bucket.stage
-            );
+            if worker_id.is_empty() || !worker_ids.insert(worker_id.as_str()) {
+                return Err(anyhow!(
+                    "bucket_config bucket {:?} has an empty or duplicate worker id",
+                    bucket.id
+                ));
+            }
+            if !stage_workers.insert((bucket.stage, worker_id.as_str())) {
+                return Err(anyhow!(
+                    "bucket_config worker {:?} belongs to more than one {:?} bucket",
+                    worker_id,
+                    bucket.stage
+                ));
+            }
         }
         validate_range(
             bucket.min_extend_tokens,
@@ -151,28 +195,33 @@ fn validate_bucket_config(bucket_config: &BucketConfig) -> Result<()> {
             &bucket.id,
             "sequence",
         )?;
-        ensure!(
-            bucket.max_context_tokens != Some(0),
-            "bucket_config bucket {:?} max_context_tokens must be > 0",
-            bucket.id
-        );
-        ensure!(
-            bucket.ttft_p95_at_capacity_ms != Some(0),
-            "bucket_config bucket {:?} TTFT p95 must be > 0",
-            bucket.id
-        );
-        ensure!(
-            bucket
-                .tps_p05_at_capacity
-                .is_none_or(|value| value.is_finite() && value > 0.0),
-            "bucket_config bucket {:?} TPS p05 must be finite and > 0",
-            bucket.id
-        );
-        ensure!(
-            bucket.max_pending_prefill_tokens != Some(0),
-            "bucket_config bucket {:?} max_pending_prefill_tokens must be > 0",
-            bucket.id
-        );
+        if bucket.max_context_tokens == Some(0) {
+            return Err(anyhow!(
+                "bucket_config bucket {:?} max_context_tokens must be > 0",
+                bucket.id
+            ));
+        }
+        if bucket.ttft_p95_at_capacity_ms == Some(0) {
+            return Err(anyhow!(
+                "bucket_config bucket {:?} TTFT p95 must be > 0",
+                bucket.id
+            ));
+        }
+        if bucket
+            .tps_p05_at_capacity
+            .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            return Err(anyhow!(
+                "bucket_config bucket {:?} TPS p05 must be finite and > 0",
+                bucket.id
+            ));
+        }
+        if bucket.max_pending_prefill_tokens == Some(0) {
+            return Err(anyhow!(
+                "bucket_config bucket {:?} max_pending_prefill_tokens must be > 0",
+                bucket.id
+            ));
+        }
         match bucket.stage {
             BucketStage::Prefill
                 if bucket.min_sequence_tokens.is_some()
@@ -198,19 +247,20 @@ fn validate_bucket_config(bucket_config: &BucketConfig) -> Result<()> {
             _ => {}
         }
     }
-    ensure!(
-        has_prefill_bucket,
-        "bucket_config must contain at least one Prefill bucket; enabling Bucket \
-         routing otherwise leaves every request without a Prefill domain"
-    );
+    if !has_prefill_bucket {
+        return Err(anyhow!(
+            "bucket_config must contain at least one Prefill bucket; enabling Bucket routing otherwise leaves every request without a Prefill domain"
+        ));
+    }
     Ok(())
 }
 
 fn validate_range(min: Option<u64>, max: Option<u64>, id: &str, name: &str) -> Result<()> {
-    ensure!(
-        min.zip(max).is_none_or(|(min, max)| min <= max),
-        "bucket_config bucket {id:?} has invalid {name} range: min > max"
-    );
+    if min.zip(max).is_some_and(|(min, max)| min > max) {
+        return Err(anyhow!(
+            "bucket_config bucket {id:?} has invalid {name} range: min > max"
+        ));
+    }
     Ok(())
 }
 
@@ -218,6 +268,10 @@ fn validate_range(min: Option<u64>, max: Option<u64>, id: &str, name: &str) -> R
 mod tests {
     use super::*;
 
+    /// Build a minimal valid-shape `Config` with the given static worker
+    /// URLs and model id, so the `validate()` branches can be exercised
+    /// directly. CLI parsing and the static-vs-k8s mapping are covered in
+    /// the `cli` module tests; the k8s selector grammar in `types`.
     fn cfg(model_id: &str, urls: &[&str]) -> Config {
         Config {
             server: ServerConfig::default(),
@@ -236,13 +290,12 @@ mod tests {
                 fused: None,
                 eligibility: None,
                 sampling_overrides: Default::default(),
-                default_chat_template_kwargs: Default::default(),
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: urls.iter().map(|s| s.to_string()).collect(),
             }),
             proxy: ProxyConfig::default(),
-            router_inflight_load: InflightLoadConfig::default(),
+            active_load: ActiveLoadConfig::default(),
         }
     }
 
@@ -496,13 +549,19 @@ mod tests {
 
     #[test]
     fn shutdown_drain_advisory_is_silent_below_the_k8s_default_grace() {
+        // Anything strictly under the k8s default terminationGracePeriodSeconds
+        // (30 s) still leaves room for the in-flight drain, so it is safe
+        // without operator action.
         assert!(shutdown_drain_advisory(29, None).is_none());
         assert!(shutdown_drain_advisory(0, None).is_none());
     }
 
-    /// Pinned because this is the one case an operator meets without choosing it:
-    /// an edit to either constant that silenced the warning would change the default
-    /// deployment's behaviour, and should have to say so here.
+    /// The default drain is exactly the assumed grace period, so out of the box
+    /// it leaves nothing for the in-flight drain and says so on every startup.
+    /// Asserted rather than left implicit because it is the one case an
+    /// operator meets without choosing it: a later edit to either constant that
+    /// silenced the warning would be changing the default deployment's
+    /// behaviour, and should have to say so here.
     #[test]
     fn the_default_drain_warns_until_the_grace_period_is_raised() {
         let advisory = shutdown_drain_advisory(default_shutdown_drain_secs(), None)
@@ -526,6 +585,11 @@ mod tests {
 
     #[test]
     fn shutdown_drain_advisory_warns_once_the_drain_consumes_the_whole_grace() {
+        // A drain of exactly the 30 s k8s default leaves zero seconds for the
+        // in-flight drain, so the pod is SIGKILLed mid-drain — the boundary
+        // itself must warn, not just values past it. The ceiling is in the list
+        // because it is startable: `validate` accepts it, so the advisory is
+        // the only thing left to say it does not fit the default grace period.
         for drain in [K8S_DEFAULT_GRACE_SECS, 120, MAX_SHUTDOWN_DRAIN_SECS] {
             let advisory = shutdown_drain_advisory(drain, None)
                 .unwrap_or_else(|| panic!("{drain}s must warn"));
@@ -538,6 +602,9 @@ mod tests {
         }
     }
 
+    /// The advisory's whole purpose is to be silenceable by declaring the real
+    /// budget: a 60 s drain under a 120 s grace period is a correct
+    /// configuration, and warning about it trains operators to ignore the line.
     #[test]
     fn shutdown_drain_advisory_respects_a_declared_grace_period() {
         assert!(
@@ -557,12 +624,18 @@ mod tests {
             shutdown_drain_advisory(10, Some(10)).is_some(),
             "a short declared grace period must still be compared against",
         );
+        // The configuration the ceiling was raised for: a completion streaming
+        // for minutes wants a drain of minutes, under a grace period declared
+        // to match. That is correct, not merely tolerated, so it must be silent.
         assert!(
             shutdown_drain_advisory(MAX_SHUTDOWN_DRAIN_SECS, Some(3600)).is_none(),
             "a long drain under a grace period declared to cover it must not warn",
         );
     }
 
+    /// `validate` is the hard gate the advisory deliberately is not: past the
+    /// ceiling the value can only be a typo, and starting on it would make
+    /// every later termination a SIGKILL.
     #[test]
     fn validate_rejects_a_shutdown_drain_past_the_ceiling() {
         let mut config = cfg("qwen3-0.6b", &["http://10.0.0.1:30000"]);

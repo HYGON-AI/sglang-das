@@ -20,18 +20,12 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
-)
-from sglang.srt.layers.fused_rms_quant import (
-    fused_mla_qkv_a_rms_norm_per_token_quant,
-    supports_fused_mla_qkv_a_rms_quant_input,
 )
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -39,7 +33,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
     view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
-from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
 )
@@ -49,24 +42,20 @@ from sglang.srt.lora.deepseek_mla_correction import (
 from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
 )
-from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
-    _apply_attention_output_gate,
     _select_local_dcp_heads_for_autotune,
     is_dcp_mla_decode_phase,
     is_mla_dcp_lse_base_on_e,
-    should_defer_dsa_cp_kv_gather,
 )
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
     _is_block_scale_fp8,
     _is_gfx95_supported,
-    _is_hcu,
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
@@ -148,10 +137,7 @@ if _use_aiter_gfx95:
         fused_flatten_mxfp4_quant,
         fused_rms_mxfp4_quant,
     )
-    from sglang.srt.layers.rocm_linear_utils import (
-        fused_fp8_bmm_rope_cat_and_cache_mla,
-        fused_qk_rope_cat_and_cache_mla,
-    )
+    from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
 
 
 def _absorb_weight_bf16(w: torch.Tensor, w_scale) -> torch.Tensor:
@@ -281,28 +267,6 @@ def rocm_absorb_v_bmm(
                 out=_bmm_buf.transpose(0, 1),
             )
         else:
-            if (
-                _is_hcu
-                and attn_output.dtype == torch.bfloat16
-                and attn.w_vc.dtype == torch.bfloat16
-                and attn.o_proj.weight.dtype != torch.uint8
-                and not _is_block_scale_fp8(attn.o_proj)
-            ):
-                # rocBLAS accepts this strided output. Writing the final token-
-                # major layout avoids a transpose/flatten copy after the GEMM.
-                output = torch.empty(
-                    attn_output.shape[0],
-                    attn_output.shape[1],
-                    attn.w_vc.shape[-1],
-                    dtype=torch.bfloat16,
-                    device=attn_output.device,
-                )
-                torch.bmm(
-                    attn_output.transpose(0, 1),
-                    _absorb_weight_bf16(attn.w_vc, attn.w_scale),
-                    out=output.transpose(0, 1),
-                )
-                return output.flatten(1, 2)
             attn_bmm_output = torch.bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1),
                 _absorb_weight_bf16(attn.w_vc, attn.w_scale),
@@ -384,84 +348,10 @@ def _fused_rope_cat_and_cache(
         q_nope_out.dtype
         if attn.kv_cache_dtype == "fp8_e4m3"
         and attn.current_attention_backend == "aiter"
-        and q_nope_out.shape[-2] == 12
         else kv_cache_dtype
     )
-    kv_pool = get_token_to_kv_pool()
-    if isinstance(kv_pool, HiSparseDSATokenToKVPool):
-        # The fused write bypasses set_mla_kv_buffer()'s logical-to-device mapping.
-        out_cache_loc = kv_pool.translate_loc_to_hisparse_device(out_cache_loc)
-    # AITER reads slot_mapping with stride 1, including on the resident path.
-    out_cache_loc = out_cache_loc.contiguous()
     return fused_qk_rope_cat_and_cache_mla(
         q_nope_out,
-        q_pe,
-        k_nope,
-        k_pe,
-        kv_pool.get_key_buffer(attn.attn_mqa.layer_id),
-        out_cache_loc,
-        positions,
-        attn.rotary_emb.cos_cache,
-        attn.rotary_emb.sin_cache,
-        attn.attn_mqa.k_scale,
-        attn.rotary_emb.is_neox_style,
-        q_out_dtype=q_out_dtype,
-    )
-
-
-def _can_fuse_bmm_rope_cat_and_cache(attn: DeepseekV2AttentionMLA) -> bool:
-    """Whether one AITER kernel can do the q absorb, the RoPE and the KV write.
-
-    Those are otherwise two launches -- ``rocm_absorb_q_bmm`` in prepare and
-    ``_fused_rope_cat_and_cache`` in core -- and at decode shapes each fills
-    well under half the CUs, so a fused grid runs them side by side instead of
-    back to back. Every term below mirrors a branch one of those two would
-    otherwise have taken, so the fused path is only chosen where it is exactly
-    equivalent.
-
-    The caller adds one more term it alone can see: DCP q replication splits the
-    absorb across a different weight, which this kernel does not carry.
-
-    DCP is excluded outright: its decode phase all-gathers q_nope_out and q_pe
-    before core runs, and this path has no q_nope_out to hand it -- the absorb
-    has not happened yet.
-    """
-    return (
-        _use_aiter_gfx95
-        and not get_parallel().dcp_enabled
-        and attn.w_kc.dtype == torch.float8_e4m3fn
-        and attn.rotary_emb is not None
-        and attn._skip_rope_for_dsa_tilelang_fused()
-        and attn.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
-        and not attn.use_deep_gemm_bmm
-        and not _SGLANG_EXPERIMENTAL_LORA_OPTI
-        and not is_kv_b_lora_active(attn)
-    )
-
-
-def _fused_bmm_rope_cat_and_cache(
-    attn: DeepseekV2AttentionMLA,
-    q_nope: torch.Tensor,
-    q_pe: torch.Tensor,
-    k_nope: torch.Tensor,
-    k_pe: torch.Tensor,
-    positions: torch.Tensor,
-    out_cache_loc: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """q absorb + RoPE + concat + KV-cache write in one AITER kernel.
-
-    Takes q_nope un-absorbed: the BMM ``rocm_absorb_q_bmm`` would have done is
-    the first half of this kernel's grid.
-    """
-    kv_cache_dtype = fp8_dtype if attn.kv_cache_dtype == "fp8_e4m3" else q_nope.dtype
-    # Same weights and group size the fp8 branch of rocm_absorb_q_bmm passes to
-    # batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant;
-    # that call takes q_nope as (B, QH, P) and transposes internally, while this
-    # kernel wants (QH, B, P) up front.
-    return fused_fp8_bmm_rope_cat_and_cache_mla(
-        q_nope.transpose(0, 1),
-        attn.w_kc.transpose(-1, -2),
-        attn.w_scale,
         q_pe,
         k_nope,
         k_pe,
@@ -470,10 +360,9 @@ def _fused_bmm_rope_cat_and_cache(
         positions,
         attn.rotary_emb.cos_cache,
         attn.rotary_emb.sin_cache,
-        group_size=128,
-        k_scale=attn.attn_mqa.k_scale,
-        is_neox=attn.rotary_emb.is_neox_style,
-        q_out_dtype=kv_cache_dtype,
+        attn.attn_mqa.k_scale,
+        attn.rotary_emb.is_neox_style,
+        q_out_dtype=q_out_dtype,
     )
 
 
@@ -489,11 +378,6 @@ class DeepseekMLARocmForwardMixin:
     ):
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
-        attention_output_gate = (
-            self.prepare_attention_output_gate(hidden_states)
-            if hasattr(self, "prepare_attention_output_gate")
-            else None
-        )
         q_replicate_active = (
             get_parallel().dcp_replicate_q_proj
             and is_dcp_mla_decode_phase(forward_batch)
@@ -504,32 +388,18 @@ class DeepseekMLARocmForwardMixin:
         q_lora = None
         topk_indices = None
         if self.q_lora_rank is not None:
-            qkv_latent = get_attn_tp_context().fetch_qkv_latent()
-            q_input_quant_args = None
-            use_hcu_norm_quant = (
-                self.use_lightop_mla_qkv_a_rms_quant
-                and not q_replicate_active
-                and supports_fused_mla_qkv_a_rms_quant_input(
-                    qkv_latent, self.q_a_layernorm.weight, self.kv_a_layernorm.weight
+            q, latent_cache = (
+                get_attn_tp_context()
+                .fetch_qkv_latent()
+                .split(
+                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                    dim=-1,
                 )
-            )
-            if use_hcu_norm_quant:
-                q_input_quant_args = fused_mla_qkv_a_rms_norm_per_token_quant(
-                    packed_input=qkv_latent,
-                    q_weight=self.q_a_layernorm.weight,
-                    kv_weight=self.kv_a_layernorm.weight,
-                    q_epsilon=self.q_a_layernorm.variance_epsilon,
-                    kv_epsilon=self.kv_a_layernorm.variance_epsilon,
-                )
-            q, latent_cache = qkv_latent.split(
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
             # overlap qk norm
-            if use_hcu_norm_quant:
-                pass  # Both normalized views were written into packed qkv_latent.
-            elif self.alt_stream is not None and get_is_capture_mode():
+            if self.alt_stream is not None and get_is_capture_mode():
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
@@ -609,7 +479,7 @@ class DeepseekMLARocmForwardMixin:
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     k_nope = k_nope.unsqueeze(1)
-                    q = self.q_b_proj_forward(q, input_quant_args=q_input_quant_args)
+                    q = self.q_b_proj_forward(q)
                 if self.should_run_indexer(prev_topk_indices):
                     topk_indices = self.indexer(
                         x=hidden_states,
@@ -634,7 +504,7 @@ class DeepseekMLARocmForwardMixin:
                         self.qk_head_dim,
                     )
                 else:
-                    q = self.q_b_proj_forward(q, input_quant_args=q_input_quant_args)
+                    q = self.q_b_proj_forward(q)
 
                 if q_lora is not None:
                     if self.should_run_indexer(prev_topk_indices):
@@ -667,10 +537,6 @@ class DeepseekMLARocmForwardMixin:
             k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
         q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
-
-        fuse_bmm_rope_cache = not q_replicate_active and (
-            _can_fuse_bmm_rope_cat_and_cache(self)
-        )
 
         if q_replicate_active:
             q_nope_out = (
@@ -709,25 +575,20 @@ class DeepseekMLARocmForwardMixin:
                     expected_m,
                 )
                 q_nope_out = q_nope_out[:, :expected_m, :]
-            elif fuse_bmm_rope_cache:
-                # The absorb is the first half of the kernel core will run, and
-                # that kernel wants q_nope un-absorbed. Nothing to do here.
-                q_nope_out = None
             else:
                 q_nope_out = rocm_absorb_q_bmm(
                     self, q_nope, is_capture_mode=get_is_capture_mode()
                 )
 
-            if q_nope_out is not None:
-                q_nope_out = q_nope_out.transpose(0, 1)
-                if _SGLANG_EXPERIMENTAL_LORA_OPTI:
-                    from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
-                        kv_b_lora_q_apply,
-                    )
+            q_nope_out = q_nope_out.transpose(0, 1)
+            if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+                from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
+                    kv_b_lora_q_apply,
+                )
 
-                    q_nope_out = kv_b_lora_q_apply(self, q_nope, q_nope_out, _kvb_q)
-                elif is_kv_b_lora_active(self):
-                    q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
+                q_nope_out = kv_b_lora_q_apply(self, q_nope, q_nope_out, _kvb_q)
+            elif is_kv_b_lora_active(self):
+                q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
 
@@ -761,32 +622,6 @@ class DeepseekMLARocmForwardMixin:
             )
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-
-        dsa_prefill_cp = dsa_use_prefill_cp(forward_batch)
-        mla_prefill_cp = mla_use_prefill_cp(forward_batch)
-        defer_kv_gather_until_after_rope = should_defer_dsa_cp_kv_gather(
-            dsa_prefill_cp=dsa_prefill_cp,
-            fuse_rope_for_trtllm_mla=fuse_rope_for_trtllm_mla,
-        )
-        if dsa_prefill_cp and not defer_kv_gather_until_after_rope:
-            from sglang.srt.layers.attention.dsa_backend import materialize_full_kv_cp
-
-            k_nope, k_pe = materialize_full_kv_cp(
-                self,
-                forward_batch,
-                latent_cache,
-                k_nope,
-                k_pe,
-            )
-        elif mla_prefill_cp and not is_cp_v2_active(forward_batch):
-            # CP-v1 gathers the latent here; CP-v2 gathers it in the attention
-            # backend via the strategy (materialize_full_mla_kv).
-            k_nope, k_pe = self.rebuild_cp_kv_cache(
-                latent_cache,
-                forward_batch,
-                k_nope,
-                k_pe,
-            )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if get_parallel().dcp_enabled:
@@ -829,14 +664,6 @@ class DeepseekMLARocmForwardMixin:
             positions,
             topk_indices,
             llama_4_scaling,
-            q_nope if fuse_bmm_rope_cache else None,
-            # Only models that own the MLA output gate (currently HYV4) emit
-            # this extra slot, so every other caller keeps the 10-tuple.
-            *(
-                (attention_output_gate,)
-                if hasattr(self, "prepare_attention_output_gate")
-                else ()
-            ),
         )
 
     def forward_absorb_rocm_core(
@@ -850,43 +677,20 @@ class DeepseekMLARocmForwardMixin:
         positions,
         topk_indices,
         llama_4_scaling,
-        q_nope_unabsorbed=None,
-        attention_output_gate: Optional[torch.Tensor] = None,
     ):
         save_kv_cache = True
-        # HYV4 carries a per-head learnable attention sink logit that the
-        # sparse backend folds into the softmax denominator.
-        sink_args = (
-            dict(attn_sink=self.learnable_sink_param)
-            if getattr(self, "learnable_sink_param", None) is not None
-            else {}
-        )
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
-                if q_nope_unabsorbed is not None:
-                    # prepare left the absorb to us: one kernel for the BMM,
-                    # the RoPE and the KV write instead of two launches that
-                    # each leave most of the machine idle.
-                    q_cat, _, k_pe_fused, _ = _fused_bmm_rope_cat_and_cache(
-                        self,
-                        q_nope_unabsorbed,
-                        q_pe,
-                        k_nope,
-                        k_pe,
-                        positions,
-                        forward_batch.out_cache_loc,
-                    )
-                else:
-                    q_cat, _, k_pe_fused, _ = _fused_rope_cat_and_cache(
-                        self,
-                        q_nope_out,
-                        q_pe,
-                        k_nope,
-                        k_pe,
-                        positions,
-                        forward_batch.out_cache_loc,
-                    )
+                q_cat, _, k_pe_fused, _ = _fused_rope_cat_and_cache(
+                    self,
+                    q_nope_out,
+                    q_pe,
+                    k_nope,
+                    k_pe,
+                    positions,
+                    forward_batch.out_cache_loc,
+                )
                 save_kv_cache = False
                 # Pass q_cat straight to attn_mqa with q_rope=None so the backend
                 # reuses it as a zero-copy view instead of rebuilding a tensor
@@ -910,7 +714,6 @@ class DeepseekMLARocmForwardMixin:
                         q_rope=None,
                         k_rope=k_pe_fused,
                         save_kv_cache=save_kv_cache,
-                        **sink_args,
                         **(
                             dict(topk_indices=topk_indices)
                             if topk_indices is not None
@@ -930,7 +733,6 @@ class DeepseekMLARocmForwardMixin:
                         q_rope=q_pe_fused,
                         k_rope=k_pe_fused,
                         save_kv_cache=save_kv_cache,
-                        **sink_args,
                         **(
                             dict(topk_indices=topk_indices)
                             if topk_indices is not None
@@ -970,7 +772,6 @@ class DeepseekMLARocmForwardMixin:
                         q_rope=q_pe,
                         k_rope=k_pe,
                         **extra_args,
-                        **sink_args,
                         **(
                             dict(topk_indices=topk_indices)
                             if topk_indices is not None
@@ -1035,7 +836,6 @@ class DeepseekMLARocmForwardMixin:
                 k_nope,
                 forward_batch,
                 save_kv_cache=save_kv_cache,
-                **sink_args,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
 
@@ -1123,10 +923,6 @@ class DeepseekMLARocmForwardMixin:
         elif is_kv_b_lora_active(self):
             attn_bmm_output = apply_kv_b_lora_v_correction(
                 self, attn_output, attn_bmm_output
-            )
-        if attention_output_gate is not None:
-            attn_bmm_output = _apply_attention_output_gate(
-                self, attn_bmm_output, attention_output_gate
             )
         output, _ = self.o_proj(attn_bmm_output)
 

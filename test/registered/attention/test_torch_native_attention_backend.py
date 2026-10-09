@@ -12,16 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+Usage:
+python3 -m unittest test_torch_native_attention_backend.TestTorchNativeAttnBackend.test_mmlu
+"""
+
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cuda_ci,
-    register_hcu_ci,
-)
-from sglang.test.sgl_eval_utils import run_sgl_eval
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+
+register_hcu_ci(est_time=150, suite="stage-b-test-1-hcu-small", disabled='HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
+
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -33,8 +37,6 @@ from sglang.test.test_utils import (
 # Torch native attention backend integration test with MMLU eval
 register_cuda_ci(est_time=310, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=150, suite="stage-b-test-1-gpu-small-amd")
-
-register_hcu_ci(est_time=150, suite="stage-b-test-1-hcu-small", disabled='HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
 
 
 class TestTorchNativeAttnBackend(CustomTestCase):
@@ -57,7 +59,7 @@ class TestTorchNativeAttnBackend(CustomTestCase):
                 num_threads=32,
             )
 
-            metrics = run_sgl_eval(args)
+            metrics = run_eval(args)
             self.assertGreaterEqual(metrics["score"], 0.64)
         finally:
             kill_process_tree(process.pid)

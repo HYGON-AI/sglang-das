@@ -7,7 +7,6 @@ to reduce tokenization overhead when multiple requests arrive concurrently.
 
 import asyncio
 import logging
-import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Any, Dict, List, Optional
@@ -32,7 +31,6 @@ class AsyncDynamicbatchTokenizer:
         tokenizer,
         max_batch_size: int = 32,
         batch_wait_timeout_s: float = 0.002,
-        executor: Optional[ThreadPoolExecutor] = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.max_batch_size = max_batch_size
@@ -42,11 +40,8 @@ class AsyncDynamicbatchTokenizer:
         self._queue: Optional[asyncio.Queue] = None
         self._batcher_task: Optional[asyncio.Task] = None
 
-        # All encode-family calls sharing one tokenizer must be serialized.
-        # Reuse TokenizerManager's executor when provided so dynamic batching
-        # cannot race request conversion on a second tokenizer thread.
-        self._owns_executor = executor is None
-        self._executor = executor or ThreadPoolExecutor(max_workers=1)
+        # Single-thread executor for blocking tokenizer calls
+        self._executor = ThreadPoolExecutor(max_workers=1)
         self._initialized = False
 
     def _ensure_initialized(self):
@@ -60,13 +55,11 @@ class AsyncDynamicbatchTokenizer:
         """Encode a single prompt."""
         return await self.encode(prompt, **kwargs)
 
-    async def encode(self, prompt: str, _tokenization_timing=None, **kwargs) -> Any:
+    async def encode(self, prompt: str, **kwargs) -> Any:
         """Encode a single prompt."""
         self._ensure_initialized()
         result_future: asyncio.Future = asyncio.get_running_loop().create_future()
-        if _tokenization_timing is not None:
-            _tokenization_timing["queue_entry"] = time.perf_counter()
-        await self._queue.put((prompt, kwargs, result_future, _tokenization_timing))
+        await self._queue.put((prompt, kwargs, result_future))
         return await result_future
 
     async def _dynamic_batch_loop(self):
@@ -74,13 +67,12 @@ class AsyncDynamicbatchTokenizer:
         while True:
             try:
                 # Get the first request
-                prompt, kwargs, result_future, timing = await self._queue.get()
+                prompt, kwargs, result_future = await self._queue.get()
 
                 # Collect requests into dynamic batch
                 prompts = [prompt]
                 kwargs_list = [kwargs]
                 result_futures = [result_future]
-                timings = [timing]
 
                 # Check if there are more items immediately available in the queue
                 # If queue is empty, process single item immediately without timeout
@@ -99,18 +91,12 @@ class AsyncDynamicbatchTokenizer:
 
                         remaining_time = self.batch_wait_timeout_s - elapsed
                         try:
-                            (
-                                prompt,
-                                kwargs,
-                                result_future,
-                                timing,
-                            ) = await asyncio.wait_for(
+                            prompt, kwargs, result_future = await asyncio.wait_for(
                                 self._queue.get(), remaining_time
                             )
                             prompts.append(prompt)
                             kwargs_list.append(kwargs)
                             result_futures.append(result_future)
-                            timings.append(timing)
                         except asyncio.TimeoutError:
                             break
 
@@ -120,9 +106,7 @@ class AsyncDynamicbatchTokenizer:
                 )
 
                 # Process the dynamic batch
-                await self._process_dynamic_batch(
-                    prompts, kwargs_list, result_futures, timings
-                )
+                await self._process_dynamic_batch(prompts, kwargs_list, result_futures)
 
             except Exception as e:
                 logger.error(f"Error in dynamic batch loop: {e}")
@@ -133,7 +117,6 @@ class AsyncDynamicbatchTokenizer:
         prompts: List[str],
         kwargs_list: List[Dict],
         result_futures: List[asyncio.Future],
-        timings: List[Optional[Dict[str, float]]],
     ) -> None:
         """Process a dynamic batch of encode requests for single string prompts."""
         # Check if all kwargs are identical for efficient batch processing
@@ -141,26 +124,13 @@ class AsyncDynamicbatchTokenizer:
         can_batch = all(kw == first_kw for kw in kwargs_list[1:])
         kwargs = first_kw if can_batch else None
 
-        def run_with_timing(fn):
-            exec_start = time.perf_counter()
-            for timing in timings:
-                if timing is not None:
-                    timing["exec_start"] = exec_start
-            try:
-                return fn()
-            finally:
-                exec_finish = time.perf_counter()
-                for timing in timings:
-                    if timing is not None:
-                        timing["exec_finish"] = exec_finish
-
         try:
             # If every request uses identical kwargs we can run a single
             # batch tokenizer call for a big speed-up.
             if can_batch and len(prompts) > 1:
                 encode_fn = partial(self.tokenizer, prompts, **kwargs)
                 results = await asyncio.get_running_loop().run_in_executor(
-                    self._executor, run_with_timing, encode_fn
+                    self._executor, encode_fn
                 )
 
                 for i, fut in enumerate(result_futures):
@@ -180,7 +150,7 @@ class AsyncDynamicbatchTokenizer:
                     self.tokenizer(p, **kw) for p, kw in zip(prompts, kwargs_list)
                 ]
                 results = await asyncio.get_running_loop().run_in_executor(
-                    self._executor, run_with_timing, encode_fn
+                    self._executor, encode_fn
                 )
 
                 for fut, res in zip(result_futures, results):
@@ -197,5 +167,5 @@ class AsyncDynamicbatchTokenizer:
         if hasattr(self, "_batcher_task") and self._batcher_task:
             if not self._batcher_task.done():
                 self._batcher_task.cancel()
-        if getattr(self, "_owns_executor", False) and hasattr(self, "_executor"):
+        if hasattr(self, "_executor"):
             self._executor.shutdown(wait=False)

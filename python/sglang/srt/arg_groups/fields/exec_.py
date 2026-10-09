@@ -1,4 +1,11 @@
-"""Config fields of the ``exec`` namespace."""
+"""Config fields of the ``exec`` namespace.
+
+One class per namespace. The class *is* the namespace: a field declared here
+lands in the ``exec`` bag, which is what ``get_exec()`` returns, so a reader
+spells it exactly as before. ``ServerArgs`` composes these classes, so the
+record stays one flat object -- the split moves where declarations live, not
+how config is shaped at runtime.
+"""
 
 from __future__ import annotations
 
@@ -273,8 +280,8 @@ class ExecKernel(msgspec.Struct):
     dsa_paged_mqa_logits_backend: A[
         str,
         Arg(
-            help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (DeepGEMM on CUDA, aiter on ROCm, LightOp on HCU), 'deepgemm', 'cutedsl' (SM100), 'aiter' (ROCm), 'lightop' (HCU).",
-            choices=["auto", "deepgemm", "cutedsl", "aiter", "lightop"],
+            help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm), 'deepgemm', 'cutedsl' (CuTe DSL kernel, SM 100 (Blackwell) only; wins at low batch size and long context), 'aiter' (ROCm only).",
+            choices=["auto", "deepgemm", "cutedsl", "aiter"],
         ),
     ] = "auto"
     dsa_topk_backend: A[
@@ -639,25 +646,9 @@ class ExecComm(msgspec.Struct):
             resolvable=True,
         ),
     ] = False
-    custom_all_reduce_backend: A[
-        str,
-        Arg(
-            help=(
-                "Choose the custom all-reduce backend. "
-                "'auto' picks aiter on HIP/HCU when available otherwise the "
-                "native SGLang implementation; 'native' forces the SGLang "
-                "kernel; 'aiter' forces the Hygon/HCU aiter kernel and, when "
-                "AITER_AR_TRANSPORT=fabric, fails hard rather than silently "
-                "falling back; 'off' disables custom all-reduce entirely. "
-                "--disable-custom-all-reduce overrides this and forces 'off'."
-            ),
-            choices=["auto", "native", "aiter", "off"],
-            resolvable=True,
-        ),
-    ] = "auto"
     enable_mscclpp: A[
         bool,
-        "Enable MSCCL++ for tuned AllReduce and AllGather messages, with NCCL fallback.",
+        "Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
     ] = False
     enable_torch_symm_mem: A[
         bool,
@@ -681,7 +672,7 @@ class ExecComm(msgspec.Struct):
         "Enforce disable FlashInfer allreduce fusion.",
     ] = False
     flashinfer_allreduce_fusion_backend: A[
-        Optional[Literal["auto", "trtllm", "mnnvl", "cutedsl"]],
+        Optional[Literal["auto", "trtllm", "mnnvl"]],
         Arg(
             help=(
                 "Enable FlashInfer allreduce fusion and choose backend. "
@@ -692,9 +683,6 @@ class ExecComm(msgspec.Struct):
                 "'trtllm': available on single-node systems only. "
                 "'mnnvl': available on SM90 single-node systems and SM100/SM103 "
                 "single-node or multi-node systems via MNNVL fabric. "
-                "'cutedsl': Blackwell-only bf16 MNNVL CuTe DSL backend; also "
-                "fuses the MoE finalize and the shared-expert add into the "
-                "collective when the MoE runner can defer them. "
                 "Fuses allreduce with Residual + RMSNorm for supported MoE models."
             ),
             resolvable=True,
@@ -702,28 +690,6 @@ class ExecComm(msgspec.Struct):
     ] = None
     enable_aiter_allreduce_fusion: A[
         bool, Arg(help="Enable Aiter AllReduce Fusion.", resolvable=True)
-    ] = False
-    disable_aiter_allreduce_fusion_in_prefill: A[
-        bool,
-        Arg(
-            help=(
-                "Disable Aiter AllReduce Fusion for prefill batches "
-                "(EXTEND / MIXED / SPLIT_PREFILL) while keeping it for decode. "
-                "Only meaningful with --enable-aiter-allreduce-fusion."
-            ),
-            resolvable=True,
-        ),
-    ] = False
-    disable_aiter_allreduce_fusion_in_decode: A[
-        bool,
-        Arg(
-            help=(
-                "Disable Aiter AllReduce Fusion for decode batches (DECODE / "
-                "TARGET_VERIFY / draft-extend / IDLE) while keeping it for prefill. "
-                "Only meaningful with --enable-aiter-allreduce-fusion."
-            ),
-            resolvable=True,
-        ),
     ] = False
 
 
@@ -830,15 +796,6 @@ class ExecMoe(msgspec.Struct):
         Optional[Literal["static", "dynamic", "fake", "lp"]],
         "The algorithm to choose ranks for redundant experts in expert parallel.",
     ] = None
-    ep_static_dispatch_policy: A[
-        Literal["nearest", "locality_fair"],
-        "Choose the replica-selection policy for static expert dispatch. "
-        "`nearest` preserves the legacy nearest-replica behavior. "
-        "`locality_fair` builds a deterministic source-rank-to-replica map "
-        "that preserves same-GPU, then same-node locality while balancing "
-        "static bindings among equally local replicas; it does not rebalance "
-        "live token traffic.",
-    ] = "nearest"
     init_expert_location: A[str, "Initial location of EP experts."] = "trivial"
     enable_eplb: A[bool, "Enable EPLB algorithm"] = False
     eplb_algorithm: A[str, "Chosen EPLB algorithm"] = "auto"
@@ -899,6 +856,10 @@ class ExecMoe(msgspec.Struct):
     elastic_ep_scale_timeout: A[
         float, "Timeout in seconds for a pending elastic EP scale operation."
     ] = 600
+    elastic_ep_rejoin: A[
+        bool,
+        "[Deprecated] Alias for --elastic-ep-join-mode recover.",
+    ] = False
     disable_flashinfer_cutlass_moe_fp4_allgather: A[
         bool, "Disables quantize before all-gather for flashinfer cutlass moe."
     ] = False

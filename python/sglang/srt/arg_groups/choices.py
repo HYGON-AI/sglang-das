@@ -1,4 +1,10 @@
-"""Shared config choices, re-exported by server_args for plugin compatibility."""
+"""Enumerated choices shared by the config field declarations.
+
+These lived in ``server_args.py`` beside the fields that name them. The fields
+moved to ``arg_groups/fields/``, and ``server_args`` imports the field modules,
+so the lists cannot stay there without a cycle. ``server_args`` re-exports them
+for the handful of modules that import them from their old home.
+"""
 
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -53,10 +59,6 @@ QUANTIZATION_CHOICES = [
     "auto-round-int8",
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
-    # HCU ChannelWise W4A8 / Marlin (registered in QUANTIZATION_METHODS)
-    "slimquant_w4a8",
-    "slimquant_w4a8_marlin",
-    "slimquant_marlin",
     "mxfp_w4a8",  # for NPU W4A8 (MXFP4 weights + MXFP8 activations)
     "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
     "quark_int4fp8_moe",
@@ -237,7 +239,6 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "cutedsl_mla",
     "trtllm_mla",
     "tokenspeed_mla",
-    "hcu_mla",
 ]
 add_chunked_prefix_cache_attention_backend = (
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append

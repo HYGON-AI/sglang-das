@@ -123,9 +123,7 @@ class TestCPStrategyUnit(CustomTestCase):
             self.assertFalse(is_dsa_enable_prefill_cp())
 
     def test_hcu_dsa_cp_is_enabled(self):
-        parallel = SimpleNamespace(
-            attn_cp_size=2, enable_dsa_prefill_context_parallel=True
-        )
+        parallel = SimpleNamespace(attn_cp_size=2)
         model_config = SimpleNamespace(hf_config=SimpleNamespace())
 
         with (
@@ -139,6 +137,8 @@ class TestCPStrategyUnit(CustomTestCase):
             ),
             patch("sglang.srt.layers.attention.dsa.utils.is_hip", return_value=True),
             patch("sglang.srt.layers.attention.dsa.utils.is_hcu", return_value=True),
+            patch("sglang.srt.layers.attention.dsa.utils.is_npu", return_value=False),
+            patch("sglang.srt.layers.attention.dsa.utils.is_musa", return_value=False),
             patch(
                 "sglang.srt.configs.model_config.is_deepseek_dsa",
                 return_value=True,
@@ -147,9 +147,7 @@ class TestCPStrategyUnit(CustomTestCase):
             self.assertTrue(is_dsa_enable_prefill_cp())
 
     def test_disabled_dsa_cp_skips_platform_probes(self):
-        parallel = SimpleNamespace(
-            attn_cp_size=1, enable_dsa_prefill_context_parallel=False
-        )
+        parallel = SimpleNamespace(attn_cp_size=1)
 
         with (
             patch(
@@ -157,22 +155,19 @@ class TestCPStrategyUnit(CustomTestCase):
                 return_value=parallel,
             ),
             patch("sglang.srt.layers.attention.dsa.utils.is_hip") as mock_is_hip,
-            patch(
-                "sglang.srt.layers.attention.dsa.utils.is_hcu", return_value=True
-            ) as mock_is_hcu,
+            patch("sglang.srt.layers.attention.dsa.utils.is_hcu") as mock_is_hcu,
+            patch("sglang.srt.layers.attention.dsa.utils.is_npu") as mock_is_npu,
+            patch("sglang.srt.layers.attention.dsa.utils.is_musa") as mock_is_musa,
         ):
             self.assertFalse(is_dsa_enable_prefill_cp())
 
         mock_is_hip.assert_not_called()
-        mock_is_hcu.assert_called_once()
+        mock_is_hcu.assert_not_called()
+        mock_is_npu.assert_not_called()
+        mock_is_musa.assert_not_called()
 
 
 class TestPrefillCPBCGReplay(CustomTestCase):
-    def setUp(self):
-        generic_cp = patch("sglang.srt.layers.cp.utils.enable_cp_v2", return_value=True)
-        generic_cp.start()
-        self.addCleanup(generic_cp.stop)
-
     def tearDown(self):
         init_cp_strategy(enable_prefill_cp=False, cp_size=1, cp_strategy="zigzag")
 
@@ -319,9 +314,6 @@ class TestPrefillCPBCGReplay(CustomTestCase):
 
 class TestCPZigzagStrategy(CustomTestCase):
     def setUp(self):
-        generic_cp = patch("sglang.srt.layers.cp.utils.enable_cp_v2", return_value=True)
-        generic_cp.start()
-        self.addCleanup(generic_cp.stop)
         init_cp_strategy(
             enable_prefill_cp=True,
             cp_size=4,
@@ -845,9 +837,6 @@ class TestCPZigzagStrategy(CustomTestCase):
 
 class TestCPInterleaveStrategy(CustomTestCase):
     def setUp(self):
-        generic_cp = patch("sglang.srt.layers.cp.utils.enable_cp_v2", return_value=True)
-        generic_cp.start()
-        self.addCleanup(generic_cp.stop)
         init_cp_strategy(
             enable_prefill_cp=True,
             cp_size=4,

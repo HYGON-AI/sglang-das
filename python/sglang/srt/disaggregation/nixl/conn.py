@@ -45,11 +45,8 @@ from sglang.srt.disaggregation.utils import (
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
-    pack_state_types,
     resolve_dcp_dst_entry_indices,
     slice_dsa_tail_dst_ptrs_for_pp,
-    resolve_state_component_dst_index,
-    unpack_state_types,
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_device, get_parallel, get_schedule
@@ -248,7 +245,6 @@ class KVArgsRegisterInfo:
     dst_state_item_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: List[List[int]] = dataclasses.field(default_factory=list)
     dst_state_layer_ids: List[List[int]] = dataclasses.field(default_factory=list)
-    dst_state_types: List[StateType] = dataclasses.field(default_factory=list)
     dst_homogeneous_mem_kind: Optional[str] = None
     kv_xfer_segments: Optional[List[_KVXferPreparedSegment]] = None
     staging_base_ptr: int = 0
@@ -293,7 +289,6 @@ class KVArgsRegisterInfo:
             if len(msg) > 20 and msg[20] != b""
             else []
         )
-        dst_state_types = unpack_state_types(msg[23]) if len(msg) > 23 else []
 
         return cls(
             room=str(msg[0].decode("ascii")),
@@ -322,7 +317,6 @@ class KVArgsRegisterInfo:
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
             dst_state_layer_ids=dst_state_layer_ids,
-            dst_state_types=dst_state_types,
             staging_base_ptr=(
                 struct.unpack("Q", msg[14])[0]
                 if len(msg) > 14 and len(msg[14]) == 8
@@ -418,8 +412,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     # message is tagged too. It is new to NIXL, hence free to carry the reason.
     kv_status_msg_tag = b"KV_STATUS"
     kv_status_msg_carries_reason = True
-    # ABORT handler defers the ack until the transfer worker drains.
-    supports_deferred_decode_kv_release = True
 
     def __init__(
         self,
@@ -840,10 +832,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         interleave num_groups per token, peers select via head_group_idx.
         prefill_tp > decode_tp: num_groups=1. Dst dlist is per-peer.
         """
-        from sglang.srt.disaggregation.common.staging_buffer import (
-            compute_head_slice_params,
-        )
-
         decode_tp_size = decode_kv_args.decode_tp_size
         dst_kv_item_len = decode_kv_args.dst_kv_item_len
         prefill_tp_size = self.attn_tp_size
@@ -854,25 +842,39 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if total_kv_heads <= 0:
             total_kv_heads = self.kv_args.kv_head_num * prefill_tp_size
 
+        src_heads_per_rank = max(1, total_kv_heads // prefill_tp_size)
         dst_heads_per_rank = max(1, total_kv_heads // decode_tp_size)
         bytes_per_head_slice = dst_kv_item_len // page_size // dst_heads_per_rank
 
         if prefill_tp_size > decode_tp_size:
             # Multiple prefill ranks feed one decode rank: each prefill rank sends
             # all its src heads to a specific head-range in the decode rank.
-            _, num_heads_to_send, dst_head_start, _ = compute_head_slice_params(
-                prefill_tp_size,
-                decode_tp_size,
-                self.kv_args.engine_rank,
-                decode_kv_args.decode_tp_rank,
-                total_kv_heads,
-            )
+            src_replication = max(1, prefill_tp_size // total_kv_heads)
+            local_tp_rank_in_group = self.kv_args.engine_rank % prefill_tp_size
             num_groups = 1
+            num_heads_to_send = src_heads_per_rank
             head_group_idx = 0
+            unique_head_idx = local_tp_rank_in_group // src_replication
+            dst_head_start = (unique_head_idx * src_heads_per_rank) % dst_heads_per_rank
             dst_head_offset = dst_head_start * bytes_per_head_slice
         else:
             # One prefill rank feeds multiple decode ranks: interleave num_groups
             # head-groups in the src dlist so each decode rank picks its slice.
+            #
+            # Under GQA the decode side can have MORE attn-TP ranks than there are
+            # KV heads (decode_tp_size > total_kv_heads). In that case consecutive
+            # decode ranks replicate a shared KV head, so the src dlist must
+            # interleave one group per UNIQUE source head-slice, not one per decode
+            # rank -- otherwise it addresses past the registered KV region and
+            # prep_xfer_dlist raises NIXL_ERR_NOT_FOUND.
+            #
+            # Reuse the shared replicated-KV head map (integer division under
+            # replication, not modulo) that the mooncake backend already relies
+            # on, so the two backends stay in sync.
+            from sglang.srt.disaggregation.common.staging_buffer import (
+                compute_head_slice_params,
+            )
+
             src_head_start, num_heads_to_send, _, _ = compute_head_slice_params(
                 prefill_tp_size,
                 decode_tp_size,
@@ -880,9 +882,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 decode_kv_args.decode_tp_rank,
                 total_kv_heads,
             )
-            # One group per UNIQUE head-slice, not per decode rank: replicating
-            # ranks share one, and over-counting addresses past the registered
-            # KV region, where prep_xfer_dlist raises NIXL_ERR_NOT_FOUND.
+            # num_groups (distinct head-groups packed in one prefill rank's src
+            # region) and head_group_idx (this peer's group) are NIXL-specific and
+            # not returned by the shared helper, so derive them here.
             dst_replication = max(1, decode_tp_size // total_kv_heads)
             num_groups = decode_tp_size // prefill_tp_size // dst_replication
             head_group_idx = src_head_start // dst_heads_per_rank
@@ -1436,7 +1438,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_state_item_lens=dst_info.dst_state_item_lens,
                                 dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
                                 dst_state_layer_ids=dst_info.dst_state_layer_ids,
-                                dst_state_types=dst_info.dst_state_types,
                             )
                             handles.extend(
                                 h for h in state_xfer_handles if h is not None
@@ -1866,7 +1867,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             src_token_indices=src_token_indices,
             token_item_lens=token_item_lens[:num_target],
             pack_offset_bytes=rank * rank_stride,
-            pack_capacity_bytes=rank_stride,
         )
         return packed_source_by_dcp_rank[rank]
 
@@ -2536,7 +2536,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_state_item_lens: List[List[int]] | None = None,
         dst_state_dim_per_tensor: List[List[int]] | None = None,
         dst_state_layer_ids: List[List[int]] | None = None,
-        dst_state_types: List[StateType] | None = None,
     ):
         """Send state per hybrid component, dispatching by state_type[i]."""
         state_types = getattr(self.kv_args, "state_types", []) or []
@@ -2555,15 +2554,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_state_item_lens = dst_state_item_lens or []
         dst_state_dim_per_tensor = dst_state_dim_per_tensor or []
         dst_state_layer_ids = dst_state_layer_ids or []
-        dst_state_types = dst_state_types or []
 
         handles = []
         for i, st in enumerate(state_types):
-            dst_component_index = resolve_state_component_dst_index(
-                state_types,
-                dst_state_types,
-                i,
-            )
             src_indices = (
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None
             )
@@ -2587,31 +2580,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 else []
             )
             src_lids = src_state_layer_ids[i] if i < len(src_state_layer_ids) else []
-            dst_ptrs = (
-                dst_state_data_ptrs[dst_component_index]
-                if dst_component_index < len(dst_state_data_ptrs)
-                else []
-            )
-            dst_indices = (
-                dst_state_indices[dst_component_index]
-                if dst_component_index < len(dst_state_indices)
-                else []
-            )
-            dst_lens = (
-                dst_state_item_lens[dst_component_index]
-                if dst_component_index < len(dst_state_item_lens)
-                else []
-            )
+            dst_ptrs = dst_state_data_ptrs[i] if i < len(dst_state_data_ptrs) else []
+            dst_indices = dst_state_indices[i] if i < len(dst_state_indices) else []
+            dst_lens = dst_state_item_lens[i] if i < len(dst_state_item_lens) else []
             dst_dims = (
-                dst_state_dim_per_tensor[dst_component_index]
-                if dst_component_index < len(dst_state_dim_per_tensor)
-                else []
+                dst_state_dim_per_tensor[i] if i < len(dst_state_dim_per_tensor) else []
             )
-            dst_lids = (
-                dst_state_layer_ids[dst_component_index]
-                if dst_component_index < len(dst_state_layer_ids)
-                else []
-            )
+            dst_lids = dst_state_layer_ids[i] if i < len(dst_state_layer_ids) else []
             comp_notif = f"{notif}_{i}"
 
             if st == StateType.MAMBA:
@@ -2685,8 +2660,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
             elif st in (
                 StateType.SWA,
-                StateType.BLOCK_SCALE,
-                StateType.BLOCK_SCALE_SWA,
                 StateType.QSA_PENDING,
                 StateType.QSA_COMPRESSED,
                 StateType.SWA_RING,
@@ -2722,16 +2695,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     dst_layer_ids=dst_lids,
                     dst_item_lens=dst_lens,
                 )
-            elif st in (StateType.MINIMAX_INDEX_K, StateType.MINIMAX_DENSE_KV):
-                # Compacted layer lists require equal TP and PP=1 on both peers.
+            elif st == StateType.MINIMAX_INDEX_K:
+                # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer
+                # lists, so PP>1 mis-slices and heterogeneous TP is unsupported.
                 if self.pp_size is not None and self.pp_size > 1:
                     raise RuntimeError(
-                        "PD disagg: PP>1 not supported for MiniMax state yet."
+                        "PD disagg: PP>1 not supported for MiniMax sparse index yet."
                     )
                 if self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
                         "PD disagg: heterogeneous TP not supported for MiniMax "
-                        "state yet."
+                        "sparse index yet."
                     )
                 if len(src_indices) != len(dst_indices):
                     raise RuntimeError(
@@ -3258,7 +3232,6 @@ class NixlKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
-        spec_metadata: Optional[dict] = None,
     ):
         if self.bootstrap_infos is None:
             logger.error(
@@ -3387,7 +3360,6 @@ class NixlKVReceiver(CommonKVReceiver):
             packed_state_layer_ids = pack_int_lists(
                 self.kv_mgr.kv_args.state_layer_ids, "I"
             )
-            packed_state_types = pack_state_types(self.kv_mgr.kv_args.state_types)
 
             # Include staging allocator metadata if available
             if (
@@ -3436,7 +3408,6 @@ class NixlKVReceiver(CommonKVReceiver):
                             packed_kv_layer_ids,
                             str(self.kv_mgr.dcp_size).encode("ascii"),
                             str(self.kv_mgr.dcp_rank).encode("ascii"),
-                            packed_state_types,
                         ]
                     )
             except zmq.ZMQError:

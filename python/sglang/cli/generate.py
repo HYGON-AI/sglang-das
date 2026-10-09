@@ -1,6 +1,5 @@
 import argparse
 
-from sglang.cli.main import COOKBOOK_EPILOG
 from sglang.cli.utils import get_is_diffusion_model, get_model_path
 
 
@@ -11,11 +10,7 @@ def generate(args, extra_argv):
             add_multimodal_gen_generate_args,
         )
 
-        parser = argparse.ArgumentParser(
-            description="SGLang Multimodal Generation",
-            epilog=COOKBOOK_EPILOG,
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-        )
+        parser = argparse.ArgumentParser(description="SGLang Multimodal Generation")
         add_multimodal_gen_generate_args(parser)
         parser.parse_args(extra_argv)
         return

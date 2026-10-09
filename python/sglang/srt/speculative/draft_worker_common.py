@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
@@ -17,6 +16,7 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -63,12 +63,12 @@ def build_draft_tp_worker(
     *,
     server_args: ServerArgs,
     gpu_id: int,
+    ps: ParallelState,
     nccl_port: int,
     target_model_config: ModelConfig,
     algo_label: str,
     attention_backend_override: Optional[str] = None,
     draft_worker_cls: type[TpModelWorker] = TpModelWorker,
-    random_seed: Optional[int] = None,
 ) -> DraftWorkerBundle:
     # An override names a draft-specific backend the caller has already
     # validated (e.g. a self-drafting architecture); it skips the generic
@@ -78,26 +78,18 @@ def build_draft_tp_worker(
     )
     from sglang.srt.layers.moe.utils import draft_model_build_scope
 
-    draft_w4a8_context = nullcontext()
-    if algo_label == "DSPARK":
-        from sglang.srt.layers.moe.utils import (
-            dspark_w4a8_tpmoe_backend_context,
-        )
-
-        draft_w4a8_context = dspark_w4a8_tpmoe_backend_context()
-
     # The draft's model construction runs its own MoE gates; the scope routes
     # their fusion decision to the speculative leaf and gives the target its
     # ACTIVE value back. It deliberately does not swap runner_backend: these
     # workers run the draft outside speculative_moe_backend_context, so a
     # construction-only swap would build and execute under different backends.
-    with draft_model_build_scope(), draft_w4a8_context:
+    with draft_model_build_scope():
         draft_worker = draft_worker_cls(
             server_args=server_args,
             gpu_id=gpu_id,
+            ps=ps,
             nccl_port=nccl_port,
             is_draft_worker=True,
-            random_seed=random_seed,
             # The draft runs at absolute target positions.
             context_length=target_model_config.context_len,
             draft_attention_backend=draft_backend,
@@ -121,10 +113,6 @@ def make_draft_input_v2(
     *,
     bonus_tokens: torch.Tensor,
     new_seq_lens: torch.Tensor,
-    prefill_tail_hidden_states: torch.Tensor | None = None,
-    prefill_tail_valid_mask: torch.Tensor | None = None,
-    prefill_tail_start_positions: torch.Tensor | None = None,
-    prefill_tail_hidden_projected: bool = True,
 ) -> DFlashDraftInputV2:
     bs = int(new_seq_lens.numel())
     device = bonus_tokens.device
@@ -134,10 +122,6 @@ def make_draft_input_v2(
         bonus_tokens=bonus_tokens.to(dtype=torch.int64),
         new_seq_lens=new_seq_lens.to(dtype=torch.int64),
         hidden_states=torch.empty((bs, 0), device=device, dtype=torch.float16),
-        prefill_tail_hidden_states=prefill_tail_hidden_states,
-        prefill_tail_valid_mask=prefill_tail_valid_mask,
-        prefill_tail_start_positions=prefill_tail_start_positions,
-        prefill_tail_hidden_projected=prefill_tail_hidden_projected,
     )
 
 

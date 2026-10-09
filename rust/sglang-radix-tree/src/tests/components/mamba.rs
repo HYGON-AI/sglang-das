@@ -340,7 +340,11 @@ fn lock_without_mamba_records_the_receipt_and_leaves_mamba_evictable() {
     assert_eq!(tc.arena.node(leaf).device_lock_ref(FULL), 1);
 
     // The receipt replays exactly what was taken: FULL only.
-    let params = result.to_dec_params();
+    let params = DecLockRefParams {
+        swa_uuid_for_lock: result.swa_uuid_for_lock,
+        skipped_lock_components: result.skipped_lock_components,
+        ..Default::default()
+    };
     tc.dec_lock_ref(leaf_handle, &params, /* skip_swa = */ false)
         .expect("live test node");
     assert_eq!(tc.arena.node(parent).device_lock_ref(FULL), 0);
@@ -364,7 +368,11 @@ fn swa_only_release_spares_another_holders_mamba_lock() {
     assert_eq!(tc.arena.node(leaf).device_lock_ref(MAMBA), 1);
 
     // The holder's early SWA release must not drop the owner's mamba lock.
-    let holder_params = holder.to_dec_params();
+    let holder_params = DecLockRefParams {
+        swa_uuid_for_lock: holder.swa_uuid_for_lock,
+        skipped_lock_components: holder.skipped_lock_components,
+        ..Default::default()
+    };
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
     tc.dec_swa_lock_only(
@@ -383,7 +391,11 @@ fn swa_only_release_spares_another_holders_mamba_lock() {
     tc.dec_lock_ref(leaf_handle, &holder_params, /* skip_swa = */ true)
         .expect("live test node");
     assert_eq!(tc.arena.node(leaf).device_lock_ref(MAMBA), 1);
-    let owner_params = owner.to_dec_params();
+    let owner_params = DecLockRefParams {
+        swa_uuid_for_lock: owner.swa_uuid_for_lock,
+        skipped_lock_components: owner.skipped_lock_components,
+        ..Default::default()
+    };
     tc.dec_lock_ref(leaf_handle, &owner_params, /* skip_swa = */ false)
         .expect("live test node");
     assert_eq!(tc.arena.node(leaf).device_lock_ref(MAMBA), 0);

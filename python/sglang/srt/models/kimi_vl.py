@@ -44,7 +44,6 @@
 import copy
 import logging
 import math
-from array import array
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
 
@@ -193,7 +192,7 @@ class KimiVLForConditionalGeneration(nn.Module):
         res = self.multi_modal_projector(image_features)
         return res
 
-    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

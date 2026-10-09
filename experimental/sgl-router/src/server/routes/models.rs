@@ -61,7 +61,6 @@ mod tests {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
-            default_chat_template_kwargs: Default::default(),
         };
         let app = crate::server::app::build_router(std::sync::Arc::new(ctx));
         let res = app

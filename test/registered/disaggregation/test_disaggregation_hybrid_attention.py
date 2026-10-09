@@ -2,17 +2,6 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cuda_ci, register_hcu_ci
-from sglang.test.server_fixtures.disaggregation_fixture import (
-    PDDisaggregationServerBase,
-)
-from sglang.test.sgl_eval_utils import run_sgl_eval
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    is_in_ci,
-    popen_launch_pd_server,
-)
-
-register_cuda_ci(est_time=578, stage="extra-b", runner_config="8-gpu-h200")
 
 # HCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
 register_hcu_ci(
@@ -21,6 +10,18 @@ register_hcu_ci(
     nightly=True,
     disabled="HCU CSV CI placeholder: disaggregation hybrid-attention path needs BW1100 multi-device validation before enabling.",
 )
+
+from sglang.test.run_eval import run_eval
+from sglang.test.server_fixtures.disaggregation_fixture import (
+    PDDisaggregationServerBase,
+)
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    is_in_ci,
+    popen_launch_pd_server,
+)
+
+register_cuda_ci(est_time=578, stage="extra-b", runner_config="8-gpu-h200")
 
 
 @unittest.skipIf(is_in_ci(), "Temporarily disable the flaky test.")
@@ -85,11 +86,12 @@ class TestDisaggregationHybridAttentionGDN(PDDisaggregationServerBase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            max_tokens=2048,
+            api="completion",
+            max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_sgl_eval(args)
+        metrics = run_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
         self.assertGreater(metrics["score"], 0.93)
@@ -160,11 +162,12 @@ class TestDisaggregationHybridAttentionGDNExtraBuffer(PDDisaggregationServerBase
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            max_tokens=2048,
+            api="completion",
+            max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_sgl_eval(args)
+        metrics = run_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
         # TODO: Fix PD disaggregation accuracy issue (https://github.com/sgl-project/sglang/issues/21744) and increase the threshold back to 0.93.
@@ -238,11 +241,12 @@ class TestDisaggregationHybridAttentionGDNDPDecode(PDDisaggregationServerBase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            max_tokens=2048,
+            api="completion",
+            max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_sgl_eval(args)
+        metrics = run_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
         # TODO: Fix PD disaggregation accuracy issue (https://github.com/sgl-project/sglang/issues/21744) and increase the threshold back to 0.93.
@@ -310,13 +314,12 @@ class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            max_tokens=8192,
-            temperature=0.6,
-            top_p=0.95,
+            api="completion",
+            max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_sgl_eval(args)
+        metrics = run_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
         self.assertGreater(metrics["score"], 0.87)
@@ -387,13 +390,12 @@ class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBa
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            max_tokens=8192,
-            temperature=0.6,
-            top_p=0.95,
+            api="completion",
+            max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_sgl_eval(args)
+        metrics = run_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
         self.assertGreater(metrics["score"], 0.87)

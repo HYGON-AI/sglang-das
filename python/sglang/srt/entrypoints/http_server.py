@@ -58,7 +58,6 @@ from fastapi import (
     UploadFile,
     WebSocket,
 )
-from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
@@ -89,7 +88,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ClassifyRequest,
     CompletionRequest,
-    DecisionRequest,
     DetokenizeRequest,
     EmbeddingRequest,
     ErrorResponse,
@@ -102,7 +100,6 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
-from sglang.srt.entrypoints.openai.serving_decisions import OpenAIServingDecisions
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
 from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
@@ -114,15 +111,12 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
-from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
-from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
-    BeginWeightUpdateReqInput,
     CheckWeightsReqInput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
@@ -130,7 +124,6 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
-    EndWeightUpdateReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -310,15 +303,6 @@ async def lifespan(fast_api_app: FastAPI):
             thread_label = "Decode" + thread_label
         trace_set_thread_info(thread_label)
 
-    _global_state.tokenizer_manager.auto_create_handle_loop()
-    wait_for_assignment = getattr(
-        _global_state.tokenizer_manager, "wait_for_warmup_assignment", None
-    )
-    is_warmup_owner = (
-        await wait_for_assignment() if wait_for_assignment is not None else True
-    )
-    warmup_thread_kwargs = dict(warmup_thread_kwargs, is_warmup_owner=is_warmup_owner)
-
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
         _global_state.tokenizer_manager, _global_state.template_manager
@@ -336,9 +320,6 @@ async def lifespan(fast_api_app: FastAPI):
     )
     fast_api_app.state.openai_serving_score = OpenAIServingScore(
         _global_state.tokenizer_manager
-    )
-    fast_api_app.state.openai_serving_decisions = OpenAIServingDecisions(
-        fast_api_app.state.openai_serving_chat
     )
     fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
         _global_state.tokenizer_manager, _global_state.template_manager
@@ -358,11 +339,6 @@ async def lifespan(fast_api_app: FastAPI):
 
     # Initialize Anthropic-compatible serving handler
     fast_api_app.state.anthropic_serving = AnthropicServing(
-        fast_api_app.state.openai_serving_chat
-    )
-
-    # Initialize System One compatible decision handler
-    fast_api_app.state.systemone_serving = SystemOneServing(
         fast_api_app.state.openai_serving_chat
     )
 
@@ -405,23 +381,14 @@ async def lifespan(fast_api_app: FastAPI):
             f"OpenAIServingResponses init traceback:\n{get_exception_traceback()}"
         )
 
-    try:
-        # Execute custom warmups
-        if get_serving().warmups is not None and is_warmup_owner:
-            await execute_warmups(
-                get_disagg().disaggregation_mode,
-                get_serving().warmups.split(","),
-                _global_state.tokenizer_manager,
-            )
-            logger.info("Warmup ended")
-
-    except BaseException:
-        report = getattr(
-            _global_state.tokenizer_manager, "report_server_warmup_result", None
+    # Execute custom warmups
+    if get_serving().warmups is not None:
+        await execute_warmups(
+            get_disagg().disaggregation_mode,
+            get_serving().warmups.split(","),
+            _global_state.tokenizer_manager,
         )
-        if is_warmup_owner and report is not None:
-            report(False)
-        raise
+        logger.info("Warmup ended")
 
     # Start the native gRPC server and warmup inside the try so a failure in
     # either still runs the finally cleanup below. Native gRPC is enabled via
@@ -450,15 +417,7 @@ async def lifespan(fast_api_app: FastAPI):
             target=_wait_and_warmup,
             kwargs=warmup_thread_kwargs,
         )
-        try:
-            warmup_thread.start()
-        except BaseException:
-            report = getattr(
-                _global_state.tokenizer_manager, "report_server_warmup_result", None
-            )
-            if is_warmup_owner and report is not None:
-                report(False)
-            raise
+        warmup_thread.start()
 
         # Start the HTTP server
         yield
@@ -642,28 +601,14 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
     For /v1/messages, emit Anthropic-style envelope and scrub the message so
     file paths or Python internals from the default ``str(exc)`` representation
-    never reach the client. For /v1/responses, keep OpenAI-style. For
-    /v1/systemone, keep the 422 detail list that the System One API documents.
-    Otherwise use the legacy ErrorResponse shape.
+    never reach the client. For /v1/responses, keep OpenAI-style. Otherwise
+    use the legacy ErrorResponse shape.
     """
     if request.url.path.startswith("/v1/messages"):
         return _anthropic_error_response(
             status_code=HTTPStatus.BAD_REQUEST.value,
             error_type="invalid_request_error",
             message=_anthropic_validation_message(exc.errors()),
-        )
-
-    route_path = request.url.path.removeprefix(request.scope.get("root_path", ""))
-    if route_path == "/v1/systemone":
-        # The System One API documents FastAPI's default 422 detail list. The
-        # optional input echo is left out, since it can be any client value.
-        detail = [
-            {key: value for key, value in error.items() if key != "input"}
-            for error in exc.errors()
-        ]
-        return ORJSONResponse(
-            status_code=HTTPStatus.UNPROCESSABLE_ENTITY.value,
-            content={"detail": jsonable_encoder(detail)},
         )
 
     exc_str = str(exc)
@@ -736,11 +681,6 @@ async def health_generate(request: Request) -> Response:
         logger.info("Health check request received during shutdown. Returning 503.")
         return Response(status_code=503)
 
-    if (
-        getattr(_global_state.tokenizer_manager, "server_warmup_result", True)
-        is not True
-    ):
-        return Response(status_code=503)
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
 
@@ -859,6 +799,16 @@ async def model_info():
     return msgspec_to_builtins(result)
 
 
+@app.get("/get_weight_version")
+@app.get("/weight_version")
+async def weight_version():
+    """Get the current weight version."""
+    raise HTTPException(
+        status_code=404,
+        detail="Endpoint '/get_weight_version' or '/weight_version' is deprecated. Please use '/model_info' instead.",
+    )
+
+
 @app.get("/get_server_info")
 async def get_server_info():
     """Get the server information (deprecated - use /server_info instead)."""
@@ -896,13 +846,39 @@ async def server_info():
             "startup_time": _global_state.tokenizer_manager.startup_time,
             "internal_states": internal_states,
             "version": __version__,
-            "frontend": "python",
             # Structured KV-event publisher descriptor for KV-aware routers.
             # `None` when publishing is disabled or misconfigured; see
             # `runtime_context.describe_kv_events_publisher` for the contract.
             "kv_events": describe_kv_events_publisher(server_args),
         }
     )
+
+
+@app.get("/get_load")
+async def get_load():
+    """Get load metrics (deprecated - use /v1/loads instead).
+
+    Legacy shim backed by /v1/loads. Projects the load snapshot down to the
+    historical field shape (dp_rank, num_reqs, num_waiting_reqs, num_tokens,
+    num_pending_tokens, ts_tic) so existing clients keep working.
+    """
+    logger.warning(
+        "Endpoint '/get_load' is deprecated and will be removed in a future version. "
+        "Please use '/v1/loads' instead."
+    )
+    load_results = await _global_state.tokenizer_manager.get_loads(include=["core"])
+    ts = time.perf_counter()
+    return [
+        {
+            "dp_rank": r.dp_rank,
+            "num_reqs": r.num_running_reqs + r.num_waiting_reqs,
+            "num_waiting_reqs": r.num_waiting_reqs,
+            "num_tokens": r.num_total_tokens,
+            "num_pending_tokens": r.num_total_tokens - r.num_used_tokens,
+            "ts_tic": ts,
+        }
+        for r in load_results
+    ]
 
 
 # example usage:
@@ -1091,8 +1067,22 @@ async def list_external_corpora():
     )
 
 
+@app.api_route("/clear_hicache_storage_backend", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def clear_hicache_storage_backend_deprecated():
+    """Deprecated: use POST /hicache/storage-backend/clear."""
+    ret = await _global_state.tokenizer_manager.clear_hicache_storage()
+    return Response(
+        content=(
+            "Deprecated endpoint. Use POST /hicache/storage-backend/clear.\n"
+            "Hierarchical cache storage backend cleared.\n"
+        ),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
 # example usage:
-# curl -s -X POST http://127.0.0.1:30000/hicache/storage-backend/clear
+# curl -s -X POST http://127.0.0.1:30000/clear_hicache_storage_backend
 @app.api_route("/hicache/storage-backend/clear", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def clear_hicache_storage_backend():
@@ -1425,36 +1415,6 @@ async def update_weights_from_tensor(
     content = {"success": success, "message": message}
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
-    )
-
-
-@app.post("/begin_weight_update")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def begin_weight_update(
-    obj: Annotated[BeginWeightUpdateReqInput, Body()], request: Request
-):
-    """Open a weight-update session so in-place-quantized weights become loadable."""
-    success, message = await _global_state.tokenizer_manager.begin_weight_update(
-        obj, request
-    )
-    return ORJSONResponse(
-        {"success": success, "message": message},
-        status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST,
-    )
-
-
-@app.post("/end_weight_update")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def end_weight_update(
-    obj: Annotated[EndWeightUpdateReqInput, Body()], request: Request
-):
-    """Close the weight-update session and finalize quantized weights."""
-    success, message = await _global_state.tokenizer_manager.end_weight_update(
-        obj, request
-    )
-    return ORJSONResponse(
-        {"success": success, "message": message},
-        status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST,
     )
 
 
@@ -1991,14 +1951,6 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
     )
 
 
-@app.post("/v1/decisions", dependencies=[Depends(validate_json_request)])
-async def v1_decisions_request(request: DecisionRequest, raw_request: Request):
-    """Answer typed choice, score, and yes or no questions about an input by scoring single-token answer labels through the scoring API, without generation."""
-    return await raw_request.app.state.openai_serving_decisions.handle_request(
-        request, raw_request
-    )
-
-
 @app.post("/v1/responses", dependencies=[Depends(validate_json_request)])
 async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
@@ -2109,15 +2061,6 @@ async def anthropic_v1_count_tokens(
 ):
     """Anthropic-compatible token counting endpoint."""
     return await raw_request.app.state.anthropic_serving.handle_count_tokens(
-        request, raw_request
-    )
-
-
-## System One compatible decision API
-@app.post("/v1/systemone", dependencies=[Depends(validate_json_request)])
-async def systemone_decisions(request: SystemOneRequest, raw_request: Request):
-    """System One compatible decisions, answered by candidate scoring without generation."""
-    return await raw_request.app.state.systemone_serving.handle_request(
         request, raw_request
     )
 
@@ -2467,98 +2410,53 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
     freeze_headers = {}
     if freeze_key:
         freeze_headers["Authorization"] = f"Bearer {freeze_key}"
-    # Skip-warmup bypasses the listener-readiness poll. Retry only connection
-    # failures while preserving the current SSL verification API.
-    deadline = time.monotonic() + 30
-    while True:
-        try:
-            res = requests.post(
-                server_args.url() + "/freeze_gc",
-                headers=freeze_headers,
-                timeout=10,
-                verify=ssl_verify_of(server_args),
-            )
-            res.raise_for_status()
-            return
-        except requests.exceptions.ConnectionError:
-            if time.monotonic() >= deadline:
-                logger.warning("post-warmup freeze_gc failed", exc_info=True)
-                return
-            time.sleep(0.5)
-        except requests.exceptions.RequestException:
-            logger.warning("post-warmup freeze_gc failed", exc_info=True)
-            return
+    try:
+        res = requests.post(
+            server_args.url() + "/freeze_gc",
+            headers=freeze_headers,
+            timeout=10,
+            verify=ssl_verify_of(server_args),
+        )
+        res.raise_for_status()
+    except requests.exceptions.RequestException:
+        logger.warning("post-warmup freeze_gc failed", exc_info=True)
 
 
 def _wait_and_warmup(
     server_args: ServerArgs,
     launch_callback: Optional[Callable[[], None]] = None,
     execute_warmup_func: Callable = _execute_server_warmup,
-    is_warmup_owner: bool = True,
 ):
-    tokenizer_manager = _global_state.tokenizer_manager
-    if not is_warmup_owner:
-        wait_for_warmup_result = getattr(
-            tokenizer_manager, "wait_for_server_warmup_result", None
+    if get_model().checkpoint_engine_wait_weights_before_ready:
+        _wait_weights_ready()
+
+    # Joiner schedulers are served through the primary after adoption.
+    skip_elastic_joiner_warmup = get_exec().moe.is_ep_scale_joiner
+    if skip_elastic_joiner_warmup:
+        logger.debug(
+            "[Elastic EP] Skipping server warmup for elastic joiner (ep_join_mode=%s)",
+            get_exec().moe.ep_join_mode,
         )
-        if wait_for_warmup_result is None:
-            tokenizer_manager.server_status = ServerStatus.UnHealthy
-            logger.error("Tokenizer worker cannot receive the server warmup result")
+
+    if not get_serving().skip_server_warmup and not skip_elastic_joiner_warmup:
+        if not execute_warmup_func(server_args):
             return
+    else:
+        _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
-        success = wait_for_warmup_result()
-        tokenizer_manager.server_status = (
-            ServerStatus.Up if success else ServerStatus.UnHealthy
-        )
-        return
+    _freeze_gc_after_server_warmup(server_args)
 
-    success = False
-    try:
-        if get_model().checkpoint_engine_wait_weights_before_ready:
-            _wait_weights_ready()
+    # The server is ready for requests
+    logger.info("The server is fired up and ready to roll!")
 
-        # Joiner schedulers are served through the primary after adoption.
-        skip_elastic_joiner_warmup = get_exec().moe.is_ep_scale_joiner
-        if skip_elastic_joiner_warmup:
-            logger.debug(
-                "[Elastic EP] Skipping server warmup for elastic joiner (ep_join_mode=%s)",
-                get_exec().moe.ep_join_mode,
-            )
+    if get_model().delete_ckpt_after_loading:
+        delete_directory(get_model().model_path)
 
-        if not get_serving().skip_server_warmup and not skip_elastic_joiner_warmup:
-            if (
-                not execute_warmup_func(server_args)
-                or tokenizer_manager.server_status != ServerStatus.Up
-            ):
-                tokenizer_manager.server_status = ServerStatus.UnHealthy
-                return
-        else:
-            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+    if get_observability().debug_tensor_dump_input_file:
+        kill_process_tree(os.getpid())
 
-        _freeze_gc_after_server_warmup(server_args)
-
-        # The server is ready for requests
-        logger.info("The server is fired up and ready to roll!")
-
-        if get_model().delete_ckpt_after_loading:
-            delete_directory(get_model().model_path)
-
-        if get_observability().debug_tensor_dump_input_file:
-            kill_process_tree(os.getpid())
-
-        if launch_callback is not None:
-            launch_callback()
-
-        success = True
-    except BaseException:
-        tokenizer_manager.server_status = ServerStatus.UnHealthy
-        raise
-    finally:
-        report_warmup_result = getattr(
-            tokenizer_manager, "report_server_warmup_result", None
-        )
-        if report_warmup_result is not None:
-            report_warmup_result(success)
+    if launch_callback is not None:
+        launch_callback()
 
 
 def _wait_weights_ready():
@@ -2881,33 +2779,22 @@ def _setup_and_run_http_server(
                     ssl_keyfile_password=get_serving().ssl_keyfile_password,
                 )
             else:
-                from sglang.srt.entrypoints.multiprocessing_spawn import (
-                    use_multiprocessing_spawn_bootstrap,
-                    use_uvicorn_worker_startup_wait,
+                uvicorn.run(
+                    "sglang.srt.entrypoints.http_server:app",
+                    host=get_serving().host,
+                    port=get_serving().port,
+                    root_path=get_serving().fastapi_root_path,
+                    log_level=get_observability().log_level_http
+                    or get_observability().log_level,
+                    timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                    timeout_worker_healthcheck=envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get(),
+                    loop="uvloop",
+                    workers=get_serving().tokenizer_worker_num,
+                    ssl_keyfile=get_serving().ssl_keyfile,
+                    ssl_certfile=get_serving().ssl_certfile,
+                    ssl_ca_certs=get_serving().ssl_ca_certs,
+                    ssl_keyfile_password=get_serving().ssl_keyfile_password,
                 )
-
-                with (
-                    use_multiprocessing_spawn_bootstrap(),
-                    use_uvicorn_worker_startup_wait(
-                        envs.SGLANG_UVICORN_WORKER_STARTUP_TIMEOUT.get()
-                    ),
-                ):
-                    uvicorn.run(
-                        "sglang.srt.entrypoints.http_server:app",
-                        host=get_serving().host,
-                        port=get_serving().port,
-                        root_path=get_serving().fastapi_root_path,
-                        log_level=get_observability().log_level_http
-                        or get_observability().log_level,
-                        timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
-                        timeout_worker_healthcheck=envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get(),
-                        loop="uvloop",
-                        workers=get_serving().tokenizer_worker_num,
-                        ssl_keyfile=get_serving().ssl_keyfile,
-                        ssl_certfile=get_serving().ssl_certfile,
-                        ssl_ca_certs=get_serving().ssl_ca_certs,
-                        ssl_keyfile_password=get_serving().ssl_keyfile_password,
-                    )
     finally:
         if get_serving().tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:
@@ -2940,7 +2827,6 @@ def _start_native_grpc_server_for_runtime(
         port=grpc_port,
         runtime_handle=runtime_handle,
         worker_threads=get_serving().grpc_worker_threads,
-        response_timeout_secs=get_serving().grpc_response_timeout_secs,
     )
     logger.info(f"Native gRPC server started on {get_serving().host}:{grpc_port}")
     return grpc_handle
@@ -2992,10 +2878,6 @@ def launch_server(
         run_scheduler_process_func=run_scheduler_process_func,
         run_detokenizer_process_func=run_detokenizer_process_func,
     )
-
-    if get_parallel().node_rank >= 1:
-        # _launch_subprocesses already blocked until the schedulers exited.
-        return
 
     if envs.SGLANG_RUST_SERVER.get():
         # The Rust server serves api-server, tokenizer, and detokenizer, so the

@@ -37,7 +37,12 @@ dev = "cuda"
 
 @pytest.fixture
 def stated_tp_group():
-    """Provide a TP-group placeholder for kernels with mocked symmetric memory."""
+    """A TP group for a test that runs in a process without one.
+
+    The production call passes the group *into* `use_symmetric_memory`, so
+    stubbing that context manager does not stop the read -- the argument is
+    evaluated first. Stating it on the context answers every spelling.
+    """
     from sglang.srt.runtime_context import get_parallel
 
     with get_parallel().override(tp_group=None):

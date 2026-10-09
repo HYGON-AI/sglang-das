@@ -1,4 +1,7 @@
-"""Config-time override declarations for kimi_k3."""
+"""Config-time override declarations for kimi_k3.
+
+Architectures: KimiK3ForConditionalGeneration.
+"""
 
 import inspect
 import logging

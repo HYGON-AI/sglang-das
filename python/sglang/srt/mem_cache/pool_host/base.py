@@ -3,11 +3,10 @@ from __future__ import annotations
 import abc
 import logging
 import threading
-from collections.abc import Iterable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
-from typing import Optional, TypeGuard
+from typing import Optional
 
 import torch
 
@@ -18,12 +17,11 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_from_storage,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_cuda, is_hcu, is_hip
+from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
-_is_hcu = is_hcu()
 _is_hip = is_hip()
 
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
@@ -37,26 +35,6 @@ _host_memory_budget: ContextVar[Optional[int]] = ContextVar(
 )
 
 
-def uses_shared_host_layout(host_pool: object) -> TypeGuard[HostKVCache]:
-    return (
-        isinstance(host_pool, HostKVCache)
-        and host_pool.shared_allocation_domain is not None
-    )
-
-
-def shared_host_layout_domains(host_pools: Iterable[object]) -> list:
-    domains = []
-    seen = set()
-    for pool in host_pools:
-        if not uses_shared_host_layout(pool):
-            continue
-        domain = pool.shared_allocation_domain
-        if id(domain) not in seen:
-            seen.add(id(domain))
-            domains.append(domain)
-    return domains
-
-
 @contextmanager
 def host_memory_budget_scope(budget_bytes: int):
     """Book every pool built inside against one snapshot, not re-sampled psutil."""
@@ -68,15 +46,19 @@ def host_memory_budget_scope(budget_bytes: int):
 
 
 def ranks_per_host() -> int:
-    """Return the launch ranks per host, assuming uniform placement.
+    """Number of ranks of this job running on the same machine as this one.
 
-    Avoid a collective: ranks may construct different numbers of host pools.
+    Derived as the launch width // nnodes: the launcher slices ranks
+    uniformly across nodes (resolution asserts divisibility), so no hostname
+    collective is needed — a collective here would have to be issued the same
+    number of times on every rank, and ranks build different numbers of host
+    pools.
     """
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return 1
     try:
         launch_world_size = get_parallel().launch_world_size
-    except (RuntimeError, ValueError):
+    except AssertionError:
         return 1
     if launch_world_size == 1:
         return 1
@@ -103,16 +85,13 @@ def host_memory_budget_bytes(requested_bytes: int = 0) -> int:
     return free // ranks_per_host()
 
 
-def sync_fixed_hicache_size(
-    size: int, host_size: int, *, sync_tp_group: bool = False
-) -> int:
-    """Sync fixed-size HiCache token capacity across model-parallel ranks.
+def sync_fixed_hicache_size(size: int, host_size: int) -> int:
+    """Sync fixed-size HiCache token capacity across PP ranks.
 
     A fixed --hicache-size is specified in GB, but each PP stage may have a
     different bytes/token because it owns different layers. Use the global
     minimum token capacity within the PP group so all stages expose the same
-    host-cache capacity. HCU LayerSplit also uses a different bytes/token on
-    uneven CP layer shards, so include the TP group for that configuration.
+    host-cache capacity.
     Ratio-based sizing already derives from the synced device pool size.
     """
     if host_size <= 0 or not torch.distributed.is_available():
@@ -124,30 +103,26 @@ def sync_fixed_hicache_size(
     try:
         from sglang.srt.runtime_context import get_parallel
 
-        parallel = get_parallel()
-        groups = [parallel.pp_group]
-        if sync_tp_group:
-            groups.append(parallel.tp_group)
-    except RuntimeError:
+        pp_group = get_parallel().pp_group
+    except AssertionError:
+        return size
+
+    if pp_group.world_size <= 1:
         return size
 
     tensor = torch.tensor(size, dtype=torch.int64)
-    for group in groups:
-        if group.world_size <= 1:
-            continue
-        torch.distributed.all_reduce(
-            tensor,
-            op=torch.distributed.ReduceOp.MIN,
-            group=group.cpu_group,
-        )
+    torch.distributed.all_reduce(
+        tensor,
+        op=torch.distributed.ReduceOp.MIN,
+        group=pp_group.cpu_group,
+    )
     synced_size = int(tensor.item())
 
     if synced_size != size:
         logger.info(
-            "Sync fixed-size HiCache host token capacity from %d to %d%s.",
+            "Sync fixed-size HiCache host token capacity from %d to %d.",
             size,
             synced_size,
-            " across PP and TP groups" if sync_tp_group else " across PP ranks",
         )
     return synced_size
 
@@ -164,7 +139,6 @@ def synchronized(func):
 class HostKVCache(abc.ABC):
     dcp_size = 1
     dcp_rank = 0
-    shared_allocation_domain = None
 
     def __init__(
         self,
@@ -200,44 +174,26 @@ class HostKVCache(abc.ABC):
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
-        # Unified pools report token capacity separately from their buffer-row count.
-        device_capacity = getattr(device_pool, "host_capacity_tokens", None)
-        if device_capacity is None:
-            device_capacity = device_pool.size
-        self.device_capacity_tokens = device_capacity
-        layer_sharded_on_hcu = _is_hcu and self._is_device_layer_sharded(device_pool)
         if host_size > 0:
-            # An empty tail shard owns no bytes. Let non-empty ranks determine
-            # the shared capacity instead of dividing by zero or constraining
-            # the group to the device-pool size.
-            local_fixed_size = (
-                int(host_size * 1e9 // self.size_per_token)
-                if self.size_per_token > 0
-                else torch.iinfo(torch.int64).max
-            )
             self.size = sync_fixed_hicache_size(
-                local_fixed_size,
-                host_size,
-                sync_tp_group=layer_sharded_on_hcu,
+                int(host_size * 1e9 // self.size_per_token), host_size
             )
-            if self.size == torch.iinfo(torch.int64).max:
-                self.size = device_pool.size
         else:
-            self.size = int(device_capacity * host_to_device_ratio)
+            self.size = int(device_pool.size * host_to_device_ratio)
         # Align up the host memory pool size to the page size
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
-        if self.size <= device_capacity:
+        if self.size <= device_pool.size:
             logger.warning(
                 "HiCache %s host pool (%d tokens) is smaller than the device pool (%d tokens);"
                 "L2 cache effectiveness is reduced."
                 "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
                 pool_label,
                 self.size,
-                device_capacity,
+                device_pool.size,
             )
 
         # Verify there is enough available host memory.
@@ -322,9 +278,6 @@ class HostKVCache(abc.ABC):
         device_pool = device_pool or self.device_pool
         if not self._is_device_layer_sharded(device_pool):
             return device_pool.layer_num
-        if _is_hcu:
-            start, end = self._device_owned_layer_range(device_pool)
-            return end - start
         shard_size = device_pool.layer_shard_size
         return (device_pool.layer_num + shard_size - 1) // shard_size
 
@@ -368,55 +321,6 @@ class HostKVCache(abc.ABC):
         Backup KV data from the device memory pool to the host memory pool for all layers.
         """
         raise NotImplementedError()
-
-    def get_page_buffer_element_size(self, split_factor: int = 1) -> Optional[int]:
-        """Byte size of one storage element, or None for a logical anchor."""
-        indices = torch.zeros(self.page_size, dtype=torch.int64)
-        meta = (
-            self.get_split_heads_page_buffer_meta(indices, split_factor)
-            if split_factor != 1
-            else self.get_page_buffer_meta(indices)
-        )
-        sizes = meta[1] if meta else None
-        return int(sizes[0]) if sizes else None
-
-    def prepare_transfer_indices(
-        self, host_indices, device_indices, io_backend
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Resolve indices that must remain stable through one L2 submission.
-
-        Normal host pools expose physical indices directly and controllers have
-        already moved them to the backend-required device. Shared compacting
-        pools override this hook and resolve their logical ids while the transfer
-        engine holds a layout lease.
-        """
-        return host_indices, device_indices
-
-    def backup_from_device_all_layer_physical(
-        self, device_pool, host_indices, device_indices, io_backend
-    ) -> None:
-        self.backup_from_device_all_layer(
-            device_pool, host_indices, device_indices, io_backend
-        )
-
-    def load_to_device_per_layer_physical(
-        self,
-        device_pool,
-        host_indices,
-        device_indices,
-        layer_id,
-        io_backend,
-        *,
-        is_draft: bool = False,
-    ) -> None:
-        self.load_to_device_per_layer(
-            device_pool,
-            host_indices,
-            device_indices,
-            layer_id,
-            io_backend,
-            is_draft=is_draft,
-        )
 
     @abc.abstractmethod
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:

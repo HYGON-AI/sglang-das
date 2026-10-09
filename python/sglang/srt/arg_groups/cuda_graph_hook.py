@@ -14,7 +14,6 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.connector import ConnectorType
-from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import (
     ALLOWED_BACKENDS_PER_PHASE,
     Backend,
@@ -593,8 +592,6 @@ def _resolve_max_context_size(
 def finalize_cuda_graph_prefill_max_context(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     requested_size = cfg.cuda_graph_config.prefill.max_context_size
-    if requested_size is None:
-        requested_size = envs.SGLANG_BCG_PREFILL_MAX_CONTEXT.get() or None
     if requested_size is None:
         return
     page_size = cfg.page_size

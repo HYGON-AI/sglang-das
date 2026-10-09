@@ -1,4 +1,7 @@
-"""Config-time override declarations for granitemoehybrid."""
+"""Config-time override declarations for granitemoehybrid.
+
+Architectures: GraniteMoeHybridForCausalLM.
+"""
 
 from typing import Any
 

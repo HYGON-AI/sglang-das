@@ -1,4 +1,11 @@
-"""Config fields of the ``lora`` namespace."""
+"""Config fields of the ``lora`` namespace.
+
+One class per namespace. The class *is* the namespace: a field declared here
+lands in the ``lora`` bag, which is what ``get_lora()`` returns, so a reader
+spells it exactly as before. ``ServerArgs`` composes these classes, so the
+record stays one flat object -- the split moves where declarations live, not
+how config is shaped at runtime.
+"""
 
 from __future__ import annotations
 

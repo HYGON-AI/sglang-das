@@ -543,7 +543,6 @@ def handle_deterministic_inference(server_args: Any):
                     "GlmMoeDsaForCausalLM",
                     "Glm4MoeLiteForCausalLM",
                     "Glm5NextForConditionalGeneration",
-                    "Glm5NextForCausalLM",
                 ]
             except Exception:
                 pass

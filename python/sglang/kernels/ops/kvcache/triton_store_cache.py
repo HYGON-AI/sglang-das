@@ -61,8 +61,7 @@ def _triton_fused_store_flashmla_kernel(
     if token_id >= N:
         return
 
-    # Per-layer caches exceed 2 GiB; int32 byte offsets wrap and write outside the buffer.
-    loc = tl.load(indices_ptr + token_id).to(tl.int64)
+    loc = tl.load(indices_ptr + token_id).to(tl.int32)
     page = loc // PAGE_SIZE
     slot = loc % PAGE_SIZE
 
@@ -170,7 +169,7 @@ def _triton_fused_store_indexer_kernel(
     if token_id >= N:
         return
 
-    loc = tl.load(indices_ptr + token_id).to(tl.int64)
+    loc = tl.load(indices_ptr + token_id).to(tl.int32)
     page = loc // PAGE_SIZE
     slot = loc % PAGE_SIZE
 

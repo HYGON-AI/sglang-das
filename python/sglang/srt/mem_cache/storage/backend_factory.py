@@ -192,8 +192,6 @@ class StorageBackendFactory:
             return backend_class(storage_config, mem_pool_host)
         elif backend_name == "shm":
             return backend_class(storage_config, mem_pool_host)
-        elif backend_name == "tensorcast":
-            return backend_class(storage_config)
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
 
@@ -259,10 +257,4 @@ StorageBackendFactory.register_backend(
     "shm",
     "sglang.srt.mem_cache.storage.shm",
     "HiCacheShm",
-)
-
-StorageBackendFactory.register_backend(
-    "tensorcast",
-    "sglang.srt.mem_cache.storage.tensorcast_store.tensorcast_store",
-    "TensorcastStore",
 )

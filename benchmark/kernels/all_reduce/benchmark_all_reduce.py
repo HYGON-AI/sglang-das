@@ -21,7 +21,6 @@ from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from sglang.test.test_utils import publish_build_topology
 
 
 def parse_args():
@@ -86,8 +85,7 @@ def init_dist(backend: str):
         distributed_init_method=distributed_init_method,
         local_rank=rank,
     )
-    publish_build_topology(world_rank=rank, tp_size=world_size)
-    initialize_model_parallel()
+    initialize_model_parallel(tensor_model_parallel_size=world_size)
     return dist.group.WORLD
 
 

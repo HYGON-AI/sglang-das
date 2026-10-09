@@ -28,7 +28,6 @@ from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
-from sglang.srt.layers.moe.ep_balance import make_ep_balanced_expert_ids
 from sglang.srt.layers.moe.topk import (
     _RENORMALIZE_SUM_EPSILON,
     StandardTopKOutput,
@@ -38,7 +37,7 @@ from sglang.srt.layers.moe.topk import (
     remap_topk_for_per_rank_shared_slots,
 )
 from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_hip, is_npu, is_xpu
 
 logger = logging.getLogger(__name__)
@@ -66,16 +65,6 @@ class HashTopK(nn.Module):
         self.enable_waterfill = (
             num_fused_shared_experts > 0 and get_exec().moe.enable_waterfill
         )
-        if envs.SGLANG_SIMULATED_EXPERT_BALANCE.get():
-            if get_exec().moe.ep_num_redundant_experts != 0:
-                raise ValueError(
-                    "SGLANG_SIMULATED_EXPERT_BALANCE cannot be used with "
-                    "redundant physical experts"
-                )
-            if self.enable_waterfill:
-                raise ValueError(
-                    "SGLANG_SIMULATED_EXPERT_BALANCE cannot be used with " "waterfill"
-                )
         self.waterfill_balancer = None
 
         if self.enable_waterfill:
@@ -257,7 +246,7 @@ class HashTopK(nn.Module):
         if _is_xpu:
             topk_weights, topk_ids = self._forward_xpu(router_logits, input_ids)
         elif envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
-            from sglang.kernels.ops.moe.dsv4 import hash_topk
+            from sglang.kernels.ops.attention.dsv4 import hash_topk
 
             topk_weights, topk_ids = hash_topk(
                 router_logits=router_logits,
@@ -269,36 +258,6 @@ class HashTopK(nn.Module):
             )
         else:
             topk_weights, topk_ids = self._forward_torch(router_logits, input_ids)
-        if envs.SGLANG_SIMULATED_EXPERT_BALANCE.get():
-            if expert_location_dispatch_info is not None:
-                raise ValueError(
-                    "SGLANG_SIMULATED_EXPERT_BALANCE requires contiguous expert "
-                    "placement and cannot be used with EPLB"
-                )
-            routed_topk = self.topk - self.num_fused_shared_experts
-            parallel = get_parallel()
-            balanced_routed_ids = make_ep_balanced_expert_ids(
-                num_tokens=topk_ids.shape[0],
-                topk=routed_topk,
-                num_experts=self.num_experts,
-                ep_size=parallel.moe_ep_size,
-                ep_rank=parallel.moe_ep_rank,
-                device=topk_ids.device,
-                dtype=topk_ids.dtype,
-                layer_id=self.layer_id,
-            )
-            if topk_ids.shape[1] < routed_topk:
-                raise ValueError(
-                    f"Top-k output has {topk_ids.shape[1]} columns, but "
-                    f"{routed_topk} routed expert columns are required"
-                )
-            if topk_ids.shape[1] == routed_topk:
-                topk_ids = balanced_routed_ids
-            else:
-                # Preserve fused shared-expert columns and their weights.
-                topk_ids = torch.cat(
-                    (balanced_routed_ids, topk_ids[:, routed_topk:]), dim=1
-                )
         if _is_hip or _is_npu:
             topk_weights = topk_weights.to(torch.float32)
 

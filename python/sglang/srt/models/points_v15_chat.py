@@ -1,5 +1,4 @@
 import copy
-from array import array
 from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
@@ -102,7 +101,7 @@ class POINTSV15ChatModel(nn.Module):
             prefix=add_prefix("vision_projector", prefix),
         )
 
-    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

@@ -49,13 +49,12 @@ async fn failover_when_one_worker_dies() {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
-            default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec![w1.url.clone(), w2.url.clone(), w3.url.clone()],
         }),
         proxy: ProxyConfig::default(),
-        router_inflight_load: InflightLoadConfig::default(),
+        active_load: ActiveLoadConfig::default(),
     };
 
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());

@@ -14,7 +14,6 @@
 """SGLang implementation of Bailing/Ling 3 VL image and video inference."""
 
 import logging
-from array import array
 from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
@@ -129,7 +128,7 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
 
-    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         return self.pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def _materialize_items(self, items: List[MultimodalDataItem]) -> torch.Tensor:

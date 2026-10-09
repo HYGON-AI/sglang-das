@@ -43,7 +43,6 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.srt.utils import is_hcu
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
@@ -483,9 +482,6 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         if enable_override is False:
             # The per-request kill switch wins over quality="high".
             desired_mode = None
-        elif batch.sampling_params.enable_spectrum:
-            # Spectrum skips the block stack; Cache-DiT wraps those blocks.
-            desired_mode = None
         elif quality == "high":
             desired_mode = "high"
         else:
@@ -684,11 +680,11 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             or current_platform.is_mps()
             or current_platform.is_npu()
             or current_platform.is_xpu()
-            or is_hcu()
         ):
             raise RuntimeError(
-                "MiniMax H3 full-loop denoise requires CPU, CUDA, HCU, MPS, XPU, or Ascend NPU"
+                "MiniMax H3 full-loop denoise requires CPU, CUDA, MPS, XPU, or Ascend NPU"
             )
+
         device = current_platform.get_local_torch_device()
         sigmas_video = [float(v) for v in ctx.sigmas["video"]]
         self._maybe_enable_cache_dit_and_torch_compile(
@@ -776,6 +772,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 model,
                 positive,
                 device=device,
+                shared_conditioning=emb,
             )
             _precompute_rope_cache(
                 model,

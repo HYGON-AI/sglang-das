@@ -1,4 +1,11 @@
-"""Config fields of the ``serving`` namespace."""
+"""Config fields of the ``serving`` namespace.
+
+One class per namespace. The class *is* the namespace: a field declared here
+lands in the ``serving`` bag, which is what ``get_serving()`` returns, so a reader
+spells it exactly as before. ``ServerArgs`` composes these classes, so the
+record stays one flat object -- the split moves where declarations live, not
+how config is shaped at runtime.
+"""
 
 from __future__ import annotations
 
@@ -83,11 +90,6 @@ class Serving(msgspec.Struct):
         "default. In legacy --smg-grpc-mode this is the SMG server port and "
         "defaults to --port + 10000.",
     ] = None
-    grpc_response_timeout_secs: A[
-        int,
-        "Timeout in seconds waiting for each native gRPC response chunk, "
-        "including the first. Must be positive. Defaults to 300.",
-    ] = 300
     # Env-only (SGLANG_GRPC_WORKER_THREADS); a field so the projection sees it.
     grpc_worker_threads: A[Optional[int], Arg(no_cli=True)] = None
     sidecar: A[
@@ -124,7 +126,9 @@ class Serving(msgspec.Struct):
         int,
         "Initial connection-level HTTP/2 receive window in bytes (1024 to "
         "2^31 - 1). Only applies with --enable-http2.",
-    ] = 1024 * 1024
+    ] = (
+        1024 * 1024
+    )
 
     # -------------------------------------------------------------------------
     # SSL/TLS
@@ -156,7 +160,7 @@ class Serving(msgspec.Struct):
     ] = None
     admin_api_key: A[
         Optional[str],
-        "Set admin API key for sensitive management endpoints (e.g. /hicache/storage-backend/clear). When set, admin endpoints require this key and do NOT accept --api-key.",
+        "Set admin API key for sensitive management endpoints (e.g. /clear_hicache_storage_backend). When set, admin endpoints require this key and do NOT accept --api-key.",
     ] = None
     served_model_name: A[
         Optional[str],
@@ -170,10 +174,6 @@ class Serving(msgspec.Struct):
         Optional[str],
         "The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
     ] = None
-    trust_request_chat_template: A[
-        bool,
-        "Allow a request to override the server chat template via its chat_template_kwargs. Off by default for safety.",
-    ] = False
     hf_chat_template_name: A[
         Optional[str],
         "When the HuggingFace tokenizer has multiple chat templates (e.g., 'default', 'tool_use', 'rag'), specify which named template to use. If not set, the first available template is used.",
@@ -283,10 +283,6 @@ class Serving(msgspec.Struct):
         bool,
         "(xgrammar and llguidance backends only) Enforce compact representation in JSON constrained output.",
     ] = False
-    constrained_json_max_whitespace_cnt: A[
-        Optional[int],
-        "(xgrammar backend only) Max consecutive whitespace chars allowed in JSON constrained output. None means unbounded.",
-    ] = None
 
     # -------------------------------------------------------------------------
     # Dynamic batch tokenizer
@@ -310,30 +306,3 @@ class Serving(msgspec.Struct):
     disable_tokenizer_batch_decode: A[
         bool, "Disable batch decoding when decoding multiple completions."
     ] = False
-
-    # GLM serving extensions, opt-in for compatibility with existing clients.
-    glm_adaptive_max_tokens: A[
-        bool, "Reduce requested completion tokens to fit the GLM context budget."
-    ] = False
-    glm_check_chat_prompt_length: A[
-        bool,
-        "Return HTTP 413 when the GLM prompt and completion exceed the context budget.",
-    ] = False
-    glm_check_total_num_tokens: A[
-        bool,
-        "Check that the KV token capacity can hold the configured GLM context length.",
-    ] = False
-    glm_decoding_constraint_module: A[
-        Optional[str],
-        "Module exporting GLM generation_constraint and get_special_token_config.",
-    ] = None
-    glm_disable_nothink: A[
-        bool, "Reject requests that disable thinking for thinking-only GLM models."
-    ] = False
-    glm_ignore_decoding_constraint_exception: A[
-        bool, "Log GLM constraint errors and continue without the constraint."
-    ] = False
-    glm_special_token_escape_seed: A[
-        Optional[int],
-        "Seed used to escape GLM special token strings while preserving token IDs.",
-    ] = None

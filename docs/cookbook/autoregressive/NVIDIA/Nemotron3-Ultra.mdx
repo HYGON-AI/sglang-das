@@ -528,13 +528,8 @@ python3 -m sglang.launch_server \
 
 **Run Benchmark**
 ```bash Command
-sgl-eval run gsm8k \
-  --base-url http://127.0.0.1:30000/v1 \
-  --num-examples 200 \
-  --num-threads 64
+python3 benchmark/gsm8k/bench_sglang.py
 ```
-
-Historical results below use the removed harness and are not measurements of the sgl-eval command above.
 
 **Test Results:**
 ```text Output
@@ -548,9 +543,7 @@ Output throughput: 745.333 token/s
 
 **Run Benchmark**
 ```bash Command
-sgl-eval run mmlu \
-  --base-url http://127.0.0.1:30000/v1 \
-  --num-threads 64 --max-tokens 2048
+python3 benchmark/mmlu/bench_sglang.py
 ```
 
 **Test Results:**

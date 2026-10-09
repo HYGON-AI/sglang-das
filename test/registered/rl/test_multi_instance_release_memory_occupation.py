@@ -99,9 +99,7 @@ class EngineWrapper:
         self, named_tensors: Iterable[Tuple[str, torch.Tensor]]
     ):
         if self._tp_rank == 0:
-            self._engine.begin_weight_update()
             self._engine.update_weights_from_tensor(list(named_tensors))
-            self._engine.end_weight_update()
             self._engine.flush_cache()
         dist.barrier(group=self._device_mesh_cpu.get_group())
 

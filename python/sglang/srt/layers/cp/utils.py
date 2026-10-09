@@ -46,16 +46,12 @@ def is_glm_dsa_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
     """Whether DSA GPU KV/indexer cache layers are sharded across CP ranks.
 
     Layer split is a prefill-CP-only optimization for DSA (DeepSeek Sparse
-    Attention) MLA models (e.g. GLM-5.2). Single-layer NextN drafts can opt in
-    after the EAGLE worker supplies a compatible target Main-KV scratch pool.
+    Attention) MLA models (e.g. GLM-5.2). Draft workers keep the full cache.
     """
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
     return (
-        (
-            not model_runner.is_draft_worker
-            or getattr(model_runner, "dsa_layer_split_scratch_source", None) is not None
-        )
+        not model_runner.is_draft_worker
         and get_parallel().enable_dsa_cache_layer_split
         and model_runner.use_mla_backend
         and is_deepseek_dsa(model_runner.model_config.hf_config)
@@ -92,10 +88,6 @@ def get_glm_dsa_layer_split_effective_num_layers(
     if shard_size <= 1:
         return num_layers
     owned_layers_upper_bound = (num_layers + shard_size - 1) // shard_size
-    if getattr(model_runner, "dsa_layer_split_scratch_source", None) is not None:
-        # The draft aliases target Main-KV scratch, so count only its owner
-        # storage here. Index-K has its own independent scratch budget.
-        return owned_layers_upper_bound
     return max(1, owned_layers_upper_bound + 1)
 
 
@@ -126,21 +118,8 @@ def get_layer_owner(local_layer_idx: int, shard_size: int, total_layers: int) ->
     )
 
 
-def enable_cp_v2() -> bool:
-    """Return whether the strategy-based generic prefill CP path is available."""
-    from sglang.srt.utils import is_hip, is_musa, is_npu
-
-    return not (is_hip() or is_npu() or is_musa())
-
-
 def is_cp_active(forward_batch) -> bool:
     """Return whether the current forward batch is running through CP."""
-    # HIP/NPU/MUSA retain their platform CP implementations.  Treating those
-    # batches as strategy-CP here shards the model inputs a second time while
-    # their attention backends still use the legacy layout.
-    if not enable_cp_v2():
-        return False
-
     forward_mode = getattr(forward_batch, "forward_mode", None)
     if forward_mode is None or not forward_mode.is_context_parallel_extend():
         return False
@@ -156,29 +135,9 @@ def is_cp_active(forward_batch) -> bool:
     return strategy.can_apply(len(input_ids), forward_batch)
 
 
-# Compatibility name retained for pre-generic-CP callers.
-is_cp_v2_active = is_cp_active
-
-
 def is_mla_cp_enabled() -> bool:
     """Return whether prefill CP is configured for an MLA attention backend."""
     return is_cp_enabled() and uses_mla_backend()
-
-
-def is_mla_prefill_cp_enabled() -> bool:
-    """Compatibility name used by the CUDA-graph runner."""
-    return is_mla_cp_enabled()
-
-
-def mla_use_prefill_cp(forward_batch) -> bool:
-    """Compatibility predicate for platform-specific MLA prefill CP."""
-    if enable_cp_v2():
-        return is_mla_prefill_cp_enabled() and is_cp_active(forward_batch)
-    return (
-        getattr(forward_batch, "attn_cp_metadata", None) is not None
-        and is_mla_prefill_cp_enabled()
-        and forward_batch.forward_mode.is_context_parallel_extend()
-    )
 
 
 def is_mla_cp_active(forward_batch) -> bool:
@@ -299,12 +258,6 @@ def cp_materialize_global_token_order(
     x: Any, forward_batch, stream: Optional[Any] = None
 ):
     """Materialize a CP tensor in the global logical token order."""
-    if not enable_cp_v2():
-        from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
-
-        return cp_all_gather_rerange_output(
-            x, get_parallel().attn_cp_size, forward_batch, stream
-        )
     assert is_cp_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
@@ -379,9 +332,7 @@ __all__ = [
     "ZigzagCPStrategy",
     "ZigzagContextParallelMetadata",
     "get_cp_strategy",
-    "enable_cp_v2",
     "is_cp_active",
-    "is_cp_v2_active",
     "is_mla_cp_enabled",
     "is_mla_cp_active",
     "cp_gather_after_forward",

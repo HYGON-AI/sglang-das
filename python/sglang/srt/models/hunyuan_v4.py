@@ -6,14 +6,8 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
-from sglang.srt.layers.hy4_ihc_tilelang import (
-    try_tilelang_ihc_head,
-    try_tilelang_ihc_post,
-    try_tilelang_ihc_pre,
-)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -105,20 +99,6 @@ class HYV4HCPreLayer(nn.Module):
         rms_weight: torch.Tensor | None = None,
         rms_eps: float = 0.0,
     ):
-        if rms_weight is None and envs.SGLANG_OPT_HY4_IHC_TILELANG.get():
-            # Opt-in HCU TileLang iHC (SGLANG_OPT_HY4_IHC_TILELANG); it does not
-            # fuse the RMSNorm, so it only serves the unfused-norm call.
-            fused = try_tilelang_ihc_pre(
-                hidden_states,
-                self.hc_fn.weight,
-                self.hc_scale,
-                self.hc_base,
-                self.rms_norm_eps,
-                self.hc_eps,
-                self.magnitude,
-            )
-            if fused is not None:
-                return fused
         if hidden_states.is_cuda and not self._fused_ihc_pre_disabled:
             try:
                 from sglang.kernels.ops.layernorm.hy4_ihc import fused_hy4_ihc_pre
@@ -216,9 +196,6 @@ class HYV4HCLayer(nn.Module):
         return reduced, post, hidden_states
 
     def post(self, output, residual, post):
-        fused = try_tilelang_ihc_post(output, residual, post)
-        if fused is not None:
-            return fused
         if output.is_cuda and not self._fused_ihc_post_disabled:
             try:
                 from sglang.kernels.ops.layernorm.hy4_ihc import fused_hy4_ihc_post
@@ -293,16 +270,6 @@ class HYV4HCHeadLayer(nn.Module):
         self._fused_ihc_head_disabled = False
 
     def forward(self, hidden_states: torch.Tensor, norm: RMSNorm | None = None):
-        fused = try_tilelang_ihc_head(
-            hidden_states,
-            self.hc_head_fn.weight,
-            self.hc_head_scale,
-            self.hc_head_base,
-            self.config.rms_norm_eps,
-            self.config.hc_eps,
-        )
-        if fused is not None:
-            return fused if norm is None else norm(fused)
         if (
             hidden_states.is_cuda
             and not self._fused_ihc_head_disabled
@@ -563,8 +530,7 @@ class HYV4Attention(DeepseekV2AttentionMLA):
         if hasattr(backend, "use_mha") and backend.use_mha is not False:
             backend.use_mha = False
         method = super().dispatch_attn_forward_method(forward_batch)
-        # HIP (HCU) maps MLA onto its ROCm implementation of the same path.
-        if method not in (AttnForwardMethod.MLA, AttnForwardMethod.MLA_ROCM):
+        if method != AttnForwardMethod.MLA:
             raise RuntimeError("HYV4 requires the sparse MLA attention path")
         return method
 

@@ -26,7 +26,7 @@ from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_si
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerFacts,
+    LayerScatterModes,
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
@@ -45,7 +45,7 @@ from sglang.srt.models.mimo_v2 import (
     MiMoV2Attention,
     MiMoV2ForCausalLM,
     MiMoV2MLP,
-    load_mimo_v2_qkv_proj_weight,
+    load_mimo_v2_qkv_proj_weight_v2,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
@@ -119,7 +119,7 @@ class MiMoV2MTPLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.layernorm_epsilon
         )
-        self.layer_facts = LayerFacts.init_new(
+        self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=1,
             is_layer_sparse=self.is_layer_sparse,
@@ -127,10 +127,9 @@ class MiMoV2MTPLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
         self.layer_communicator = LayerCommunicator(
-            layer_facts=self.layer_facts,
+            layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
-            allow_deferred_ffn_reduction=False,
         )
 
     def forward(
@@ -155,12 +154,11 @@ class MiMoV2MTPLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        with (
-            self.layer_communicator.ffn_exit(forward_batch) as ffn_exit,
-            get_global_expert_distribution_recorder().disable_this_region(),
-        ):
+        with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
 
         return hidden_states, residual
 
@@ -313,13 +311,14 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
             if "qkv_proj" in name:
                 if name in params_dict:
                     param = params_dict[name]
-                    load_mimo_v2_qkv_proj_weight(
+                    load_mimo_v2_qkv_proj_weight_v2(
                         name,
                         param,
                         loaded_weight,
                         expected_fused_tp_size=get_mimo_v2_fused_qkv_expected_tp_size(
                             self.config
-                        )
+                        ),
+                        config=self.config,
                     )
                 continue
 

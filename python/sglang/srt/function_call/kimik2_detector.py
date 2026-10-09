@@ -468,7 +468,6 @@ class KimiK2Detector(BaseFormatDetector):
             tools=converted_tools,
             tool_choice=converted_tool_choice,
             reasoning=thinking_mode,
-            parallel_tool_calls=parallel_tool_calls,
         )
 
     def get_structural_tag_name(self) -> str:

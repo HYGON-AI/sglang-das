@@ -5,8 +5,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use sgl_kv_indexer::PrefixOutcome;
+use sgl_router::policies::kv_events::{
+    compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId,
+};
 use sgl_router::policies::prefix_provider::RadixTreePrefixProvider;
-use sgl_router::state::kv_events::{compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId};
 
 #[test]
 fn radix_tree_reports_contiguous_prefix_depth_per_worker() {

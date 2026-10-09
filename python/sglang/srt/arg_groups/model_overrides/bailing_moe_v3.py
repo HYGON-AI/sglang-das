@@ -1,4 +1,8 @@
-"""Config-time override declarations for bailing_moe_v3."""
+"""Config-time override declarations for bailing_moe_v3.
+
+Architectures: BailingMoeV3ForCausalLM,
+BailingMoeV3VLForConditionalGeneration.
+"""
 
 import logging
 from typing import Any

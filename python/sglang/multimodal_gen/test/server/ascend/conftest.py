@@ -1,7 +1,4 @@
-"""Ascend NPU fixtures for performance validation and model page cache.
-
-NPU performance guards cover inference latency, not model loading latency.
-Loading times are still collected and reported by the shared test harness.
+"""Ascend NPU conftest: evict stale model page cache before each test case.
 
 Memory-capped CI runners (e.g. a 128 GiB cgroup on the 4-NPU A3 pool) count
 reclaimable page cache from previously loaded models in cgroup
@@ -25,16 +22,6 @@ from sglang.multimodal_gen.test.server.ascend.testcase_configs_npu import (
 
 _CGROUP_V2_CURRENT = "/sys/fs/cgroup/memory.current"
 _CGROUP_V1_USAGE = "/sys/fs/cgroup/memory/memory.usage_in_bytes"
-
-
-@pytest.fixture(autouse=True)
-def _disable_load_latency_validation(monkeypatch):
-    """Disable loading-latency comparisons only for tests in this directory."""
-    from sglang.multimodal_gen.test.server.test_server_utils import PerformanceValidator
-
-    monkeypatch.setattr(
-        PerformanceValidator, "validate_load", lambda self, summary: None
-    )
 
 
 def _read_cgroup_memory_current() -> str:

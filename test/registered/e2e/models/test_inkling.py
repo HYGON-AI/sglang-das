@@ -86,6 +86,7 @@ class TestInklingServer(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
+            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
 
     @classmethod

@@ -1,26 +1,10 @@
-"""Weight-free MQA operators for the simple QSA indexer.
+"""Weight-free TileLang MQA operators for the simple QSA indexer;
+the torch implementations are the fallback and the reference."""
 
-The public entry points try BoltOPs TileLang first (HCU only), then the in-tree
-TileLang kernels, then the Torch reference.
-"""
-
-import logging
 import math
-from functools import lru_cache
 from typing import Optional
 
 import torch
-
-from sglang.srt.utils.common import is_hcu, is_hip
-
-logger = logging.getLogger(__name__)
-
-_is_hcu = is_hcu()
-
-
-@lru_cache(maxsize=8)
-def _warn_tilelang_fallback(kind: str, reason: str) -> None:
-    logger.warning("QSA MQA TileLang %s falls back to torch: %s", kind, reason)
 
 try:
     import flashinfer.comm  # noqa: F401
@@ -309,14 +293,7 @@ def tilelang_qsa_mqa_prefill(
             torch.ones_like(logits, dtype=torch.bool), -float("inf")
         )
     heads, head_dim = q.shape[1:]
-    # HIP LDS is 64KB. The CUDA launch (threads=512, num_stages=3,
-    # block_q=128//heads) pipelines three K tiles and overflows (~80KB).
-    # Keep GEMM N = block_q * heads = 128 (MFMA-aligned), drop the pipeline
-    # replicas and match the decode kernel's 128-thread CTA.
-    if is_hip():
-        threads, num_stages, block_q = 128, 1, 32
-    else:
-        threads, num_stages, block_q = 512, 3, max(1, 128 // heads)
+    block_q = max(1, 128 // heads)
     padding = (-rows) % block_q
     padded_rows = rows + padding
     # A torch.cat of the padding rows would copy the whole [rows, keys] fp32 matrix,
@@ -330,13 +307,7 @@ def tilelang_qsa_mqa_prefill(
         starts = torch.cat([starts, starts[-1:].expand(padding)])
         ends = torch.cat([ends, ends[-1:].expand(padding)])
 
-    _tilelang_qsa_mqa_prefill_kernel(
-        heads=heads,
-        head_dim=head_dim,
-        block_q=block_q,
-        num_stages=num_stages,
-        threads=threads,
-    )(
+    _tilelang_qsa_mqa_prefill_kernel(heads=heads, head_dim=head_dim, block_q=block_q)(
         q_padded.reshape(-1, head_dim),
         k[:, 0].to(torch.bfloat16).contiguous(),
         logits,
@@ -378,14 +349,10 @@ def tilelang_qsa_mqa_decode(
     )
     if not q.shape[0] or not max_model_len:
         return logits
-    # CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires
-    # sixteen. Zero-padding preserves the weight-free head sum on both paths.
+    # The validated MMA layout requires N (the Q-head dimension) to be a
+    # multiple of eight. Zero-padding preserves the weight-free head sum.
     query_heads, head_dim = q.shape[1:]
-    head_alignment = 16 if is_hip() else 8
-    kernel_heads = max(
-        head_alignment,
-        ((query_heads + head_alignment - 1) // head_alignment) * head_alignment,
-    )
+    kernel_heads = max(8, ((query_heads + 7) // 8) * 8)
     q_kernel = q.to(torch.bfloat16)
     if kernel_heads != query_heads:
         q_kernel = torch.cat(
@@ -415,21 +382,8 @@ def qsa_mqa_prefill(
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    if _is_hcu:
-        from sglang.srt.layers.attention.qsa.boltops_mqa import (
-            try_boltops_qsa_mqa_prefill,
-        )
-
-        boltops_logits = try_boltops_qsa_mqa_prefill(
-            q, k, row_starts, row_ends, score_scale
-        )
-        if boltops_logits is not None:
-            return boltops_logits
     if q.is_cuda and HAS_TILELANG:
-        try:
-            return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
-        except Exception as exc:
-            _warn_tilelang_fallback("prefill", str(exc))
+        return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
     return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
 
 
@@ -441,23 +395,10 @@ def qsa_mqa_decode(
     max_model_len: int,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    if _is_hcu:
-        from sglang.srt.layers.attention.qsa.boltops_mqa import (
-            try_boltops_qsa_mqa_decode,
-        )
-
-        boltops_logits = try_boltops_qsa_mqa_decode(
+    if q.is_cuda and HAS_TILELANG:
+        return tilelang_qsa_mqa_decode(
             q, k_cache, page_table, context_lens, max_model_len, score_scale
         )
-        if boltops_logits is not None:
-            return boltops_logits
-    if q.is_cuda and HAS_TILELANG:
-        try:
-            return tilelang_qsa_mqa_decode(
-                q, k_cache, page_table, context_lens, max_model_len, score_scale
-            )
-        except Exception as exc:
-            _warn_tilelang_fallback("decode", str(exc))
     return torch_qsa_mqa_decode(
         q, k_cache, page_table, context_lens, max_model_len, score_scale
     )

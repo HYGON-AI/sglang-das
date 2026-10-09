@@ -134,10 +134,10 @@ def run_activation(
 
 @register_custom_op(mutates_args=["out"])
 def _run_unary_activation_inplace(
-    op_name: str, input: torch.Tensor, out: torch.Tensor, fast_math: bool = True
+    op_name: str, input: torch.Tensor, out: torch.Tensor
 ) -> None:
     last = input.shape[-1]
-    module = activation_module(input.dtype, fast_math=fast_math)
+    module = activation_module(input.dtype)
     module.run_unary_activation(input.view(-1, last), out.view(-1, last), op_name)
 
 
@@ -145,8 +145,6 @@ def run_unary_activation(
     op_name: str,
     input: torch.Tensor,
     out: Optional[torch.Tensor] = None,
-    *,
-    fast_math: bool = True,
 ) -> torch.Tensor:
     """Apply a standalone (non-gated) element-wise activation: ``out = act(input)``.
 
@@ -158,18 +156,16 @@ def run_unary_activation(
     )
     if out is None:
         out = torch.empty_like(input)
-    _run_unary_activation_inplace(op_name, input, out, fast_math)
+    _run_unary_activation_inplace(op_name, input, out)
     return out
 
 
 def relu2(
     input: torch.Tensor,
     out: Optional[torch.Tensor] = None,
-    *,
-    fast_math: bool = True,
 ) -> torch.Tensor:
-    """Squared ReLU; disable fast math to preserve BF16 subnormal results."""
-    return run_unary_activation("relu2", input, out, fast_math=fast_math)
+    """Squared ReLU: ``out = max(0, input) ** 2`` (element-wise)."""
+    return run_unary_activation("relu2", input, out)
 
 
 def silu_and_mul(

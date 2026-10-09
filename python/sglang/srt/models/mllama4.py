@@ -3,7 +3,6 @@ import logging
 import math
 import os
 import re
-from array import array
 from collections.abc import Iterable
 from typing import List, Optional, Set, Tuple
 
@@ -560,7 +559,7 @@ class Llama4ForConditionalGeneration(nn.Module):
         except (OSError, json_lib.JSONDecodeError, KeyError):
             return False
 
-    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         return self.padding_pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(

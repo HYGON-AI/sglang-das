@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, List, Literal, Optional, TypeAlias, Union, cas
 import torch
 
 from sglang.kernels.jit.utils import is_hip_runtime
-from sglang.srt.utils import is_hcu
 from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
@@ -86,12 +85,6 @@ def _extract_positions_from_plan(
 
 
 class CompressorBackendMixin:
-    # Per-ForwardBatch cache of the v1 paged compress metadata built for the RLC
-    # path (see _forward_unified_rlc). Keyed by object identity: the slot holds
-    # a strong reference to the ForwardBatch, so while it is cached the object
-    # stays alive and its id() can never be reused by a different batch.
-    _rlc_paged_cache: Optional[tuple] = None
-
     def __init__(self):
         super().__init__()
         self.forward_metadata: DSV4Metadata
@@ -126,7 +119,6 @@ class CompressorBackendMixin:
         kv_layout: KVLayout = KVLayout.V4,
         fp8_2buff: bool = False,
         kv_cache_rope: Optional[torch.Tensor] = None,
-        int8_store: bool = False,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -192,7 +184,6 @@ class CompressorBackendMixin:
             ),
             fp8_2buff=fp8_2buff,
             kvcache_rope=kv_cache_rope,
-            int8_store=int8_store,
         )
 
     def forward_unified(
@@ -203,15 +194,6 @@ class CompressorBackendMixin:
         compressor: Compressor,
     ) -> None:
         if forward_batch.forward_mode.is_idle():
-            return
-
-        # RLC (Repartition-Local Compression): attention c4 + prefill-CP +
-        # round-robin. Replaces the full-kv_score all-gather with all-to-all
-        # repartition + local compress + all-gather of the compact output.
-        # Off by default (SGLANG_DSV4_COMPRESS_RLC); when off the gate check
-        # short-circuits on the env flag and the base path runs unchanged.
-        if self._rlc_gate(forward_batch, compressor):
-            self._forward_unified_rlc(x, forward_batch, layer_id, compressor)
             return
 
         token_to_kv_pool = self.token_to_kv_pool
@@ -304,12 +286,6 @@ class CompressorBackendMixin:
             fp8_2buff=fp8_2buff,
             kv_cache_rope=(
                 None if kv_cache_rope is None else kv_cache_rope.view(dtype=torch.uint8)
-            ),
-            # HCU INT8 index-K cache: the indexer store quantizes K in-kernel.
-            int8_store=(
-                is_hcu()
-                and compressor.is_in_indexer
-                and token_to_kv_pool.use_int8_index_k_cache
             ),
         )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
@@ -414,13 +390,7 @@ class CompressorBackendMixin:
         if kv_to_store.shape[0] == 0:
             return
 
-        if is_indexer and token_to_kv_pool.use_int8_index_k_cache:
-            token_to_kv_pool.set_index_k_int8_buffer(
-                layer_id=layer_id,
-                loc=out_loc_to_store,
-                cache_k=kv_to_store,
-            )
-        elif token_to_kv_pool.is_bf16_attention_kv_cache and not is_indexer:
+        if token_to_kv_pool.is_bf16_attention_kv_cache and not is_indexer:
             # The DSV4 BF16 attention cache has its own paged scatter path.  It
             # must not fall through to the FP8 pack path when the generic fused
             # store-cache optimization is disabled.
@@ -451,80 +421,6 @@ class CompressorBackendMixin:
                 loc=out_loc_to_store,
                 cache_k=kv_to_store,
             )
-
-    def _rlc_gate(self, forward_batch: ForwardBatch, compressor: Compressor) -> bool:
-        """Whether this forward_unified call should run the RLC path.
-
-        The env flag is checked first so the disabled state costs one boolean
-        read; the remaining imports are lazy so they stay out of module load.
-        """
-        if (
-            not envs.SGLANG_DSV4_COMPRESS_RLC.get()
-            or not is_hcu()
-            or not compressor.overlap
-            or compressor.is_in_indexer
-            or compressor.ratio != 4
-        ):
-            return False
-
-        from sglang.srt.layers.attention.dsa.utils import (
-            dsa_use_prefill_cp,
-            is_dsa_prefill_cp_round_robin_split,
-        )
-        from sglang.srt.layers.attention.dsv4.compressor import _rlc_prefix_aligned
-
-        return (
-            dsa_use_prefill_cp(forward_batch)
-            and is_dsa_prefill_cp_round_robin_split()
-            and _rlc_prefix_aligned(forward_batch, compressor.ratio)
-        )
-
-    def _forward_unified_rlc(
-        self,
-        x: torch.Tensor,
-        forward_batch: ForwardBatch,
-        layer_id: int,
-        compressor: Compressor,
-    ) -> None:
-        """RLC variant of ``forward_unified`` for the core c4 compressor.
-
-        Runs ``Compressor._forward_rlc`` (all-to-all repartition + local
-        compress + compact all-gather) and stores its output exactly like
-        ``forward_core_compressor`` does. The v1-style paged metadata
-        (write_loc / extra_data / v1 plan) needed by the RLC kernels is built
-        once per ForwardBatch and reused across all c4 layers.
-        """
-        from sglang.srt.layers.attention.dsv4.compressor import (
-            create_paged_compressor_data,
-        )
-
-        token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", self.token_to_kv_pool)
-
-        cache = self._rlc_paged_cache
-        if cache is None or cache[0] is not forward_batch:
-            paged = create_paged_compressor_data(
-                compressor.ratio,
-                is_prefill=True,
-                token_to_kv_pool=token_to_kv_pool,
-                req_to_token=self.req_to_token_pool.req_to_token,
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
-                extend_lens=forward_batch.extend_seq_lens,
-                seq_lens_cpu=list(forward_batch.seq_lens_cpu),
-                extend_lens_cpu=list(forward_batch.extend_seq_lens_cpu),
-            )
-            self._rlc_paged_cache = (forward_batch, paged)
-        else:
-            paged = cache[1]
-
-        compressed = compressor._forward_rlc(x, forward_batch, self, paged)
-
-        compressor.store_rlc_output(
-            token_to_kv_pool,
-            layer_id,
-            self._get_out_loc(compressor.ratio),
-            compressed,
-        )
 
     # NOTE: alias for backward compatibility
     forward_indexer_compressor = forward_unified

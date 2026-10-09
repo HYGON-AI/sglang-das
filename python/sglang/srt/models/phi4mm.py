@@ -20,7 +20,6 @@
 import logging
 import math
 import re
-from array import array
 from collections.abc import Iterable
 from typing import List, Optional, Tuple
 
@@ -476,7 +475,7 @@ class Phi4MMForCausalLM(nn.Module):
 
         return hidden_states
 
-    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

@@ -1,4 +1,7 @@
-"""Config-time override declarations for qwen3_vl."""
+"""Config-time override declarations for qwen3_vl.
+
+Architectures: Qwen3VLForConditionalGeneration, Qwen3VLMoeForConditionalGeneration.
+"""
 
 import logging
 from typing import Any, Optional

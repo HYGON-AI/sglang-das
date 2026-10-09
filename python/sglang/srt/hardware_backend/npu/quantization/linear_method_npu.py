@@ -7,12 +7,6 @@ from torch.nn.parameter import Parameter
 from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
 
-from sglang.kernels.npu_kernels.npu_dynamic_quant_triton import npu_dynamic_quant_triton
-from sglang.kernels.npu_kernels.npu_quant_matmul_w8a8 import (
-    npu_quant_matmul_w8a8,
-    pack_int8_weight_as_tn,
-)
-
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
@@ -134,19 +128,6 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
         if hasattr(layer, "weight_offset"):
             layer.weight_offset.data = layer.weight_offset.data.flatten()
 
-        # lightop.gemm_w8a8_smooth needs TN [K, N] (stride 1, K). Pack once
-        # here so decode CUDA graphs do not recapture t().contiguous() on
-        # every token (~148 ms/token on Kimi-K3). Same byte count; prefill
-        # I8II is unchanged (still the large-M path inside smooth()).
-        w = layer.weight.data
-        if (
-            w.dim() == 2
-            and w.dtype == torch.int8
-            and w.is_contiguous()
-            and w.stride(1) == 1
-        ):
-            layer.weight.data = pack_int8_weight_as_tn(w)
-
     def apply(
         self,
         layer: torch.nn.Module,
@@ -158,12 +139,10 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
             """dynamic_scale is calculated in malprolog kernel"""
             original_dtype = torch.bfloat16
             quant_out, dynamic_scale = x
-            device = quant_out.device
         else:
             original_dtype = x.dtype
-            device = x.device
-            quant_out, dynamic_scale = npu_dynamic_quant_triton(x)
-        out = npu_quant_matmul_w8a8(
+            quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x)
+        return torch.ops.npu.npu_quant_matmul(
             quant_out,
             layer.weight,
             layer.weight_scale,
@@ -171,7 +150,6 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
             bias=bias,
             output_dtype=original_dtype,
         )
-        return out.to(device=device)
 
 
 class NPUMXFP8LinearMethod(_NPULinearMethodBase):

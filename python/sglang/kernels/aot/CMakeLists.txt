@@ -266,7 +266,6 @@ set(SOURCES
     "csrc/elementwise/copy.cu"
     "csrc/elementwise/dsv4_norm_rope.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
-    "csrc/elementwise/kpool_write_plan.cu"
     "csrc/elementwise/l2norm_kernel.cu"
     "csrc/elementwise/pos_enc.cu"
     "csrc/elementwise/topk.cu"

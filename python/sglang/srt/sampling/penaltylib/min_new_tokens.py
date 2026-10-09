@@ -1,7 +1,6 @@
 import torch
 
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
-from sglang.srt.utils.common import is_pin_memory_available
 
 
 class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
@@ -15,21 +14,15 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         )
 
     def _prepare(self):
-        pin_memory = is_pin_memory_available(self.orchestrator.device)
-        self.min_new_tokens = (
-            torch.tensor(
-                data=[
-                    req.sampling_params.min_new_tokens
-                    for req in self.orchestrator.reqs()
-                ],
-                dtype=torch.int32,
-                pin_memory=pin_memory,
-            )
-            .to(self.orchestrator.device, non_blocking=True)
-            .unsqueeze_(1)
-        )
+        self.min_new_tokens = torch.tensor(
+            data=[
+                req.sampling_params.min_new_tokens for req in self.orchestrator.reqs()
+            ],
+            dtype=torch.int32,
+            device=self.orchestrator.device,
+        ).unsqueeze_(1)
 
-        padded_stop_token_ids_cpu = torch.nn.utils.rnn.pad_sequence(
+        padded_stop_token_ids = torch.nn.utils.rnn.pad_sequence(
             sequences=[
                 torch.tensor(
                     data=[
@@ -47,16 +40,12 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
                         if token_id is not None
                     ],
                     dtype=torch.int64,
+                    device=self.orchestrator.device,
                 )
                 for req in self.orchestrator.reqs()
             ],
             batch_first=True,
             padding_value=self.orchestrator.vocab_size,
-        )
-        if pin_memory:
-            padded_stop_token_ids_cpu = padded_stop_token_ids_cpu.pin_memory()
-        padded_stop_token_ids = padded_stop_token_ids_cpu.to(
-            self.orchestrator.device, non_blocking=True
         )
         self.stop_token_penalties = torch.zeros(
             size=(len(self.orchestrator.reqs()), self.orchestrator.vocab_size + 1),

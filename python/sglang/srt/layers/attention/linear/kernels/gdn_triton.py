@@ -33,11 +33,12 @@ if not is_cpu():
 
 if is_npu():
     from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
-    from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent_decode_optimized import (
-        fused_sigmoid_gating_delta_rule_update_decode_npu as fused_sigmoid_gating_delta_rule_update,
+    from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
+        fused_sigmoid_gating_delta_rule_update_npu,
     )
 
     chunk_gated_delta_rule = chunk_gated_delta_rule_npu
+    fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
 elif is_cpu():
     from sgl_kernel.mamba import chunk_gated_delta_rule_cpu
 
@@ -57,7 +58,6 @@ class TritonGDNKernel(LinearAttnKernelBase):
     """Triton-based kernel for GDN (Gated Delta Network) linear attention."""
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
-    supports_strided_target_verify_qkv: bool = True
 
     def packed_decode(
         self,

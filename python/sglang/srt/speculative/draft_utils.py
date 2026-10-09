@@ -222,12 +222,6 @@ class DraftBackendFactory:
         from sglang.srt.layers.attention.dsa_backend import (
             DeepseekSparseAttnMultiStepBackend,
         )
-        from sglang.srt.layers.attention.glm5_next import is_glm5_next_hcu
-
-        if is_glm5_next_hcu(self.draft_model_runner.model_config.hf_config):
-            from sglang.srt.layers.attention.glm5_next.dsa_backend import (
-                NativeSparseAttnMultiStepBackend as DeepseekSparseAttnMultiStepBackend,
-            )
 
         return (
             "dsa",
@@ -241,12 +235,6 @@ class DraftBackendFactory:
 
     def _create_dsa_prefill_backend(self):
         from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
-        from sglang.srt.layers.attention.glm5_next import is_glm5_next_hcu
-
-        if is_glm5_next_hcu(self.draft_model_runner.model_config.hf_config):
-            from sglang.srt.layers.attention.glm5_next.dsa_backend import (
-                NativeSparseAttnBackend as DeepseekSparseAttnBackend,
-            )
 
         return (
             "dsa",

@@ -29,10 +29,6 @@ def load_ext():
     if _ext is None:
         from torch.utils import cpp_extension
 
-        from sglang.srt.utils.cpp_extension_loader import (
-            load_extension_with_recovery,
-        )
-
         src = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
             "../../../../jit/csrc/attention/kda_prefill.cu",
@@ -43,7 +39,7 @@ def load_ext():
         stubs = os.path.join(
             cpp_extension.CUDA_HOME or "/usr/local/cuda", "lib64", "stubs"
         )
-        _ext = load_extension_with_recovery(
+        _ext = cpp_extension.load(
             name=_EXT_NAME,
             sources=[src],
             extra_cuda_cflags=[

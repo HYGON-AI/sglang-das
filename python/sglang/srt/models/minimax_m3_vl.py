@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
-from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -196,7 +195,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             text_config
         )
 
-    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
             input_ids, mm_inputs
         )

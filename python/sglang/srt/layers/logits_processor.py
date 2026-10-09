@@ -19,7 +19,6 @@ from contextlib import contextmanager
 from enum import IntEnum
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 from torch import nn
 
@@ -57,12 +56,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.runtime_context import (
-    LoRABatchLayout,
-    get_exec,
-    get_forward,
-    get_parallel,
-)
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import is_hcu
 from sglang.srt.utils.common import (
     is_cpu,
@@ -100,20 +94,17 @@ class SamplingMaskStatus(IntEnum):
 
 @dataclasses.dataclass
 class SamplingMaskOutput:
-    """Sampling-support IDs and optional full-support behavior logprobs."""
+    """Tensor result for opted-in rows in batch order."""
 
     token_ids: torch.Tensor
     lengths: torch.Tensor
     selected_logprobs: torch.Tensor
-    support_logprobs: Optional[torch.Tensor]
     statuses: torch.Tensor
 
     def map_device_tensors(self, fn) -> None:
         self.token_ids = fn(self.token_ids)
         self.lengths = fn(self.lengths)
         self.selected_logprobs = fn(self.selected_logprobs)
-        if self.support_logprobs is not None:
-            self.support_logprobs = fn(self.support_logprobs)
         self.statuses = fn(self.statuses)
 
 
@@ -148,16 +139,6 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
     # A shared target lm_head can retain the draft's stale ModelOpt method; use it
     # only when the runtime tensor layout matches that method.
     if method_name == "ModelOptFp4LinearMethod":
-        if getattr(quant_method, "quant_mode", None) == "w4a16":
-            return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
-                lm_head,
-                (
-                    "weight_scale_interleaved",
-                    "alpha",
-                    "input_size_per_partition",
-                    "output_size_per_partition",
-                ),
-            )
         if lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
             lm_head,
             (
@@ -224,8 +205,6 @@ class LogitsProcessorOutput:
     # The logits of the next tokens.       shape: [#seq, vocab_size]
     # Can be None for certain prefill-only requests (e.g., multi-item scoring) that don't need next token generation
     next_token_logits: Optional[torch.Tensor]
-    draft_top1_token_ids: Optional[torch.Tensor] = None
-    draft_top1_probs: Optional[torch.Tensor] = None
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
@@ -245,11 +224,11 @@ class LogitsProcessorOutput:
         List[Union[List[float], torch.Tensor]]
     ] = None
     next_token_token_ids_logprobs_idx: Optional[List] = None
-    # Post-filter support IDs and requested behavior logprobs, bounded by server
-    # capacity. Logprobs are normalized over the full realized support.
+    # Post-filter support IDs, bounded by server capacity, and selected-token
+    # logprob over the full realized support.
     sampling_mask_output: Optional[SamplingMaskOutput] = None
-    next_token_sampling_mask_idx: Optional[List[Optional[np.ndarray]]] = None
-    next_token_sampling_logprobs: Optional[List[Optional[np.ndarray]]] = None
+    next_token_sampling_mask_idx: Optional[List[Optional[List[int]]]] = None
+    next_token_sampling_logprobs: Optional[List[Optional[float]]] = None
     next_token_sampling_mask_status: Optional[List[Optional[int]]] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
@@ -518,12 +497,6 @@ class LogitsProcessor(nn.Module):
             self.vocab_size, chunking_group=chunking_group
         )
 
-        self.draft_lm_head_vp = None
-
-    def set_draft_lm_head_vp(self, draft_lm_head_vp) -> None:
-        """Install the draft-only vocabulary-parallel top-1 helper."""
-        self.draft_lm_head_vp = draft_lm_head_vp
-
     def forward(
         self,
         input_ids,
@@ -533,12 +506,10 @@ class LogitsProcessor(nn.Module):
         aux_hidden_states: Optional[AuxHiddenStates] = None,
         hidden_states_before_norm: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
-        # Extract MIS / setwise indices before ForwardBatch → LogitsMetadata conversion
+        # Extract MIS indices before ForwardBatch → LogitsMetadata conversion
         multi_item_delimiter_indices = None
-        token_indices_to_pool = None
         if isinstance(logits_metadata, ForwardBatch):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
-            token_indices_to_pool = logits_metadata.token_indices_to_pool
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
         # Autotune dummy run discards this output. `is False` not `not`: None
@@ -555,18 +526,6 @@ class LogitsProcessor(nn.Module):
             input_ids=input_ids,
             forward_mode=logits_metadata.forward_mode,
         )
-
-        # Setwise scoring (CausalLM): read label-token logprobs AT each anchor
-        # position instead of the last token. Takes precedence over the MIS
-        # delimiter path; the two are mutually exclusive for generation.
-        if token_indices_to_pool is not None and logits_metadata.is_prefill_only:
-            return self.compute_logprobs_at_positions(
-                input_ids,
-                hidden_states,
-                lm_head,
-                logits_metadata,
-                token_indices_to_pool,
-            )
 
         # Multi-item scoring only for prefill-only requests with pre-computed indices.
         if multi_item_delimiter_indices is not None and logits_metadata.is_prefill_only:
@@ -610,35 +569,6 @@ class LogitsProcessor(nn.Module):
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
-            if (
-                self.draft_lm_head_vp is not None
-                and logits_metadata.forward_mode.is_decode_or_idle()
-            ):
-                if not hasattr(lm_head, "weight"):
-                    raise RuntimeError(
-                        "Draft LM-head VP requires an LM-head with a weight tensor."
-                    )
-                top1_scores, top1_token_ids = self.draft_lm_head_vp.project_top1(
-                    pruned_states,
-                    lm_head.weight,
-                    logit_scale=self.logit_scale,
-                    final_logit_softcapping=self.final_logit_softcapping,
-                )
-                top1_probs = torch.ones(
-                    (top1_token_ids.shape[0], 1),
-                    dtype=torch.float32,
-                    device=top1_token_ids.device,
-                )
-                return LogitsProcessorOutput(
-                    # Keep a compact tensor for generic output slicing and NaN
-                    # diagnostics. The EAGLE worker consumes draft_top1_*.
-                    next_token_logits=top1_scores.unsqueeze(-1),
-                    hidden_states=hidden_states_to_store,
-                    draft_top1_token_ids=top1_token_ids.unsqueeze(-1),
-                    draft_top1_probs=top1_probs,
-                    mm_input_embeds=logits_metadata.mm_input_embeds,
-                )
-
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
@@ -945,13 +875,7 @@ class LogitsProcessor(nn.Module):
             _trace_e2e_logits("pre_lm_head_sync_returned")
 
         _trace_e2e_logits("lm_head_enter", hidden_shape=tuple(hidden_states.shape))
-        lora_batch_layout = (
-            LoRABatchLayout.TP_GLOBAL
-            if self.do_tensor_parallel_all_gather_dp_attn
-            else LoRABatchLayout.DP_LOCAL
-        )
-        with get_forward().scoped(lora_batch_layout=lora_batch_layout):
-            logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
         _trace_e2e_logits("lm_head_returned", logits_shape=tuple(logits.shape))
         if envs.SGLANG_TRACE_LOGITS_E2E_SYNC.get():
             _trace_e2e_logits("post_lm_head_sync_enter")
@@ -1170,7 +1094,9 @@ class LogitsProcessor(nn.Module):
         get_parallel().tp_group.all_to_all_single(
             all_to_all_output.view(-1), logits.view(-1)
         )
-        return _reassemble_tp_lm_head_all_to_all_output(all_to_all_output)
+        return _reassemble_tp_lm_head_all_to_all_output(
+            all_to_all_output, get_parallel().tp_size
+        )
 
     def _scatter_dp_attn_logits(
         self,
@@ -1329,92 +1255,9 @@ class LogitsProcessor(nn.Module):
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
 
-    def compute_logprobs_at_positions(
-        self,
-        input_ids,
-        hidden_states,
-        lm_head: VocabParallelEmbedding,
-        logits_metadata: Union[LogitsMetadata, ForwardBatch],
-        token_indices_to_pool: List[torch.Tensor],
-    ):
-        """Compute label-token logprobs AT each requested position (setwise, CausalLM).
-
-        Mirrors ``compute_logprobs_for_multi_item_scoring`` but reads the LM head
-        AT ``token_indices_to_pool`` (no delimiter - 1 shift, no discarded row):
-        each anchor's logprobs are P(next token | prefix up to and including the
-        anchor), one row per anchor.
-        """
-        device = input_ids.device
-        all_tensors = []
-        if logits_metadata.extend_seq_lens_cpu is not None:
-            offset = 0
-            for req_seq_len, indices_tensor in zip(
-                logits_metadata.extend_seq_lens_cpu, token_indices_to_pool
-            ):
-                if len(indices_tensor) > 0:
-                    all_tensors.append(indices_tensor + offset)
-                offset += req_seq_len
-        else:
-            all_tensors.append(token_indices_to_pool[0])
-        pooled_indices = torch.cat(all_tensors).to(device, non_blocking=True)
-
-        sliced_hidden = hidden_states[pooled_indices]
-        sliced_logits = self._get_logits(sliced_hidden, lm_head, logits_metadata)
-        sliced_logprobs = torch.nn.functional.log_softmax(sliced_logits, dim=-1)
-
-        input_token_ids_logprobs_val = []
-        input_token_ids_logprobs_idx = []
-        input_top_logprobs_val = None
-        input_top_logprobs_idx = None
-
-        if (
-            logits_metadata.token_ids_logprobs
-            or logits_metadata.extend_return_top_logprob
-        ):
-            logits_metadata.extend_logprob_pruned_lens_cpu = [
-                len(t) for t in token_indices_to_pool
-            ]
-
-        if logits_metadata.extend_token_ids_logprob:
-            (
-                input_token_ids_logprobs_val,
-                input_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs_raw(
-                sliced_logprobs,
-                logits_metadata.token_ids_logprobs,
-                stage=LogprobStage.PREFILL,
-                extend_logprob_pruned_lens_cpu=logits_metadata.extend_logprob_pruned_lens_cpu,
-                no_copy_to_cpu=True,
-            )
-
-        if logits_metadata.extend_return_top_logprob:
-            (
-                input_top_logprobs_val,
-                input_top_logprobs_idx,
-            ) = get_top_logprobs_raw(
-                sliced_logprobs,
-                logits_metadata.top_logprobs_nums,
-                stage=LogprobStage.PREFILL,
-                extend_logprob_pruned_lens_cpu=logits_metadata.extend_logprob_pruned_lens_cpu,
-            )
-
-        # Zeros to satisfy the shared logprob pipeline's non-None / length asserts;
-        # score_request() reads only input_token_ids_logprobs_val (see the MIS path).
-        input_token_logprobs = torch.zeros(pooled_indices.shape[0], device=device)
-
-        return LogitsProcessorOutput(
-            next_token_logits=None,
-            input_token_logprobs=input_token_logprobs,
-            input_top_logprobs_val=input_top_logprobs_val,
-            input_top_logprobs_idx=input_top_logprobs_idx,
-            input_token_ids_logprobs_val=input_token_ids_logprobs_val,
-            input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
-            mm_input_embeds=logits_metadata.mm_input_embeds,
-        )
-
 
 def _reassemble_tp_lm_head_all_to_all_output(
-    all_to_all_output: torch.Tensor,
+    all_to_all_output: torch.Tensor, tp_size: int
 ) -> torch.Tensor:
     """Convert source-major all-to-all output to row-major full-vocab logits.
 
@@ -1423,7 +1266,6 @@ def _reassemble_tp_lm_head_all_to_all_output(
     along dim 0, while the sampler expects the vocab shards concatenated along
     dim 1.
     """
-    tp_size = get_parallel().tp_size
     assert all_to_all_output.shape[0] % tp_size == 0
     local_rows = all_to_all_output.shape[0] // tp_size
     vocab_shard = all_to_all_output.shape[1]
@@ -1432,3 +1274,74 @@ def _reassemble_tp_lm_head_all_to_all_output(
         .permute(1, 0, 2)
         .reshape(local_rows, tp_size * vocab_shard)
     )
+
+
+def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
+    return all(hasattr(lm_head, attr_name) for attr_name in attr_names)
+
+
+def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
+    if (
+        quant_method is None
+        or not hasattr(lm_head, "weight")
+        or not callable(getattr(quant_method, "apply", None))
+    ):
+        return False
+
+    method_name = type(quant_method).__name__
+    if method_name in _UNQUANTIZED_LM_HEAD_METHODS:
+        return False
+
+    # Some draft models share an unquantized target lm_head tensor while still
+    # carrying the draft model's stale ModelOpt quant_method. Only use the
+    # ModelOpt lm_head kernel when the runtime quantization state matches it.
+    if method_name == "ModelOptFp4LinearMethod":
+        if quant_method.quant_mode == "w4a16":
+            return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
+                lm_head,
+                (
+                    "weight_scale_interleaved",
+                    "alpha",
+                    "input_size_per_partition",
+                    "output_size_per_partition",
+                ),
+            )
+        if lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale",
+                "weight_global_scale",
+                "workspace",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        ):
+            return True
+        return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale_interleaved",
+                "alpha",
+                "input_scale_inv",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        )
+    if method_name == "ModelOptNvFp4A16LinearMethod":
+        return lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale",
+                "weight_global_scale",
+                "workspace",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        )
+    if method_name == "ModelOptFp8LinearMethod":
+        return (
+            lm_head.weight.dtype == torch.float8_e4m3fn
+            and _has_lm_head_runtime_attrs(lm_head, ("weight_scale", "input_scale"))
+        )
+
+    return True

@@ -15,7 +15,6 @@
 
 import logging
 import re
-from array import array
 from functools import lru_cache
 from typing import Iterable, List, Optional, Set, Tuple, TypedDict, Union
 
@@ -297,9 +296,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
     def pad_input_ids(
         self,
-        input_ids: array,
+        input_ids: List[int],
         mm_inputs: MultimodalInputs,
-    ) -> array:
+    ) -> List[int]:
         """Pad input IDs with image and audio tokens."""
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)

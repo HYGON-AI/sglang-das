@@ -48,11 +48,9 @@ impl ScoringPolicy for LoadBasedPolicy {
 mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+    use crate::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
     use crate::policies::scoring::argmax::TIE_EPSILON;
     use crate::policies::Policy;
-    use crate::state::load_monitor::engine_reported_load::{
-        EngineReportedLoadSnapshot, EngineReportedWorkerLoad,
-    };
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -96,10 +94,7 @@ mod tests {
                 let ok = (scores[i] > scores[j] + TIE_EPSILON, scores[i].is_nan());
                 assert_eq!(ok, (loads[i] < loads[j], false), "{spec} scored {scores:?}");
             }
-            let got = p
-                .select(&ws, &ctx)
-                .expect("non-empty")
-                .router_inflight_load();
+            let got = p.select(&ws, &ctx).expect("non-empty").active_load();
             assert_eq!(got, *loads.iter().min().expect("non-empty"), "{spec}");
         }
     }
@@ -112,12 +107,12 @@ mod tests {
         // After the request snapshot, local counters say w0 is lighter.
         // The policy must still preserve the frozen Engine Load ordering.
         let _after_snapshot: Vec<_> = (0..10).map(|_| w1.load_guard()).collect();
-        let snapshot = EngineReportedLoadSnapshot::from_workers(
+        let snapshot = EngineLoadSnapshot::from_workers(
             23,
             HashMap::from([
                 (
                     w0.url.clone(),
-                    EngineReportedWorkerLoad {
+                    EngineWorkerLoad {
                         num_running_reqs: 50,
                         num_waiting_reqs: 0,
                         num_tokens: 0,
@@ -127,7 +122,7 @@ mod tests {
                 ),
                 (
                     w1.url.clone(),
-                    EngineReportedWorkerLoad {
+                    EngineWorkerLoad {
                         num_running_reqs: 1,
                         num_waiting_reqs: 0,
                         num_tokens: 0,
@@ -153,12 +148,12 @@ mod tests {
         let w0 = worker("w0");
         let w1 = worker("w1");
         let captured_at = Instant::now();
-        let snapshot = EngineReportedLoadSnapshot::from_workers(
+        let snapshot = EngineLoadSnapshot::from_workers(
             37,
             HashMap::from([
                 (
                     w0.url.clone(),
-                    EngineReportedWorkerLoad {
+                    EngineWorkerLoad {
                         num_running_reqs: 0,
                         num_waiting_reqs: 0,
                         num_tokens: 0,
@@ -168,7 +163,7 @@ mod tests {
                 ),
                 (
                     w1.url.clone(),
-                    EngineReportedWorkerLoad {
+                    EngineWorkerLoad {
                         num_running_reqs: 1,
                         num_waiting_reqs: 0,
                         num_tokens: 0,
@@ -197,12 +192,12 @@ mod tests {
         let _before_snapshot = [w0.timestamped_load_guard(), w0.timestamped_load_guard()];
         std::thread::sleep(std::time::Duration::from_millis(5));
         let captured_at = Instant::now();
-        let snapshot = EngineReportedLoadSnapshot::from_workers(
+        let snapshot = EngineLoadSnapshot::from_workers(
             41,
             HashMap::from([
                 (
                     w0.url.clone(),
-                    EngineReportedWorkerLoad {
+                    EngineWorkerLoad {
                         num_running_reqs: 0,
                         num_waiting_reqs: 0,
                         num_tokens: 0,
@@ -212,7 +207,7 @@ mod tests {
                 ),
                 (
                     w1.url.clone(),
-                    EngineReportedWorkerLoad {
+                    EngineWorkerLoad {
                         num_running_reqs: 1,
                         num_waiting_reqs: 0,
                         num_tokens: 0,
@@ -238,11 +233,11 @@ mod tests {
         let w0 = worker("w0");
         let w1 = worker("w1");
         let _local_load = [w0.load_guard(), w0.load_guard()];
-        let snapshot = EngineReportedLoadSnapshot::from_workers(
+        let snapshot = EngineLoadSnapshot::from_workers(
             43,
             HashMap::from([(
                 w0.url.clone(),
-                EngineReportedWorkerLoad {
+                EngineWorkerLoad {
                     num_running_reqs: 0,
                     num_waiting_reqs: 0,
                     num_tokens: 0,

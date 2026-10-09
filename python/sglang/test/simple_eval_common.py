@@ -677,10 +677,3 @@ def set_ulimit(target_soft_limit=65535):
             resource.setrlimit(resource_type, (target_soft_limit, current_hard))
         except ValueError as e:
             print(f"Fail to set RLIMIT_NOFILE: {e}")
-
-
-def import_load_dataset():
-    """Load datasets lazily for the retained legacy AIME scorers."""
-    from datasets import load_dataset
-
-    return load_dataset

@@ -56,7 +56,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
-    is_gfx95_supported,
     is_hip,
     is_npu,
     is_xpu,
@@ -791,17 +790,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         ):
             layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
-        if self.use_flashinfer_cutlass:
-            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
-                materialize_swiglu_params_for_cutlass,
-            )
-
-            layer._cutlass_swiglu_params = materialize_swiglu_params_for_cutlass(
-                layer.moe_runner_config,
-                int(layer.num_local_experts),
-                layer.w13_weight.device,
-            )
-
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
             # The cached indices are GPU tensors. Colocated weight offloading
@@ -1062,32 +1050,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
         param.data = param.data.reshape(expected_shape)
 
-    def _aiter_ck_moe_unsupported_reason(self, layer) -> Optional[str]:
+    def _aiter_ck_moe_supported(self, layer) -> bool:
         # aiter CK fused-MoE requires intermediate_size_per_partition to be 128-aligned
         # (GemmSpec=Default; otherwise CK raises "not support this GEMM problem").
-        if layer.intermediate_size_per_partition % 128 != 0:
-            return (
-                "intermediate_size_per_partition="
-                f"{layer.intermediate_size_per_partition} is not 128-aligned"
-            )
-
-        if not is_gfx95_supported():
-            return None
-
-        cfg = layer.moe_runner_config
-        wants_swiglu_oai = (
-            cfg.gemm1_alpha is not None or cfg.gemm1_clamp_limit is not None
-        )
-        if wants_swiglu_oai:
-            return (
-                f"activation={cfg.activation} with gemm1_alpha={cfg.gemm1_alpha} / "
-                f"gemm1_clamp_limit={cfg.gemm1_clamp_limit} (SwiGLU-OAI) is not "
-                "implemented by the aiter CK bf16 fused-MoE kernels"
-            )
-        return None
-
-    def _aiter_ck_moe_supported(self, layer) -> bool:
-        return self._aiter_ck_moe_unsupported_reason(layer) is None
+        return layer.intermediate_size_per_partition % 128 == 0
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -1116,7 +1082,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             backend = MoeRunnerBackend.TRITON
         self.runner = MoeRunner(backend, moe_runner_config)
 
-        # aiter CK fused-MoE only supports some shapes / activations; else use triton.
+        # aiter CK fused-MoE only supports 128-aligned shapes; otherwise use triton.
         self._aiter_runner: Optional[MoeRunner] = None
         if (
             _use_aiter
@@ -1126,19 +1092,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             )
             and get_moe_a2a_backend().is_none()
         ):
-            reason = self._aiter_ck_moe_unsupported_reason(layer)
-            if reason is None:
+            if self._aiter_ck_moe_supported(layer):
                 self._aiter_runner = MoeRunner(
                     MoeRunnerBackend.AITER, moe_runner_config
                 )
             elif get_moe_runner_backend().is_aiter():
                 raise ValueError(
-                    f"moe_runner_backend=aiter is not supported: {reason}; "
+                    "moe_runner_backend=aiter is not supported for "
+                    f"intermediate_size_per_partition={layer.intermediate_size_per_partition}; "
                     "use --moe-runner-backend triton."
                 )
             else:
                 logger.warning_once(
-                    f"aiter CK fused-MoE does not support this layer: {reason}; "
+                    "aiter CK fused-MoE does not support "
+                    f"intermediate_size_per_partition={layer.intermediate_size_per_partition}; "
                     "using triton MoE runner."
                 )
 
@@ -1214,15 +1181,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 FlashInferCutlassMoeQuantInfo,
             )
 
-            swiglu_alpha, swiglu_beta, swiglu_limit = layer._cutlass_swiglu_params
             quant_info = FlashInferCutlassMoeQuantInfo(
                 quant_type="bf16",
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
                 output_dtype=x.dtype,
-                swiglu_alpha=swiglu_alpha,
-                swiglu_beta=swiglu_beta,
-                swiglu_limit=swiglu_limit,
                 moe_ep_size=layer.moe_ep_size,
                 moe_ep_rank=layer.moe_ep_rank,
                 moe_tp_size=layer.moe_tp_size,
@@ -1246,14 +1209,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             if not _is_hcu and self._aiter_runner is not None:
                 from sglang.srt.layers.moe.moe_runner.aiter import (
                     AiterMoeQuantInfo,
-                    aiter_swiglu_oai_limit,
                 )
 
                 quant_info = AiterMoeQuantInfo(
                     w13_weight=layer.w13_weight,
                     w2_weight=layer.w2_weight,
                     expert_mask=layer.dispatcher.expert_mask_gpu,
-                    swiglu_limit=aiter_swiglu_oai_limit(self.moe_runner_config) or 0.0,
                 )
                 return self._aiter_runner.run(dispatch_output, quant_info)
             elif _is_hcu and _use_marlin_w16a16_moe and not _use_aiter_w16a16_moe:
@@ -1395,7 +1356,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
                     moe_config=moe_cfg,
-                    inplace=moe_runner_config.inplace,
+                    inplace=True,
                     w1_scale=None,
                     w2_scale=None,
                     activation=activation,

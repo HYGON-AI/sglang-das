@@ -16,7 +16,6 @@
 
 import logging
 import re
-from array import array
 from collections import defaultdict
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
@@ -1424,7 +1423,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         cfg = getattr(model, "config", None)
         return int(getattr(cfg, "num_hidden_layers", 0))
 
-    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         if mm_inputs and mm_inputs.mm_items:
             _require_vision(self)
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()

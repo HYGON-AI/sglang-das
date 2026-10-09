@@ -24,10 +24,9 @@ class IdleSleeper:
     data that needs handling immediately.
     """
 
-    def __init__(self, sockets, can_empty_cache=None):
+    def __init__(self, sockets):
         self.poller = zmq.Poller()
         self.last_empty_time = real_time()
-        self.can_empty_cache = can_empty_cache
         for s in sockets:
             self.poller.register(s, zmq.POLLIN)
 
@@ -40,8 +39,7 @@ class IdleSleeper:
             and real_time() - self.last_empty_time > self.empty_cache_interval
         ):
             self.last_empty_time = real_time()
-            if self.can_empty_cache is None or self.can_empty_cache():
-                current_platform.empty_cache()
+            current_platform.empty_cache()
 
 
 class RustServerIdleSleeper:
@@ -54,13 +52,10 @@ class RustServerIdleSleeper:
     requests — or the timeout elapses.
     """
 
-    def __init__(
-        self, rust_server: RustServer, timeout_ms: int = 1000, can_empty_cache=None
-    ):
+    def __init__(self, rust_server: RustServer, timeout_ms: int = 1000):
         self.rust_server = rust_server
         self.timeout_ms = timeout_ms
         self.last_empty_time = real_time()
-        self.can_empty_cache = can_empty_cache
         self.empty_cache_interval = envs.SGLANG_EMPTY_CACHE_INTERVAL.get()
 
     def maybe_sleep(self):
@@ -70,5 +65,4 @@ class RustServerIdleSleeper:
             and real_time() - self.last_empty_time > self.empty_cache_interval
         ):
             self.last_empty_time = real_time()
-            if self.can_empty_cache is None or self.can_empty_cache():
-                current_platform.empty_cache()
+            current_platform.empty_cache()

@@ -11,6 +11,10 @@ from sglang.kernels.spec import (
     FormatSignature,
     KernelBackend,
 )
+from sglang.srt.utils import is_hcu
+
+_is_hcu = is_hcu()
+
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
@@ -45,9 +49,13 @@ class ClampPositionOp(BaseFusedOp):
 
     op = "attention.clamp_position"
     priority = (KernelBackend.JIT, KernelBackend.TORCH)
+    # HCU reports as HIP but has no working JIT build of this kernel, and
+    # clamp_position runs on every decode step -- keep it on forward_native.
     capabilities = {
         KernelBackend.JIT: frozenset(
-            {CapabilityRequirement.CUDA, CapabilityRequirement.HIP}
+            {CapabilityRequirement.CUDA}
+            if _is_hcu
+            else {CapabilityRequirement.CUDA, CapabilityRequirement.HIP}
         )
     }
     format_signature = FormatSignature(

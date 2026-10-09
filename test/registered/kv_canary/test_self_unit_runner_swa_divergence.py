@@ -15,28 +15,24 @@ from sglang.srt.kv_canary.runner.swa_divergence import (
     SwaDivergenceReporter,
     compute_swa_full_idx_divergence,
 )
-from sglang.srt.utils import create_device_stream
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cuda_ci,
-    register_xpu_ci,
-)
-from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE, make_buffer_group
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kv_canary.fixtures import make_buffer_group
 from sglang.test.kv_canary.runner_test_base import CanaryManagerTestCase, make_manager
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=11, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=45, suite="extra-a-test-1-gpu-small-amd")
-register_xpu_ci(est_time=60, suite="stage-b-test-1-gpu-xpu")
+
+_DEVICE = torch.device("cuda")
 
 _EMPTY_FORWARD_BATCH = SimpleNamespace(
-    req_pool_indices=torch.empty(0, dtype=torch.int64, device=DEFAULT_DEVICE),
-    seq_lens=torch.empty(0, dtype=torch.int64, device=DEFAULT_DEVICE),
+    req_pool_indices=torch.empty(0, dtype=torch.int64, device=_DEVICE),
+    seq_lens=torch.empty(0, dtype=torch.int64, device=_DEVICE),
 )
 
 
 def _make_verify_plan(value: int) -> VerifyPlan:
-    plan = VerifyPlan.allocate(verify_capacity=4, device=DEFAULT_DEVICE)
+    plan = VerifyPlan.allocate(verify_capacity=4, device=_DEVICE)
     plan.verify_num_valid.copy_(torch.tensor([value], dtype=torch.int32))
     return plan
 
@@ -50,13 +46,11 @@ def _make_req_to_token_pool_stub(req_to_token: torch.Tensor) -> SimpleNamespace:
 
 
 def _make_identity_mapping(size: int) -> torch.Tensor:
-    return torch.arange(size, dtype=torch.int64, device=DEFAULT_DEVICE)
+    return torch.arange(size, dtype=torch.int64, device=_DEVICE)
 
 
 def _make_identity_req_to_token(num_reqs: int, max_seq_len: int) -> torch.Tensor:
-    base = torch.arange(
-        num_reqs * max_seq_len, dtype=torch.int64, device=DEFAULT_DEVICE
-    )
+    base = torch.arange(num_reqs * max_seq_len, dtype=torch.int64, device=_DEVICE)
     return base.view(num_reqs, max_seq_len)
 
 
@@ -89,9 +83,9 @@ def _run_compute(
 
 class TestSwaDivergenceReporter(CustomTestCase):
     def test_swa_divergence_log_emitted(self) -> None:
-        d2h_stream = create_device_stream(DEFAULT_DEVICE)
+        d2h_stream = torch.cuda.Stream(device=_DEVICE)
         stats = SwaDivergenceReporter(
-            device=DEFAULT_DEVICE,
+            device=_DEVICE,
             d2h_stream=d2h_stream,
             interval=10,
             swa_allocator=None,
@@ -102,13 +96,13 @@ class TestSwaDivergenceReporter(CustomTestCase):
         for forward_idx in range(3):
             stats.observe_after_invoke_plan(
                 group=make_buffer_group(
-                    device=DEFAULT_DEVICE, kind=PoolKind.FULL, has_v=False, num_slots=1
+                    device=_DEVICE, kind=PoolKind.FULL, has_v=False, num_slots=1
                 ),
                 verify_plan=_make_verify_plan(10),
             )
             stats.observe_after_invoke_plan(
                 group=make_buffer_group(
-                    device=DEFAULT_DEVICE, kind=PoolKind.SWA, has_v=False, num_slots=1
+                    device=_DEVICE, kind=PoolKind.SWA, has_v=False, num_slots=1
                 ),
                 verify_plan=_make_verify_plan(3),
             )
@@ -121,13 +115,13 @@ class TestSwaDivergenceReporter(CustomTestCase):
         # the staged future hangs onto it. forward_ct is now 4.
         stats.observe_after_invoke_plan(
             group=make_buffer_group(
-                device=DEFAULT_DEVICE, kind=PoolKind.FULL, has_v=False, num_slots=1
+                device=_DEVICE, kind=PoolKind.FULL, has_v=False, num_slots=1
             ),
             verify_plan=_make_verify_plan(10),
         )
         stats.observe_after_invoke_plan(
             group=make_buffer_group(
-                device=DEFAULT_DEVICE, kind=PoolKind.SWA, has_v=False, num_slots=1
+                device=_DEVICE, kind=PoolKind.SWA, has_v=False, num_slots=1
             ),
             verify_plan=_make_verify_plan(3),
         )
@@ -156,9 +150,9 @@ class TestSwaDivergenceReporter(CustomTestCase):
         self.assertEqual(fields.swa_full_idx_divergence, 0)
 
     def test_swa_divergence_counts_monotonic_increasing(self) -> None:
-        d2h_stream = create_device_stream(DEFAULT_DEVICE)
+        d2h_stream = torch.cuda.Stream(device=_DEVICE)
         stats = SwaDivergenceReporter(
-            device=DEFAULT_DEVICE,
+            device=_DEVICE,
             d2h_stream=d2h_stream,
             interval=10,
             swa_allocator=None,
@@ -194,19 +188,13 @@ class TestSwaDivergenceReporter(CustomTestCase):
             for _ in range(5):
                 stats.observe_after_invoke_plan(
                     group=make_buffer_group(
-                        device=DEFAULT_DEVICE,
-                        kind=PoolKind.FULL,
-                        has_v=False,
-                        num_slots=1,
+                        device=_DEVICE, kind=PoolKind.FULL, has_v=False, num_slots=1
                     ),
                     verify_plan=_make_verify_plan(7),
                 )
                 stats.observe_after_invoke_plan(
                     group=make_buffer_group(
-                        device=DEFAULT_DEVICE,
-                        kind=PoolKind.SWA,
-                        has_v=False,
-                        num_slots=1,
+                        device=_DEVICE, kind=PoolKind.SWA, has_v=False, num_slots=1
                     ),
                     verify_plan=_make_verify_plan(2),
                 )
@@ -228,8 +216,8 @@ class TestSwaFullIdxDivergenceCompute(CustomTestCase):
         req_to_token = _make_identity_req_to_token(num_reqs=4, max_seq_len=16)
 
         forward_batch = _make_forward_batch(
-            req_pool_indices=torch.empty(0, dtype=torch.int64, device=DEFAULT_DEVICE),
-            seq_lens=torch.empty(0, dtype=torch.int64, device=DEFAULT_DEVICE),
+            req_pool_indices=torch.empty(0, dtype=torch.int64, device=_DEVICE),
+            seq_lens=torch.empty(0, dtype=torch.int64, device=_DEVICE),
         )
 
         self.assertEqual(
@@ -246,10 +234,8 @@ class TestSwaFullIdxDivergenceCompute(CustomTestCase):
         req_to_token = _make_identity_req_to_token(num_reqs=4, max_seq_len=16)
 
         forward_batch = _make_forward_batch(
-            req_pool_indices=torch.tensor(
-                [0, 2], dtype=torch.int64, device=DEFAULT_DEVICE
-            ),
-            seq_lens=torch.tensor([8, 5], dtype=torch.int64, device=DEFAULT_DEVICE),
+            req_pool_indices=torch.tensor([0, 2], dtype=torch.int64, device=_DEVICE),
+            seq_lens=torch.tensor([8, 5], dtype=torch.int64, device=_DEVICE),
         )
 
         self.assertEqual(
@@ -270,10 +256,8 @@ class TestSwaFullIdxDivergenceCompute(CustomTestCase):
         mapping[17] = 60
 
         forward_batch = _make_forward_batch(
-            req_pool_indices=torch.tensor(
-                [0, 1], dtype=torch.int64, device=DEFAULT_DEVICE
-            ),
-            seq_lens=torch.tensor([8, 8], dtype=torch.int64, device=DEFAULT_DEVICE),
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64, device=_DEVICE),
+            seq_lens=torch.tensor([8, 8], dtype=torch.int64, device=_DEVICE),
         )
 
         self.assertEqual(
@@ -297,10 +281,8 @@ class TestSwaFullIdxDivergenceCompute(CustomTestCase):
         mapping[7] = 42
 
         forward_batch = _make_forward_batch(
-            req_pool_indices=torch.tensor(
-                [0], dtype=torch.int64, device=DEFAULT_DEVICE
-            ),
-            seq_lens=torch.tensor([8], dtype=torch.int64, device=DEFAULT_DEVICE),
+            req_pool_indices=torch.tensor([0], dtype=torch.int64, device=_DEVICE),
+            seq_lens=torch.tensor([8], dtype=torch.int64, device=_DEVICE),
         )
 
         self.assertEqual(
@@ -320,10 +302,8 @@ class TestSwaFullIdxDivergenceCompute(CustomTestCase):
         mapping[28] = 77
 
         forward_batch = _make_forward_batch(
-            req_pool_indices=torch.tensor(
-                [0], dtype=torch.int64, device=DEFAULT_DEVICE
-            ),
-            seq_lens=torch.tensor([10], dtype=torch.int64, device=DEFAULT_DEVICE),
+            req_pool_indices=torch.tensor([0], dtype=torch.int64, device=_DEVICE),
+            seq_lens=torch.tensor([10], dtype=torch.int64, device=_DEVICE),
         )
 
         self.assertEqual(
@@ -345,16 +325,12 @@ class TestSwaFullIdxDivergenceCompute(CustomTestCase):
         mapping[33] = 100
 
         fb_req0 = _make_forward_batch(
-            req_pool_indices=torch.tensor(
-                [0], dtype=torch.int64, device=DEFAULT_DEVICE
-            ),
-            seq_lens=torch.tensor([4], dtype=torch.int64, device=DEFAULT_DEVICE),
+            req_pool_indices=torch.tensor([0], dtype=torch.int64, device=_DEVICE),
+            seq_lens=torch.tensor([4], dtype=torch.int64, device=_DEVICE),
         )
         fb_req2 = _make_forward_batch(
-            req_pool_indices=torch.tensor(
-                [2], dtype=torch.int64, device=DEFAULT_DEVICE
-            ),
-            seq_lens=torch.tensor([4], dtype=torch.int64, device=DEFAULT_DEVICE),
+            req_pool_indices=torch.tensor([2], dtype=torch.int64, device=_DEVICE),
+            seq_lens=torch.tensor([4], dtype=torch.int64, device=_DEVICE),
         )
 
         self.assertEqual(
@@ -387,17 +363,15 @@ class TestSwaDivergenceReporterWithCompute(CustomTestCase):
         mapping[2] = 52
 
         forward_batch = _make_forward_batch(
-            req_pool_indices=torch.tensor(
-                [0], dtype=torch.int64, device=DEFAULT_DEVICE
-            ),
-            seq_lens=torch.tensor([8], dtype=torch.int64, device=DEFAULT_DEVICE),
+            req_pool_indices=torch.tensor([0], dtype=torch.int64, device=_DEVICE),
+            seq_lens=torch.tensor([8], dtype=torch.int64, device=_DEVICE),
         )
 
         swa_allocator = _make_allocator_stub(mapping)
         req_to_token_pool = _make_req_to_token_pool_stub(req_to_token)
-        d2h_stream = create_device_stream(DEFAULT_DEVICE)
+        d2h_stream = torch.cuda.Stream(device=_DEVICE)
         stats = SwaDivergenceReporter(
-            device=DEFAULT_DEVICE,
+            device=_DEVICE,
             d2h_stream=d2h_stream,
             interval=10,
             swa_allocator=swa_allocator,
@@ -405,13 +379,13 @@ class TestSwaDivergenceReporterWithCompute(CustomTestCase):
         )
         stats.observe_after_invoke_plan(
             group=make_buffer_group(
-                device=DEFAULT_DEVICE, kind=PoolKind.FULL, has_v=False, num_slots=1
+                device=_DEVICE, kind=PoolKind.FULL, has_v=False, num_slots=1
             ),
             verify_plan=_make_verify_plan(11),
         )
         stats.observe_after_invoke_plan(
             group=make_buffer_group(
-                device=DEFAULT_DEVICE, kind=PoolKind.SWA, has_v=False, num_slots=1
+                device=_DEVICE, kind=PoolKind.SWA, has_v=False, num_slots=1
             ),
             verify_plan=_make_verify_plan(3),
         )

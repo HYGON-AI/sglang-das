@@ -45,7 +45,6 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.kernels.ops.speculative.eagle import (
     fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
 )
-from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
@@ -251,41 +250,6 @@ def draft_kv_indices_used_len(
     num_steps = i + 1 (per-step slice) and speculative_num_steps (capacity assert).
     """
     return seq_lens_sum * topk + bs * num_steps
-
-
-def resolve_draft_decode_window(model_runner) -> Tuple[int, int]:
-    """Resolve (window_size, sink_size) for generate_draft_decode_kv_indices.
-
-    Returns (0, 0) -- full draft attention, the pristine read plan -- when
-    --speculative-draft-window-size is unset, and also when the draft model
-    already has a sliding window of its own: the index builder emits one KV list
-    shared by every draft layer, so it cannot express a per-layer window, and the
-    draft model's own window is authoritative -- whether it comes from the
-    checkpoint or, for LlamaForCausalLMEagle3, from this same flag.
-    """
-    # Read through the resolving view: handle_speculative_decoding declares both
-    # fields rather than assigning them, so the raw field holds the unvalidated input.
-    cfg = resolving_view(model_runner.server_args)
-    window_size = int(cfg.speculative_draft_window_size or 0)
-    if window_size <= 0:
-        return 0, 0
-    # The runner's resolved window, not the raw config field: config keys
-    # (sliding_window / window_size) are overloaded across model families, while
-    # this is the same value the attention backends key their own SWA paths on.
-    native_window = getattr(model_runner, "sliding_window_size", None)
-    if native_window is not None and native_window > 0:
-        # An equal window is the one that was asked for, applied per layer instead
-        # of here (LlamaForCausalLMEagle3 routes this flag into its own window).
-        if native_window != window_size:
-            logger.warning(
-                "Ignoring --speculative-draft-window-size=%d: this draft model has a "
-                "sliding window of %d, which the attention backend applies per layer. "
-                "Draft-decode windowing stays off.",
-                window_size,
-                native_window,
-            )
-        return 0, 0
-    return window_size, int(cfg.speculative_draft_sink_size or 0)
 
 
 def record_stream_each(tensors, stream):
@@ -529,27 +493,6 @@ def traverse_tree(
         retrieve_next_token.shape == retrieve_next_sibling.shape == draft_tokens.shape
     )
 
-    matcher = getattr(grammar, "matcher", None)
-    if matcher is not None and hasattr(matcher, "traverse_draft_tree"):
-        # xgrammar >= 0.2.0 requires int64 tensors for the C++ traversal.
-        rnt = (
-            retrieve_next_token
-            if retrieve_next_token.dtype == torch.int64
-            else retrieve_next_token.to(torch.int64)
-        )
-        rns = (
-            retrieve_next_sibling
-            if retrieve_next_sibling.dtype == torch.int64
-            else retrieve_next_sibling.to(torch.int64)
-        )
-        dts = (
-            draft_tokens
-            if draft_tokens.dtype == torch.int64
-            else draft_tokens.to(torch.int64)
-        )
-        matcher.traverse_draft_tree(rnt, rns, dts, allocate_token_bitmask)
-        return
-
     def dfs(
         curr: int,
         retrieve_next_token: torch.Tensor,
@@ -782,10 +725,10 @@ def draft_pp_context():
 
 
 @contextmanager
-def draft_tp_context(tp_group: GroupCoordinator, *, owns_attention: bool):
+def draft_tp_context(tp_group: GroupCoordinator):
     # Draft model doesn't use dp and has its own tp group.
     # We disable mscclpp now because it doesn't support 2 comm groups.
-    with patch_tensor_parallel_group(tp_group, owns_attention=owns_attention):
+    with patch_tensor_parallel_group(tp_group):
         yield
 
 
@@ -887,8 +830,6 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     set_mamba_track_indices_from_reqs(batch, track_positions)
     batch.mamba_track_mask = None
     batch.mamba_track_seqlens = None
-    batch.mamba_prefill_track_mask_cpu = None
-    batch.mamba_track_seqlens_cpu = None
 
 
 def _verify_commit_step_indices(
@@ -1111,9 +1052,7 @@ def commit_mamba_states_after_verify(
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         bs = accept_lens.shape[0]
-        state_batch_indices = req_pool.translate_mamba_indices(
-            req_pool.get_mamba_indices(batch.req_pool_indices)
-        )
+        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
         accept_indices_offset = torch.arange(
             0,
             bs * draft_token_num,
@@ -1145,11 +1084,8 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track = torch.where(
                 to_track_mask, candidate, torch.full_like(candidate, -1)
             )
-        if mamba_track_indices is not None:
-            mamba_track_indices = req_pool.translate_mamba_indices(mamba_track_indices)
         commit_kda_replayssm_after_verify(
             spec_state=spec_state,
-            use_hcu_kda=mamba_pool.use_hcu_kda,
             state_batch_indices=state_batch_indices,
             accept_lens=accept_lens,  # incl. bonus token
             last_correct_step_indices=last_correct_step_indices,

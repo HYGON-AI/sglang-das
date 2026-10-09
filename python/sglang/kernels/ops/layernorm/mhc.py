@@ -32,98 +32,10 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_interleave
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.runtime_context import get_parallel, get_platform
-from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hcu, is_hip
+from sglang.srt.utils import get_bool_env_var, is_hcu
 from sglang.srt.utils.common import is_gfx1250_supported
 
 logger = logging.getLogger(__name__)
-
-_AITER_MHC_RUNTIME_DISABLED = False
-_AITER_MHC_ACTIVE_LOGGED = False
-
-
-def _use_aiter_mhc() -> bool:
-    return (
-        not _AITER_MHC_RUNTIME_DISABLED
-        and is_gfx95_supported()
-        and envs.SGLANG_USE_AITER.get()
-    )
-
-
-def _try_aiter_mhc_pre(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    rms_eps: float,
-    hc_pre_eps: float,
-    hc_sinkhorn_eps: float,
-    hc_post_mult_value: float,
-    sinkhorn_repeat: int,
-    norm_weight: torch.Tensor | None,
-    norm_eps: float | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-    global _AITER_MHC_RUNTIME_DISABLED, _AITER_MHC_ACTIVE_LOGGED
-
-    try:
-        from aiter.ops.mhc import mhc_pre as aiter_mhc_pre
-    except Exception as err:
-        logger.warning("AITER mHC pre is unavailable, falling back: %s", err)
-        _AITER_MHC_RUNTIME_DISABLED = True
-        return None
-
-    kwargs = {}
-    if norm_weight is not None:
-        kwargs["norm_weight"] = norm_weight
-        kwargs["norm_eps"] = norm_eps if norm_eps is not None else rms_eps
-
-    try:
-        result = aiter_mhc_pre(
-            residual,
-            fn,
-            hc_scale,
-            hc_base,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-            **kwargs,
-        )
-    except Exception as err:
-        logger.warning("AITER mHC pre failed, disabling fast path: %s", err)
-        _AITER_MHC_RUNTIME_DISABLED = True
-        return None
-
-    if not _AITER_MHC_ACTIVE_LOGGED:
-        logger.info("Using AITER gfx950 mHC pre/post kernels")
-        _AITER_MHC_ACTIVE_LOGGED = True
-    return result
-
-
-def _try_aiter_mhc_post(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    post_layer_mix: torch.Tensor,
-    comb_res_mix: torch.Tensor,
-) -> torch.Tensor | None:
-    global _AITER_MHC_RUNTIME_DISABLED
-
-    try:
-        from aiter.ops.mhc import mhc_post as aiter_mhc_post
-    except Exception as err:
-        logger.warning("AITER mHC post is unavailable, falling back: %s", err)
-        _AITER_MHC_RUNTIME_DISABLED = True
-        return None
-
-    out = torch.empty_like(residual)
-    try:
-        aiter_mhc_post(out, x, residual, post_layer_mix, comb_res_mix)
-    except Exception as err:
-        logger.warning("AITER mHC post failed, disabling fast path: %s", err)
-        _AITER_MHC_RUNTIME_DISABLED = True
-        return None
-    return out
-
 
 # This module is imported during model-registry discovery. Do not import the real
 # TileLang package here: it loads native CUDA stubs. The proxy below lets
@@ -165,6 +77,40 @@ def _resolve_lazy_tilelang_value(value):
     return value
 
 
+# def _patch_tilelang_decouple_type_cast_for_rocm() -> None:
+#     if torch.version.hip is None:
+#         return
+#     try:
+#         from tilelang.transform import decouple_type_cast as _dtc
+#     except Exception:
+#         return
+#     if getattr(_dtc, "_sglang_rocm_bool_alloc_patch", False):
+#         return
+
+#     original_allocate = _dtc.Allocate
+
+#     def _is_bool_expr(expr) -> bool:
+#         try:
+#             dtype = expr.dtype
+#             if callable(dtype):
+#                 dtype = dtype()
+#             return str(dtype) == "bool8"
+#         except Exception:
+#             return False
+
+#     def _allocate(data, dtype, extents, condition, body, annotations=None, span=None):
+#         if not _is_bool_expr(condition):
+#             condition = _dtc.tir.const(1) == _dtc.tir.const(1)
+#         if annotations is None:
+#             return original_allocate(data, dtype, extents, condition, body)
+#         if span is None:
+#             return original_allocate(data, dtype, extents, condition, body, annotations)
+#         return original_allocate(data, dtype, extents, condition, body, annotations, span)
+
+#     _dtc.Allocate = _allocate
+#     _dtc._sglang_rocm_bool_alloc_patch = True
+
+
 def _load_tilelang():
     global _real_tilelang, _real_T, tilelang, T
     if _real_tilelang is None:
@@ -178,6 +124,7 @@ def _load_tilelang():
                         "tilelang is not installed; this kernel cannot run on the current platform"
                     ) from exc
                 new_tilelang.set_log_level("WARNING")
+                # _patch_tilelang_decouple_type_cast_for_rocm()
                 tilelang = new_tilelang
                 T = new_T
                 _real_T = new_T
@@ -228,29 +175,7 @@ _mhc_pre_warmed = False
 _is_hcu = is_hcu()
 _use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC")
 if _is_hcu and _use_aiter_tilelang_mhc:
-    from aiter.ops.tilelang import (
-        mhc_post_fwd,
-        mhc_pre_big_fuse,
-        pre_big_fuse_tilelang,
-    )
-
-
-def _use_deep_gemm_hc_prenorm() -> bool:
-    if is_hip() or not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
-        return False
-
-    from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
-
-    return ENABLE_JIT_DEEPGEMM
-
-
-def _use_tilelang_mhc_pre() -> bool:
-    return envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get() and not is_hip()
-
-
-def _use_tilelang_mhc_post() -> bool:
-    return envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get() and not is_hip()
-
+    from aiter.ops.tilelang import pre_big_fuse_tilelang
 
 FP8 = "float8_e4m3"
 BF16 = "bfloat16"
@@ -555,7 +480,9 @@ def hc_split_sinkhorn_torch(
     batch, seq_len, _ = mixes.shape
     mixes_flat = mixes.view(-1, (2 + hc_mult) * hc_mult)
 
-    pre = torch.sigmoid(mixes_flat[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + eps
+    pre = torch.sigmoid(
+        mixes_flat[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+    ) + eps
     post = 2 * torch.sigmoid(
         mixes_flat[:, hc_mult : 2 * hc_mult] * hc_scale[1]
         + hc_base[hc_mult : 2 * hc_mult]
@@ -601,9 +528,9 @@ def mhc_pre_torch(
     rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + rms_eps)
     mixes = torch.matmul(x_flat, fn.t()) * rsqrt
 
-    pre = (
-        torch.sigmoid(mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + hc_pre_eps
-    )
+    pre = torch.sigmoid(
+        mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+    ) + hc_pre_eps
     post = (
         2
         * torch.sigmoid(
@@ -616,7 +543,9 @@ def mhc_pre_torch(
     comb = comb + hc_base[2 * hc_mult :].view(1, hc_mult, hc_mult)
     comb = _sinkhorn_matrix_torch(comb, sinkhorn_repeat, hc_sinkhorn_eps)
 
-    layer_input = torch.einsum("nh,nhd->nd", pre, residual_flat.float())
+    layer_input = torch.einsum(
+        "nh,nhd->nd", pre, residual_flat.float()
+    )
     post_mix = post.view(*outer_shape, hc_mult, 1)
     comb_mix = comb.view(*outer_shape, hc_mult, hc_mult)
     layer_input = layer_input.view(*outer_shape, hidden_size).to(torch.bfloat16)
@@ -1290,7 +1219,7 @@ def mhc_pre(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
         )
 
-    if _use_deep_gemm_hc_prenorm():
+    if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
         n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
         gemm_out_mul = torch.empty(
@@ -1927,7 +1856,7 @@ def mhc_fused_post_pre(
             hidden_size,
         )
 
-        if _use_deep_gemm_hc_prenorm():
+        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
             import deep_gemm
 
             deep_gemm.tf32_hc_prenorm_gemm(
@@ -2121,25 +2050,7 @@ def _mhc_pre_dispatch(
     norm_eps: float | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
-    if _use_aiter_mhc():
-        result = _try_aiter_mhc_pre(
-            residual=residual,
-            fn=fn,
-            hc_scale=hc_scale,
-            hc_base=hc_base,
-            rms_eps=rms_eps,
-            hc_pre_eps=hc_pre_eps,
-            hc_sinkhorn_eps=hc_sinkhorn_eps,
-            hc_post_mult_value=hc_post_mult_value,
-            sinkhorn_repeat=sinkhorn_repeat,
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
-        )
-        if result is not None:
-            post_mix, comb_mix, layer_input = result
-            return post_mix, comb_mix, layer_input, norm_weight is not None
-
-    if not _use_tilelang_mhc_pre():
+    if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
         post_mix, comb_mix, layer_input = _mhc_pre_torch(
             residual=residual,
             fn=fn,
@@ -2150,23 +2061,6 @@ def _mhc_pre_dispatch(
             hc_sinkhorn_eps=hc_sinkhorn_eps,
             hc_post_mult_value=hc_post_mult_value,
             sinkhorn_repeat=sinkhorn_repeat,
-        )
-        return post_mix, comb_mix, layer_input, False
-
-    if _is_hcu and _use_aiter_tilelang_mhc:
-        # The HCU implementation includes prenorm GEMM and leaves the model's
-        # output RMSNorm to the caller, as in the original GLM-Next path.
-        post_mix, comb_mix, layer_input = mhc_pre_big_fuse(
-            residual=residual,
-            fn=fn,
-            mhc_scale=hc_scale,
-            mhc_base=hc_base,
-            rms_eps=rms_eps,
-            mhc_pre_eps=hc_pre_eps,
-            mhc_sinkhorn_eps=hc_sinkhorn_eps,
-            mhc_post_mult_value=hc_post_mult_value,
-            sinkhorn_repeat=sinkhorn_repeat,
-            n_splits=16,
         )
         return post_mix, comb_mix, layer_input, False
 
@@ -2195,20 +2089,8 @@ def _mhc_post_dispatch(
 ) -> torch.Tensor:
     assert x.dim() == 2 and residual.dim() == 3
     assert post_layer_mix.dim() == 3 and comb_res_mix.dim() == 3
-    if _use_aiter_mhc():
-        result = _try_aiter_mhc_post(
-            x=x,
-            residual=residual,
-            post_layer_mix=post_layer_mix,
-            comb_res_mix=comb_res_mix,
-        )
-        if result is not None:
-            return result
-
-    if not _use_tilelang_mhc_post():
+    if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
-    if _is_hcu and _use_aiter_tilelang_mhc:
-        return mhc_post_fwd(x, residual, post_layer_mix.squeeze(-1), comb_res_mix)
     return mhc_post(x, residual, post_layer_mix, comb_res_mix)
 
 

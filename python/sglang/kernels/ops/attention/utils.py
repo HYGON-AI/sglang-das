@@ -54,18 +54,12 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 from sglang.kernels.ops.kvcache.rope_cache import (
     fused_qk_rope_reshape_and_cache as fused_qk_rope_reshape_and_cache,
 )
-from sglang.srt.environ import envs
-from sglang.srt.utils import is_cuda, is_hcu
+from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
-_use_hcu_concat_mla_absorb_q = (
-    is_hcu() and envs.SGLANG_ENABLE_HCU_CONCAT_MLA_ABSORB_Q.get()
-)
 
 if _is_cuda:
     from sglang.kernels.ops.attention.concat_mla import concat_mla_absorb_q
-elif _use_hcu_concat_mla_absorb_q:
-    from sgl_kernel import concat_mla_absorb_q
 
 
 # When num_kv_heads=1, we have tensors with degenerate strides,
@@ -223,22 +217,10 @@ def mla_quantize_without_rope_for_fp8(
 
 
 def concat_mla_absorb_q_general(q_nope, q_rope):
-    can_use_custom_op = (
-        (_is_cuda or _use_hcu_concat_mla_absorb_q)
-        and q_nope.ndim == q_rope.ndim == 3
-        and q_nope.shape[:-1] == q_rope.shape[:-1]
-        and (q_nope.shape[-1], q_rope.shape[-1]) == (512, 64)
-        and q_nope.dtype == q_rope.dtype == torch.bfloat16
-        and q_nope.is_cuda
-        and q_rope.is_cuda
-        and q_nope.device == q_rope.device
-        and q_nope.stride(-1) == q_rope.stride(-1) == 1
-        and all(stride % 8 == 0 for stride in q_nope.stride()[:-1])
-        and all(stride % 8 == 0 for stride in q_rope.stride()[:-1])
-    )
-    if can_use_custom_op:
+    if _is_cuda and q_nope.shape[-1] == 512 and q_rope.shape[-1] == 64:
         return concat_mla_absorb_q(q_nope, q_rope)
-    return torch.cat([q_nope, q_rope], dim=-1)
+    else:
+        return torch.cat([q_nope, q_rope], dim=-1)
 
 
 @triton.jit
@@ -516,43 +498,3 @@ def assert_buffer_fits(used: int, capacity: int, what: str, **context) -> None:
     assert used <= capacity, f"{what}: used {used} > capacity {capacity}" + (
         f" ({', '.join(f'{k}={v}' for k, v in context.items())})" if context else ""
     )
-
-
-HCU_MLA_FP8_PADDED_KV_CACHE_DIM = 576
-
-
-def is_hcu_mla_fp8_kv_dtype(kv_cache_dtype: torch.dtype) -> bool:
-    return kv_cache_dtype in (
-        torch.float8_e4m3fn,
-        torch.float8_e4m3fnuz,
-        torch.float8_e5m2,
-        torch.float8_e5m2fnuz,
-    )
-
-
-def should_pad_hcu_mla_fp8_kv_cache(
-    kv_cache_dim: int,
-    qk_rope_head_dim: int,
-    kv_cache_dtype: torch.dtype,
-    uses_hcu_mla: bool,
-) -> bool:
-    return (
-        is_hcu()
-        and uses_hcu_mla
-        and qk_rope_head_dim == 0
-        and kv_cache_dim == 512
-        and is_hcu_mla_fp8_kv_dtype(kv_cache_dtype)
-    )
-
-
-def get_hcu_mla_fp8_kv_cache_dim(
-    kv_cache_dim: int,
-    qk_rope_head_dim: int,
-    kv_cache_dtype: torch.dtype,
-    uses_hcu_mla: bool,
-) -> int:
-    if should_pad_hcu_mla_fp8_kv_cache(
-        kv_cache_dim, qk_rope_head_dim, kv_cache_dtype, uses_hcu_mla
-    ):
-        return HCU_MLA_FP8_PADDED_KV_CACHE_DIM
-    return kv_cache_dim

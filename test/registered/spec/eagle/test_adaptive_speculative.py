@@ -8,12 +8,10 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.sgl_eval_utils import run_sgl_eval
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
-    DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_TARGET_MODEL_EAGLE,
-    DEFAULT_TARGET_MODEL_EAGLE3,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -41,8 +39,8 @@ MAX_DOWNSHIFT_ATTEMPTS = 6
 class TestAdaptiveSpeculativeServer(CustomTestCase):
     """Test adaptive speculative decoding with state switching and GSM8K accuracy."""
 
-    model = DEFAULT_TARGET_MODEL_EAGLE3
-    draft_model = DEFAULT_DRAFT_MODEL_EAGLE3
+    model = DEFAULT_TARGET_MODEL_EAGLE
+    draft_model = DEFAULT_DRAFT_MODEL_EAGLE
     base_url = DEFAULT_URL_FOR_TEST
 
     @classmethod
@@ -69,13 +67,10 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=[
                     "--trust-remote-code",
-                    # Target embeddings are shared with the FP16-default draft.
-                    "--dtype",
-                    "bfloat16",
                     "--attention-backend",
                     "triton",
                     "--speculative-algorithm",
-                    "EAGLE3",
+                    "EAGLE",
                     "--speculative-draft-model-path",
                     cls.draft_model,
                     "--speculative-adaptive",
@@ -173,11 +168,12 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            max_tokens=2048,
+            api="completion",
+            max_tokens=512,
             num_examples=100,
             num_threads=64,
         )
-        metrics = run_sgl_eval(args)
+        metrics = run_eval(args)
         print(f"GSM8K after adaptive switches: {metrics}")
         self.assertGreater(metrics["score"], 0.20)
 

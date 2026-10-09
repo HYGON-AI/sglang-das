@@ -55,11 +55,8 @@ _is_hip = is_hip()
 _disable_hip_linear_quant = _is_hip and get_bool_env_var(
     "SGLANG_ROCM_DISABLE_LINEARQUANT"
 )
-_use_fused_rms_quant = get_bool_env_var("SGLANG_USE_LEGACY_FUSED_RMS_QUANT")
+_use_fused_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
 _use_fused_silu_mul_quant = get_bool_env_var("SGLANG_USE_FUSED_SILU_MUL_QUANT")
-_use_fused_silu_mul_fp8_quant = (
-    envs.SGLANG_USE_FUSED_SILU_MUL_FP8_QUANT.get() or _use_fused_silu_mul_quant
-)
 _use_fused_bailing_silu_mul_fp8_quant = get_bool_env_var(
     "SGLANG_USE_FUSED_BAILING_SILU_MUL_FP8_QUANT"
 )
@@ -69,9 +66,7 @@ _use_fused_dpskv4_silu_mul_fp8_quant = get_bool_env_var(
 
 if _use_fused_rms_quant:
     try:
-        from sglang.srt.layers.fused_rms_quant import (
-            fused_rms_norm_per_token_quant as lm_faster_rmsquant,
-        )
+        from lightop.norm import lm_faster_rmsquant
     except Exception as e:
         print(f"Error: Import fused rmsquant error: {e}")
 if _use_fused_silu_mul_quant:
@@ -80,33 +75,12 @@ if _use_fused_silu_mul_quant:
     except Exception as e:
         print(f"Error: Import fused silu_mul_quant error: {e}")
 
-_lightop_fuse_silu_mul_clamp_quant = None
-if _use_fused_silu_mul_quant:
+if _use_fused_bailing_silu_mul_fp8_quant or _use_fused_dpskv4_silu_mul_fp8_quant:
     try:
-        from lightop import fuse_silu_mul_clamp_quant
-
-        _lightop_fuse_silu_mul_clamp_quant = fuse_silu_mul_clamp_quant
+        from lightop.activation import fuse_silu_mul_fp8_quant
     except ImportError:
-        pass
-
-_lightop_fuse_silu_mul_fp8_quant = None
-if (
-    _use_fused_silu_mul_fp8_quant
-    or _use_fused_bailing_silu_mul_fp8_quant
-    or _use_fused_dpskv4_silu_mul_fp8_quant
-):
-    try:
-        from lightop.activation import (
-            fuse_silu_mul_fp8_quant as _lightop_fuse_silu_mul_fp8_quant,
-        )
-    except ImportError:
-        try:
-            # Current HCU wheels export this operator from the package root.
-            from lightop import (
-                fuse_silu_mul_fp8_quant as _lightop_fuse_silu_mul_fp8_quant,
-            )
-        except ImportError:
-            pass
+        # Current HCU wheels export this operator from the package root.
+        from lightop import fuse_silu_mul_fp8_quant
 
 if _use_fused_bailing_silu_mul_fp8_quant or _use_fused_dpskv4_silu_mul_fp8_quant:
     import deepgemm
@@ -357,39 +331,30 @@ class ReplicatedLinear(LinearBase):
         residual: Optional[torch.Tensor] = None,
         quant_args: Optional[list] = None,
         update_hd: Optional[bool] = True,
-        input_quant_args: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        rms_norm_eps: Optional[float] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        bias = self.bias if not self.skip_bias_add else None
-        assert self.quant_method is not None
-        if input_quant_args is not None:
-            if not getattr(self.quant_method, "supports_prequantized_input", False):
-                raise TypeError(
-                    f"{type(self.quant_method).__name__} does not support prequantized input"
-                )
-            output = self.quant_method.apply(
-                self, x, bias, input_quant_args=input_quant_args
-            )
-        elif _use_fused_rms_quant and rms_weight is not None:
-            if rms_norm_eps is None:
-                raise ValueError("rms_norm_eps must be provided for fused RMS+quant")
+        if _use_fused_rms_quant and rms_weight is not None:
             i_q, _scales = lm_faster_rmsquant(
                 input=x,
                 rms_weight=rms_weight,
-                epsilon=rms_norm_eps,
+                epsilon=1e-6,
                 quant_dtype=torch.int8,
                 residual=residual,
                 update_input=update_hd,
             )
 
-            input_quant_args = (i_q, _scales)
-            output = self.quant_method.apply(
-                self, x, bias, input_quant_args=input_quant_args
-            )
+            input_quant_args = [i_q, _scales]
+
+            bias = self.bias if not self.skip_bias_add else None
+            assert self.quant_method is not None
+            output = self.quant_method.apply(self, x, bias, input_quant_args)
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
         else:
+            bias = self.bias if not self.skip_bias_add else None
+            assert self.quant_method is not None
             output = self.quant_method.apply(self, x, bias)
-        output_bias = self.bias if self.skip_bias_add else None
-        return output, output_bias
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
 
     def extra_repr(self) -> str:
         s = f"in_features={self.input_size}"
@@ -589,8 +554,8 @@ class ColumnParallelLinear(LinearBase):
         update_hd: Optional[bool] = True,
         input_quant_args=None,
     ):
-        if input_quant_args is not None or (
-            _use_fused_rms_quant and rms_weight is not None
+        if _use_fused_rms_quant and (
+            rms_weight is not None or input_quant_args is not None
         ):
             if input_quant_args is None:
                 i_q, _scales = lm_faster_rmsquant(
@@ -606,12 +571,8 @@ class ColumnParallelLinear(LinearBase):
 
             bias = self.bias if not self.skip_bias_add else None
             assert self.quant_method is not None
-            if not getattr(self.quant_method, "supports_prequantized_input", False):
-                raise TypeError(
-                    f"{type(self.quant_method).__name__} does not support prequantized input"
-                )
             output_parallel = self.quant_method.apply(
-                self, input_, bias, input_quant_args=input_quant_args
+                self, input_, bias, input_quant_args
             )
 
             if self.gather_output:
@@ -1089,10 +1050,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         rms_weight: Optional[torch.Tensor] = None,
         residual: Optional[torch.Tensor] = None,
         update_hd: Optional[bool] = True,
-        input_quant_args: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
-        if input_quant_args is not None:
-            return super().forward(input_, input_quant_args=input_quant_args)
         if _use_fused_rms_quant and rms_weight is not None:
             input_quant_args = None
             assert residual is not None and rms_weight is not None
@@ -1109,12 +1067,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
             bias = self.bias if not self.skip_bias_add else None
             assert self.quant_method is not None
-            if not getattr(self.quant_method, "supports_prequantized_input", False):
-                raise TypeError(
-                    f"{type(self.quant_method).__name__} does not support prequantized input"
-                )
             output_parallel = self.quant_method.apply(
-                self, input_, bias, input_quant_args=input_quant_args
+                self, input_, bias, input_quant_args
             )
 
             if self.gather_output:
@@ -1790,28 +1744,6 @@ class RowParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_row_parallel_weight(loaded_weight)
 
-    def supports_fused_silu_mul_quant_input(self) -> bool:
-        return bool(
-            _use_fused_silu_mul_quant
-            and _lightop_fuse_silu_mul_clamp_quant is not None
-            and getattr(
-                self.quant_method,
-                "supports_prequantized_input",
-                False,
-            )
-        )
-
-    def supports_fused_silu_mul_fp8_quant_input(self) -> bool:
-        return bool(
-            _use_fused_silu_mul_fp8_quant
-            and _lightop_fuse_silu_mul_fp8_quant is not None
-            and getattr(
-                getattr(self, "scheme", None),
-                "supports_fp8_prequantized_input",
-                False,
-            )
-        )
-
     def forward(
         self,
         input_,
@@ -1819,7 +1751,6 @@ class RowParallelLinear(LinearBase):
         forward_batch=None,
         use_fused_silu_mul_quant: Optional[bool] = False,
         use_fused_silu_mul_fp8_quant: Optional[bool] = False,
-        swiglu_limit: Optional[float] = None,
         output_tensor=None,
     ):
         if self.input_is_parallel:
@@ -1858,60 +1789,31 @@ class RowParallelLinear(LinearBase):
             )
 
         if use_fused_silu_mul_quant:
-            if swiglu_limit is None:
-                xq, xs = lm_fuse_silu_mul_quant(input_parallel)
-                quant_kwargs = {"silu_quant_args": [xq, xs]}
-                gemm_input = input_parallel
-            else:
-                if not self.supports_fused_silu_mul_quant_input():
-                    raise RuntimeError("LightOp clamp quantization is unavailable")
-                xq, xs = _lightop_fuse_silu_mul_clamp_quant(
-                    input_parallel, swiglu_limit
-                )
-                gemm_input = input_parallel[..., : input_parallel.shape[-1] // 2]
-                quant_kwargs = {"input_quant_args": (xq, xs)}
+            xq, xs = lm_fuse_silu_mul_quant(input_parallel)
+            silu_quant_args = [xq, xs]
             with symm_ctx as sm:
                 output_parallel = self.quant_method.apply(
                     self,
-                    gemm_input,
+                    input_parallel,
                     bias=bias_,
-                    **quant_kwargs,
+                    silu_quant_args=silu_quant_args,
                 )
                 if sm is not None:
                     sm.tag(output_parallel)
         elif use_fused_silu_mul_fp8_quant:
-            if not self.supports_fused_silu_mul_fp8_quant_input():
-                raise RuntimeError("LightOp FP8 SwiGLU quantization is unavailable")
-            if input_parallel.dim() != 2 or not input_parallel.is_contiguous():
-                raise ValueError(
-                    "Fused FP8 SwiGLU quantization requires a contiguous 2D input"
-                )
-
-            num_tokens, gate_up_width = input_parallel.shape
-            if gate_up_width % 2 != 0:
-                raise ValueError("SwiGLU gate/up width must be even")
-            input_x = torch.empty(
-                (num_tokens, gate_up_width // 2),
-                device=input_parallel.device,
-                dtype=torch.float8_e4m3fn,
-            )
-            x_scale = torch.empty(
-                (num_tokens, 1), device=input_parallel.device, dtype=torch.float32
-            )
-            _lightop_fuse_silu_mul_fp8_quant(
-                input_parallel,
-                fp8type=0,
-                output=input_x,
-                scales=x_scale,
-                limit=swiglu_limit,
-            )
+            output_shape = [*input_.shape[:-1], self.weight.shape[1]]
+            input_x, x_scale = fuse_silu_mul_fp8_quant(input_parallel, fp8type=0)
 
             with symm_ctx as sm:
-                output_parallel = self.quant_method.apply(
-                    self,
-                    (input_x, x_scale, input_parallel.dtype),
-                    bias=bias_,
+                output = torch.empty(
+                    output_shape, device=input_.device, dtype=input_.dtype
                 )
+                deepgemm.fp8_gemm(
+                    (input_x, x_scale),
+                    (self.weight, self.weight_scale),
+                    output,
+                )
+                output_parallel = output.view(*output_shape)
                 if sm is not None:
                     sm.tag(output_parallel)
         else:

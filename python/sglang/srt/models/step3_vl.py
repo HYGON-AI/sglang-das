@@ -1,6 +1,5 @@
 import logging
 import math
-from array import array
 from math import sqrt
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -22,7 +21,7 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
+from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -338,7 +337,7 @@ class Step3TextDecoderLayer(nn.Module):
         )
         self.is_next_layer_sparse = True if layer_id + 1 in moe_layers_idx else False
 
-        self.layer_facts = LayerFacts.init_new(
+        self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
@@ -379,10 +378,9 @@ class Step3TextDecoderLayer(nn.Module):
                 )
 
         self.layer_communicator = LayerCommunicator(
-            layer_facts=self.layer_facts,
+            layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
-            allow_deferred_ffn_reduction=False,
         )
 
     def moe_mlp_forward(self, hidden_states):
@@ -416,12 +414,14 @@ class Step3TextDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
-            if self.use_moe:
-                hidden_states = self.moe_mlp_forward(hidden_states)
-            else:
-                hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
+        if self.use_moe:
+            hidden_states = self.moe_mlp_forward(hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states)
+
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
 
         return hidden_states, residual
 
@@ -895,7 +895,7 @@ class Step3VLForConditionalGeneration(nn.Module):
                 )
         return self._flatten_embeddings(merged_image_features)
 
-    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

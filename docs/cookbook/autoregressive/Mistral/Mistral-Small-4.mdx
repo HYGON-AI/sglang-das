@@ -333,13 +333,8 @@ shapes to create a distinct symbol which signifies copyright protection.
 #### GSM8K
 
 ```bash Command
-sgl-eval run gsm8k \
-  --base-url http://127.0.0.1:30000/v1 \
-  --num-examples 200 \
-  --num-threads 64
+python3 benchmark/gsm8k/bench_sglang.py --port 30000
 ```
-
-The command above uses sgl-eval. Historical scores from other harnesses are not directly comparable; rerun this command for a matching result.
 
 **Results:**
 
@@ -350,9 +345,7 @@ TODO
 #### MMLU
 
 ```bash Command
-sgl-eval run mmlu \
-  --base-url http://127.0.0.1:30000/v1 \
-  --num-threads 64 --max-tokens 2048
+python3 benchmark/mmlu/bench_sglang.py --port 30000
 ```
 
 **Results:**

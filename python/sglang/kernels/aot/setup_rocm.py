@@ -51,10 +51,8 @@ sources = [
     "csrc/attention/merge_attn_states.cu",
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
-    "csrc/elementwise/concat_mla_absorb_q_hcu.cu",
     "csrc/elementwise/deepseek_v4_topk.cu",
     "csrc/elementwise/dsv4_norm_rope.cu",
-    "csrc/elementwise/kpool_write_plan.cu",
     # HCU-only kernel, no upstream counterpart.
     "csrc/elementwise/l2norm_kernel.cu",
     # Fused RoPE-tail + FP4 fake-quant for DSV4.1 KV cache write on HIP/DCU.

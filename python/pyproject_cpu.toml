@@ -51,7 +51,6 @@ dependencies = [
   "python-multipart",
   "pytest",
   "pyzmq>=25.1.2",
-  "regex",
   "requests",
   "scipy",
   "sentencepiece",
@@ -71,7 +70,7 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "xxhash",
-  "xgrammar==0.2.7",
+  "xgrammar==0.2.1",
   "zstandard",
 ]
 
@@ -111,7 +110,7 @@ test = [
   "pandas",
   "peft>=0.18.0",
   "sentence_transformers",
-  "sgl-eval==0.1.2",
+  "sgl-eval==0.1.0",
 ]
 all = []
 dev = ["sglang[test]"]

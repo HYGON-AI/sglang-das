@@ -52,7 +52,6 @@ DSV4_Q8KV8_PREFILL_ENV = "SGLANG_DSV4_Q8KV8_PREFILL"
 DSV4_Q8KV8_PREFILL_LOG_ENV = "SGLANG_DSV4_Q8KV8_PREFILL_LOG"
 
 from sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels import (
-    _build_cp_sparse_query_metadata_kernel,
     _build_swa_token_ids_kernel,
     _combine_topk_swa_indices_kernel,
 )
@@ -110,57 +109,6 @@ def combined_topk_width(topk: int, window_size: int) -> int:
     """Width of the padded combined_indices last dim that
     ``combine_topk_swa_indices`` would produce for these args."""
     return ceil_align(topk + window_size, SPARSE_PREFILL_TOPK_ALIGNMENT)
-
-
-def build_cp_sparse_query_metadata(
-    extend_seq_lens: torch.Tensor,
-    extend_start_loc: torch.Tensor,
-    query_positions: torch.Tensor,
-    cp_size: int,
-    cp_rank: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build CP-local query geometry entirely on the accelerator.
-
-    Returns physical per-request lengths (including the final padding suffix),
-    real per-request lengths, and rank-local query positions with every dummy
-    row replaced by the explicit -1 sentinel.
-    """
-    assert extend_seq_lens.dtype == torch.int32
-    assert extend_start_loc.dtype == torch.int32
-    assert query_positions.dtype == torch.int32
-    assert extend_seq_lens.device == extend_start_loc.device
-    assert extend_seq_lens.device == query_positions.device
-    assert extend_seq_lens.shape == extend_start_loc.shape
-    assert query_positions.is_contiguous()
-    assert cp_size > 1
-    assert 0 <= cp_rank < cp_size
-
-    num_reqs = extend_seq_lens.shape[0]
-    num_local_queries = query_positions.shape[0]
-    assert num_reqs > 0
-    assert num_local_queries > 0
-
-    real_query_lens = torch.empty_like(extend_seq_lens)
-    physical_query_lens = torch.empty_like(extend_seq_lens)
-    sanitized_query_positions = torch.empty_like(query_positions)
-
-    block_queries = 256
-    grid = (max(triton.cdiv(num_local_queries, block_queries), 1),)
-    _build_cp_sparse_query_metadata_kernel[grid](
-        real_query_lens,
-        physical_query_lens,
-        sanitized_query_positions,
-        extend_seq_lens,
-        extend_start_loc,
-        query_positions,
-        num_reqs,
-        num_local_queries,
-        cp_rank,
-        CP_SIZE=cp_size,
-        BLOCK_REQS=triton.next_power_of_2(num_reqs),
-        BLOCK_QUERIES=block_queries,
-    )
-    return physical_query_lens, real_query_lens, sanitized_query_positions
 
 
 def combine_topk_swa_indices(
@@ -363,10 +311,6 @@ class SparsePrefillChunkCache:
     swa_gather_lens: torch.Tensor  # (num_reqs,) int32
     swa_offsets: torch.Tensor  # (num_reqs+1,) int32
 
-    # Real rank-local query rows per request. Unlike query_start_loc's physical
-    # segments, these lengths exclude CP padding and may legitimately be zero.
-    real_query_seq_lens: Optional[torch.Tensor] = None  # (num_reqs,) int32
-
     # c0 pre-computed combine output (entire input set is chunk-invariant).
     c0_combined_indices: torch.Tensor = field(default=None)
     c0_combined_lens: torch.Tensor = field(default=None)
@@ -389,18 +333,11 @@ class SparsePrefillChunkCache:
         num_qo_tokens: int,
         max_seq_len: int,
         total_swa: int,
-        real_query_seq_lens: Optional[torch.Tensor] = None,
     ) -> "SparsePrefillChunkCache":
         """``query_lens`` / ``query_pos``: the rows this forward runs (the extend, or
         a CP rank's interleaved share of it); the SWA gather spans the whole extend."""
         device = seq_lens.device
         num_reqs = seq_lens.shape[0]
-
-        if real_query_seq_lens is None:
-            real_query_seq_lens = query_lens
-        assert real_query_seq_lens.dtype == torch.int32
-        assert real_query_seq_lens.shape == seq_lens.shape
-        assert real_query_seq_lens.device == device
 
         query_start_loc = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
         query_start_loc[1:] = torch.cumsum(query_lens, dim=0).to(torch.int32)
@@ -430,7 +367,6 @@ class SparsePrefillChunkCache:
             swa_first_pos=swa_first_pos,
             swa_gather_lens=swa_gather_lens,
             swa_offsets=swa_offsets,
-            real_query_seq_lens=real_query_seq_lens,
         )
 
         # Pre-compute the c0 combine output: TOPK=0, compressed_base=0,
@@ -512,20 +448,11 @@ class SparsePrefillChunkCache:
             f"live c128 extent {c128_max} exceeds metadata capacity "
             f"{c128_page_indices.shape[-1]}"
         )
-        # HCU CP padding belongs to the last physical segment, but the
-        # compressed page table must come from its last *real* query row.
-        real_lens = self.real_query_seq_lens
-        has_real_q = real_lens > 0
-        last_real_q = self.query_start_loc[:-1] + real_lens - 1
-        last_q_per_req = (
-            torch.where(has_real_q, last_real_q, torch.zeros_like(last_real_q))
-            .clamp(min=0, max=self.num_qo_tokens - 1)
-            .long()
-        )
+        # A request without rows on this rank gathers into a region nothing reads.
+        last_q_per_req = (self.query_start_loc[1:] - 1).clamp_min(0).long()
         per_req_c128 = c128_page_indices.narrow(1, 0, c128_max).index_select(
             0, last_q_per_req
         )
-        per_req_c128 = torch.where(has_real_q[:, None], per_req_c128, -1)
         # Clamp -1 -> 0 so dequant doesn't OOB; combine masks the invalid
         # tail via topk_len.
         flat_c128_ids = per_req_c128.reshape(-1).clamp_min(0).to(torch.int32)
@@ -581,8 +508,6 @@ class SparsePrefillChunkCache:
         assert c_max <= c_capacity, (
             f"live c{compress_ratio} extent {c_max} exceeds metadata capacity {c_capacity}"
         )
-        real_lens = self.real_query_seq_lens
-        has_real_q = real_lens > 0
         first_q_per_req = (
             self.query_start_loc[:-1].clamp_max(self.num_qo_tokens - 1).long()
         )
@@ -590,9 +515,6 @@ class SparsePrefillChunkCache:
         assert num_blocks <= page_table.shape[1]
         per_req_page_table = page_table.narrow(1, 0, num_blocks).index_select(
             0, first_q_per_req
-        )
-        per_req_page_table = torch.where(
-            has_real_q[:, None], per_req_page_table, -1
         )
 
         k_arange = torch.arange(c_max, dtype=torch.int32, device=device)

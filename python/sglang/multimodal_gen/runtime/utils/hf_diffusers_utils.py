@@ -149,12 +149,13 @@ def _is_weight_bearing_diffusers_component(key: str, value: Any) -> bool:
 
 
 def _get_declared_weight_component_dirs(model_path: str) -> list[str]:
-    model_index_path = _local_model_index_path(model_path)
+    model_index_path = os.path.join(model_path, "model_index.json")
     if not os.path.exists(model_index_path):
         return []
 
     try:
-        model_index = _read_model_index(model_index_path)
+        with open(model_index_path) as f:
+            model_index = json.load(f)
     except Exception as exc:
         logger.warning(
             "Failed to read model_index.json at %s: %s", model_index_path, exc
@@ -373,12 +374,13 @@ def _ci_validate_diffusers_model(model_path: str) -> tuple[bool, bool]:
 
 def _verify_diffusers_model_complete(path: str) -> bool:
     """Check if a diffusers model directory has all required component subdirectories."""
-    config_path = _local_model_index_path(path)
+    config_path = os.path.join(path, "model_index.json")
     if not os.path.exists(config_path):
         return False
 
     try:
-        model_index = _read_model_index(config_path)
+        with open(config_path) as config_file:
+            model_index = json.load(config_file)
     except Exception as exc:
         logger.warning("Failed to read model_index.json at %s: %s", config_path, exc)
         return False
@@ -681,29 +683,6 @@ def maybe_download_lora(
     return target
 
 
-def _local_model_index_path(model_path: str) -> str:
-    standard = os.path.join(model_path, "model_index.json")
-    if os.path.isfile(standard):
-        return standard
-    return os.path.join(model_path, "modular_model_index.json")
-
-
-def _read_model_index(path: str) -> dict[str, Any]:
-    with open(path) as f:
-        config = json.load(f)
-    if os.path.basename(path) == "modular_model_index.json":
-        config.pop("_blocks_class_name", None)
-        for name, spec in config.items():
-            if isinstance(spec, list) and len(spec) == 3 and isinstance(spec[2], dict):
-                # native loaders consume the component directories in this snapshot
-                if spec[2].get("subfolder", name) != name:
-                    raise ValueError(
-                        f"Modular component {name!r} must use its own subfolder"
-                    )
-                config[name] = spec[:2]
-    return config
-
-
 def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
     """
     Verify that the model directory contains a valid diffusers configuration.
@@ -716,16 +695,16 @@ def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
     """
 
     # Check for model_index.json which is required for diffusers models
-    config_path = _local_model_index_path(model_path)
+    config_path = os.path.join(model_path, "model_index.json")
     if not os.path.exists(config_path):
         raise ValueError(
-            f"Model directory {model_path} does not contain model_index.json "
-            "or modular_model_index.json. "
+            f"Model directory {model_path} does not contain model_index.json. "
             "Only HuggingFace diffusers format is supported."
         )
 
     # Load the config
-    config = _read_model_index(config_path)
+    with open(config_path) as f:
+        config = json.load(f)
 
     # Verify diffusers version exists
     if "_diffusers_version" not in config:
@@ -766,37 +745,26 @@ def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
     return cast(dict[str, Any], config)
 
 
-def _resolve_remote_repo_model_index_path(
-    model_name_or_path: str, filename: str = "model_index.json"
-) -> str:
+def _resolve_remote_repo_model_index_path(model_name_or_path: str) -> str:
     """Return a local path to a remote repo's ``model_index.json``"""
     try:
         # Cache-aware: no local_dir, so the selected Hub reuses its cache and
         # revalidates the remote file when online.
-        return hf_hub_download(repo_id=model_name_or_path, filename=filename)
+        return hf_hub_download(repo_id=model_name_or_path, filename="model_index.json")
     except EntryNotFoundError:
-        if filename == "model_index.json":
-            return _resolve_remote_repo_model_index_path(
-                model_name_or_path, "modular_model_index.json"
-            )
+        # Repo exists but has no model_index.json (single-model repo); let the
+        # caller fall through to the single-model path.
         raise
     except Exception as online_err:
         cached_path = None
         if not envs.SGLANG_USE_MODELSCOPE.get():
             from huggingface_hub import try_to_load_from_cache
 
-            filenames = (
-                (filename, "modular_model_index.json")
-                if filename == "model_index.json"
-                else (filename,)
+            cached = try_to_load_from_cache(
+                repo_id=model_name_or_path, filename="model_index.json"
             )
-            for candidate in filenames:
-                cached = try_to_load_from_cache(
-                    repo_id=model_name_or_path, filename=candidate
-                )
-                if isinstance(cached, str) and os.path.exists(cached):
-                    cached_path = cached
-                    break
+            if isinstance(cached, str) and os.path.exists(cached):
+                cached_path = cached
         if cached_path is not None:
             logger.warning(
                 "Could not fetch model_index.json for '%s' from the Hugging Face "
@@ -847,7 +815,8 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
         model_index_path = _resolve_remote_repo_model_index_path(model_name_or_path)
 
         # Load the model_index.json
-        config = _read_model_index(model_index_path)
+        with open(model_index_path) as f:
+            config: dict[str, Any] = json.load(f)
 
         # Verify it has the required fields
         if "_class_name" not in config:

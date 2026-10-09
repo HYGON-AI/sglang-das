@@ -1,4 +1,7 @@
-"""Config-time override declarations for qwen4_exp."""
+"""Config-time override declarations for qwen4_exp.
+
+Architectures: Qwen4ExpForConditionalGeneration.
+"""
 
 import logging
 from typing import Any, Dict
@@ -22,7 +25,7 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
     """Compressed QSA must own ``page_size`` here,
     so the qwen3_5 hybrid attention-shape policy is restated rather than shared.
     page_size=64 needs page-aligned full-KV allocation (slots are full_slot // ratio),
-    which in turn needs the mamba extra-buffer strategy or --disable-radix-cache.
+    which MambaRadixCache allows only with mamba extra-buffer or --disable-radix-cache.
     """
     cfg = resolving_view(server_args)
     if (

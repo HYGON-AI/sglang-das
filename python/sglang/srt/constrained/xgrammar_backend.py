@@ -16,7 +16,6 @@
 import dataclasses
 import json
 import logging
-import time
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -121,12 +120,6 @@ class XGrammarGrammar(BaseGrammarObject):
         return _allocate_token_bitmask(vocab_size, batch_size)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
-        stats = self.grammar_stats
-        if stats is not None and stats.first_mask_fill_time is None:
-            s = time.perf_counter()
-            self.matcher.fill_next_token_bitmask(vocab_mask, idx)
-            stats.first_mask_fill_time = time.perf_counter() - s
-            return
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
 
     @staticmethod
@@ -160,13 +153,7 @@ class XGrammarGrammar(BaseGrammarObject):
         )
         if grammar_stats := self.grammar_stats:
             grammar_stats = dataclasses.replace(
-                grammar_stats,
-                is_cache_hit=True,
-                tree_traversal_time=[],
-                first_mask_fill_time=None,
-                compilation_time=None,
-                ebnf_size=None,
-                schema_count=None,
+                grammar_stats, is_cache_hit=True, tree_traversal_time=[]
             )
         return XGrammarGrammar(
             matcher,
@@ -228,7 +215,6 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         vocab_size: int,
         model_eos_token_ids: Optional[List[int]] = None,
         any_whitespace: bool = True,
-        max_whitespace_cnt: Optional[int] = None,
     ):
         super().__init__()
 
@@ -258,7 +244,6 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
         self.any_whitespace = any_whitespace
-        self.max_whitespace_cnt = max_whitespace_cnt
 
     @property
     def is_support_token_filter(self):
@@ -274,15 +259,11 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        if logits.device.type in {"cuda", "xpu", "musa"}:
+        if logits.device.type in {"cuda", "npu", "xpu", "musa"}:
             if _is_hip:
                 apply_token_bitmask_inplace_cuda(logits, vocab_mask)
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
-        elif logits.device.type == "npu":
-            import sgl_kernel_npu  # noqa: F401
-
-            torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
@@ -367,9 +348,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 schema = json.loads(key_string)
                 validate_xgrammar_json_schema(schema)
                 ctx = self.grammar_compiler.compile_json_schema(
-                    schema=key_string,
-                    any_whitespace=self.any_whitespace,
-                    max_whitespace_cnt=self.max_whitespace_cnt,
+                    schema=key_string, any_whitespace=self.any_whitespace
                 )
 
         except (
@@ -388,11 +367,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         except RuntimeError as e:
             logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
-        return self._from_context(
-            ctx,
-            key_string,
-            GrammarStats(dispatch_type="ebnf", ebnf_size=len(key_string)),
-        )
+        return self._from_context(ctx, key_string, GrammarStats(dispatch_type="ebnf"))
 
     def dispatch_regex(self, key_string: str) -> BaseGrammarObject:
         try:
@@ -434,12 +409,6 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         return self._from_context(
             ctx, key_string, GrammarStats(dispatch_type="structural_tag")
         )
-
-    def get_cache_stats(self) -> Tuple[int, int]:
-        entries = len(self.cache)
-        # get_cache_size_bytes only exists in xgrammar >= 0.2.6.
-        get_bytes = getattr(self.grammar_compiler, "get_cache_size_bytes", None)
-        return entries, int(get_bytes()) if get_bytes is not None else 0
 
     def reset(self):
         super().reset()

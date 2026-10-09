@@ -1,4 +1,3 @@
-from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -129,7 +128,7 @@ class Step3p7ForConditionalGeneration(nn.Module):
             )
         return self._flatten_embeddings(merged_image_features)
 
-    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

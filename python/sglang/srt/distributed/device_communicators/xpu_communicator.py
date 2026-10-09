@@ -6,7 +6,6 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.utils import is_xpu
 
 
@@ -34,7 +33,9 @@ class XpuCommunicator:
             (self.world_size,) + input_size, dtype=input_.dtype, device=input_.device
         )
         # All-gather.
-        all_gather_single(output_tensor, input_, group=self.group)
+        torch.distributed.all_gather_into_tensor(
+            output_tensor, input_, group=self.group
+        )
         if rank_in_group == dst:
             # Reshape
             output_tensor = output_tensor.movedim(0, dim)

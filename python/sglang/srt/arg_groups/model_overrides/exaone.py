@@ -1,4 +1,7 @@
-"""Config-time override declarations for exaone."""
+"""Config-time override declarations for exaone.
+
+Architectures: Exaone4ForCausalLM, ExaoneMoEForCausalLM.
+"""
 
 import logging
 from typing import Any

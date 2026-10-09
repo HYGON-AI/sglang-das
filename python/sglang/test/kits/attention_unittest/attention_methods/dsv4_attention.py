@@ -22,6 +22,7 @@ from torch import nn
 from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -348,6 +349,7 @@ class MockDSV4ModelRunner:
         self.tp_size = 1
         self.dp_size = 1
         self.pp_size = 1
+        self.ps = ParallelState.trivial()
         self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,

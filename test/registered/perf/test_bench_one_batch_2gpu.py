@@ -1,0 +1,75 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import unittest
+
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+
+register_hcu_ci(
+    est_time=120,
+    suite="nightly-hcu-perf",
+    nightly=True,
+    disabled="HCU BW1100 2GPU perf validation with current wheel stayed silent for more than 8 minutes during MoE bench_one_batch cold start; keep disabled until perf cold-start behavior and pass thresholds are baselined.",
+)
+
+from sglang.test.test_utils import (
+    DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_MOE_MODEL_NAME_FOR_TEST,
+    CustomTestCase,
+    is_in_amd_ci,
+    is_in_ci,
+    run_bench_offline_throughput,
+    write_github_step_summary,
+)
+
+register_cuda_ci(est_time=162, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(est_time=630, suite="stage-b-test-2-gpu-large-amd")
+
+
+class TestBenchOneBatch2GPU(CustomTestCase):
+    def test_moe_tp2_bs1(self):
+        output_throughput = run_bench_offline_throughput(
+            DEFAULT_MOE_MODEL_NAME_FOR_TEST,
+            ["--tp", "2", "--cuda-graph-max-bs-decode", "2"],
+        )
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_moe_tp2_bs1 (Mixtral-8x7B)\n"
+                f"output_throughput: {output_throughput:.2f} token/s\n"
+            )
+            if is_in_amd_ci():
+                self.assertGreater(output_throughput, 85)
+            else:
+                self.assertGreater(output_throughput, 125)
+
+    def test_torch_compile_tp2_bs1(self):
+        output_throughput = run_bench_offline_throughput(
+            DEFAULT_MODEL_NAME_FOR_TEST,
+            ["--tp", "2", "--enable-torch-compile", "--cuda-graph-max-bs-decode", "2"],
+        )
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_torch_compile_tp2_bs1 (Mixtral-8x7B)\n"
+                f"output_throughput: {output_throughput:.2f} token/s\n"
+            )
+            if is_in_amd_ci():
+                self.assertGreater(output_throughput, 200)
+            else:
+                self.assertGreater(output_throughput, 220)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -15,7 +15,6 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     fused_moe as fused_moe_sglang,
 )
-from sglang.test.test_utils import publish_build_topology
 
 from .common_utils import get_model_config
 
@@ -244,8 +243,10 @@ def main():
             backend="nccl" if torch.cuda.is_available() else "gloo",
         )
 
-        publish_build_topology()
-        initialize_model_parallel()
+        initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+        )
 
         shape_configs = get_model_config(args.model, args.tp_size, args.ep_size)
         benchmark.run(

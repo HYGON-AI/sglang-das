@@ -9,7 +9,7 @@ on:
         type: string
         default: ""
       runner_label:
-        description: "Deprecated; ignored. HCU jobs use the ci and bw1100 labels."
+        description: "HCU runner label override"
         required: false
         type: string
         default: ""
@@ -40,7 +40,7 @@ concurrency:
 jobs:
   check-full-trigger:
     name: Check full trigger
-    runs-on: [ci, bw1100]
+    runs-on: ${{ inputs.runner_label || vars.HCU_CI_RUNNER_LABEL }}
     outputs:
       should_run: ${{ steps.trigger.outputs.should_run }}
     steps:
@@ -58,7 +58,7 @@ jobs:
           fi
 
           if [[ "${HAS_FULL_LABEL}" != "true" ]]; then
-            echo "HCU full enabled run is disabled. Add the 'run-hcu-full' label to this PR, or use the 'run-ci' compatibility label."
+            echo "HCU full enabled run is disabled. Add the 'run-hcu-full' label to this PR, or use the temporary 'run-ci' compatibility gate on the hcu-ci-pr validation branch."
             echo "should_run=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
@@ -75,8 +75,9 @@ jobs:
     name: Validate HCU full config
     needs: check-full-trigger
     if: needs.check-full-trigger.outputs.should_run == 'true'
-    runs-on: [ci, bw1100]
+    runs-on: ${{ inputs.runner_label || vars.HCU_CI_RUNNER_LABEL }}
     outputs:
+      runner_label: ${{ steps.resolve.outputs.runner_label }}
       image: ${{ steps.resolve.outputs.image }}
       continue_on_error_flag: ${{ steps.resolve.outputs.continue_on_error_flag }}
     steps:
@@ -102,15 +103,27 @@ jobs:
             fetch --no-tags --depth=1 origin "${CHECKOUT_REF}"
           git checkout --force FETCH_HEAD
 
-      - name: Resolve HCU image
+      - name: Resolve HCU runner and image
         id: resolve
         env:
+          INPUT_RUNNER_LABEL: ${{ inputs.runner_label || '' }}
           INPUT_IMAGE: ${{ inputs.image || '' }}
+          VAR_RUNNER_LABEL: ${{ vars.HCU_CI_RUNNER_LABEL || '' }}
           VAR_IMAGE: ${{ vars.HCU_CI_IMAGE || '' }}
           CONTINUE_ON_ERROR: ${{ inputs.continue_on_error || '' }}
         run: |
+          runner_label="${INPUT_RUNNER_LABEL:-${VAR_RUNNER_LABEL}}"
+          if [[ "${runner_label}" == "hcu-ci-pr" ]]; then
+            echo "Routing validation runner label hcu-ci-pr to hcu-ci-pr-2 for nmz4 test runner."
+            runner_label="hcu-ci-pr-2"
+          fi
           image="${INPUT_IMAGE:-${VAR_IMAGE}}"
           continue_on_error="${CONTINUE_ON_ERROR:-true}"
+
+          if [[ -z "${runner_label}" ]]; then
+            echo "::error::HCU runner label is required. Set vars.HCU_CI_RUNNER_LABEL or workflow input runner_label."
+            exit 1
+          fi
 
           if [[ -z "${image}" ]]; then
             echo "::error::HCU CI image is required. Set vars.HCU_CI_IMAGE or workflow input image."
@@ -122,6 +135,7 @@ jobs:
             continue_on_error_flag="--continue-on-error"
           fi
 
+          echo "runner_label=${runner_label}" >> "${GITHUB_OUTPUT}"
           echo "image=${image}" >> "${GITHUB_OUTPUT}"
           echo "continue_on_error_flag=${continue_on_error_flag}" >> "${GITHUB_OUTPUT}"
 
@@ -156,7 +170,7 @@ jobs:
     name: Wait HCU wheels
     needs: validate-config
     if: needs.validate-config.result == 'success' && inputs.force_wheel_mode == true
-    runs-on: [ci, bw1100]
+    runs-on: ${{ needs.validate-config.outputs.runner_label }}
     outputs:
       wheel_urls: ${{ steps.wait.outputs.wheel_urls }}
     env:
@@ -293,7 +307,7 @@ jobs:
       - validate-config
       - wait-hcu-wheels
     if: always() && needs.validate-config.result == 'success' && (needs.wait-hcu-wheels.result == 'success' || needs.wait-hcu-wheels.result == 'skipped')
-    runs-on: [ci, bw1100]
+    runs-on: ${{ needs.validate-config.outputs.runner_label }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
@@ -661,7 +675,7 @@ jobs:
       - wait-hcu-wheels
       - full-enabled-hcu
     if: always()
-    runs-on: [ci, bw1100]
+    runs-on: ${{ inputs.runner_label || vars.HCU_CI_RUNNER_LABEL }}
     steps:
       - name: Check all dependent job statuses
         run: |
