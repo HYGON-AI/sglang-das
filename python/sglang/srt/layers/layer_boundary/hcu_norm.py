@@ -57,7 +57,7 @@ def hcu_bailing_stage_norm(stage_name: str, norm, forward_batch):
     attention input takes it without EP and DP, the FFN input when the bailing
     layer asks for it through ``forward_batch.rms_quant_flag``."""
     if stage_name == "attention":
-        if get_parallel().ep_size != 1 or get_parallel().dp_size != 1:
+        if get_parallel().ep_size != 1 or get_parallel().dp_size != 1 or get_parallel().attn_dp_size != 1:
             return norm
         return _HcuBailingRmsQuantNorm(norm, forward_batch, first_layer_plain=True)
     if getattr(forward_batch, "rms_quant_flag", False):

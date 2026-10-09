@@ -743,7 +743,7 @@ def eagle_sample(
     """
     import torch.nn.functional as F
 
-    from sglang.srt.distributed import get_tp_group
+
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
     )
@@ -858,7 +858,7 @@ def eagle_sample(
             tp_group = (
                 get_parallel().attn_tp_group
                 if is_dp_attention_enabled()
-                else get_tp_group()
+                else get_parallel().tp_group
             )
             if tp_group.world_size > 1:
                 tp_group.broadcast(predict, src=0)
@@ -894,7 +894,7 @@ def eagle_sample(
         tp_group = (
             get_parallel().attn_tp_group
             if is_dp_attention_enabled()
-            else get_tp_group()
+            else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
             tp_group.broadcast(predict, src=0)
@@ -997,7 +997,7 @@ def eagle_sample(
         tp_group = (
             get_parallel().attn_tp_group
             if is_dp_attention_enabled()
-            else get_tp_group()
+            else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
             tp_group.broadcast(predict, src=0)

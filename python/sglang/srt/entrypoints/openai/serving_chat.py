@@ -106,6 +106,7 @@ from sglang.srt.parser.reasoning_parser import (
     IQuestQ1ReasoningDetector,
     ReasoningParser,
 )
+from sglang.srt.parser.template_detection import detect_inline_system_support
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
 )
@@ -388,6 +389,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
         self.init_glm()
+        self.supports_inline_system = self._resolve_inline_system_support()
         self._dsv4_reasoning_effort_profile = (
             chat_encoding.resolve_dsv4_reasoning_effort_profile(
                 model_path=self.tokenizer_manager.model_path,
@@ -566,7 +568,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 return bool(val)
         return True
 
-    def _resolve_chat_encoding_spec(self) -> Optional[str]:
+    def _resolve_inline_system_support(self) -> bool:
+        if self.chat_encoding_spec is not None:
+            return chat_encoding.spec_supports_inline_system(self.chat_encoding_spec)
+        if self.template_manager.chat_template_name is not None:
+            return False
+        tokenizer = self.tokenizer_manager.tokenizer
+        return tokenizer is not None and detect_inline_system_support(
+            tokenizer.chat_template
+        )
+
+    def _resolve_chat_encoding_spec(self) -> str | None:
         """Determine which chat encoding spec to use.
 
         Override in subclass to add custom encoding specs.

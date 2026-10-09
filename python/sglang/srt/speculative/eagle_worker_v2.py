@@ -24,7 +24,7 @@ from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_postprocess,
 )
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
-from sglang.srt.distributed import get_pp_group
+
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -56,7 +56,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -125,7 +125,6 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_oob,
 )
 from sglang.srt.utils.common import (
-    empty_context,
     fast_topk,
     get_available_gpu_memory,
     is_cpu,
@@ -206,15 +205,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Use the same attention topology during draft construction and execution.
         self.draft_owns_attention = (
-            get_parallel().enable_dp_attention
-            and self.speculative_algorithm.is_eagle3()
+            get_parallel().attn_dp_enabled and self.speculative_algorithm.is_eagle3()
         )
-        if self.draft_owns_attention:
-            ctx = draft_tp_context(get_parallel().attn_tp_group, owns_attention=True)
-        else:
-            ctx = empty_context()
         with (
-            ctx,
+            draft_tp_context(self.draft_owns_attention),
             draft_pp_context(),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
@@ -235,9 +229,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._init_dsa_index_share_state()
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
-        self.draft_tp_context = (
-            draft_tp_context if get_parallel().enable_dp_attention else empty_context
-        )
         self.tree_mask_mode = default_tree_mask_mode()
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
@@ -306,10 +297,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def init_attention_backends(self):
         with (
-            self.draft_tp_context(
-                self.draft_runner.tp_group,
-                owns_attention=self.draft_owns_attention,
-            ),
+            draft_pp_context(),
+            draft_tp_context(self.draft_owns_attention),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
@@ -318,10 +307,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def init_cuda_graphs(self):
         with (
-            self.draft_tp_context(
-                self.draft_runner.tp_group,
-                owns_attention=self.draft_owns_attention,
-            ),
+            draft_pp_context(),
+            draft_tp_context(self.draft_owns_attention),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
@@ -1165,6 +1152,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         next_token_ids = batch_result.next_token_ids.to(torch.int64)
 
         # Prepare for draft extend in a separate stream
+        if self.plan_stream:
+            self.plan_stream.wait_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
         with self.plan_stream_ctx:
             forward_batch = prepare_for_draft_extend(
                 draft_extend_input,
@@ -1327,7 +1318,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Only the last PP stage runs the draft; other EAGLEWorkerV2 instances
         # return proxies so scheduler dispatch remains rank-uniform.
-        self._hosts_draft = get_pp_group().is_last_rank
+        self._hosts_draft = get_parallel().pp_group.is_last_rank
         self._draft_worker = (
             EagleDraftWorker(
                 server_args,
@@ -1385,10 +1376,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
             with (
-                self._draft_worker.draft_tp_context(
-                    self._draft_worker.draft_runner.tp_group,
-                    owns_attention=self._draft_worker.draft_owns_attention,
-                ),
+                draft_tp_context(self._draft_worker.draft_owns_attention),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
             ):
@@ -1466,10 +1454,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 verify_input = self._build_trivial_verify_input(batch)
             else:
                 with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group,
-                        owns_attention=self.draft_worker.draft_owns_attention,
-                    ),
+                    draft_tp_context(self.draft_worker.draft_owns_attention),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft"),
@@ -1488,15 +1473,51 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self._stub_skipped_draft_extend(batch, batch_output)
             else:
                 with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group,
-                        owns_attention=self.draft_worker.draft_owns_attention,
-                    ),
+                    draft_tp_context(self.draft_worker.draft_owns_attention),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft_extend"),
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
+
+            if (
+                get_parallel().pp_size > 1
+                and not batch.forward_mode.is_idle()
+                and self.speculative_num_steps > 0
+            ):
+                # PP tail-draft: draft the NEXT round's chain now — earlier
+                # stages must have the tokens before running their half of the
+                # next verify forward, so drafting cannot wait for the next
+                # iteration. Mimic the head-of-iteration state draft() expects;
+                # the scheduler's forward isolation reverts these SB edits, and
+                # the chain rides out on batch_output.
+                batch.spec_info = batch_output.next_draft_input
+                batch.seq_lens = batch_output.new_seq_lens
+                batch.forward_mode = ForwardMode.DECODE
+                # eagle_prepare_for_verify left the verify tokens here; the
+                # head-of-iteration draft always sees None (the scheduler
+                # clears it), so mirror that state.
+                batch.input_ids = None
+                # Attention metadata planning reads the CPU copies; one D2H
+                # per round (TODO: async or upper-bound estimate).
+                batch.seq_lens_cpu = batch_output.new_seq_lens.to("cpu")
+                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                with (
+                    draft_tp_context(self.draft_worker.draft_owns_attention),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                    spec_stage_span("draft"),
+                ):
+                    next_verify_input, parent_list, top_scores_index = (
+                        self.draft_worker.draft(batch, with_topology=True)
+                    )
+                batch_output.next_verify_chain = next_verify_input.draft_token
+                # The tree shape is data-dependent once topk > 1, so the other
+                # stages cannot re-derive it; relay it alongside the tokens.
+                # clone(): both come out of cuda-graph-owned buffers under
+                # decode replay and would be overwritten before the relay.
+                batch_output.next_verify_parent_list = parent_list.clone()
+                batch_output.next_verify_top_scores_index = top_scores_index.clone()
 
             return batch_output
 
@@ -1541,10 +1562,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Draft prefill
         with (
-            self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group,
-                owns_attention=self.draft_worker.draft_owns_attention,
-            ),
+            draft_tp_context(self.draft_worker.draft_owns_attention),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
             spec_stage_span("draft_extend"),
@@ -1599,10 +1617,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
         plan.apply(draft_batch, "draft", rank, local_only=draft_local_only)
         with (
-            self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group,
-                owns_attention=self.draft_worker.draft_owns_attention,
-            ),
+            draft_tp_context(self.draft_worker.draft_owns_attention),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
             spec_stage_span("draft"),
@@ -1626,10 +1641,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             on_publish(result.new_seq_lens)
         plan.apply(batch, "draft_extend", rank, local_only=draft_local_only)
         with (
-            self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group,
-                owns_attention=self.draft_worker.draft_owns_attention,
-            ),
+            draft_tp_context(self.draft_worker.draft_owns_attention),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
             spec_stage_span("draft_extend"),

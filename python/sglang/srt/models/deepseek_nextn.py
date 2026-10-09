@@ -28,7 +28,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
-from sglang.srt.distributed import get_pp_group
+
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.dsa.utils import (
@@ -286,7 +286,7 @@ class DeepseekModelNextN(nn.Module):
             # temporary Main-KV tensor aliases the target's LayerSplit scratch.
             # Configure it before the decoder/indexer can read historical KV.
             if get_parallel().enable_dsa_cache_layer_split:
-                from sglang.srt.layers.layer_boundary.adapters.context_parallel import (
+                from sglang.srt.layers.attention.dsa.utils import (
                     maybe_prefetch_full_attention_kv as maybe_prefetch_dsa_full_kv,
                 )
 
@@ -303,7 +303,7 @@ class DeepseekModelNextN(nn.Module):
                 )
             hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                hidden_states = residual_batch.norm(
+                hidden_states = residual_batch.final_norm(
                     hidden_states, forward_batch, self.shared_head.norm
                 )
 
@@ -368,10 +368,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.determine_num_fused_shared_experts()
         nextn_quant_config = self._resolve_nextn_quant_config(config, quant_config)
 

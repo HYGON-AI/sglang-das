@@ -476,10 +476,6 @@ class VisionTritonAttention(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        use_data_parallel = (
-            kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
-        )
-        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
 
     def forward(
         self,
@@ -552,10 +548,6 @@ class VisionFlash3Attention(nn.Module):
                 "VisionFlash3Attention is only available for CUDA, MUSA, or HCU"
             )
         super().__init__()
-        use_data_parallel = (
-            kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
-        )
-        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
 
     def forward(
         self,

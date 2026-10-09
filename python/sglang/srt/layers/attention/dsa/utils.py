@@ -1,5 +1,6 @@
+import logging
 from functools import lru_cache
-from typing import TYPE_CHECKING, List, Tuple, Union
+from typing import TYPE_CHECKING, List, Tuple, Union, Optional
 
 import torch
 import triton
@@ -9,6 +10,7 @@ from sglang.srt.layers.attention.dsa.forward_batch_utils import (
     effective_forward_mode,
 )
 from sglang.srt.layers.dp_attention import DpPaddingMode, dp_slot_in
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
@@ -23,6 +25,8 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hcu, is_hip, is_musa
 from sglang.srt.utils.common import ceil_align, ceil_div
+
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
@@ -61,6 +65,82 @@ def aiter_can_use_preshuffle_paged_mqa() -> bool:
         return Version(Version(triton.__version__).base_version) >= Version("3.5.0")
     except Exception:
         return False
+
+
+@lru_cache(maxsize=1)
+def gfx950_fused_indexer_runtime_ok() -> bool:
+    """Whether this runtime can serve the gfx950 fused indexer: aiter with
+    preshuffled paged MQA, and kernels that build.
+
+    Reached only on gfx950, since fused_decode.supported_hardware() is evaluated
+    first. Every decline here is therefore a configuration or toolchain error;
+    it is logged, as a warning when the path was asked for by name."""
+    from sglang.srt.runtime_context import get_exec
+
+    requested = get_exec().kernel.enable_dsa_fused_indexer
+    if requested is False:
+        return False  # asked for the standard path; not worth a line per server
+
+    # Every decline logs its reason. Without this the path is invisible: a run
+    # with the switch on and one with it off produce identical logs, and telling
+    # the two apart cost a day of bisecting benchmark results.
+    def _refuse(reason: str) -> bool:
+        # Asked for by name: warn, but still start on the standard path.
+        log = logger.warning if requested is True else logger.info
+        log("gfx950 fused DSA indexer disabled: %s", reason)
+        return False
+
+    # No hardware term here: fused_decode.supported_hardware() is the hardware
+    # half of the gate and runs first, so anything reaching this point is
+    # already on gfx950. What is left is what a deployment can get wrong.
+    if not get_bool_env_var("SGLANG_USE_AITER"):
+        return _refuse("SGLANG_USE_AITER is not set")
+    if not aiter_can_use_preshuffle_paged_mqa():
+        return _refuse("aiter cannot use preshuffled paged MQA logits")
+    from sglang.kernels.ops.attention.dsa.hip_gfx950 import loader
+
+    # modules_or_none logged the build error; do not repeat the compiler output.
+    if loader.modules_or_none() is None:
+        return _refuse("the kernels failed to build, see the warning above")
+    logger.info("gfx950 fused DSA indexer enabled")
+    return True
+
+
+def gfx950_model_shape_supported(**kwargs) -> bool:
+    """Static per-model half of the gate: shapes and dtypes that cannot change
+    after load."""
+    from sglang.kernels.ops.attention.dsa.hip_gfx950 import model_shape_supported
+
+    return model_shape_supported(**kwargs)
+
+
+def hadamard_preserved(indexer) -> bool:
+    """Whether Indexer._maybe_rotate still applies the Hadamard the fused kernels
+    fold in. If not, the fused path must stay off, or prefill and decode would
+    write different index-K formats."""
+    device = indexer.k_norm.weight.device
+    probe = torch.zeros(1, indexer.head_dim, dtype=torch.bfloat16, device=device)
+    probe[0, 0] = 1.0
+    rotated = indexer._maybe_rotate(probe)
+    # A 128-point Hadamard sends e_0 to a vector whose every entry is 128**-0.5;
+    # the identity leaves 127 zeros. Check the magnitude too, so a transform that
+    # is merely dense does not pass for the rotation the kernels assume.
+    expected = float(indexer.head_dim) ** -0.5
+    if not bool(
+        (rotated != 0).all()
+        and torch.allclose(
+            rotated.float().abs(),
+            torch.full_like(rotated.float(), expected),
+            rtol=0.05,
+            atol=0.0,
+        )
+    ):
+        logger.warning(
+            "gfx950 fused DSA indexer disabled: Indexer._maybe_rotate does not "
+            "apply the Hadamard rotation the fused kernels assume"
+        )
+        return False
+    return True
 
 
 # Tile size for the indexer FP8 K-cache preshuffle layout. Store and gather
@@ -348,6 +428,90 @@ def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
         return True
     else:
         return False
+
+
+def _dsa_prefill_has_history(forward_batch: "ForwardBatch") -> bool:
+    prefix_lens = forward_batch.extend_prefix_lens_cpu
+    if prefix_lens is None:
+        return True
+    return any(int(prefix_len) > 0 for prefix_len in prefix_lens)
+
+
+def maybe_configure_main_kv_page_plan(forward_batch: "ForwardBatch") -> None:
+    """Install this batch's compact Main-KV mapping when LayerSplit is active."""
+
+    from sglang.srt.mem_cache.dsa_cache_layer_split import build_main_kv_page_plan
+    from sglang.srt.model_executor.forward_context import get_req_to_token_pool
+
+    token_to_kv_pool = get_token_to_kv_pool()
+    use_prefill_cp = dsa_use_prefill_cp(forward_batch)
+    configure_page_plan = getattr(token_to_kv_pool, "configure_main_kv_page_plan", None)
+    if configure_page_plan is not None:
+        page_plan = None
+        can_compact_main_kv = (
+            is_hcu()
+            and getattr(token_to_kv_pool, "layer_shard_enabled", False)
+            and use_prefill_cp
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            # Compact mapping is batch-specific; retain the official full-
+            # scratch path while TBO alternates between two child batches.
+            and not forward_batch.can_run_tbo
+            and forward_batch.tbo_parent_token_range is None
+            and forward_batch.extend_prefix_lens_cpu is not None
+            and forward_batch.out_cache_loc is not None
+        )
+        if can_compact_main_kv:
+            if forward_batch.dsa_layer_split_main_kv_page_plan is None:
+                forward_batch.dsa_layer_split_main_kv_page_plan = (
+                    build_main_kv_page_plan(
+                        req_to_token=get_req_to_token_pool().req_to_token,
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        prefix_lens=forward_batch.extend_prefix_lens_cpu,
+                        current_locs=forward_batch.out_cache_loc,
+                        page_size=token_to_kv_pool.page_size,
+                    )
+                )
+            page_plan = forward_batch.dsa_layer_split_main_kv_page_plan
+        # Explicitly clear a compact layout left by an earlier ForwardBatch
+        # before entering the legacy full-pool path.
+        configure_page_plan(page_plan, forward_batch)
+
+
+def maybe_prefetch_full_attention_kv(
+    forward_batch: "ForwardBatch",
+    full_attention_layer_id: Optional[int],
+) -> None:
+    """Configure the batch plan and prefetch one DSA layer's caches."""
+
+    maybe_configure_main_kv_page_plan(forward_batch)
+
+    if full_attention_layer_id is None or not dsa_use_prefill_cp(forward_batch):
+        return
+
+    token_to_kv_pool = get_token_to_kv_pool()
+    has_history = _dsa_prefill_has_history(forward_batch)
+    prefetch_mla = getattr(token_to_kv_pool, "prefetch_mla_kv_buffer", None)
+    if prefetch_mla is not None:
+        prefetch_mla(full_attention_layer_id, has_history=has_history)
+    else:
+        # Index-K and Main-KV share a communicator, so all ranks enqueue them
+        # in this order. A skip-topk layer makes the Index-K call a no-op.
+        prefetch_index = getattr(token_to_kv_pool, "prefetch_index_buffer", None)
+        if is_hcu() and prefetch_index is not None:
+            prefetch_index(full_attention_layer_id, has_history=has_history)
+        prefetch_kv = getattr(token_to_kv_pool, "prefetch_kv_buffer", None)
+        if prefetch_kv is not None:
+            prefetch_kv(full_attention_layer_id, has_history=has_history)
+
+
+def maybe_prefetch_next_full_attention_kv(
+    forward_batch: "ForwardBatch",
+    next_full_attention_layer_id: Optional[int],
+) -> None:
+    """Prefetch the next layer while the current layer's MLP runs."""
+
+    maybe_prefetch_full_attention_kv(forward_batch, next_full_attention_layer_id)
+
 
 
 def fp8_mqa_logits_ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:

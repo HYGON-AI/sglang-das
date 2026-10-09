@@ -2148,7 +2148,7 @@ class MMReceiverBase(ABC):
         self.tp_group = tp_group
         if (
             scheduler is not None
-            and get_parallel().enable_dp_attention
+            and get_parallel().attn_dp_enabled
             and get_parallel().attn_cp_size == 1
         ):
             # Work requests are routed independently to each attention DP group.

@@ -77,6 +77,9 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
     verify_logits_adjustments_are_noop,
 )
+from sglang.srt.speculative.spec_sampling_mask import (
+    SpeculativeSamplingMaskCapture,
+)
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
@@ -194,7 +197,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
 
         self._draft_dp_context_enabled = (
-            ps.enable_dp_attention and not self._draft_is_moe
+            get_parallel().attn_dp_enabled and not self._draft_is_moe
         )
         self._use_full_projection_prefill = False
         if self._is_pd_prefill and self._draft_is_moe and ps.pp_size > 1:
@@ -217,7 +220,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and not self._is_pd_prefill
         )
         if (
-            get_parallel().enable_dp_attention
+            get_parallel().attn_dp_enabled
             and self._draft_is_moe
             and get_parallel().attn_tp_size > 1
         ):
@@ -227,6 +230,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "MoE-under-DP all-reduce."
             )
 
+        # Inside the draft scope the context answers the draft's narrowed rank.
+        self._target_tp_rank = get_parallel().tp_rank
         # HCU context-only ranks must retain their original PP placement so
         # the draft model can decide whether it owns target features.
         draft_pp_scope = (
@@ -291,9 +296,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         parallel = get_parallel()
         self._tp_sync = SpecTpSync(
-            parallel.attn_tp_group
-            if parallel.enable_dp_attention
-            else parallel.tp_group
+            parallel.attn_tp_group if parallel.attn_dp_enabled else parallel.tp_group
         )
         self._draft_graph_group = (
             parallel.attn_tp_group
@@ -301,7 +304,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             else parallel.tp_group
         )
 
-        if self.model_runner.tp_rank == 0:
+        if get_parallel().tp_rank == 0:
             logger.info(
                 "Initialized DSpark draft runner. attention_backend=%s, model=%s, "
                 "gamma=%s, verify_num_draft_tokens=%s, query_token_num=%s, "
@@ -323,7 +326,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_token_num=int(self.query_token_num), device=self.device
         )
 
-        self._attach_shared_modules()
+        if not getattr(self.draft_model, "uses_own_vocab_modules", False):
+            self._attach_shared_modules()
         self._target_hidden_projection_enabled = False
 
         self._verify_planner = DSparkVerifyPlanner(
@@ -331,18 +335,18 @@ class DSparkWorkerV2(BaseSpecWorker):
             gamma=self.gamma,
             model_runner=self.model_runner,
             device=self.device,
-            tp_rank=self.model_runner.tp_rank,
+            tp_rank=get_parallel().tp_rank,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_sync=self._tp_sync,
         )
         if (
-            get_parallel().enable_dp_attention
+            get_parallel().attn_dp_enabled
             and not self._draft_is_moe
             and self._verify_planner.is_compact_mode
             and self._decode_graph_allowed
         ):
             raise ValueError(
-                "DSpark dense-draft compact verify under --enable-dp-attention does not "
+                "DSpark dense-draft compact verify under attention DP does not "
                 "yet support cuda graph (idle DP groups cannot join the token-keyed "
                 "compact graph). Re-run with --disable-cuda-graph (eager is lossless), "
                 "or use SGLANG_RAGGED_VERIFY_MODE=static. The dsv4 (MoE) draft supports "
@@ -363,7 +367,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
             tp_sync=self._tp_sync,
-            dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
+            dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
         )
         self._verify_epilogue = None
         target_is_dsv41 = (
@@ -378,13 +382,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             target_is_dsv41
             and self._verify_planner.mode_value == "static"
             and self._draft_is_moe
-            and not get_parallel().enable_dp_attention
-            and self.model_runner.pp_size == 1
+            and not get_parallel().attn_dp_enabled
+            and get_parallel().pp_size == 1
         )
+        # ROCm (V4.1 target only): inside a HIP graph the accept-site TP broadcasts
+        # need the group's pynccl communicator
         if (
             (self._verify_planner.is_compact_mode or static_epilogue_supported)
             and self._decode_graph_allowed
-            and is_cuda()
+            and (is_cuda() or (is_cuda_alike() and target_is_dsv41))
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
@@ -443,7 +449,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             planner=self._verify_planner,
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
-            tp_rank=self.model_runner.tp_rank,
+            tp_rank=get_parallel().tp_rank,
             device=self.device,
             simulate_acc_len=self._simulate_acc_len,
         )
@@ -576,7 +582,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         with ExitStack() as stack:
             if self._draft_dp_context_enabled:
                 stack.enter_context(
-                    draft_tp_context(get_parallel().attn_tp_group, owns_attention=True)
+                    draft_tp_context(True)
                 )
             stack.enter_context(speculative_moe_backend_context())
             stack.enter_context(speculative_moe_a2a_backend_context())
@@ -624,7 +630,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_model=self.draft_model,
             is_deepseek_v4_draft=self._draft_is_moe,
         )
-        if self._target_hidden_projection_enabled and self.model_runner.tp_rank == 0:
+        if self._target_hidden_projection_enabled and get_parallel().tp_rank == 0:
             logger.info(
                 "DSpark prefill target-hidden projection runs before "
                 "sequence-parallel gather."
@@ -689,7 +695,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             gamma=self.gamma,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             device=self.device,
-            tp_rank=self.model_runner.tp_rank,
+            tp_rank=self._target_tp_rank,
             tp_sync=self._tp_sync,
             available_memory_gb=available_memory_gb,
             confidence_fn=(
@@ -1060,7 +1066,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         capture_hidden_mode: CaptureHiddenMode,
     ) -> GenerationBatchResult:
         expert_distribution_metrics = None
-        if get_parallel().enable_dp_attention:
+        if get_parallel().attn_dp_enabled:
             batch_output = self.target_worker.forward_batch_generation(
                 batch,
                 pp_proxy_tensors=pp_proxy_tensors,
@@ -1091,7 +1097,7 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _dp_verify_tier_num_tokens(self, batch: ScheduleBatch) -> Optional[int]:
         if not (
             self._draft_is_moe
-            and get_parallel().enable_dp_attention
+            and get_parallel().attn_dp_enabled
             and batch.global_num_tokens is not None
             and self._verify_planner.is_compact_mode
         ):
@@ -1165,7 +1171,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         global_num_reqs = (
             max(batch.global_num_tokens)
             if self._draft_is_moe
-            and get_parallel().enable_dp_attention
+            and get_parallel().attn_dp_enabled
             and batch.global_num_tokens is not None
             else None
         )
@@ -1182,7 +1188,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_idle():
             self._observers.note_idle_decode_step()
             expert_distribution_metrics = None
-            if get_parallel().enable_dp_attention:
+            if get_parallel().attn_dp_enabled:
                 if self._draft_is_moe:
                     with self._draft_context():
                         self._proposer.run_idle_participation(batch)
@@ -1349,6 +1355,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
             commit_lens=accept.commit_lens,
         )
+        sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
+            sampling_info,
+            next_token_logits=logits_output.next_token_logits,
+            draft_input=draft_input,
+            draft_token_num=self.verify_num_draft_tokens,
+            bs=bs,
+            greedy_mask=draft_block.greedy_mask,
+        )
+        if sampling_mask_capture is not None:
+            logits_output.sampling_mask_output = sampling_mask_capture.build_output(
+                out_tokens=accept.out_tokens,
+                commit_lens=accept.commit_lens,
+            )
         if batch.return_logprob:
             compute_spec_logprobs(
                 batch,

@@ -2022,7 +2022,7 @@ def setup_state_kv_args(
                     )
             if isinstance(token_to_kv_pool, NPUMLATokenToKVPool):
                 kv_args.kv_buf_groups = (
-                    len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num
+                    3 if token_to_kv_pool.index_head_dim is not None else 2
                 )
                 kv_args.hidden_kv_layers = total_kv_layers
                 kv_args.draft_kv_layers = (

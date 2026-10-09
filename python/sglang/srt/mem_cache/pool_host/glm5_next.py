@@ -367,13 +367,22 @@ class Glm5NextMLAPoolHost(_HcuLayerOwnership, MLATokenToKVPoolHost):
 class Glm5NextIndexerPoolHost(_HcuLayerOwnership, DSAIndexerPoolHost):
     def __init__(
         self,
-        device_pool: dsa.DSATokenToKVPool,
-        anchor_host: MLATokenToKVPoolHost,
-        layout: str,
+        device_pool: dsa.DSATokenToKVPool = None,
+        anchor_host: MLATokenToKVPoolHost = None,
+        layout: str = None,
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        *,
+        decl=None,
+        packed_draft_device_pools=(),
     ):
+        if decl is None:
+            decl = dsa.make_dsa_indexer_pool_decl(device_pool)
+        self.decl = decl
+        device_pool = decl.device_pool
+        layout = anchor_host.layout if layout is None else layout
+
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
         self.layout = layout
@@ -384,7 +393,7 @@ class Glm5NextIndexerPoolHost(_HcuLayerOwnership, DSAIndexerPoolHost):
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
         self.target_layer_num = self._effective_host_layer_num()
-        self.mtp_draft_device_pools = anchor_host.mtp_draft_device_pools
+        self.mtp_draft_device_pools = tuple(packed_draft_device_pools or anchor_host.mtp_draft_device_pools)
         self.layer_num = self.target_layer_num + self._draft_layer_num()
 
         self.index_head_dim = device_pool.index_head_dim
@@ -436,6 +445,15 @@ class Glm5NextIndexerPoolHost(_HcuLayerOwnership, DSAIndexerPoolHost):
         self.clear()
 
         self._init_hcu_transfer_ptrs()
+
+    def _is_device_layer_owned(self, device_pool, layer_id):
+        return dsa.HostKVCache._is_device_layer_owned(self, device_pool, layer_id)
+
+    def _host_layer_index(self, layer_id, device_pool=None):
+        return dsa.HostKVCache._host_layer_index(self, layer_id, device_pool)
+
+    def _owned_device_layer_ids(self, device_pool):
+        return dsa.HostKVCache._owned_device_layer_ids(self, device_pool)
 
     def _get_device_index_buffers(self, pool):
         if pool.use_fp8_index_k_cache:

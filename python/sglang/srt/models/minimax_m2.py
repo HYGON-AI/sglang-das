@@ -33,7 +33,7 @@ from transformers import PretrainedConfig
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
-from sglang.srt.distributed.parallel_state import get_tp_group
+
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.aux_hidden_states import (
@@ -111,7 +111,7 @@ from sglang.srt.utils import (
     is_non_idle_and_non_empty,
     is_npu,
     is_xpu,
-    make_layers,
+    make_pp_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -707,7 +707,7 @@ class MiniMaxM2MoE(nn.Module):
         topk_output = self.topk(hidden_states, router_logits)
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
-        tp_group = get_tp_group()
+        tp_group = get_parallel().tp_group
         i_q, i_s = per_token_quant_int8(hidden_states)
 
         i_q = tp_group.all_gather(i_q, dim=0)
@@ -1246,12 +1246,12 @@ class MiniMaxM2DecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
             )
             if layer_id != 0
             else None,
@@ -1267,7 +1267,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         if _is_hcu and get_server_args().minimax_opt:
             stream = residual_batch.stream_of(forward_batch)
-            hidden_states, residual = stream.finish(hidden_states)
+            hidden_states, residual = stream.export(hidden_states)
             hidden_states, residual = self.forward_opt(
                 positions, hidden_states, forward_batch, residual
             )
@@ -1276,7 +1276,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
 
         if _use_fused_rms_quant:
             stream = residual_batch.stream_of(forward_batch)
-            hidden_states, residual = stream.finish(hidden_states)
+            hidden_states, residual = stream.export(hidden_states)
             pre_norm = hidden_states.clone() if residual is None else residual
             hidden_states = self.attn_boundary.prepare(
                 hidden_states, forward_batch, hcu_skip_layernorm=True
@@ -1301,7 +1301,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
-            captured_last_layer_outputs=captured_last_layer_outputs,
+            capture_gathered=captured_last_layer_outputs,
         )
         if not forward_batch.forward_mode.is_idle():
             hidden_states = self.self_attn(
@@ -1404,7 +1404,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
 
     def op_comm_postprocess_layer(self, state):
         """Communication postprocess for layer - TBO operation"""
-        hidden_states = self.ffn_boundary.postprocess(
+        hidden_states = self.ffn_boundary.finish_complete_output(
             state.pop("hidden_states_mlp_output"), state.forward_batch
         )
 
@@ -1450,11 +1450,9 @@ class MiniMaxM2Model(nn.Module):
                 prefix=prefix,
             )
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             layer_fn,
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
@@ -1528,10 +1526,9 @@ class MiniMaxM2Model(nn.Module):
 
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
-        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
-
-        if hidden_states.shape[0] != 0:
-            hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm)
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
 
         if use_minimax_sp:
             attn_tp_group = get_parallel().attn_tp_group

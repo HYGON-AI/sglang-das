@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from sglang.srt.runtime_context import get_parallel
 import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
@@ -36,10 +37,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
-from sglang.srt.distributed.parallel_state import (
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
-)
+
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
 from sglang.srt.layers import deep_gemm_wrapper
@@ -1266,8 +1264,8 @@ class DeepEPMoE(FusedMoE):
 
         if all_tokens <= 0:
             return hidden_states.bfloat16()
-        rank_expert_offset = get_moe_expert_parallel_rank() * (
-            self.num_experts // get_moe_expert_parallel_world_size()
+        rank_expert_offset = get_parallel().moe_ep_rank * (
+            self.num_experts // get_parallel().moe_ep_size
         )
         topk_idx = torch.where(
             topk_idx == -1,

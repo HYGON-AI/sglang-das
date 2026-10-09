@@ -25,13 +25,7 @@ from sglang.srt.distributed import (
     get_moe_tensor_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.distributed.parallel_state import (
-    get_attn_tensor_model_parallel_rank,
-    get_attn_tensor_model_parallel_world_size,
-    get_moe_expert_parallel_world_size,
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
-)
+
 from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
@@ -40,10 +34,10 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layer_boundary import (
     declare_attn, declare_ffn, make_stages,
 )
-from sglang.srt.layers.layer_boundary.residual.add_norm import ADD
+from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 
-from sglang.srt.layers.layer_boundary import enable_moe_dense_fully_dp
+from sglang.srt.layers.layer_boundary import is_dense_ffn_fully_dp
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -219,9 +213,6 @@ class HYV3MoEFused(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
-        self.tp_size = get_moe_tensor_parallel_world_size()
-        self.dense_tp_size = get_tensor_model_parallel_world_size()
-        self.ep_size = get_moe_expert_parallel_world_size()
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.n_routed_experts = config.num_experts
@@ -540,8 +531,8 @@ class HYV3Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        attn_tp_rank = get_attn_tensor_model_parallel_rank()
-        attn_tp_size = get_attn_tensor_model_parallel_world_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -840,7 +831,7 @@ class HYV3DecoderLayer(nn.Module):
 
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
         if layer_id < first_k_dense_replace:
-            if enable_moe_dense_fully_dp():
+            if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
@@ -896,8 +887,8 @@ class HYV3DecoderLayer(nn.Module):
                 positions, hidden_states, forward_batch, residual
             )
 
-        hidden_states, stream = ResidualStream.arrive(
-            hidden_states, residual, ADD
+        hidden_states, stream = ResidualStream.from_handoff(
+            hidden_states, residual, PLAIN_ADD
         )
         forward_batch.residual_stream = stream
         hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
@@ -927,7 +918,7 @@ class HYV3DecoderLayer(nn.Module):
                     use_reduce_scatter=ffn_exit.mlp_reduce_scatter,
                 )
         hidden_states = ffn_exit.finish(hidden_states)
-        hidden_states, residual = stream.finish(hidden_states)
+        hidden_states, residual = stream.export(hidden_states)
         forward_batch.residual_stream = None
         return hidden_states, residual
 
@@ -968,7 +959,7 @@ class HYV3Model(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1087,7 +1078,7 @@ class HYV3ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.model = HYV3Model(config, quant_config, prefix=f"{prefix}.model")
         if self.pp_group.is_last_rank:

@@ -295,13 +295,10 @@ def cp_all_gather_rerange_launch(input_tensor, cp_size, comm_stream, event_key):
     the allocator can hand the input block back to the compute stream before the
     comm-stream kernel has read it.
     """
-    from sglang.srt.distributed.parallel_state import (
-        get_attn_cp_group,
-        get_attn_cp_overlap_group,
-    )
+    from sglang.srt.distributed.parallel_state import get_attn_cp_overlap_group
 
     group = get_attn_cp_overlap_group()
-    assert group is not get_attn_cp_group(), (
+    assert group is not get_parallel().attn_cp_group, (
         "the comm-stream path needs the duplicate attn_cp_overlap communicator; "
         "driving one communicator from two streams deadlocks RCCL"
     )

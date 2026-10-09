@@ -755,7 +755,7 @@ class LayerCommunicator:
                         hidden_states, residual
                     )
             else:
-                enable_dp_attention = get_server_args().enable_dp_attention
+                enable_dp_attention = get_parallel().attn_dp_enabled
                 moe_a2a_backend = get_server_args().moe_a2a_backend
                 if residual is None:
                     residual = hidden_states

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from sglang.srt.runtime_context import get_parallel
 import contextlib
 import logging
 from abc import ABC, abstractmethod
@@ -91,11 +92,8 @@ if is_npu():
     import torch_npu
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
-from sglang.srt.distributed import (
-    get_attn_context_model_parallel_rank,
-    get_attn_context_model_parallel_world_size,
-)
-from sglang.srt.distributed.parallel_state import get_pp_group
+
+
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.glm5_next.runtime import (
     get_glm5_next_runtime_args as get_global_server_args,
@@ -404,8 +402,8 @@ class Indexer(MultiPlatformOp):
         self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
-            self.cp_size = get_attn_context_model_parallel_world_size()
-            self.cp_rank = get_attn_context_model_parallel_rank()
+            self.cp_size = get_parallel().attn_cp_size
+            self.cp_rank = get_parallel().attn_cp_rank
         else:
             self.cp_size = None
             self.cp_rank = None
@@ -413,7 +411,7 @@ class Indexer(MultiPlatformOp):
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = get_global_server_args().pp_size
-            self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
+            self.logits_with_pp_recv = pp_size > 1 and not get_parallel().pp_group.is_last_rank
         elif _is_hcu:
             device_props = torch.cuda.get_device_properties(0)
             device_name = (
@@ -423,7 +421,7 @@ class Indexer(MultiPlatformOp):
             )
             self.sm_count = device_props.multi_processor_count
             pp_size = get_global_server_args().pp_size
-            self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
+            self.logits_with_pp_recv = pp_size > 1 and not get_parallel().pp_group.is_last_rank
         else:
             self.logits_with_pp_recv = False
 

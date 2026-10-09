@@ -999,7 +999,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 shard_offset=rank_shard_offset,
                 shard_size=rank_shard_size,
                 tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
                 use_presharded_weights=self.use_presharded_weights,
             )
 
@@ -1031,7 +1030,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                         loaded_weight=loaded_weight,
                         shard_id=shard_id,
                         tp_rank=self.tp_rank,
-                        tp_size=self.tp_size,
                     )
                 return
             elif isinstance(param, BlockQuantScaleParameter):
@@ -1041,7 +1039,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 param.load_merged_column_weight(
                     loaded_weight=loaded_weight,
                     tp_rank=self.tp_rank,
-                    tp_size=self.tp_size,
                 )
                 return
             output_sizes = (
@@ -1080,7 +1077,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_size=shard_size,
             use_presharded_weights=self.use_presharded_weights,
             tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
         )
 
     def forward(

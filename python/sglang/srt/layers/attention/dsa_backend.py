@@ -191,6 +191,7 @@ def materialize_full_kv_cp(
     return attn_mla.rebuild_cp_kv_cache(latent_cache, forward_batch, k_nope, k_pe)
 
 
+_is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 
@@ -640,8 +641,12 @@ class DeepseekSparseAttnBackend(
                     device=model_runner.device,
                 ),
             )
-        # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
-        elif self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
+        # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode).
+        # These come from flashinfer, which is CUDA-only, so the SM major alone
+        # cannot gate them: ROCm gfx1250 also reports compute capability (12, 5).
+        elif _is_cuda and (
+            self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm"
+        ):
             self.workspace_buffer = get_buffer(
                 "dsa_trtllm_workspace",
                 lambda: torch.empty(
@@ -3236,9 +3241,9 @@ class DeepseekSparseAttnBackend(
         )
 
         # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues.
-        # gfx950 reports device capability sm_(9,5), so it never enters this SM100+
-        # branch and falls through to the aiter flash_attn_varlen_func path below.
-        if self.device_sm_major >= 10:
+        # ROCm devices fall through to the aiter flash_attn_varlen_func path below:
+        # flashinfer is CUDA-only and gfx1250 also reports a major of 12 here.
+        if _is_cuda and self.device_sm_major >= 10:
             import flashinfer
 
             seq_lens = metadata.cache_seqlens_int32

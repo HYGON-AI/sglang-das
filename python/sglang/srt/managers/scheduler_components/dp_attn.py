@@ -74,47 +74,47 @@ def _spec_input_cuda_graph_compatible(
     return spec_info is None or spec_info.cuda_graph_compatible
 
 
-def _resolve_elastic_world_dp_size(
-    dp_size: int,
+def _resolve_elastic_world_num_dp_ranks(
+    num_dp_ranks: int,
     *,
     group: torch.distributed.ProcessGroup,
     local_num_tokens: int,
     local_forward_mode: int,
 ) -> int:
     if not world_dp_gather_enabled():
-        return dp_size
+        return num_dp_ranks
 
     from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
-    live_dp_size = dp_gather_width()
+    live_num_dp_ranks = dp_gather_width()
     effective_ep_size = ElasticEPStateManager.get_effective_ep_size()
     # Query live membership because elastic joins can expand WORLD.
     world_size = torch.distributed.get_world_size(group)
 
-    if live_dp_size != effective_ep_size:
+    if live_num_dp_ranks != effective_ep_size:
         raise RuntimeError(
-            "[Elastic EP] WORLD MLP sync dp_size is out of sync: "
+            "[Elastic EP] WORLD MLP sync num_dp_ranks is out of sync: "
             f"rank={torch.distributed.get_rank(group)} "
-            f"live_dp_size={live_dp_size} "
+            f"live_num_dp_ranks={live_num_dp_ranks} "
             f"effective_ep_size={effective_ep_size} "
-            f"world_size={world_size} server_args_dp_size={dp_size} "
+            f"world_size={world_size} configured_num_dp_ranks={num_dp_ranks} "
             f"local_num_tokens={local_num_tokens} "
             f"local_forward_mode={local_forward_mode}"
         )
-    if live_dp_size > world_size:
+    if live_num_dp_ranks > world_size:
         raise RuntimeError(
-            "[Elastic EP] WORLD MLP sync dp_size exceeds WORLD size: "
+            "[Elastic EP] WORLD MLP sync num_dp_ranks exceeds WORLD size: "
             f"rank={torch.distributed.get_rank(group)} "
-            f"live_dp_size={live_dp_size} world_size={world_size} "
+            f"live_num_dp_ranks={live_num_dp_ranks} world_size={world_size} "
             f"effective_ep_size={effective_ep_size}"
         )
 
-    return live_dp_size
+    return live_num_dp_ranks
 
 
 @dataclass
 class MLPSyncBatchInfo:
-    dp_size: int
+    num_dp_ranks: int
     tp_size: int
     cp_size: int
 
@@ -195,7 +195,7 @@ class MLPSyncBatchInfo:
         # is a no-op, and the masked fallback writes below would then read and
         # write the same storage.
         global_info_tensor = fallback_tensor.repeat(
-            self.dp_size, self.tp_size * self.cp_size, 1
+            self.num_dp_ranks, self.tp_size * self.cp_size, 1
         )
 
         if use_all_reduce:
@@ -220,7 +220,7 @@ class MLPSyncBatchInfo:
             )
 
         tp_info = global_info_tensor.view(
-            self.dp_size * self.tp_size * self.cp_size, info_width
+            self.num_dp_ranks * self.tp_size * self.cp_size, info_width
         )
         num_ranks_in_tp_info = tp_info.shape[0]
         if device == "cpu":
@@ -305,7 +305,7 @@ def _update_gather_batch(
     )
 
 
-def should_skip_scheduler_all_gather(dp_size: int) -> bool:
+def should_skip_scheduler_all_gather(num_dp_ranks: int) -> bool:
     """Return whether scheduler metadata is already local and rank-invariant.
 
     With one attention-DP rank there is no cross-DP state to reconcile.  The
@@ -316,7 +316,7 @@ def should_skip_scheduler_all_gather(dp_size: int) -> bool:
     DP1.
     """
 
-    return dp_size == 1 or envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+    return num_dp_ranks == 1 or envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
 
 
 def _local_decode_cuda_graph_vote(
@@ -430,7 +430,7 @@ def prepare_mlp_sync_batch_raw(
     dwdp: bool = False,
 ):
     parallel = get_parallel()
-    dp_size = parallel.dp_size
+    num_dp_ranks = parallel.num_dp_ranks
     attn_tp_size = parallel.attn_tp_size
     tp_group = parallel.tp_group
     # Check if other DP workers have running batches
@@ -465,7 +465,7 @@ def prepare_mlp_sync_batch_raw(
     # on HCU CPU process groups during the idle loop.  Reuse the established
     # skip path, which records each rank's local token count as required by CP.
     skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get() or (
-        dp_size == 1 and attn_tp_size == 1 and not require_mlp_tp_gather
+        get_parallel().num_dp_ranks == 1 and attn_tp_size == 1 and not require_mlp_tp_gather
     )
     can_run_decode_cuda_graph = _local_decode_cuda_graph_vote(
         local_batch=local_batch, disable_cuda_graph=disable_cuda_graph
@@ -515,16 +515,16 @@ def prepare_mlp_sync_batch_raw(
 
     local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
     if use_world_group:
-        dp_size = _resolve_elastic_world_dp_size(
-            dp_size,
+        num_dp_ranks = _resolve_elastic_world_num_dp_ranks(
+            num_dp_ranks,
             group=group,
             local_num_tokens=num_tokens,
             local_forward_mode=local_forward_mode,
         )
-    skip_all_gather = should_skip_scheduler_all_gather(dp_size)
+    skip_all_gather = should_skip_scheduler_all_gather(num_dp_ranks)
 
     mlp_sync_info = MLPSyncBatchInfo(
-        dp_size=dp_size,
+        num_dp_ranks=num_dp_ranks,
         tp_size=attn_tp_size,
         cp_size=parallel.attn_cp_size,
         num_tokens=num_tokens,
@@ -538,7 +538,7 @@ def prepare_mlp_sync_batch_raw(
         prefill_cuda_graph_max_prefix_len=prefill_cuda_graph_max_prefix_len,
     )
 
-    if dp_size == 1:
+    if num_dp_ranks == 1:
         mlp_sync_info.finalize_local()
     elif not skip_all_gather:
         mlp_sync_info.all_gather(
@@ -557,7 +557,7 @@ def prepare_mlp_sync_batch_raw(
     # Decide whether to emit idle batch
     if skip_all_gather:
         # Skip idle batch when attn-dp=1 (and always under DWDP: ranks run independently)
-        need_idle_batch = not dwdp and dp_size > 1
+        need_idle_batch = not dwdp and num_dp_ranks > 1
     else:
         need_idle_batch = max(mlp_sync_info.global_num_tokens) > 0
 

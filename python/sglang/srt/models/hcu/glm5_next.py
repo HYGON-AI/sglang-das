@@ -26,11 +26,7 @@ from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
 from sglang.kernels.ops.layernorm.mhc import hc_pre as _hc_pre_fn
 from sglang.srt.configs.glm5_next import Glm5NextConfig as ModelNextConfig
 from sglang.srt.configs.model_config import is_deepseek_dsa
-from sglang.srt.distributed.parallel_state import (
-    get_moe_expert_parallel_world_size,
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
-)
+
 from sglang.srt.distributed.utils import divide
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import (
@@ -1025,7 +1021,7 @@ class ModelNextModel(nn.Module):
         self.first_k_dense_replace = config.first_k_dense_replace
         self.consumed_train_tokens = None
         self.consumed_train_samples = None
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.nsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
@@ -1131,7 +1127,7 @@ class ModelNextModel(nn.Module):
                         or a2a_backend.is_mooncake()
                     )
                     tp_size = (
-                        1 if is_a2a_moe else get_tensor_model_parallel_world_size()
+                        1 if is_a2a_moe else get_parallel().tp_size
                     )
                     intermediate_size = (
                         config.moe_intermediate_size * config.n_shared_experts
@@ -1368,9 +1364,9 @@ class ModelNextForCausalLM(nn.Module):
                 "kv_a_proj_with_mqa",
             ]
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         if quant_config is not None:
             quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
         self.quant_config = quant_config
@@ -1473,7 +1469,7 @@ class ModelNextForCausalLM(nn.Module):
             return "GLM shared experts fusion requires CUDA devices."
         if _device_sm is not None and _device_sm < 80:
             return "GLM shared experts fusion requires SM80 or newer GPUs."
-        if get_moe_expert_parallel_world_size() > 1:
+        if get_parallel().moe_ep_size > 1:
             return "GLM shared experts fusion does not support expert parallelism."
         if get_moe_a2a_backend().is_deepep():
             return "GLM shared experts fusion does not support DeepEP."
@@ -1751,9 +1747,9 @@ class Glm5NextForConditionalGeneration(GlmVisualEncoderMixin, ModelNextForCausal
                     "q_a_proj",
                     "kv_a_proj_with_mqa",
                 ]
-            self.pp_group = get_pp_group()
+            self.pp_group = get_parallel().pp_group
             self.config = config
-            self.tp_size = get_tensor_model_parallel_world_size()
+            self.tp_size = get_parallel().tp_size
             if quant_config is not None:
                 quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
             self.quant_config = quant_config
