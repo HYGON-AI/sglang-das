@@ -139,7 +139,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
         _log_hcu_deepgemm_once("masked")
         if recipe_a is not None or recipe_b is not None:
             raise NotImplementedError("HCU DeepGEMM does not use CUDA recipes")
-        return deepgemm.m_grouped_fp8_gemm_nt_masked_ll(
+        return deepgemm.m_grouped_fp8_gemm_nt_masked(
             lhs,
             rhs,
             out,

@@ -58,7 +58,7 @@ def test_hcu_deepgemm_masked_wrapper_uses_vendor_abi(monkeypatch):
     monkeypatch.setattr(
         deep_gemm_entrypoint,
         "deepgemm",
-        SimpleNamespace(m_grouped_fp8_gemm_nt_masked_ll=masked),
+        SimpleNamespace(m_grouped_fp8_gemm_nt_masked=masked),
     )
     lhs = (torch.empty((2, 3, 4)), torch.empty((2, 3)))
     rhs = (torch.empty((2, 1, 1, 1, 1, 1)), torch.empty((2, 8)))

@@ -18,7 +18,11 @@ import openai
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_hcu_ci,
+)
 
 register_hcu_ci(est_time=90, suite="stage-b-test-1-hcu-small")
 
@@ -67,12 +71,15 @@ class TestRequestLengthValidation(CustomTestCase):
                 temperature=0,
             )
 
-        self.assertIn("is longer than the model's context length", str(cm.exception))
+        self.assertIn(
+            "is longer than the server's maximum allowed length", str(cm.exception)
+        )
 
     def test_input_length_longer_than_maximum_allowed_length(self):
         client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
 
-        long_text = "hello " * 999  # the maximum allowed length is 994 tokens
+        # The runtime input limit can be below 1000 due to KV-cache page alignment.
+        long_text = "hello " * 999
 
         with self.assertRaises(openai.BadRequestError) as cm:
             client.chat.completions.create(
@@ -83,7 +90,9 @@ class TestRequestLengthValidation(CustomTestCase):
                 temperature=0,
             )
 
-        self.assertIn("is longer than the model's context length", str(cm.exception))
+        self.assertIn(
+            "is longer than the server's maximum allowed length", str(cm.exception)
+        )
 
     def test_input_length_longer_than_context_length_streaming(self):
         client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
@@ -100,7 +109,9 @@ class TestRequestLengthValidation(CustomTestCase):
                 stream=True,
             )
 
-        self.assertIn("is longer than the model's context length", str(cm.exception))
+        self.assertIn(
+            "is longer than the server's maximum allowed length", str(cm.exception)
+        )
 
     def test_max_tokens_validation(self):
         client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
