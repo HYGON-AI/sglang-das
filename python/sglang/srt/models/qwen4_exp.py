@@ -930,8 +930,39 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.quant_method = None
 
         source_weight = embedding.weight
+        released_source_weight = False
         if source_weight.device.type == "cpu" and source_weight.is_pinned():
             cpu_weight = source_weight
+        elif source_weight.dtype == torch.bfloat16:
+            # BF16-only: INT8/FP8 keep the original factory below.
+            # Unquantized Qwen3.8 ngram tables are ~12.8GB/rank at TP8.
+            # The old path kept an uninitialized pageable copy while
+            # hipHostMalloc'ing a pinned twin, under the outer
+            # `with torch.device("cuda")` model-init context. That HIP-OOMs
+            # BF16 serving; INT8/FP8 tables are half the size and already
+            # pin successfully, so they are left unchanged.
+            shape = tuple(source_weight.shape)
+            dtype = source_weight.dtype
+            extras = {
+                name: value
+                for name, value in vars(source_weight).items()
+                if name != "data"
+            }
+            params = getattr(embedding, "_parameters", None)
+            if isinstance(params, dict) and "weight" in params:
+                params.pop("weight")
+            elif hasattr(embedding, "weight"):
+                try:
+                    delattr(embedding, "weight")
+                except AttributeError:
+                    pass
+            del source_weight
+            released_source_weight = True
+            with torch.device("cpu"):
+                pinned = torch.empty(shape, dtype=dtype, pin_memory=True)
+            cpu_weight = nn.Parameter(pinned, requires_grad=False)
+            for name, value in extras.items():
+                setattr(cpu_weight, name, value)
         else:
             cpu_weight = nn.Parameter(
                 torch.empty(
@@ -946,9 +977,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             # the checkpoint loader fills cpu_weight afterwards. Copying the
             # uninitialized source would touch the full PLE table once for no
             # benefit (more than 50 GB in the Qwen3.8 ngram checkpoints).
-        for name, value in vars(source_weight).items():
-            if name != "data":
-                setattr(cpu_weight, name, value)
+        if not released_source_weight:
+            for name, value in vars(source_weight).items():
+                if name != "data":
+                    setattr(cpu_weight, name, value)
         cpu_weight.weight_loader = self.weight_loader
         self.register_parameter("weight", cpu_weight)
         source_scale = embedding.weight_scale
@@ -981,7 +1013,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 device=f"cuda:{torch.cuda.current_device()}",
                 dtype=cpu_scale.dtype,
             )
-        if cpu_weight is not source_weight:
+        if (not released_source_weight) and cpu_weight is not source_weight:
             del embedding.weight
         self._block_d = triton.next_power_of_2(self.embedding_dim)
 
