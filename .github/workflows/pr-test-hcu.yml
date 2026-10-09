@@ -773,11 +773,26 @@ jobs:
           # Temporarily excluded from the required HCU PR partition:
           # - test_server_args.py: HiCache expectations are stale after 1b9d81cc0.
           # - test_triton_scaled_mm.py: deterministic BW1100 int8 numeric mismatch.
+          # Include files must exist in the PR checkout: branches that lack a
+          # release-only test (e.g. test_profile_merger_http_api.py exists only
+          # on release/**) would otherwise abort run_suite.py at startup.
+          optional_include_files=(
+            registered/unit/managers/test_profile_merger_http_api.py
+          )
+          optional_include_args=()
+          for f in "${optional_include_files[@]}"; do
+            if [ -f "$f" ]; then
+              optional_include_args+=(--include-file "$f")
+            else
+              echo "[stage-b] skip missing optional include: $f"
+            fi
+          done
           bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" -w /sglang-checkout/test --container-name "${HCU_CI_CONTAINER_NAME}" \
             -e SGLANG_HCU_RERANKER_MODEL="${SGLANG_HCU_RERANKER_MODEL}" -- \
             python3 run_suite.py \
               --hw hcu \
               --suite stage-b-test-1-hcu-small \
+              "${optional_include_args[@]}" \
               --include-file registered/hcu/interface/test_hcu_stage_b_flow_0.py \
               --include-file registered/hcu/interface/test_hcu_stage_b_flow_1.py \
               --include-file registered/unit/observability/test_metrics_utils.py \
@@ -797,7 +812,6 @@ jobs:
               --include-file registered/attention/test_create_kvindices.py \
               --include-file registered/layers/mamba/test_causal_conv1d.py \
               --include-file registered/unit/managers/test_io_struct.py \
-              --include-file registered/unit/managers/test_profile_merger_http_api.py \
               --include-file registered/unit/mem_cache/test_radix_cache_unit.py \
               --include-file registered/ops/test_repeat_interleave.py \
               --include-file registered/openai_server/basic/test_serving_completions.py \
