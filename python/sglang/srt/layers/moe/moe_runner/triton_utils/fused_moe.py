@@ -43,8 +43,8 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
-    is_hip,
     is_hcu,
+    is_hip,
     is_musa,
     is_xpu,
 )
@@ -98,8 +98,6 @@ elif _is_hip:
                 MoeSolutionType,
                 aiter_moe,
                 get_aiter_moe_config,
-                aiter_moe_shfl_weight,
-                aiter_moe_shfl_scale,
             )
         except ImportError:
             raise ImportError(
@@ -1486,6 +1484,8 @@ def fused_experts_impl(
 ):
     if (
         _use_aiter_moe
+        # HCU INT8 fallback requires raw weights and Triton's swiglu_limit.
+        and not (_is_hcu and use_int8_w8a8)
         and not is_triton_forced_for_dspark_aiter_fallback()
         # AITER expects a complete expert weight set. EP-local shards keep
         # global expert ids and require Triton's filter_expert path.

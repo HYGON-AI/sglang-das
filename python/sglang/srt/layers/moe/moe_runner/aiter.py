@@ -239,6 +239,7 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     swiglu_limit: float = 0.0
     use_int8_w8a8: bool = False
     use_fp8_w8a8: bool = False
+    w8a8_no_shuffle: bool = False
     global_num_experts: Optional[int] = None
     expert_map: Optional[torch.Tensor] = None
     moe_config_cache: Optional[dict] = None
@@ -319,7 +320,51 @@ class AiterRunnerOutput(RunnerOutput):
         return MoeRunnerBackend.AITER
 
 
+def _prepare_aiter_w8a8_weights(layer: torch.nn.Module) -> None:
+    """Keep checkpoint-layout weights; the unified runner owns any shuffle."""
+    config = getattr(layer, "moe_runner_config", None)
+    if getattr(layer, "apply_router_weight_on_input", False) or (
+        config is not None and config.apply_router_weight_on_input
+    ):
+        raise RuntimeError(
+            "AITER channel-W8A8 does not support apply_router_weight_on_input=True"
+        )
+
+
+def _get_aiter_w8a8_quant_info(
+    layer: torch.nn.Module, *, use_fp8: bool
+) -> AiterMoeQuantInfo:
+    dispatcher = getattr(layer, "dispatcher", None)
+    expert_map = (
+        getattr(dispatcher, "local_expert_mapping", None)
+        if getattr(dispatcher, "expert_mask_gpu", None) is not None
+        else None
+    )
+    if not use_fp8 and (
+        layer.w13_weight.dtype != torch.int8 or layer.w2_weight.dtype != torch.int8
+    ):
+        raise ValueError("AITER INT8 W8A8 requires torch.int8 expert weights")
+    return AiterMoeQuantInfo(
+        w13_weight=layer.w13_weight,
+        w2_weight=layer.w2_weight,
+        quant_type=AiterQuantType.PER_TOKEN,
+        w13_scale=layer.w13_weight_scale,
+        w2_scale=layer.w2_weight_scale,
+        a13_scale=getattr(layer, "w13_input_scale", None),
+        a2_scale=getattr(layer, "w2_input_scale", None),
+        expert_mask=expert_map,
+        use_int8_w8a8=not use_fp8,
+        use_fp8_w8a8=use_fp8,
+        w8a8_no_shuffle=bool(
+            not use_fp8 and getattr(layer, "_sglang_hcu_aiter_int8_noshuffle", False)
+        ),
+    )
+
+
 def process_weights_after_loading_aiter_w8a8_int8(layer: torch.nn.Module) -> None:
+    if _is_hcu:
+        _prepare_aiter_w8a8_weights(layer)
+        return
 
     moe_runner_config = getattr(layer, "moe_runner_config", None)
     if getattr(layer, "apply_router_weight_on_input", False) or (
@@ -345,6 +390,9 @@ def process_weights_after_loading_aiter_w8a8_int8(layer: torch.nn.Module) -> Non
 
 
 def process_weights_after_loading_aiter_w8a8_fp8(layer: torch.nn.Module) -> None:
+    if _is_hcu:
+        _prepare_aiter_w8a8_weights(layer)
+        return
 
     moe_runner_config = getattr(layer, "moe_runner_config", None)
     if getattr(layer, "apply_router_weight_on_input", False) or (
@@ -370,6 +418,8 @@ def process_weights_after_loading_aiter_w8a8_fp8(layer: torch.nn.Module) -> None
 
 
 def get_aiter_w8a8_int8_quant_info(layer: torch.nn.Module) -> AiterMoeQuantInfo:
+    if _is_hcu:
+        return _get_aiter_w8a8_quant_info(layer, use_fp8=False)
     dispatcher = getattr(layer, "dispatcher", None)
     expert_map = (
         getattr(dispatcher, "local_expert_mapping", None)
@@ -419,6 +469,8 @@ def get_aiter_w8a8_int8_quant_info(layer: torch.nn.Module) -> AiterMoeQuantInfo:
 
 
 def get_aiter_w8a8_fp8_quant_info(layer: torch.nn.Module) -> AiterMoeQuantInfo:
+    if _is_hcu:
+        return _get_aiter_w8a8_quant_info(layer, use_fp8=True)
     dispatcher = getattr(layer, "dispatcher", None)
     expert_map = (
         getattr(dispatcher, "local_expert_mapping", None)
@@ -915,6 +967,7 @@ class AiterRunnerCore(MoeRunnerCore):
             self.config.is_gated,
             runner_input.uses_local_expert_ids,
             force_moe_c,
+            quant_info.w8a8_no_shuffle,
         )
         cached = self._unified_config_cache.get(cache_key)
         if cached is not None:
@@ -935,7 +988,17 @@ class AiterRunnerCore(MoeRunnerCore):
         )
         if force_moe_c:
             config_kwargs["spec_sol_type"] = MoeSolutionType.MOE_C
+        if quant_info.w8a8_no_shuffle:
+            # Match the scheme's probe: no-shuffle ASM, not a default
+            # shuffled MoE-C config for the same dimensions.
+            config_kwargs["spec_sol_type"] = MoeSolutionType.ASM
+            config_kwargs["use_shuffle"] = 0
         status, moe_config = get_aiter_moe_config(**config_kwargs)
+        if quant_info.w8a8_no_shuffle and status:
+            status = (
+                moe_config.solution_type == MoeSolutionType.ASM
+                and not moe_config.need_shuffle
+            )
         if runner_input.uses_local_expert_ids:
             from aiter.jit.utils.chip_info import get_gfx
 
@@ -1246,6 +1309,10 @@ class AiterRunnerCore(MoeRunnerCore):
         quant_type, block_size, block_shape = self._unified_quant_params(
             runner_input.quant_type
         )
+        if quant_info.use_int8_w8a8:
+            from aiter.moe import MoeQuantType
+
+            quant_type, block_size, block_shape = MoeQuantType.W8A8, 0, None
         moe_config = self._get_unified_moe_config(
             runner_input, quant_info, quant_type, block_size
         )
@@ -1281,6 +1348,16 @@ class AiterRunnerCore(MoeRunnerCore):
             )
         )
         activation_kwargs = get_aiter_moe_activation_kwargs(self.config, aiter_moe)
+        # DeepSeek-V4 requests ordinary SiLU with a clamp, not MiniMax's
+        # alpha/beta activation. Preserve that epilogue when migrating W8A8.
+        if (
+            (quant_info.use_int8_w8a8 or quant_info.use_fp8_w8a8)
+            and self.config.swiglu_limit is not None
+            and "gemm1_limit" not in activation_kwargs
+        ):
+            if not _aiter_moe_supports_gemm1_activation_params(aiter_moe):
+                raise RuntimeError("AITER channel-W8A8 requires gemm1_limit support")
+            activation_kwargs["gemm1_limit"] = float(self.config.swiglu_limit)
         activation = (
             "swigluoai"
             if self._uses_moe_c_oai_interleaved_layout(moe_config)
@@ -1351,7 +1428,9 @@ class AiterRunnerCore(MoeRunnerCore):
                 hidden_states = hidden_states.to(runner_input.output_dtype)
             return AiterRunnerOutput(hidden_states=hidden_states)
 
-        if self._requires_unified_moe():
+        if (
+            _is_hcu and (quant_info.use_int8_w8a8 or quant_info.use_fp8_w8a8)
+        ) or self._requires_unified_moe():
             return self._run_unified_moe(runner_input, quant_info)
 
         if quant_info.use_int8_w8a8 or quant_info.use_fp8_w8a8:

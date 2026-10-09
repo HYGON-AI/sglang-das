@@ -9,8 +9,8 @@ mid-serving (e.g. a new adaptive speculative draft length, or a rare batch-size
 bucket) can die in ``cuModuleLoadData`` with CUDA OOM, minutes or hours in.
 
 Once ``mark_serving_started()`` has been called, this module warns when an
-uncached Triton compilation takes at least one second or a device-load starts
-with less than 1 GiB of free device memory. Set
+uncached Triton compilation takes at least one second (once per kernel name
+per worker) or a device-load starts with less than 1 GiB of free device memory. Set
 ``SGLANG_CRASH_ON_TRITON_LOAD_AFTER_READY=1`` to raise on every late load
 instead — for CI recipes that assert full startup warmup coverage. The hooks
 only run for compilation and first-use loads, so steady-state cost is zero.
@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 _serving_started = False
 _prev_compile_listener = None
 _installed = False
+_warned_compile_kernels: set[str] = set()
 
 
 def install() -> None:
@@ -81,11 +82,15 @@ def _on_compilation(*, src, metadata, metadata_group, times, cache_hit) -> None:
     compile_time_secs = times.total / 1e6
     if compile_time_secs < envs.SGLANG_TRITON_SLOW_COMPILE_THRESHOLD_SECS.get():
         return
+    if src.name in _warned_compile_kernels:
+        return
+    _warned_compile_kernels.add(src.name)
 
     logger.warning(
         "Triton kernel '%s' took %.2f s to compile after serving started. "
         "Serving-time compilation can stall the engine; pre-compile it during "
-        "engine init.",
+        "engine init. Further slow-compilation warnings for this kernel are "
+        "suppressed in this worker.",
         src.name,
         compile_time_secs,
     )
