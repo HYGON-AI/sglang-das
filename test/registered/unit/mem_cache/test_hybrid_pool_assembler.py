@@ -699,7 +699,7 @@ class TestKvHostPoolRow(CustomTestCase):
             return SimpleNamespace(layer_num=kv_pool.layer_num)
 
         with (
-            patch.object(hybrid_pool_assembler, "MLATokenToKVPoolHost", fake_host),
+            patch.object(hybrid_pool_assembler, "get_mla_host_pool_cls", return_value=fake_host),
             patch.object(
                 hybrid_pool_assembler,
                 "get_parallel",

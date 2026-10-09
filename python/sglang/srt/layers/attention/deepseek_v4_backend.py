@@ -3536,6 +3536,10 @@ class DeepseekV4AttnBackend(
         layer_id: int,
     ) -> torch.Tensor:
         backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
+        if _is_hcu and backend == "auto":
+            # HCU uses the external FlashMLA kernel rather than HIP's auto
+            # selection between AITER and TileLang decode implementations.
+            backend = "kernel"
         return flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
 
     def _allocate_dsv4_bf16_flashmla_workspace(

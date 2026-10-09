@@ -69,11 +69,38 @@
 4. HiCache 不能以 FP8 buffer 是否非空判断所有 HCU index cache；BF16/INT8/GLM 的 storage byte width、owned layer、draft offsets 需要声明。
 5. prefix_indices / match_prefix / init_load_back、Mamba slot 与 cache-disabled 路径均有契约变更；自动合并也需要符号与调用审查。
 6. ROCm/gfx950、gfx1250 与 CUDA kernel 特性分开判断；HCU 仍使用内部 DTK torch 与实际 AOT build，不按上游 CUDA wheel 替换依赖。
-7. 本轮只验收指定 DSV4 基础 TP；其他模型以及 EP/DP/CP/PD/MTP 专有功能仅记录迁移和风险。详见[冲突台账](sync-official-main-20261009-ledger.md)。
+7. Linear 的显式 rank/size 参数迁至 `parallel_group`；packed draft layer mapping 使用 `target_device_layer_num`，不能用压缩的 host layer 数代替逻辑 device 层索引。
+8. 官方默认 FlashMLA selector 为 `auto`，HCU external kernel 的 adapter 要解析成 `kernel`，显式 Torch 参考仍可选；DeepseekV2MLP 的 AMD shared activation helper 只在非 HCU 使用，HCU 保留既有 clamp/SwiGLU kernel，防止读取未初始化的 gfx950 route 状态。
+9. 本轮只验收指定 DSV4 基础 TP；其他模型以及 EP/DP/CP/PD/MTP 专有功能仅记录迁移和风险。详见[冲突台账](sync-official-main-20261009-ledger.md)。
 
 ## 验证结果
 
-尚在合并与代码审查阶段；完成最终构建、纯 TP8 精度验证后补充命令、实际环境、日志与提交。
+截至 2026-10-09 下午，完整纯 TP8 精度门槛尚未通过；当前阻塞为缺少稳定八卡验证窗口。
+
+代码审查及 657 笔官方增量合并已完成，候选分支为 `sync/official-main-daily-20261009`，六段 merge tip 为 `af3a1c4fbe9e3c57013174de718cb3bca661251f`。最后的调用接口修正、HCU runtime 分派修正与本记录暂存，按用户要求在精度通过后完成最终 commit。`main` 保持 `fb46d17ad9f633aa7fee521484262b0c26de560d`；尚未快进、打 milestone tag 或 push。
+
+| 验证项 | 实际结果与证据 |
+|---|---|
+| Python compile / diff-check / unresolved markers | 通过；新增 F821/F811/F722 为 0，对照冻结原 main 和官方终点；`sync-evidence/20261009/final-static/` |
+| 导入与调用接口审查 | 新增缺失导入为 0；可静态解析的函数/构造器调用无新增不支持的关键字参数。此项不能证明动态属性或运行正确性 |
+| Linear parallel groups、KVLocPlan、ResidualStream | nmz22/latest：50 passed，115 subtests passed |
+| retired runtime getter census | nmz22/latest：3 passed；代码、导入与文档残留已清理 |
+| DSA CLI / registry / env aliases | nmz22/latest：14 tests passed |
+| Hybrid host assembler | nmz22/latest：42 tests、18 subtests passed；mock 迁到 host class 选择工厂 |
+| HCU suite 注册 | 281 个文件，注册结构通过；这不是运行模型测试 |
+| HIP AOT 构建与安装 | nmz22/latest、nmz107/latest 完整离线 wheel 构建和 editable 安装通过，sglang `0.5.21`，`sglang.__file__` 均解析当前工作目录 |
+| 基础纯 TP8 / GSM8K100 / graph replay | **尚未通过**。nmz22 实际启动四次：首轮 rocBLAS module 临时加载失败；第二轮 FlashMLA `auto` 和第三轮 shared-expert MLP AMD helper 分派问题已修正并通过定向检查；第四轮在加载期间遭遇其他任务占卡，KV budget 拒绝分配。最后连续空闲等待也未取得稳定窗口。三次推理和 GSM8K 未运行 |
+
+指定命令保持为 `bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel`，使用 `/home/proj_sglang_open/scripts_local/run_dpsk-v4.sh`（官方 graph CLI 已改为 `--cuda-graph-max-bs-decode`）。nmz107 网卡映射为 `ens65f0np0`，其模型从 `/models/DeepSeek-V4-Flash-0731-FP8-Channel` 建立同名 `/module` 软链接；配置和权重索引 SHA256 与 nmz22 相同。
+
+实际启动日志保存在 `sync-evidence/20261009/runtime-nmz22/`：`server-attempt1-rocblas.log` 与 `server-attempt2-backend-auto.log`、`server-attempt3-shared-act.log`、`server-attempt4-resource-race.log`。第一轮权重加载成功后，gfx938 rocBLAS FP16 small GEMM 报 Tensile module not found；独立 FP16/BF16/FP32 GEMM 和八卡并发同一 init_cublas 均通过，第二轮未再出现该错误。第二轮进入最大 batch 32 的 decode graph capture 后，HCU debug FlashMLA adapter 拒绝官方新增默认 `auto`。在 `_is_hcu` 分支将 `auto` 解析为内部 `kernel`，保留显式 Torch 参考和非 HCU 选择；实际 adapter 定向验证通过。第三轮继续 graph capture 后，shared-expert 的 `DeepseekV2MLP` fallback 错用未初始化 gfx950 FP8 grid 的 AMD activation helper；将该 helper 与其初始化条件一样限制为非 HCU，HCU 走既有 JIT clamp kernel。batch 1/32 实际 HCU kernel 与 FP32 reference 的 BF16 容差检查通过（`runtime-shared-act-test.log`）。完整模型重跑、graph replay 与精度仍待完成，不能因接口 probe 通过就视为服务验收通过。
+
+2026-10-09 下午重新启动前资源复查：nmz22 另一个 DeepSeek-V3-0324-Channel-INT8 八卡服务已启动，每卡约 86 GiB；nmz107 的 V4.1 PD decode 八卡服务每卡约 132 GiB；nmz26 有多个服务占卡。其他验证任务会持续切换模型，显存 guard 已两次阻止启动。第四次实际启动虽在空闲时触发，但到权重加载前仅剩约 51.5 GiB（前三次约 135.9 GiB），权重占用仍为同样的 41.81 GiB，加载后只剩约 9.7 GiB，KV budget 拒绝分配。这是启动期间资源竞争的证据，不能通过提高 memory fraction 或绕过预算检查解决。随后要求八卡连续空闲两分钟、最多等待十分钟；没有取得稳定窗口，已停止本次自己的等待客户端。短时等待与显存证据保留在 evidence。容器内 hy-smi 曾显示 0%，但宿主机 KFD PID 和 `torch.cuda.mem_get_info()` 证实实际占用；因此启动必须同时检查真实 free/total memory，不能只凭该面板。未终止任何其他任务，已停止本次自己的无服务等待客户端。
+
+open 容器的拓展模型单测初次失败来自旧版 LightOp 缺少 `fuse_situ_mul_quant_contiguous`，同一套代码在 latest 环境通过；这属于容器依赖差异，不能据此改写 SITU 算子语义。组件/模型运行范围仍以用户指定的 DSV4 纯 TP8 为准；PD、CP、MTP、GLM、HYV3 等仅完成静态迁移。
+
+精度流程沿用历史基线：GSM8K 前 100 题、32 并发、greedy、4096 token，客户端在 nmz26/open（evalscope 1.10.0）；上轮为 0.98，复跑 0.99。待获得约 20 分钟的稳定八卡窗口后启动、排障、验证至少三次 graph replay，再记录实际分数、错误样本与完整日志并提交。
+
 
 ## 精确官方增量提交索引
 

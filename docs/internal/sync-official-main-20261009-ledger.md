@@ -304,3 +304,29 @@
 | `python/sglang/srt/models/deepseek_v4_mhc.py` | 自动合并语义审查：post空行检查后显式 HCU AITER TileLang dispatch，避免落入通用 TileLang CUDA实现 |
 
 功能验收范围为本次用户指定的 DSV4 纯 TP8；其他模型、PD、CP、MTP 只完成代码与静态审查。
+
+## 最终接口审查与验收状态
+
+- 实际分成六段：30 / 40 / 34 / 20 / 18 / 34 个初始冲突；110 文件的全量尝试已 abort，未进入提交。前两段提交标题中的 `/7` 为规划时标签，实际终点为第六段，完整覆盖冻结的 657 commits。
+- 导入 AST delta 为 0；全仓可静态解析的调用关键字 delta 为 0。补上 `with_packed_draft_layer_mapping(target_device_layer_num=...)`，映射尾部使用 device layer 数而非压缩后的 host layer 数；HCU GLM `ModelNextMLP` 迁至 `parallel_group`。
+- `test_hybrid_pool_assembler.py` 的 row-width/packed-row 拒绝测试 mock 改为 class 选择工厂，适配内部与官方共用的分派；42 项和 18 子测试通过。
+- Linear/KVLocPlan/ResidualStream 50 项及 115 子测试、getter census 3 项、DSA alias 14 项通过。证据已保留在 `sync-evidence/20261009/` 与本地会话文件夹。
+- nmz22/latest、nmz107/latest 完整 AOT wheel 构建通过；生成的 tracked `topk.hip` 变更已保存到 evidence 后恢复，避免将容器 hipify 输出作为源码修正提交。
+- nmz22/latest 第二轮启动已进入 decode graph capture（bs 1/2/4/8/12/16/24/32），暴露 HCU adapter 未解析官方默认 `auto`；修正 `_is_hcu` 下 `auto -> kernel`。定向 probe 通过默认 kernel、显式 Torch、非 HCU 三个接口契约。首轮 rocBLAS module 加载失败在八卡独立复现与第二次启动中均未复现。
+- main 尚未快进。最终精度、服务就绪及 graph replay 仍 pending，修正后的第三轮被其他任务占满八卡的显存 guard 拦截。最终接口修正和文档暂存，精度通过后提交；没有声称 GSM8K 已通过。
+- 验证环境加入 nmz22、nmz107；nmz107 的指定模型软链接和网卡映射已准备，nmz22/latest 依赖差异已单独记录。运行前应重新检查宿主机 KFD PID 和真实显存。
+
+### Runtime 第二个接口修正
+
+- 第三次实际启动继续 decode graph capture 后，shared-expert `DeepseekV2MLP` fallback 调用了 AMD helper，读取 `_hip_act_fp8_grid` 失败；HCU 的 fused route 初始化已被排除，因此 fallback 必须采用相同平台边界。
+- 修正 `if _is_hip and not _is_hcu`，保留 HCU 原有 clamp/SwiGLU JIT kernel 和非 HCU 的上游 AMD helper；没有关闭 clamp 或改写量化语义。
+- batch 1/32 的实际 HCU fallback kernel 通过 FP32 reference 比较（BF16 rtol=0.008、atol=0.02）；静态 compile/diff-check/Ruff 新增错误为 0。日志：`runtime-shared-act-test.log`；失败日志：`server-attempt3-shared-act.log`。
+- 修正后的全模型验收待运行；八卡资源检查两次阻止与其他任务并发启动，正在进行本轮短时资源等待。
+
+### 当前最终状态：资源阻塞，精度未验收
+
+- 第四次实际启动在其他任务切换的短空档发起；权重加载前 free 从正常 135.9 GiB 降至 51.5 GiB，加载同样 41.81 GiB 权重后仅剩 9.7 GiB。`_profile_available_bytes` 按原 `mem_fraction_static=0.8` 拒绝 KV 分配，未更改参数或绕过该检查。
+- 失败证据：`server-attempt4-resource-race.log`；最后等待证据：`resource-wait.log`，门槛为八卡连续空闲 120 秒。nmz107 八卡持续约 132 GiB/卡占用，nmz26 仍有卡被其他服务占用，nmz22 持续切换模型而无稳定窗口。
+- 当前服务未就绪，无三次推理、GSM8K 或 graph replay 通过结论。最后 runtime 代码修正、测试及文档已暂存；按用户“精度 ok 后 commit”的要求，最终修正提交、main 快进和 milestone tag 均等待精度通过。六段 merge tip 仍为 `af3a1c4fbe9e3c57013174de718cb3bca661251f`。
+- 指定完整 TP8 命令、GSM8K100 的 32 并发/greedy/4096 token 配置已保存。需要稳定约 20 分钟八卡窗口，之后继续从当前暂存状态重跑，无需重做官方合并。
+- 私有运行脚本末尾的 tee pipeline 会掩盖服务非零退出（`server.exit` 可能为 0）；判定依据实际日志及 HTTP readiness，不能将该状态码作为成功证据。

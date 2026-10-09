@@ -520,7 +520,7 @@ class DeepseekV2MLP(nn.Module):
 
         # Fallback: fused silu+clamp kernel (still faster than unfused)
         elif self.swiglu_limit is not None:
-            if _is_hip:
+            if _is_hip and not _is_hcu:
                 x = _hip_act.silu_and_mul_clamp(self, gate_up)
             elif _is_npu:
                 x = torch.ops.npu.npu_clipped_swiglu(

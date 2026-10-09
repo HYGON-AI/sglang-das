@@ -259,7 +259,7 @@ def build_kv_only_group(
         full_layer_mapping = with_packed_draft_layer_mapping(
             full_layer_mapping,
             transfer_layer_start=transfer_layer_id_max,
-            target_host_layer_num=kv_host_pool.target_layer_num,
+            target_device_layer_num=kv_pool.layer_num,
             draft_layer_num=len(mtp_draft_device_pools),
         )
     return HostPoolGroup(
@@ -379,7 +379,7 @@ def build_hybrid_swa_group(
         swa_layer_mapping = with_packed_draft_layer_mapping(
             swa_layer_mapping,
             transfer_layer_start=transfer_layer_id_max,
-            target_host_layer_num=swa_host_pool.target_layer_num,
+            target_device_layer_num=swa_kv_pool.layer_num,
             draft_layer_num=len(mtp_swa_device_pools),
         )
     return HostPoolGroup(
@@ -879,7 +879,7 @@ def build_deepseek_v4_hicache_stack(
         swa_layer_mapping = with_packed_draft_layer_mapping(
             swa_layer_mapping,
             transfer_layer_start=transfer_layer_id_max,
-            target_host_layer_num=transfer_layer_id_max,
+            target_device_layer_num=transfer_layer_id_max,
             draft_layer_num=len(mtp_swa_device_buffers),
         )
 

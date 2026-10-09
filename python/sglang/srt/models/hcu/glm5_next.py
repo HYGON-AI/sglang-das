@@ -659,8 +659,7 @@ class ModelNextDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                parallel_group="replicated" if mlp_tp_size == 1 else "tp",
                 swiglu_limit=config.swiglu_limit,
             )
 
