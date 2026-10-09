@@ -3141,7 +3141,7 @@ class DeepseekV4AttnBackend(
     def _low_ratio_hcu_query_lens(self, forward_batch, pos, q_lens_cpu):
         if (
             not _is_hcu
-            or os.environ.get("SGLANG_HCU_OPT_DSV41_MQA_PREP", "0") != "1"
+            or os.environ.get("SGLANG_HCU_OPT_DSV41_MQA_PREP", "1") != "1"
             or forward_batch.forward_mode != ForwardMode.EXTEND
             or getattr(forward_batch, "_original_forward_mode", None)
             not in (None, ForwardMode.EXTEND)
@@ -3575,7 +3575,7 @@ class DeepseekV4AttnBackend(
     def _hcu_prefill_candidate_blocks(self, indexer, lc_per_req, q_lens_cpu):
         if (
             not _is_hcu
-            or os.environ.get("SGLANG_HCU_OPT_DSV41_CANDIDATE_LOGITS", "0") != "1"
+            or os.environ.get("SGLANG_HCU_OPT_DSV41_CANDIDATE_LOGITS", "1") != "1"
             or not _hcu_candidate_logits_available()
             or not indexer.uses_candidates
             or indexer.is_candidate_source
@@ -3775,7 +3775,7 @@ class DeepseekV4AttnBackend(
         retain_blocks = (
             publish is not None
             and _is_hcu
-            and os.environ.get("SGLANG_HCU_OPT_DSV41_CANDIDATE_LOGITS", "0") == "1"
+            and os.environ.get("SGLANG_HCU_OPT_DSV41_CANDIDATE_LOGITS", "1") == "1"
             and _hcu_candidate_logits_available()
             and indexer.candidate_block_size == 8
             and indexer.n_local_heads == 32
