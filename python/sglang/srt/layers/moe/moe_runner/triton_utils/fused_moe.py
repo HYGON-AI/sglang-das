@@ -43,6 +43,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_hcu,
     is_hip,
     is_musa,
     is_xpu,
@@ -57,6 +58,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 _is_hip = is_hip()
+_is_hcu = is_hcu()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -90,8 +92,6 @@ elif _is_hip:
                 MoeSolutionType,
                 aiter_moe,
                 get_aiter_moe_config,
-                aiter_moe_shfl_weight,
-                aiter_moe_shfl_scale
             )
         except ImportError:
             raise ImportError(
@@ -180,7 +180,7 @@ def inplace_fused_experts(
 ) -> None:
     if isinstance(activation, int):
         if activation == 0:
-            activation = "silu" 
+            activation = "silu"
         elif activation == 2:
             activation = "situ"
         else:
@@ -438,7 +438,10 @@ def fused_experts(
         )
         else 1
     )
-    if isinstance(moe_runner_config.activation, str) and moe_runner_config.activation.lower() == "situ":
+    if (
+        isinstance(moe_runner_config.activation, str)
+        and moe_runner_config.activation.lower() == "situ"
+    ):
         act_id = 2
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
@@ -736,7 +739,7 @@ def fused_experts_impl_aiter(
         )
 
     if (
-        (quant_type == MoeQuantType.W4A16 or quant_type ==MoeQuantType.WFP4A16)
+        (quant_type == MoeQuantType.W4A16 or quant_type == MoeQuantType.WFP4A16)
         and status
         and _aiter_moec_solution_type(moe_cfg)
         and getattr(moe_cfg, "need_shuffle_scale", False)
@@ -748,7 +751,7 @@ def fused_experts_impl_aiter(
     #     w1, w2 = aiter_moe_shfl_weight(w1, w2, moe_cfg)
     # if status and getattr(moe_cfg, "need_shuffle_scale", False):
     #     w1_scale, w2_scale = aiter_moe_shfl_scale(w1_scale, w2_scale, moe_cfg)
-    
+
     return aiter_moe(
         hidden_states,
         w1,
@@ -806,10 +809,7 @@ def _prepare_fused_moe_run(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=(
-            use_int4_w4a16
-            or use_int4_w4a8
-            or use_mxfp4_w4a16
-            or use_mxfp4_w4a8
+            use_int4_w4a16 or use_int4_w4a8 or use_mxfp4_w4a16 or use_mxfp4_w4a8
         ),
         dtype=hidden_states.dtype,
     )
@@ -1372,6 +1372,8 @@ def fused_experts_impl(
 ):
     if (
         _use_aiter_moe
+        # HCU INT8 fallback requires raw weights and Triton's swiglu_limit.
+        and not (_is_hcu and use_int8_w8a8)
         and not is_triton_forced_for_dspark_aiter_fallback()
         and (
             use_int4_w4a16
@@ -1418,7 +1420,7 @@ def fused_experts_impl(
             routed_scaling_factor,
             quant_type,
             gemm1_alpha,
-            gemm1_limit
+            gemm1_limit,
         )
 
     if isinstance(activation, int):
@@ -1428,12 +1430,7 @@ def fused_experts_impl(
         padded_size = 0
 
     # Check constraints.
-    if (
-        use_int4_w4a16
-        or use_int4_w4a8
-        or use_mxfp4_w4a16
-        or use_mxfp4_w4a8
-    ):
+    if use_int4_w4a16 or use_int4_w4a8 or use_mxfp4_w4a16 or use_mxfp4_w4a8:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     else:
         assert (
