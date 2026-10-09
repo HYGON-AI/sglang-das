@@ -93,7 +93,13 @@ def _load_rows(offloaded, rows):
     pointer = offloaded.weight.data_ptr()
     offloaded.weight_loader(offloaded.weight, rows)
     assert offloaded.weight.data_ptr() == pointer
-    assert offloaded.weight.is_pinned()
+    # BF16 offload stays pageable to avoid multi-GB hipHostMalloc / GTT OOM.
+    if offloaded.weight.dtype == torch.bfloat16:
+        assert not offloaded.weight.is_pinned()
+        assert not offloaded._use_uva_gather
+    else:
+        assert offloaded.weight.is_pinned()
+        assert offloaded._use_uva_gather
     assert offloaded.weight.weight_loader.__self__ is offloaded
     assert offloaded.quant_method is None
 

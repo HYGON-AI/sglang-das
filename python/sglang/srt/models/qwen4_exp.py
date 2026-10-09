@@ -878,8 +878,21 @@ def _gather_ple_embedding_from_pinned_kernel(
     )
 
 
+def _drop_module_weight(embedding) -> None:
+    params = getattr(embedding, "_parameters", None)
+    if isinstance(params, dict) and "weight" in params:
+        params.pop("weight")
+        return
+    if hasattr(embedding, "weight"):
+        try:
+            delattr(embedding, "weight")
+        except AttributeError:
+            pass
+
+
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
-    """PLE table read directly from pinned host memory.
+    """CPU-resident PLE table. INT8/FP8 stay pinned for UVA gathers; BF16
+    stays pageable to avoid a multi-GB hipHostMalloc / GTT OOM on HCU.
 
     The table stays in its checkpoint storage dtype (int8/fp8 with per-row
     channel scales, fp8/bf16 with a scalar scale, or bf16); gathers emit bf16.
@@ -931,38 +944,30 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
         source_weight = embedding.weight
         released_source_weight = False
-        if source_weight.device.type == "cpu" and source_weight.is_pinned():
+        extras = {
+            name: value
+            for name, value in vars(source_weight).items()
+            if name != "data"
+        }
+        if source_weight.dtype == torch.bfloat16:
+            # BF16 ngram tables are ~12.8GB/rank at TP8. hipHostMalloc of the
+            # full table (UVA / GTT) OOMs on HCU even after dropping the
+            # pageable twin. Keep one pageable CPU copy and gather through a
+            # small pinned scratch instead. INT8/FP8 stay on the pin path.
+            if source_weight.device.type == "cpu" and not source_weight.is_pinned():
+                cpu_weight = source_weight
+            else:
+                shape = tuple(source_weight.shape)
+                dtype = source_weight.dtype
+                _drop_module_weight(embedding)
+                del source_weight
+                released_source_weight = True
+                table = torch.empty(shape, dtype=dtype, device="cpu")
+                cpu_weight = nn.Parameter(table, requires_grad=False)
+                for name, value in extras.items():
+                    setattr(cpu_weight, name, value)
+        elif source_weight.device.type == "cpu" and source_weight.is_pinned():
             cpu_weight = source_weight
-        elif source_weight.dtype == torch.bfloat16:
-            # BF16-only: INT8/FP8 keep the original factory below.
-            # Unquantized Qwen3.8 ngram tables are ~12.8GB/rank at TP8.
-            # The old path kept an uninitialized pageable copy while
-            # hipHostMalloc'ing a pinned twin, under the outer
-            # `with torch.device("cuda")` model-init context. That HIP-OOMs
-            # BF16 serving; INT8/FP8 tables are half the size and already
-            # pin successfully, so they are left unchanged.
-            shape = tuple(source_weight.shape)
-            dtype = source_weight.dtype
-            extras = {
-                name: value
-                for name, value in vars(source_weight).items()
-                if name != "data"
-            }
-            params = getattr(embedding, "_parameters", None)
-            if isinstance(params, dict) and "weight" in params:
-                params.pop("weight")
-            elif hasattr(embedding, "weight"):
-                try:
-                    delattr(embedding, "weight")
-                except AttributeError:
-                    pass
-            del source_weight
-            released_source_weight = True
-            with torch.device("cpu"):
-                pinned = torch.empty(shape, dtype=dtype, pin_memory=True)
-            cpu_weight = nn.Parameter(pinned, requires_grad=False)
-            for name, value in extras.items():
-                setattr(cpu_weight, name, value)
         else:
             cpu_weight = nn.Parameter(
                 torch.empty(
@@ -977,10 +982,9 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             # the checkpoint loader fills cpu_weight afterwards. Copying the
             # uninitialized source would touch the full PLE table once for no
             # benefit (more than 50 GB in the Qwen3.8 ngram checkpoints).
-        if not released_source_weight:
-            for name, value in vars(source_weight).items():
-                if name != "data":
-                    setattr(cpu_weight, name, value)
+        if not released_source_weight and cpu_weight is not source_weight:
+            for name, value in extras.items():
+                setattr(cpu_weight, name, value)
         cpu_weight.weight_loader = self.weight_loader
         self.register_parameter("weight", cpu_weight)
         source_scale = embedding.weight_scale
@@ -988,12 +992,12 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             if source_scale.device.type == "cpu" and source_scale.is_pinned():
                 cpu_scale = source_scale
             else:
-                with torch.device("cpu"):
-                    cpu_scale = torch.empty(
-                        source_scale.shape,
-                        dtype=source_scale.dtype,
-                        pin_memory=True,
-                    )
+                cpu_scale = torch.empty(
+                    source_scale.shape,
+                    dtype=source_scale.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
                 cpu_scale.copy_(source_scale.detach().to("cpu"))
         elif source_scale.device.type == "cpu" and source_scale.is_pinned():
             cpu_scale = source_scale
@@ -1015,6 +1019,9 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             )
         if (not released_source_weight) and cpu_weight is not source_weight:
             del embedding.weight
+        self._use_uva_gather = cpu_weight.is_pinned()
+        self._pageable_id_scratch = None
+        self._pageable_row_scratch = None
         self._block_d = triton.next_power_of_2(self.embedding_dim)
 
     def allocate_output(
@@ -1028,6 +1035,40 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         with allocation_context, torch.inference_mode(False):
             # The gather kernel emits bf16 rows regardless of the table dtype.
             return torch.empty(shape, dtype=torch.bfloat16, device=device)
+
+    def _ensure_pageable_scratch(self, rows: int) -> None:
+        if self._pageable_id_scratch is None or self._pageable_id_scratch.numel() < rows:
+            self._pageable_id_scratch = torch.empty(
+                rows, dtype=torch.int64, device="cpu", pin_memory=True
+            )
+            self._pageable_row_scratch = torch.empty(
+                rows,
+                self.embedding_dim,
+                dtype=torch.bfloat16,
+                device="cpu",
+                pin_memory=True,
+            )
+
+    def _gather_from_pageable_host(
+        self, flat_ids: torch.Tensor, output: torch.Tensor
+    ) -> None:
+        # Breakable CUDA graphs re-run this Python body on replay so the CPU
+        # index sees the current ids. Full-graph capture only records the
+        # small pinned H2D; callers should graph-break around this path.
+        n = int(flat_ids.numel())
+        self._ensure_pageable_scratch(n)
+        self._pageable_id_scratch[:n].copy_(flat_ids, non_blocking=False)
+        host_ids = self._pageable_id_scratch[:n]
+        tp_start = self.shard_indices.org_vocab_start_index
+        tp_end = self.shard_indices.org_vocab_end_index
+        in_range = (host_ids >= tp_start) & (host_ids < tp_end)
+        local = torch.where(in_range, host_ids - tp_start, torch.zeros_like(host_ids))
+        rows = self.weight.detach()[local.long()].to(dtype=torch.bfloat16)
+        rows = torch.where(in_range.unsqueeze(-1), rows, torch.zeros_like(rows))
+        self._pageable_row_scratch[:n].copy_(rows)
+        output.view(n, self.embedding_dim).copy_(
+            self._pageable_row_scratch[:n], non_blocking=False
+        )
 
     def gather(
         self, input_ids: torch.Tensor, out: Optional[torch.Tensor] = None
@@ -1049,19 +1090,22 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
-            _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                self.weight.data_ptr(),
-                self.weight_scale.data_ptr(),
-                flat_ids,
-                output,
-                embedding_dim=self.embedding_dim,
-                tp_vocab_start=self.shard_indices.org_vocab_start_index,
-                tp_vocab_end=self.shard_indices.org_vocab_end_index,
-                is_fp8=self.weight.dtype == torch.float8_e4m3fn,
-                is_int8=self.weight.dtype == torch.int8,
-                is_per_row_scale=self.weight_scale.numel() > 1,
-                BLOCK_D=self._block_d,
-            )
+            if not self._use_uva_gather:
+                self._gather_from_pageable_host(flat_ids, output)
+            else:
+                _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
+                    self.weight.data_ptr(),
+                    self.weight_scale.data_ptr(),
+                    flat_ids,
+                    output,
+                    embedding_dim=self.embedding_dim,
+                    tp_vocab_start=self.shard_indices.org_vocab_start_index,
+                    tp_vocab_end=self.shard_indices.org_vocab_end_index,
+                    is_fp8=self.weight.dtype == torch.float8_e4m3fn,
+                    is_int8=self.weight.dtype == torch.int8,
+                    is_per_row_scale=self.weight_scale.numel() > 1,
+                    BLOCK_D=self._block_d,
+                )
         return output
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
@@ -1315,7 +1359,12 @@ class Qwen4ExpPLELayer(nn.Module):
         batch: Optional[_PLEBatch],
         forward_batch: ForwardBatch,
     ) -> None:
-        """Gather PLE rows via UVA while the preceding decoder layer runs."""
+        """Gather PLE rows on a side stream while the preceding decoder layer runs.
+
+        INT8/FP8 use UVA from the pinned table. BF16 pageable tables gather on
+        CPU through a small pinned scratch (not UVA), so this path graph-breaks
+        under breakable CUDA graphs and otherwise runs eagerly.
+        """
         if self._prefetch_stream is None:
             return
         if self._prefetch_state is not None:
@@ -1341,11 +1390,24 @@ class Qwen4ExpPLELayer(nn.Module):
         output_view = prefetched.view(lookup_tokens, self.ple_embedding.ngram_heads, -1)
         offloaded_embedding = self.ple_embedding.ngram_embedding
 
-        stream = self._prefetch_stream
-        stream.wait_stream(torch.cuda.current_stream())
-        lookup_ids.record_stream(stream)
-        with torch.cuda.stream(stream):
-            offloaded_embedding.gather(lookup_ids, out=output_view)
+        if not getattr(offloaded_embedding, "_use_uva_gather", True):
+            def _pageable_gather():
+                offloaded_embedding.gather(lookup_ids, out=output_view)
+
+            try:
+                from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+                    eager_on_graph,
+                )
+
+                eager_on_graph(True)(_pageable_gather)()
+            except Exception:
+                _pageable_gather()
+        else:
+            stream = self._prefetch_stream
+            stream.wait_stream(torch.cuda.current_stream())
+            lookup_ids.record_stream(stream)
+            with torch.cuda.stream(stream):
+                offloaded_embedding.gather(lookup_ids, out=output_view)
         self._prefetch_state = prefetched, semantic_tokens, physical_tokens
 
     def _consume_prefetched_embeddings(
