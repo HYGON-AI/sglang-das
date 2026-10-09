@@ -299,8 +299,8 @@ from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
+    checkpoint_kv_cache,
     discard_kv_cache_backup,
-    maybe_cache_unfinished_req,
     release_kv_cache,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -1296,6 +1296,7 @@ class Scheduler(
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
     def init_running_status(self):
+        self.tp_size = get_parallel().tp_size
         # Set by a runtime PD role switch to break out of the current event loop.
         self._event_loop_should_restart = False
         # Guards against concurrent/re-entrant PD role switches.
@@ -1312,6 +1313,10 @@ class Scheduler(
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
+        self.result_queue: deque[
+            tuple[ScheduleBatch, GenerationBatchResult | EmbeddingBatchResult]
+        ] = deque()
+        self.enable_continuous_input_polling = False
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
@@ -1323,6 +1328,7 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+        self._deferred_input_requests: List = []
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
@@ -2165,22 +2171,42 @@ class Scheduler(
         for prev_batch, prev_result in self.result_queue:
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
 
-    def ingest_requests(self, before_process=None) -> List:
-        """Receive, broadcast and dispatch this iteration's external input.
+    def ingest_requests(self, stop_at_pause: bool = False, before_process=None) -> List:
+        """Receive and broadcast input, then dispatch queued requests in order.
+
+        With stop_at_pause, retain the first pause and all following inputs
+        until the caller reaches a scheduling boundary. Receiving and broadcasting
+        continue each pass; all ranks retain the same suffix.
 
         The one place a new per-iteration input source belongs; the return
         value exists for the pipeline stages that relay requests onward.
         """
         local_reqs = []
+        # Avoid re-enqueuing timeout aborts while dispatch is stopped at a pause.
         if (
-            get_parallel().pp_rank == 0
+            not self._deferred_input_requests
+            and get_parallel().pp_rank == 0
             and get_parallel().attn_tp_rank == 0
             and get_parallel().attn_cp_rank == 0
         ):
             local_reqs = self._poll_timeout_aborts()
-        recv_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
+        recv_start_ns = time.monotonic_ns()
+        self._deferred_input_requests.extend(
+            self.request_receiver.recv_requests(local_reqs=local_reqs)
+        )
+
+        num_requests_to_process = len(self._deferred_input_requests)
+        if stop_at_pause:
+            for index, req in enumerate(self._deferred_input_requests):
+                if isinstance(req, PauseGenerationReqInput):
+                    num_requests_to_process = index
+                    break
+        recv_reqs = self._deferred_input_requests[:num_requests_to_process]
+        del self._deferred_input_requests[:num_requests_to_process]
+
         if recv_reqs:
-            self.metrics_reporter.record_scheduler_active()
+            # Count successful receive/broadcast time as active; empty polls stay idle.
+            self.metrics_reporter.record_scheduler_active(recv_start_ns)
         if before_process is not None:
             # e.g. the PP loop relays control requests that start a collective
             before_process(recv_reqs)
@@ -2858,7 +2884,7 @@ class Scheduler(
         if (
             get_exec().moe.elastic_ep_backend is None
             or self.disable_radix_cache
-            or not self.tree_cache.is_tree_cache()
+            or not self.tree_cache.supports_prefix_sharing()
         ):
             return
 
@@ -3546,16 +3572,18 @@ class Scheduler(
 
         if (timeout_s := envs.SGLANG_REQ_RUNNING_TIMEOUT.get()) > 0:
             deadline = time.perf_counter() - timeout_s
-            if get_parallel().pp_size == 1:
-                inflight_batches = [self.running_batch, self.last_batch]
-            else:
-                inflight_batches = [*self.running_mbs, *self.mbs]
+            inflight_batches = self._collect_inflight_batches()
             seen_rids = set()
             for batch in inflight_batches:
                 if batch is None:
                     continue
                 for req in batch.reqs:
-                    if req.rid in seen_rids or req.finished():
+                    # Polling must not re-emit an abort awaiting result processing.
+                    if (
+                        req.rid in seen_rids
+                        or req.finished()
+                        or req.to_finish is not None
+                    ):
                         continue
                     seen_rids.add(req.rid)
                     if 0 < req.time_stats.forward_entry_time < deadline:
@@ -3674,9 +3702,9 @@ class Scheduler(
 
     def stash_chunked_request(self, req: Req):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.cache_unfinished_disagg_prefill(req, chunked=True)
+            self.checkpoint_disagg_prefill(req)
         else:
-            maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+            checkpoint_kv_cache(req, self.tree_cache)
 
     def process_pending_chunked_abort(self) -> None:
         """Abort an in-flight chunked-prefill request once it is safe to do so.
@@ -3768,7 +3796,9 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
-    def _process_hicache_events(self) -> None:
+    def _process_hicache_events(
+        self, should_retry_storage_prefetch: bool = True
+    ) -> None:
         # The HiCache drain is TP-wide consensus; run it before rank-local
         # decisions (_should_defer_prefill) or ranks enter different collectives.
         if (
@@ -3778,7 +3808,7 @@ class Scheduler(
             or self.enable_lmcache
         ):
             self.tree_cache.check_hicache_events()
-            if self.enable_hicache_storage:
+            if self.enable_hicache_storage and should_retry_storage_prefetch:
                 self._process_storage_prefetch_retries()
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
@@ -4485,7 +4515,7 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
-        self.metrics_reporter.record_scheduler_active()
+        self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
@@ -5075,7 +5105,7 @@ class Scheduler(
         # post-flush below.
         fully_idle = self.is_fully_idle()
         if not fully_idle:
-            self.metrics_reporter.record_scheduler_active()
+            self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
             now = time.monotonic()
             if now - self._last_stall_publish_ts >= LOAD_STALL_REFRESH_S:
                 self._last_stall_publish_ts = now
@@ -5154,7 +5184,7 @@ class Scheduler(
         if self.is_fully_idle():
             self.metrics_reporter.record_scheduler_idle()
         else:
-            self.metrics_reporter.record_scheduler_active()
+            self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
 
     def is_fully_idle(self, for_health_check=False, ignore_waiting=False) -> bool:
         # Health check piggybacks on running requests in process_output.
@@ -5425,13 +5455,22 @@ class Scheduler(
         )
 
     def collect_inflight_reqs(self) -> Set[Req]:
+        return {
+            req
+            for batch in self._collect_inflight_batches()
+            if batch is not None
+            for req in batch.reqs
+        }
+
+    def _collect_inflight_batches(self) -> list[ScheduleBatch | None]:
         if get_parallel().pp_size == 1:
             inflight_batches = [self.running_batch, self.last_batch]
         else:
             inflight_batches = [*self.running_mbs, *self.mbs]
-        return {
-            req for batch in inflight_batches if batch is not None for req in batch.reqs
-        }
+        if self.enable_continuous_input_polling and self.result_queue:
+            # Polling can run intake before the newest queued batch becomes last_batch.
+            inflight_batches.extend(batch for batch, _ in self.result_queue)
+        return inflight_batches
 
     def abort_request(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:
@@ -5468,6 +5507,8 @@ class Scheduler(
                     discard_kv_cache_backup(req, self.tree_cache, "host_pool")
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
+                if req.finished_reason is None:
+                    req.finished_reason = FINISH_ABORT()
                 release_kv_cache(req, self.tree_cache)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.release_aborted_prefill_waiting_req(req)
@@ -5593,7 +5634,12 @@ class Scheduler(
             return
 
         if self.enable_overlap and self.last_batch:
-            # Process the results of the last batch
+            if (
+                self.disaggregation_mode == DisaggregationMode.PREFILL
+                and (req := self.chunked_req) is not None
+            ):
+                # Retract skips the chunk step that sets this result's KV send boundary.
+                req.tmp_end_idx = min(req.extend_range.end, len(req.origin_input_ids))
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
@@ -5931,6 +5977,8 @@ def dispatch_event_loop(scheduler: Scheduler):
 
 
 def _dispatch_event_loop_once(scheduler: Scheduler):
+    # A PD role switch can select a different loop on the same scheduler.
+    scheduler.enable_continuous_input_polling = False
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:

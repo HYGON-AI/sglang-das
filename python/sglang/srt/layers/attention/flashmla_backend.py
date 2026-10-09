@@ -32,6 +32,8 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
+from sglang.srt.mem_cache.layout.paged_view import paged_view
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import get_bool_env_var, is_hcu
@@ -469,14 +471,13 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
-        cache_loc = forward_batch.out_cache_loc
 
         if k is not None:
             assert v is not None
             if save_kv_cache:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    cache_loc,
+                    KVWriteLoc.for_batch(forward_batch),
                     k,
                     v,
                 )
@@ -507,7 +508,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             reshape_q_fp8 = reshape_q_fp8_2d.reshape(q_shape)
             o, _ = flash_mla_with_kvcache(
                 q=reshape_q_fp8,
-                k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
+                k_cache=paged_view(k_cache, PAGE_SIZE),
                 block_table=self.forward_metadata.block_kv_indices[:bs],
                 cache_seqlens=forward_batch.seq_lens.to(torch.int32),
                 head_dim_v=self.kv_lora_rank,
@@ -524,7 +525,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             # todo: need check all causal True or False?
             o, lse = flash_mla_with_kvcache(
                 q=reshape_q,
-                k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
+                k_cache=paged_view(k_cache, PAGE_SIZE),
                 block_table=self.forward_metadata.block_kv_indices[:bs],
                 cache_seqlens=forward_batch.seq_lens.to(torch.int32),
                 head_dim_v=self.kv_lora_rank,
@@ -554,12 +555,13 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             return super().forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
         else:
             # target_verify / draft_extend_v2: fixed-q decode-style kernel.
-            cache_loc = forward_batch.out_cache_loc
 
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
-                    self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer, KVWriteLoc.for_batch(forward_batch), k, v
+                    )
 
             bs = forward_batch.batch_size
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -598,7 +600,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 reshape_q_fp8 = reshape_q_fp8_2d.reshape(q_shape)
                 o, _ = flash_mla_with_kvcache(
                     q=reshape_q_fp8,
-                    k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
+                    k_cache=paged_view(k_cache, PAGE_SIZE),
                     block_table=self.forward_metadata.block_kv_indices[:bs],
                     cache_seqlens=cache_seqlens,
                     head_dim_v=self.kv_lora_rank,
@@ -612,7 +614,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             else:
                 o, _ = flash_mla_with_kvcache(
                     q=reshape_q,
-                    k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
+                    k_cache=paged_view(k_cache, PAGE_SIZE),
                     block_table=self.forward_metadata.block_kv_indices[:bs],
                     cache_seqlens=cache_seqlens,
                     head_dim_v=self.kv_lora_rank,

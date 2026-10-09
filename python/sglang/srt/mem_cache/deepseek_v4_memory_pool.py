@@ -183,16 +183,6 @@ def resolve_compressed_kv_layout(
     return KVLayout.V41_FP4 if compress_ratio in (1, 2) else KVLayout.V41
 
 
-def flashmla_supports_v41_kv_layouts() -> bool:
-    """Whether the installed FlashMLA decode kernel reads the V41 / V41_FP4
-    formats; its docstring lists the bytes-per-token it detects."""
-    try:
-        from sgl_kernel.flash_mla import flash_mla_with_kvcache
-    except Exception:
-        return False
-    return "528" in (flash_mla_with_kvcache.__doc__ or "")
-
-
 def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     """The (main-cache layout, compressed-cache option) for a new DeepSeek-V4
     family pool; the V4.1 layouts exist only in SM100 / SM103 FlashMLA or gfx950
@@ -218,17 +208,9 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
                 "V4.1 KV layouts on HIP require gfx950 with aiter_sparse attention"
             )
         return KVLayout.V41, option
-    supported = flashmla_supports_v41_kv_layouts()
-    if mode == "auto":
-        if is_sm100 and supported:
-            return KVLayout.V41, option
+    if mode == "auto" and not is_sm100:
         return KVLayout.V4, None
     assert is_sm100, "the V4.1 KV cache layouts need an SM100 / SM103 GPU"
-    if not supported:
-        logger.warning(
-            "SGLANG_DSV4_KV_LAYOUT=v41 but the installed FlashMLA does not advertise "
-            "the V4.1 KV cache formats; the attention kernel will reject the cache."
-        )
     return KVLayout.V41, option
 
 
@@ -867,6 +849,12 @@ class DeepSeekV4IndexerPool(KVCache):
         from the page layout [page_size * 64 payload | page_size * 4 scale]."""
         assert self.use_fp4_indexer, "packed readback only applies to the fp4 layout"
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        if buf.is_cuda:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+                gather_fp4_index_k,
+            )
+
+            return gather_fp4_index_k(buf, slots, page_size=self.page_size)
         slots = slots.to(torch.int64)
         p = self.page_size
         page, off = (slots // p).unsqueeze(-1), slots % p
@@ -1041,8 +1029,7 @@ class DeepSeekV4UnifiedKVPool:
 
     def get_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         if self.fp8:
-            # One pointer and row size per layer would describe only the nope pool.
-            # TODO(danli103): report both pools once a consumer needs them.
+            # one ptr/layer; PD uses get_contiguous_buf_infos / SWA_RING
             raise NotImplementedError(
                 "get_buf_infos describes one pool per layer; the fp8 rope pool "
                 "would be dropped (SGLANG_DSV4_UNIFIED_KV_FP8=1)."
@@ -1400,41 +1387,44 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         data_lens: List[int] = []
         item_lens: List[int] = []
 
-        if self._unified_kv_fp8:
-            # One pointer and one buf[0]-sized row per layer covers only the fp8 nope
-            # pool; the remote side would decode rows against stale rope.
-            # TODO(danli103): ship the rope pool as a second per-layer entry.
-            raise NotImplementedError(
-                "PD disaggregation is not supported with "
-                "SGLANG_DSV4_UNIFIED_KV_FP8=1 (the transfer assumes a single "
-                "unified pool; the rope pool would be silently dropped)."
-            )
-
         def append_page_buffer(buf: torch.Tensor) -> None:
             assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
             data_ptrs.append(buf.data_ptr())
             data_lens.append(buf.nbytes)
             item_lens.append(buf[0].nbytes)
 
+        def append_unified_compress(buf: torch.Tensor, ratio: int) -> None:
+            # Compressed pages sit after the SWA ring; PD indices are page ids
+            # into this region. SWA itself ships as StateType.SWA_RING.
+            assert buf is not None, "unified kv buffer not allocated"
+            assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
+            swa_pages = self.unified_kv_pool.swa_pages
+            row_bytes = buf[0].nbytes
+            rows_per_page = self.page_size // ratio
+            compress_rows = buf.shape[0] - swa_pages
+            data_ptrs.append(buf.data_ptr() + swa_pages * row_bytes)
+            data_lens.append(compress_rows * row_bytes)
+            item_lens.append(rows_per_page * row_bytes)
+
         stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
-        # Registration order defines the PD wire layout: C4 KV, C4 indexer, C128 KV.
-        # Keep each indexer immediately after the KV buffers of the same ratio.
+        # [C4 KV, C4 indexer, C128 KV], and under fp8 a rope group (128 B/row)
+        # after each KV group. Rope keeps the KV page indices -- shift them and
+        # decode reads a page whose rope half came from some other page.
         for ratio, kv_pool in self.kv_pools.items():
             if self._unified_kv:
-                # Unified buffers store token rows after the SWA ring. Transfer
-                # compressed pages from the offset; SWA ships as StateType.SWA_RING.
-                swa_pages = self.unified_kv_pool.swa_pages
                 for local_layer_id, layer_ratio in enumerate(stage_ratios):
                     if layer_ratio != ratio:
                         continue
-                    buf = self.unified_kv_pool.kv_buffer[local_layer_id]
-                    assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
-                    row_bytes = buf[0].nbytes
-                    rows_per_page = self.page_size // ratio
-                    compress_rows = buf.shape[0] - swa_pages
-                    data_ptrs.append(buf.data_ptr() + swa_pages * row_bytes)
-                    data_lens.append(compress_rows * row_bytes)
-                    item_lens.append(rows_per_page * row_bytes)
+                    append_unified_compress(
+                        self.unified_kv_pool.kv_buffer[local_layer_id], ratio
+                    )
+                if self._unified_kv_fp8:
+                    for local_layer_id, layer_ratio in enumerate(stage_ratios):
+                        if layer_ratio != ratio:
+                            continue
+                        append_unified_compress(
+                            self.unified_kv_pool.kv_buffer_rope[local_layer_id], ratio
+                        )
             elif kv_pool is not None:
                 for buf in kv_pool.kv_buffer:
                     append_page_buffer(buf)
@@ -1460,6 +1450,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 data_lens.append(buf.nbytes)
                 item_lens.append(buf[0].nbytes * index_pages_per_full_page)
 
+        if self._unified_kv_fp8 and data_ptrs:
+            logger.info(
+                f"DSV4 fp8 two-pool registered {len(data_ptrs)} KV regions for "
+                "PD; the peer must run with SGLANG_DSV4_UNIFIED_KV_FP8 too"
+            )
+
         return data_ptrs, data_lens, item_lens
 
     def get_unified_swa_ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
@@ -1471,20 +1467,21 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         item_lens: List[int] = []
         if not self._unified_kv:
             return data_ptrs, data_lens, item_lens
+
+        def append_ring(bufs) -> None:
+            swa_pages = self.unified_kv_pool.swa_pages
+            for buf in bufs:
+                assert buf is not None, "unified kv buffer not allocated"
+                assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
+                row_bytes = buf[0].nbytes
+                data_ptrs.append(buf.data_ptr())
+                data_lens.append(swa_pages * row_bytes)
+                item_lens.append(row_bytes)
+
+        append_ring(self.unified_kv_pool.kv_buffer)
+        # all-nope then all-rope, same grouping as kv_data. don't interleave.
         if self._unified_kv_fp8:
-            # Ring half of the fp8 gap in get_contiguous_buf_infos; fix both together.
-            raise NotImplementedError(
-                "PD disaggregation is not supported with "
-                "SGLANG_DSV4_UNIFIED_KV_FP8=1 (the SWA_RING component assumes a "
-                "single unified pool; the rope pool would be silently dropped)."
-            )
-        swa_pages = self.unified_kv_pool.swa_pages
-        for buf in self.unified_kv_pool.kv_buffer:
-            assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
-            row_bytes = buf[0].nbytes
-            data_ptrs.append(buf.data_ptr())
-            data_lens.append(swa_pages * row_bytes)
-            item_lens.append(row_bytes)
+            append_ring(self.unified_kv_pool.kv_buffer_rope)
         return data_ptrs, data_lens, item_lens
 
     def _unified_page_views(
@@ -2038,6 +2035,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_swa_key_layout(self) -> KVLayout:
         # swa_kv_pool is None under the request window and unified_kv.
         return self.kv_layout
+
+    def get_swa_key_page_size(self) -> int:
+        if self.request_window is not None:
+            return self.request_window.page_size
+        return self.swa_kv_pool.page_size
 
     def get_swa_key_bytes_per_token(self) -> int:
         """Last dim of the ``(pages, page_size, 1, bytes)`` view the attention

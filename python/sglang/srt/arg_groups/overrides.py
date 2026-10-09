@@ -1907,6 +1907,19 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     ):
         return False
 
+    # Only the hybrid-SWA byte pool has a matching post-capture resize path.
+    model_config = model_config_of(server_args)
+    if cfg.enable_unified_memory:
+        from sglang.srt.configs.hybrid_arch import mambaish_config
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        if not model_config.is_hybrid_swa or mambaish_config(model_config) is not None:
+            return False
+        # The solver budgets these independent draft pools again after capture.
+        spec = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
+        if spec.is_eagle() or spec.is_standalone() or spec.is_dflash_family():
+            return False
+
     if (
         cfg.disaggregation_mode != "prefill"
         and cfg.cuda_graph_config.decode.backend == Backend.DISABLED
@@ -1927,7 +1940,7 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
 
     from sglang.srt.configs.model_config import is_deepseek_v4, is_minimax_sparse
 
-    hf_config = model_config_of(server_args).hf_config
+    hf_config = model_config.hf_config
     if is_deepseek_v4(hf_config) or is_minimax_sparse(hf_config):
         return False
 

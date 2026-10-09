@@ -93,8 +93,8 @@ patches:
           hidden_states = self.attn_boundary.prepare(
               hidden_states,
               forward_batch,
-              captured_last_layer_outputs=captured_last_layer_outputs,
-              capture_output=capture_output,
+              capture_gathered=captured_last_layer_outputs,
+              capture=capture_output,
               **kwargs,
           )
         append: "dumper.dump('layer_input', hidden_states, dims='t h # tp:replicated')"
@@ -145,8 +145,8 @@ patches:
           hidden_states = self.attn_boundary.prepare(
               hidden_states,
               forward_batch,
-              captured_last_layer_outputs=captured_last_layer_outputs,
-              capture_output=capture_output,
+              capture_gathered=captured_last_layer_outputs,
+              capture=capture_output,
               **kwargs,
           )
         append: "dumper.dump('layer_input', hidden_states, dims='t h # tp:replicated dp:=attn_dp')"

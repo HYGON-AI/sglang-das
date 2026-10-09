@@ -544,6 +544,9 @@ class Envs:
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
+    # DSpark on HIP: with SGLANG_SIMULATE_ACC_LEN set, temperature-only sampling requests
+    # run the greedy draft/accept path and only the bonus token is temperature-sampled.
+    SGLANG_SIMULATE_ACC_GREEDY = EnvBool(True)
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
     # Benchmark-only synthetic routing; replaces routed expert IDs and must not
@@ -694,6 +697,8 @@ class Envs:
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
+    # Opt-in: keep receiving prefill requests while forward results are pending.
+    SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
 
     # ===================================================================
     # Radix and sparse KV caches
@@ -794,6 +799,10 @@ class Envs:
     # HiCache host<->device transfers use the TMA staging kernel when the GPU
     # (sm_90+), row size and page size allow; set to 0 to force the register kernel.
     SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
+    # Host memory in bytes available to HiCache pools on this host. When set,
+    # it replaces cgroup and psutil discovery; the 10 GiB reserve and the
+    # per-local-rank split still apply.
+    SGLANG_HICACHE_HOST_MEMORY_BYTES = EnvInt(None)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
@@ -927,6 +936,10 @@ class Envs:
     # Pin the AITER MoE to the moe_c backend instead of the tuned-config
     # priority order (asm > moe_c > triton). Default keeps autodetection.
     SGLANG_FORCE_AITER_MOE_C = EnvBool(False)
+    # aiter opus moe_sorting dispatch policy (0 auto, 1 oneshot, 2 multi-phase). Auto picks
+    # oneshot below ~24 tokens, which on gfx950 costs 11-16 us vs 6-7 us for multi-phase at
+    # E=385 / 129; outputs are identical and multi-phase is never slower up to 16384 tokens.
+    SGLANG_AITER_MOE_SORTING_DISPATCH_POLICY = EnvInt(2)
     # Fold `silu(gate) * up` into the triton MoE up-GEMM epilogue. W13 rows are
     # permuted in place at load so gate/up land in adjacent columns of the same
     # output tile, which removes intermediate_cache1 and the standalone
@@ -1109,6 +1122,9 @@ class Envs:
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
     # Global SlimQuant W4A8 TP-MoE backend selection.
     SGLANG_W4A8_TPMOE_BACKEND = EnvStr("auto")
+    # Cache BF16 expansions of Hopper group32 FP8 weights for larger GEMMs.
+    # Disable to save the additional weight memory or allow online updates.
+    SGLANG_OPT_HOPPER_BLOCK_FP8_BF16 = EnvBool(True)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
@@ -1640,7 +1656,7 @@ class Envs:
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
     # Paged KV layout of the DeepSeek-V4 family pools: "v4" (584 B/token, every
     # GPU), "v41" (the SM100 FlashMLA V4.1 formats: 528 B fp8 SWA cache, fp8 or
-    # fp4 compressed caches) or "auto" (v41 on SM100 when FlashMLA supports it).
+    # fp4 compressed caches) or "auto" (v41 on SM100, v4 elsewhere).
     SGLANG_DSV4_KV_LAYOUT = EnvStr("v4")
     # Compressed-cache layout under "v41": "auto" (fp4 for the fp4-rounded
     # ratio-1 / ratio-2 latents, fp8 for ratios 4 / 128), "fp8" or "fp4" for all.
@@ -1696,6 +1712,18 @@ class Envs:
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+    # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
+    # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
+    SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)
+    # DSpark draft block on the HIP radix backend: build the attention metadata inside the
+    # draft CUDA graph from the raw inputs instead of eagerly before every replay.
+    SGLANG_HIP_DSPARK_DRAFT_RAW_METADATA = EnvBool(_default_hip)
+    # gfx950 MXFP8 dense routes (aiter group32 / native): the producer emits fp8 + ue8m0 for its
+    # consumer instead of bf16 plus a separate quant launch -- the shared expert's SwiGLU for
+    # down_proj, the wo_a GEMM for wo_b, and the FFN norm for the shared expert's gate_up.
+    SGLANG_HIP_SHARED_ACT_MXFP8 = EnvBool(_default_hip)
+    SGLANG_HIP_WO_A_MXFP8 = EnvBool(_default_hip)
+    SGLANG_HIP_FFN_NORM_MXFP8 = EnvBool(_default_hip)
 
     # ===================================================================
     # DeepSeek V4 - cache, GEMM, and distributed
@@ -1933,6 +1961,9 @@ class Envs:
     # 2 is the accuracy-safe default: higher values reuse staler selections
     # in the skip layers.
     SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(2)
+    # Opt-in gfx950 TP4 decode indexer context partitioning. Keeps the index
+    # cache replicated; gathers Q and exchanges local top-k candidates.
+    SGLANG_MINIMAX_M3_INDEXER_CP = EnvBool(False)
     # gfx95: lightning-indexer K cache in fp8_e4m3fn (bf16 q x fp8 k in the scorers);
     # main attention K/V keep kv_cache_dtype.
     SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE = EnvBool(True)

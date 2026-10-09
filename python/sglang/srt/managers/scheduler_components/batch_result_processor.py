@@ -31,7 +31,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import (
     free_swa_out_of_window_slots,
-    maybe_cache_unfinished_req,
+    checkpoint_kv_cache,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -197,7 +197,7 @@ class SchedulerBatchResultProcessor:
         req.allow_radix_cache_insert_once = True
         prompt_len = getattr(req, "dsv4_decode_radix_cache_prompt_len", None)
         if prompt_len is None:
-            maybe_cache_unfinished_req(req, self.tree_cache)
+            checkpoint_kv_cache(req, self.tree_cache)
             return
 
         page_size = self.tree_cache.page_size
@@ -233,7 +233,7 @@ class SchedulerBatchResultProcessor:
         req.kv.set_evicted_seqlen(ComponentType.SWA, radix_key_len)
         req.force_radix_leaf_creation = True
         try:
-            maybe_cache_unfinished_req(req, self.tree_cache)
+            checkpoint_kv_cache(req, self.tree_cache)
             # The donated leaf is full-only, so this request's SWA tail is
             # private and looks free to release outright. It is not: the request
             # keeps decoding and its sliding window still reaches back into the
@@ -478,7 +478,7 @@ class SchedulerBatchResultProcessor:
                         )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        maybe_cache_unfinished_req(req, self.tree_cache)
+                        checkpoint_kv_cache(req, self.tree_cache)
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
@@ -569,7 +569,7 @@ class SchedulerBatchResultProcessor:
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     else:
-                        maybe_cache_unfinished_req(req, self.tree_cache)
+                        checkpoint_kv_cache(req, self.tree_cache)
                 else:
                     # being chunked reqs' prefill is not finished
                     req.inflight_middle_chunks -= 1
@@ -1467,6 +1467,9 @@ class SchedulerBatchResultProcessor:
 
             if completed_mamba_boundary and not lazy:
                 req.kv.mamba_last_track_idx = batch.mamba_track_buffer_indices[i]
+                # The slot that stops being the latest still holds its
+                # checkpoint; name it so a short key can fall back to it.
+                req.kv.mamba_prev_track_seqlen = req.kv.mamba_last_track_seqlen
                 req.kv.mamba_last_track_seqlen = req.kv.kv_committed_len - lookahead
             elif (
                 req.finished()
@@ -1596,13 +1599,17 @@ class SchedulerBatchResultProcessor:
         track_idx = req.kv.mamba_next_track_idx
         if not known_boundary and batch.mamba_track_buffer_indices is not None:
             track_idx = batch.mamba_track_buffer_indices[i]
+        previous_track_seqlen = req.kv.mamba_last_track_seqlen
         if not known_boundary:
             req.kv.mamba_last_track_seqlen = track_seqlen
         if lazy:
+            # Lazy frees the slot it stops tracking, so nothing names the
+            # previous checkpoint there; mamba_prev_track_seqlen stays None.
             self.mamba_lazy_post_decode_at_boundary(req, batch, track_idx)
         else:
             if not known_boundary:
                 req.kv.mamba_last_track_idx = track_idx
+                req.kv.mamba_prev_track_seqlen = previous_track_seqlen
             req.kv.mamba_next_track_idx = (
                 batch.req_to_token_pool.get_mamba_ping_pong_other_idx(track_idx)
             )

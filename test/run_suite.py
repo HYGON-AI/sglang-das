@@ -91,6 +91,7 @@ HW_MAPPING = {
     "hcu": HWBackend.HCU,
     "xpu": HWBackend.XPU,
     "mlx": HWBackend.MLX,
+    "ppu": HWBackend.PPU,
 }
 
 
@@ -200,6 +201,14 @@ PER_COMMIT_SUITES = {
         "stage-a-unit-test-mlx",
         "stage-b-e2e-mlx",
     ],
+    # PPU has no suite in any of the three dicts yet: pr-test-ppu.yml only runs
+    # the runner preflight until the PPU SRT platform and AOT kernels land.
+    # Declaring a name here before a workflow dispatches it would let a test
+    # register, validate, and count as covered while never running, so each PPU
+    # suite name arrives with the job that runs it. Until then PPU is in
+    # _SUITE_CHECKED_BACKENDS with no valid suite, so validate_all_suites()
+    # rejects any register_ppu_ci() outright.
+    HWBackend.PPU: [],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
@@ -328,6 +337,7 @@ _SUITE_CHECKED_BACKENDS = {
     HWBackend.MUSA,
     HWBackend.XPU,
     HWBackend.MLX,
+    HWBackend.PPU,
 }
 
 

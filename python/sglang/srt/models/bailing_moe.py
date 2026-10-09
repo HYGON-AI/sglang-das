@@ -60,7 +60,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
-    reduce_moe_output,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -600,7 +599,6 @@ class BailingMoESparseMoeBlock(nn.Module):
                         moe_i_s=moe_i_s,
                     )
 
-        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
 
     def forward_deepep(
@@ -1038,6 +1036,7 @@ class BailingMoEBlock(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
+                reduce_results=False,
             )
 
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)

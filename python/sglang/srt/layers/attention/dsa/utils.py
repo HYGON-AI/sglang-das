@@ -218,7 +218,7 @@ def dsa_prefill_has_history(forward_batch: "ForwardBatch") -> bool:
 def is_dsa_enable_prefill_cp():
     if is_hcu():
         return get_parallel().enable_dsa_prefill_context_parallel
-    if is_hip() or is_musa():
+    if is_musa():
         return False
 
     # Generic prefill CP derives activation from the runtime topology and model
@@ -228,6 +228,8 @@ def is_dsa_enable_prefill_cp():
     from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
     hf_config = process_model_config().hf_config
+    if is_hip():
+        return is_deepseek_v4(hf_config)
     return is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
 
 

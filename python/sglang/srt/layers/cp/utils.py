@@ -128,14 +128,14 @@ def get_layer_owner(local_layer_idx: int, shard_size: int, total_layers: int) ->
 
 def enable_cp_v2() -> bool:
     """Return whether the strategy-based generic prefill CP path is available."""
-    from sglang.srt.utils import is_hip, is_musa, is_npu
+    from sglang.srt.utils import is_hcu, is_musa, is_npu
 
-    return not (is_hip() or is_npu() or is_musa())
+    return not (is_hcu() or is_npu() or is_musa())
 
 
 def is_cp_active(forward_batch) -> bool:
     """Return whether the current forward batch is running through CP."""
-    # HIP/NPU/MUSA retain their platform CP implementations.  Treating those
+    # HCU/NPU/MUSA retain their platform CP implementations.  Treating those
     # batches as strategy-CP here shards the model inputs a second time while
     # their attention backends still use the legacy layout.
     if not enable_cp_v2():

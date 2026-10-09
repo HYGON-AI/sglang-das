@@ -139,3 +139,51 @@
 | `test/registered/unit/test_runtime_context.py` | census 将当前 HCU custom-allreduce backend 选择器归类为优化策略，非拓扑字段 | 静态与 residual 单测；最终 DSV4 纯 TP8。专有模型/PD/CP 未做功能声明。 |
 
 自动合并审查补齐 scheduler 的实际 DP replica 数、GLM/HCU VP 和 HYV3 SP 参数校验、host 索引的物理字节大小及 packed draft 层偏移。HCU FlashMLA default 从全局 EnvStr 迁到 `_is_hcu` resolver；非 HCU 默认跟随官方 auto。DSA utils 的 LayerSplit 引用采用 lazy import，避免循环导入。
+
+## Step 03：第 201–330 笔
+
+- 官方终点：`3e9a120adde240ba62abfe78c54ce367e32bfae9`；初始冲突 34 文件。
+- 状态：compile、diff-check、相对双方 F821/F811/F722 通过；最终 DSV4 纯 TP8 运行精度 pending。
+- 证据：`/home/proj_sglang_open/sync-evidence/20261009/step-03/`。
+
+| 文件 | 决策与保留内容 |
+|---|---|
+| `docs/src/snippets/configs/zai-org/glm-5.2.jsx` | 采用官方 GLM-5.2 部署示例并统一 LF |
+| `python/sglang/kernels/jit/csrc/deepseek_v4/main_norm_rope.cuh` | 保留 HIP vector 显式字段读取；gfx950 RoPE 舍入顺序仅在其目标架构生效 |
+| `python/sglang/srt/arg_groups/parallel_hook.py` | 采用官方新 ROCm CP 支持；仅 MUSA 保留禁用条件 |
+| `python/sglang/srt/disaggregation/common/conn.py` | 官方延迟分配/清理通知与内部 PD hidden metadata 释放并存 |
+| `python/sglang/srt/disaggregation/decode.py` | 采用官方包含 start_time 的五元组；保留本地 abort RID 记录 |
+| `python/sglang/srt/disaggregation/mooncake/conn.py` | PD hidden 流传输移植到官方 abort helper；清理只能在所有写入排空后发布，线程在初始化完成后启动一次；PD hidden deferred chunk 保持 outstanding 计数，直至最后一个 packet 写入结束 |
+| `python/sglang/srt/disaggregation/prefill.py` | 保留 PD hidden bootstrap 失败处理和重排队；采用官方 checkpoint API 与 prefill_complete 策略 |
+| `python/sglang/srt/entrypoints/openai/serving_chat.py` | 采用官方 token-first prompt 接口；显式 external constraint 优先于内置 GLM grammar |
+| `python/sglang/srt/environ.py` | 保留内部 HCU/W4A8 开关，增加官方 AITER 排序策略和 Hopper BF16 weight cache |
+| `python/sglang/srt/layers/attention/deepseek_v4_backend_hip_radix.py` | 官方 gfx95 能力检测与 HCU CPU seq-lens 路径并存 |
+| `python/sglang/srt/layers/attention/dsa/utils.py` | HCU 保留现有 CP round-robin 契约；其他 ROCm 采用官方 CP |
+| `python/sglang/srt/layers/attention/dsa_backend.py` | HCU FlashMLA 保留真实行截断/补齐，其他平台使用官方 kv_format ABI |
+| `python/sglang/srt/layers/attention/flashattention_backend.py` | 查询准备迁移至官方 helper；HCU 保留 descale、FNUZ 查询转换及 bhsd cache，官方 FA4 capture 上界修复；HCU packed MLA store 使用官方 KVWriteLoc |
+| `python/sglang/srt/layers/attention/linear/kda_backend.py` | 官方 ROCm KDA 与 HCU grouped conv 导入并存 |
+| `python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py` | 新增 QSA eager-break context；保留 HCU kernel 配置 |
+| `python/sglang/srt/layers/attn_residual.py` | 保留显式 HCU boltops aggregation；官方 TMA capability 使用 is_cuda |
+| `python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py` | 官方 platform context 与内部 custom op 注册并存 |
+| `python/sglang/srt/layers/moe/topk.py` | 官方 AITER shared-column 写入契约与 HCU LightOp gate dispatch 合并 |
+| `python/sglang/srt/layers/rotary_embedding/base.py` | 保留 rotary stream launcher；官方 HIP cos-sin cache 保持 FP32 |
+| `python/sglang/srt/layers/utils/hcu_cp_utils.py` | 隔离 HCU 已验证 CP gather/split/overlap helpers，避免恢复其他平台废弃算法 |
+| `python/sglang/srt/layers/utils/cp_utils.py` | 采用官方废弃平台 shim；_is_hcu 显式导出 HCU legacy helper |
+| `python/sglang/srt/managers/scheduler.py` | 官方暂停边界/计时与内部 PP collective 控制请求前置 relay 并存 |
+| `python/sglang/srt/managers/scheduler_components/batch_result_processor.py` | 采用官方 checkpoint_kv_cache API；保留 HCU SWA slot 释放 |
+| `python/sglang/srt/mem_cache/dsa_cache_layer_split.py` | 保留 scratch 生命周期；适配官方 KVWriteLoc 解析 |
+| `python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py` | 官方 QSA host sidecar 与 HCU GLM indexer/LayerSplit 定尺分别保留 |
+| `python/sglang/srt/mem_cache/memory_pool.py` | 官方 token-major Mamba views 和 stride 修复；HCU bhsd KV slot stride 单独保留 |
+| `python/sglang/srt/models/bailing_moe.py` | 官方 StageBoundary 支持 exit fusion；保留 HCU sparse RMS quant payload |
+| `python/sglang/srt/models/deepseek_v4.py` | HCU CP rank 置换受 _is_hcu 保护；保留官方未冲突更新；已删除 dsa_use_prefill_cp 改用官方 is_cp_active；HCU legacy CP 使用原 metadata predicate |
+| `python/sglang/srt/models/minimax_m2.py` | 保留当前 HCU MiniMax TBO hooks 和优化 prepare；官方未冲突模型流程保留 |
+| `python/sglang/srt/models/qwen4_exp.py` | 保留 PLE INT8/FP8-channelwise 识别；采用 QSA eager break 与共享 topk bridge |
+| `python/sglang/srt/models/qwen4_exp_mtp.py` | 官方 HC 宽度 graph input slot；内部 fusion loader 保留 prefix 参数 |
+| `python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py` | HCU draft VP 与官方 ROCm draft topk1 导入并存 |
+| `python/sglang/srt/speculative/eagle_worker_common.py` | 保留 HC pre-norm hidden capture，并加入官方 mrope positions |
+| `python/sglang/srt/speculative/eagle_worker_v2.py` | HCU fused top1 仅在不需要 draft distribution 时使用；采用官方全贪心跳过概率构建 |
+| `test/registered/unit/models/test_glm5_next_bfg_fusion.py` | 恢复官方 GLM generic fusion 测试；HCU 模型已独立 dispatch |
+| `python/sglang/srt/mem_cache/common.py` | checkpoint 不再接受旧 chunked kwargs；跳过 tree 插入的请求仍保留自己已计算的前缀 KV |
+| `python/sglang/srt/layers/cp/utils.py` | 官方 generic ROCm CP 生效；仅 HCU 保留 legacy batch layout，避免双重 shard |
+
+功能验收范围为本次用户指定的 DSV4 纯 TP8；其他模型、PD、CP、MTP 只完成代码与静态审查。

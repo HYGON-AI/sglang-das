@@ -1288,6 +1288,61 @@ class OpenAIServingChat(OpenAIServingBase):
             f"received unsupported content type '{media_type}'."
         )
 
+    def _engine_prompt(
+        self, processed_messages: MessageProcessingResult, is_multimodal: bool
+    ) -> tuple[str, Any]:
+        """Standard VLMs render a text prompt (with placeholder strings) for
+        the MM processor to tokenize. Token-first encoders instead produce
+        pre-rendered input_ids with single placeholder ids and leave the text
+        empty; pass those through rather than re-tokenizing an empty prompt.
+        """
+        # A lossy text round-trip makes the rendered prompt unusable, so send the
+        # ids instead. Only when nothing needs placeholder expansion: with media
+        # attached the MM processor still has to tokenize the text itself.
+        prefers_prompt_ids = (
+            self._prompt_text_round_trip_is_lossy
+            and isinstance(processed_messages.prompt_ids, list)
+            and processed_messages.prompt_ids
+            and not (
+                processed_messages.image_data
+                or processed_messages.video_data
+                or processed_messages.audio_data
+            )
+        )
+        if (
+            is_multimodal
+            and not chat_encoding.spec_renders_prompt_ids(self.chat_encoding_spec)
+            and not prefers_prompt_ids
+        ):
+            return "text", processed_messages.prompt
+        if isinstance(processed_messages.prompt_ids, str):
+            return "text", processed_messages.prompt_ids
+        return "input_ids", processed_messages.prompt_ids
+
+    def _can_reuse_text_only_prompt_ids(
+        self, processed_messages: MessageProcessingResult, is_multimodal: bool
+    ) -> bool:
+        # Moss-VL invokes its processor for text-only requests, and that processor
+        # requires the rendered text rather than pre-tokenized ids.
+        is_moss_vl = (
+            "MossVLForConditionalGeneration"
+            in self.tokenizer_manager.model_config.hf_config.architectures
+        )
+        return (
+            is_multimodal
+            and not is_moss_vl
+            and self.chat_encoding_spec is None
+            and self.template_manager.chat_template_name is None
+            and not self._prompt_text_round_trip_is_lossy
+            and not self._tokenizer_auto_adds_specials
+            and isinstance(processed_messages.prompt_ids, list)
+            and bool(processed_messages.prompt_ids)
+            and not processed_messages.image_data
+            and not processed_messages.video_data
+            and not processed_messages.audio_data
+            and not processed_messages.modalities
+        )
+
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
@@ -1354,7 +1409,9 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         # Handle single vs multiple requests
-        if request.input_ids is not None:
+        if request.input_ids is not None or self._can_reuse_text_only_prompt_ids(
+            processed_messages, is_multimodal
+        ):
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
         elif is_multimodal and self.chat_encoding_spec == "kimi_k3":
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
@@ -1501,6 +1558,27 @@ class OpenAIServingChat(OpenAIServingBase):
                     "Failed to generate decoding constraint, proceeding without constraint.\n%s",
                     traceback.format_exc(),
                 )
+        effective_tools = self._effective_tools(request)
+        # Only tool-bearing requests get the full-assistant EBNF: its terminal
+        # state finishes a request even under ignore_eos.
+        glm_constraint = (
+            self._glm_constraint_module is None
+            and self.tool_call_parser == "glm47"
+            and bool(effective_tools)
+            and not any(tool.function.strict for tool in effective_tools)
+        )
+        if glm_constraint:
+            enable_thinking = (request.chat_template_kwargs or {}).get(
+                "enable_thinking"
+            )
+            parser = FunctionCallParser(request.tools or [], self.tool_call_parser)
+            tool_call_constraint = parser.get_structure_constraint(
+                request.tool_choice,
+                parallel_tool_calls=request.parallel_tool_calls,
+                thinking_mode=True
+                if enable_thinking is None
+                else bool(enable_thinking),
+            )
 
         # Apply chat template and its stop strings
         tools = None
@@ -1517,7 +1595,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ] or None
             elif request.tools:
                 tools = [item.model_dump() for item in request.tools]
-            if self.tool_call_parser and self._glm_constraint_module is None:
+            if self.tool_call_parser and self._glm_constraint_module is None and not glm_constraint:
                 parser = FunctionCallParser(
                     effective_tools,
                     self.tool_call_parser,

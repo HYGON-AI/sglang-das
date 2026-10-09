@@ -4156,7 +4156,8 @@ def get_cuda_graph_batch_size_alignment() -> int:
         or get_parallel().hy3_sp
     ):
         alignment *= get_parallel().attn_tp_size
-    if alignment % get_parallel().attn_cp_size != 0:
+    # TODO: unverified on NVIDIA; drop the gate once validated on CUDA.
+    if not is_hip() and alignment % get_parallel().attn_cp_size != 0:
         alignment *= get_parallel().attn_cp_size
     return alignment
 
@@ -4805,7 +4806,7 @@ def get_extend_input_len_swa_limit(
     sliding_window_size: int, chunked_prefill_size: int, page_size: int
 ) -> int:
     # 1. a factor of 2x is because each prefill contains chunked_prefill_size tokens,
-    #    and between prefills, we run the tree cache's cache_unfinished_req(),
+    #    and between prefills, we run the tree cache's checkpoint(),
     #    so we unlock the previously locked nodes.
     # 2. max is to handle the case that chunked_prefill_size is larger than sliding_window_size.
     #    in that case, each prefill contains chunked_prefill_size tokens,

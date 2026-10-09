@@ -59,7 +59,6 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    reduce_moe_output,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_int8_marlin_for_minimax_m2 import (
@@ -100,7 +99,6 @@ from sglang.srt.runtime_context import (
 # transformers wrapper then crashes on config.rope_parameters (transformers v5 issue).
 # Other files (custom_all_reduce.py, hf_transformers_utils.py) also use sglang.srt.utils.
 from sglang.srt.utils import (
-    BumpAllocator,
     add_prefix,
     cpu_has_amx_support,
     get_bool_env_var,
@@ -688,7 +686,6 @@ class MiniMaxM2MoE(nn.Module):
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         final_hidden_states = self.experts(hidden_states, topk_output)
-        final_hidden_states = reduce_moe_output(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -1315,9 +1312,8 @@ class MiniMaxM2DecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.block_sparse_moe(hidden_states, forward_batch)
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.block_sparse_moe(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return hidden_states
 
@@ -1371,51 +1367,6 @@ class MiniMaxM2DecoderLayer(nn.Module):
 
 
     # TBO Operations for MiniMax Decoder Layer
-    def op_comm_prepare_attn(
-        self,
-        state,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        zero_allocator: BumpAllocator,
-        tbo_subbatch_index: Optional[int] = None,
-    ):
-        """Communication prepare for attention - TBO operation"""
-        state.hidden_states_after_comm_pre_attn = self.attn_boundary.prepare(
-            hidden_states, forward_batch
-        )
-        state.update(
-            dict(
-                forward_batch=forward_batch,
-                positions=positions,
-                zero_allocator=zero_allocator,
-                tbo_subbatch_index=tbo_subbatch_index,
-            )
-        )
-
-    def op_comm_prepare_mlp(self, state):
-        """Communication prepare for MLP - TBO operation"""
-        hidden_states = self.attn_boundary.finish(
-            state.pop("hidden_states_after_attn"), state.forward_batch
-        )
-        state.hidden_states_mlp_input = self.ffn_boundary.prepare(
-            hidden_states, state.forward_batch
-        )
-
-    def op_comm_postprocess_layer(self, state):
-        """Communication postprocess for layer - TBO operation"""
-        hidden_states = self.ffn_boundary.finish_complete_output(
-            state.pop("hidden_states_mlp_output"), state.forward_batch
-        )
-
-        output = dict(
-            positions=state.positions,
-            hidden_states=hidden_states,
-            forward_batch=state.forward_batch,
-            zero_allocator=state.zero_allocator,
-            tbo_subbatch_index=state.tbo_subbatch_index,
-        )
-        return output
 
 
 class MiniMaxM2Model(nn.Module):
