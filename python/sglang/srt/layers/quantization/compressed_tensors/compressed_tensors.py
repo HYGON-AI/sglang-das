@@ -35,6 +35,7 @@ from compressed_tensors.quantization import (
 from pydantic import BaseModel
 
 from sglang.srt.layers.moe import MoeRunnerConfig, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -244,6 +245,33 @@ class CompressedTensorsConfig(QuantizationConfig):
                     "Using Mxfp4MoEMethod for MXFP4 compressed-tensors MoE"
                 )
                 return Mxfp4MoEMethod(prefix=prefix)
+
+            if (
+                _is_hcu
+                and get_moe_runner_backend().is_deep_gemm()
+                and get_moe_a2a_backend().is_deepep()
+                and self.quant_format == CompressionFormat.pack_quantized.value
+            ):
+                scheme = self._get_moe_projection_scheme(layer, prefix)
+                if scheme is not None:
+                    weight_quant = scheme.get("weights")
+                    input_quant = scheme.get("input_activations")
+                    if (
+                        weight_quant is not None
+                        and input_quant is not None
+                        and weight_quant.type == QuantizationType.INT
+                        and input_quant.type == QuantizationType.INT
+                        and self._is_dynamic_token_w4a8(weight_quant, input_quant)
+                        and weight_quant.strategy == QuantizationStrategy.CHANNEL
+                        and weight_quant.symmetric
+                        and input_quant.symmetric
+                        and weight_quant.actorder is None
+                    ):
+                        from sglang.srt.layers.quantization.slimquant_w4a8_marlin import (
+                            HCUW4A8Int8DeepEPMoEMethod,
+                        )
+
+                        return HCUW4A8Int8DeepEPMoEMethod(self)
 
             layer.scheme = self.get_moe_scheme(layer=layer, layer_name=prefix)
             if layer.scheme is None:  # ignored layer
@@ -821,6 +849,31 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         raise NotImplementedError("No compressed-tensors compatible scheme was found.")
 
+    def _get_moe_projection_scheme(self, layer, layer_name):
+        self._add_fused_moe_to_target_scheme_map()
+        unfused_names = [
+            layer_name + projection_name
+            for projection_name in [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
+        ]
+        # Keep DSV4.1 checkpoint aliases and projection consistency checks shared
+        # between the direct method and the original scheme-based path.
+        try:
+            schemes = [self.get_scheme_dict(layer, name) for name in unfused_names]
+        except ValueError:
+            if not self._is_hcu_dsv41_w4a8_config():
+                raise
+            schemes = [
+                self.get_scheme_dict(layer, layer_name + name)
+                for name in [".0.w1", ".0.w3", ".0.w2"]
+            ]
+        scheme = schemes[0]
+        if not all(d == scheme for d in schemes):
+            raise ValueError(
+                "All MoE projections need to have same "
+                "quantization scheme but found multiple"
+            )
+        return scheme
+
     def get_moe_scheme(
         self, layer: torch.nn.Module, layer_name: Optional[str] = None
     ) -> Optional[CompressedTensorsMoEScheme]:
@@ -854,32 +907,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 logger.info_once("Using CompressedTensorsW8A8Fp8MoE")
                 return CompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
 
-        unfused_names = [
-            layer_name + projection_name
-            for projection_name in [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
-        ]
-        # TODO: refactor this to use expert_mapping and check all layer numbers
-        try:
-            all_scheme_dicts = [
-                self.get_scheme_dict(layer, name) for name in unfused_names
-            ]
-        except ValueError:
-            if not is_hcu_dsv41_w4a8:
-                raise
-            checkpoint_aliases = [".0.w1", ".0.w3", ".0.w2"]
-            all_scheme_dicts = [
-                self.get_scheme_dict(layer, layer_name + projection_name)
-                for projection_name in checkpoint_aliases
-            ]
-
-        scheme_dict = all_scheme_dicts[0] if all_scheme_dicts else None
-
-        # multiple schemes found
-        if not all(d == scheme_dict for d in all_scheme_dicts):
-            raise ValueError(
-                "All MoE projections need to have same "
-                "quantization scheme but found multiple"
-            )
+        scheme_dict = self._get_moe_projection_scheme(layer, layer_name)
 
         if scheme_dict is None:  # ignored layer
             return None

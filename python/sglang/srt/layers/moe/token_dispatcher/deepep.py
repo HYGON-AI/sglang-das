@@ -565,6 +565,12 @@ class _DeepEPDispatcherImplBase:
 
     def _validate_and_adjust_dtype(self) -> None:
         """Validate dtype against hardware and adjust if necessary."""
+        if (
+            _is_hcu
+            and self.deepep_output_dtype == DispatcherOutputDtype.INT8
+            and (self.quant_config or {}).get("hcu_w4a8_int8_dispatch", False)
+        ):
+            return  # The HCU DeepEP W4A8 kernels support INT8 communication.
         if _is_npu and self.deepep_output_dtype == DispatcherOutputDtype.FP8:
             from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
@@ -620,7 +626,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
-        if use_groupgemm and not (
+        if _is_hcu and self.quant_config.get("hcu_w4a8_int8_dispatch", False):
+            hidden_states = per_token_quant_int8(hidden_states)
+        elif use_groupgemm and not (
             _is_hcu and self.deepep_output_dtype == DispatcherOutputDtype.BF16
         ):
             if _use_fp8_w8a8_moe:
@@ -1002,7 +1010,21 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         _deepep_precompile_tp_barrier()
         npu_mxfp_quantization_opts = self._get_npu_mxfp_quantization_kwargs(buffer)
         if use_groupgemm:
-            if _use_fp8_w8a8_moe:
+            if _is_hcu and self.quant_config.get("hcu_w4a8_int8_dispatch", False):
+                packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
+                    buffer.low_latency_dispatch(
+                        hidden_states,
+                        topk_ids,
+                        topk_weights,
+                        self.num_max_dispatch_tokens_per_rank,
+                        self.num_experts,
+                        quant_type=1,
+                        fp8_round_scale=False,
+                        async_finish=not self.return_recv_hook,
+                        return_recv_hook=self.return_recv_hook,
+                    )
+                )
+            elif _use_fp8_w8a8_moe:
                 packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
                     buffer.low_latency_dispatch(
                         hidden_states,
