@@ -1944,15 +1944,14 @@ def _varlen_deep_gemm_silu_mul_quant(
     if silu_mul_keep_fp32 and gemm1_alpha is not None:
         raise ValueError("silu_mul_keep_fp32 does not support gemm1_alpha")
 
-    # oai-swiglu (gemm1_alpha) stays on the Triton kernel until
-    # per_token_group_quant grows an activation-kind axis. The output_scale dtype picks the schedule: packed
-    # int32 UE8M0 (no follow-up transform; needs G % 4 == 0 and the
-    # num_real_tokens grid bound) when eligible, row-major fp32 otherwise.
-    if gemm1_alpha is not None:
-        assert swiglu_limit is None, (
-            "swiglu_limit and gemm1_alpha are mutually exclusive"
-        )
-        assert not swizzle, "swizzle is not supported with gemm1_alpha"
+    # Channel-wise groups exceed the JIT quantizer's group-size limit.
+    # The Triton fallback must also retain plain-SiLU clamp and precision.
+    if gemm1_alpha is not None or group_size > 256:
+        if gemm1_alpha is not None:
+            assert swiglu_limit is None, (
+                "swiglu_limit and gemm1_alpha are mutually exclusive"
+            )
+        assert not swizzle, "swizzle is unsupported by the Triton activation fallback"
         from sglang.kernels.ops.moe.ep_moe_kernels import (
             silu_and_mul_masked_post_quant_fwd,
         )
@@ -1980,6 +1979,8 @@ def _varlen_deep_gemm_silu_mul_quant(
             scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             gemm1_alpha=gemm1_alpha,
             gemm1_clamp_limit=gemm1_clamp_limit or 0.0,
+            swiglu_limit=swiglu_limit,
+            silu_mul_keep_fp32=silu_mul_keep_fp32 or swiglu_limit is not None,
             num_real_tokens=num_real_tokens,
             topk=topk,
         )
