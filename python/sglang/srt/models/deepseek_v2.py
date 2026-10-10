@@ -2331,7 +2331,12 @@ class DeepseekV2AttentionMLA(
             )
         return self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
 
-    def q_b_proj_forward(self, q_lora: torch.Tensor) -> torch.Tensor:
+    def q_b_proj_forward(
+        self, q_lora: torch.Tensor, input_quant_args=None
+    ) -> torch.Tensor:
+        if input_quant_args is not None:
+            q = self.q_b_proj(q_lora, input_quant_args=input_quant_args)[0]
+            return q.view(-1, self.num_local_heads, self.qk_head_dim)
         if self._use_min_latency_q_b_gemm is None:
             self._use_min_latency_q_b_gemm = (
                 self._q_b_proj_verified_shape

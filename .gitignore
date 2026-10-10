@@ -281,6 +281,9 @@ test-results/
 # hip_kernel
 *.hip
 *_hip.*
+# Handwritten K3 HIP sources belong in version control.
+!python/sglang/kernels/ops/kimi_k3/mla_post_hip.py
+!python/sglang/kernels/ops/kimi_k3/csrc/mla_post_hip.cu
 .humanize/
 
 # Internal, non-published docs

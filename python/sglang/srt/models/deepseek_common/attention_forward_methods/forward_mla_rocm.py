@@ -10,6 +10,7 @@ The BMM absorb steps stay module level to keep ROCm kernel selection localized.
 from __future__ import annotations
 
 import logging
+from functools import cached_property
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -66,10 +67,13 @@ from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
-from sglang.srt.utils import BumpAllocator
+from sglang.srt.utils import BumpAllocator, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+_K3_FUSED_MLA_FRONT = get_bool_env_var("SGLANG_K3_FUSED_MLA_FRONT", "false")
+_K3_FUSED_MLA_POST = get_bool_env_var("SGLANG_K3_FUSED_MLA_POST", "false")
+
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -352,6 +356,31 @@ def _fused_rope_cat_and_cache(
 
 
 class DeepseekMLARocmForwardMixin:
+    @cached_property
+    def _k3_mla_front_op(self):
+        if not (_K3_FUSED_MLA_FRONT and _is_hcu) or self.q_lora_rank is None:
+            return None
+        from sglang.srt.layers.quantization.slimquant_w4a8 import (
+            SlimQuantW4A8Int8LinearMethod,
+        )
+
+        # The fusion produces the unsmoothed INT8 format used by this backend.
+        if not isinstance(self.q_b_proj.quant_method, SlimQuantW4A8Int8LinearMethod):
+            return None
+        try:
+            from lightop import mla_qkv_a_rms_norm_dynamic_per_token_quant_sglang
+        except ImportError:
+            logger.warning(
+                "LightOp MLA front fusion is unavailable; using separate norms"
+            )
+            return None
+        return mla_qkv_a_rms_norm_dynamic_per_token_quant_sglang
+
+    @cached_property
+    def _k3_mla_post_op(self):
+        from sglang.kernels.ops.kimi_k3.mla_post_hip import fused_mla_post
+
+        return fused_mla_post
 
     def forward_absorb_rocm_prepare(
         self: DeepseekV2AttentionMLA,
@@ -372,20 +401,49 @@ class DeepseekMLARocmForwardMixin:
             and self.q_b_proj_qrep_weight is not None
         )
         q_lora = None
+        q_input_quant_args = None
         topk_indices = None
         if self.q_lora_rank is not None:
-            q, latent_cache = (
-                get_attn_tp_context()
-                .fetch_qkv_latent()
-                .split(
-                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                    dim=-1,
-                )
+            # Keep the packed buffer to let HIPC read both norm inputs directly.
+            packed_qkv = get_attn_tp_context().fetch_qkv_latent()
+            q, latent_cache = packed_qkv.split(
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                dim=-1,
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
-            # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
+            # K3 decode/verify: packed norms + Q quant, preserving BF16 rounding.
+            use_k3_front = (
+                _K3_FUSED_MLA_FRONT
+                and _is_hcu
+                and self.rotary_emb is None
+                and not self.use_dsa
+                and not get_parallel().dcp_enabled
+                and self.alt_stream is None
+                and not q_replicate_active
+                and (self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim)
+                == (1536, 512, 64)
+                and packed_qkv.shape[0] > 0
+                and packed_qkv.dtype == torch.bfloat16
+                and self.q_a_layernorm.weight.dtype == packed_qkv.dtype
+                and self.kv_a_layernorm.weight.dtype == packed_qkv.dtype
+                and packed_qkv.is_contiguous()
+                and (
+                    forward_batch.forward_mode.is_decode_or_idle()
+                    or forward_batch.forward_mode.is_target_verify()
+                )
+                and self._k3_mla_front_op is not None
+            )
+            if use_k3_front:
+                q_input_quant_args = self._k3_mla_front_op(
+                    packed_qkv,
+                    self.q_a_layernorm.weight,
+                    self.kv_a_layernorm.weight,
+                    self.q_a_layernorm.variance_epsilon,
+                    self.kv_a_layernorm.variance_epsilon,
+                )
+
+            elif self.alt_stream is not None and get_is_capture_mode():
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
@@ -490,7 +548,12 @@ class DeepseekMLARocmForwardMixin:
                         self.qk_head_dim,
                     )
                 else:
-                    q = self.q_b_proj_forward(q)
+                    if q_input_quant_args is None:
+                        q = self.q_b_proj_forward(q)
+                    else:
+                        q = self.q_b_proj_forward(
+                            q, input_quant_args=q_input_quant_args
+                        )
 
                 if q_lora is not None:
                     if self.should_run_indexer(prev_topk_indices):
@@ -787,7 +850,31 @@ class DeepseekMLARocmForwardMixin:
                         ),
                     )
         else:
-            if self._skip_rope_for_aiter_fused_mla():
+            use_k3_post = (
+                _K3_FUSED_MLA_POST
+                and _is_hcu
+                and self.rotary_emb is None
+                and not self.use_dsa
+                and self.current_attention_backend == "hcu_mla"
+                and (self.kv_lora_rank, self.qk_rope_head_dim) == (512, 64)
+                and q_nope_out.dtype == torch.bfloat16
+                and not get_parallel().dcp_enabled
+                and llama_4_scaling is None
+                and (
+                    forward_batch.forward_mode.is_decode_or_idle()
+                    or forward_batch.forward_mode.is_target_verify()
+                )
+            )
+            if use_k3_post:
+                from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
+
+                pool = get_token_to_kv_pool()
+                cache = pool.get_key_buffer(self.attn_mqa.layer_id)
+                loc, _, _ = unwrap_write_loc(forward_batch.out_cache_loc)
+                q = self._k3_mla_post_op(q_nope_out, q_pe, k_nope, k_pe, cache, loc)
+                k = None
+                save_kv_cache = False
+            elif self._skip_rope_for_aiter_fused_mla():
                 q, _, _, k = _fused_rope_cat_and_cache(
                     self,
                     q_nope_out,
