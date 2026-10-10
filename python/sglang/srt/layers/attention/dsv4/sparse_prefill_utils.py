@@ -40,7 +40,11 @@ import torch
 import triton
 
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import DIM_NOPE, DIM_ROPE
-from sglang.srt.utils import ceil_align
+from sglang.srt.utils import ceil_align, get_bool_env_var, is_hcu
+
+_use_hcu_combine_topk_swa_indices = is_hcu() and get_bool_env_var(
+    "SGLANG_HCU_OPT_COMBINE_TOPK_SWA_INDICES", "true"
+)
 
 # FlashMLA sparse prefill asserts ``params.topk % B_TOPK == 0``. B_TOPK is 64
 # for the h_q=64 kernel and 128 for h_q=128; pad to 128 to satisfy both.
@@ -172,6 +176,25 @@ def combine_topk_swa_indices(
         assert out_lens.shape == (num_tokens,)
         assert out_lens.dtype == torch.int32
         combined_lens = out_lens
+
+    if _use_hcu_combine_topk_swa_indices:
+        from lightop import combine_topk_swa_indices_hcu
+
+        combine_topk_swa_indices_hcu(
+            topk_indices,
+            query_start_loc,
+            query_pos,
+            seq_lens,
+            gather_lens,
+            compressed_base,
+            swa_base,
+            combined_indices,
+            combined_lens,
+            window_size,
+            compress_ratio,
+            topk,
+        )
+        return combined_indices, combined_lens
 
     NUM_WORKERS = 128
     _combine_topk_swa_indices_kernel[(num_reqs, NUM_WORKERS)](
