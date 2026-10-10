@@ -37,7 +37,6 @@ class _Store:
         for name in (
             "batch_get_session_start_with_sources",
             "batch_get_session_prefetch",
-            "batch_get_session_refresh",
         ):
             if name not in missing:
                 setattr(self, name, lambda *args, **kwargs: None)
