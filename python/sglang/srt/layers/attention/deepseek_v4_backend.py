@@ -215,8 +215,7 @@ T = TypeVar("T", bound=Optional[torch.Tensor])
 def _should_use_sparse_prefill(q: torch.Tensor, forward_batch: ForwardBatch) -> bool:
     sparse_prefill_enabled = envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
     explicit_cp_override = (
-        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.is_set()
-        and sparse_prefill_enabled
+        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.is_set() and sparse_prefill_enabled
     )
     return (
         not _is_sm120
@@ -1277,9 +1276,7 @@ class DeepseekV4AttnBackend(
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
-        self._dsv4_bf16_flashmla_decode = (
-            envs.SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA.get()
-        )
+        self._dsv4_bf16_flashmla_decode = envs.SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA.get()
         self._dsv4_lightop_bf16_gather = (
             envs.SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER.get()
         )
@@ -2552,14 +2549,12 @@ class DeepseekV4AttnBackend(
         if is_cp_active(forward_batch):
             if _is_hcu:
                 assert forward_batch.extend_start_loc is not None
-                query_lens, real_query_lens, query_pos = (
-                    build_cp_sparse_query_metadata(
-                        extend_seq_lens=extend_seq_lens.to(torch.int32),
-                        extend_start_loc=forward_batch.extend_start_loc.to(torch.int32),
-                        query_positions=query_pos.to(torch.int32).contiguous(),
-                        cp_size=get_parallel().attn_cp_size,
-                        cp_rank=get_parallel().attn_cp_rank,
-                    )
+                query_lens, real_query_lens, query_pos = build_cp_sparse_query_metadata(
+                    extend_seq_lens=extend_seq_lens.to(torch.int32),
+                    extend_start_loc=forward_batch.extend_start_loc.to(torch.int32),
+                    query_positions=query_pos.to(torch.int32).contiguous(),
+                    cp_size=get_parallel().attn_cp_size,
+                    cp_rank=get_parallel().attn_cp_rank,
                 )
             else:
                 query_lens = torch.tensor(
@@ -3648,10 +3643,8 @@ class DeepseekV4AttnBackend(
             assert extra_indices is not None and extra_topk_lengths is not None
             assert extra_indices.ndim == 3 and extra_indices.shape[1] == 1
             assert extra_indices.shape[0] == num_queries
-            extra_gathered, extra_compact = (
-                self._get_dsv4_bf16_flashmla_workspace(
-                    "extra", num_queries, extra_topk
-                )
+            extra_gathered, extra_compact = self._get_dsv4_bf16_flashmla_workspace(
+                "extra", num_queries, extra_topk
             )
             extra_indices_2d = extra_indices[:, 0, :].contiguous()
             extra_lengths = extra_topk_lengths.reshape(-1).contiguous()
@@ -3859,8 +3852,7 @@ class DeepseekV4AttnBackend(
         # both P and D.  IDLE has no real queries and must not allocate a gather
         # workspace.
         use_bf16_gather = (
-            self._dsv4_bf16_flashmla_decode
-            and not logical_forward_mode.is_idle()
+            self._dsv4_bf16_flashmla_decode and not logical_forward_mode.is_idle()
         )
         if use_bf16_gather and swa_k_cache.dtype != torch.bfloat16:
             (
@@ -4294,6 +4286,7 @@ class DeepseekV4AttnBackend(
         # SWA + compressed regions directly into the workspace (no torch.cat).
         compressed_slice = None
         extra_k_cache = None
+        extra_k_layout = None
         extra_page_size = None
         flat_token_ids = None
         if compress_ratio == 0:
@@ -4304,6 +4297,7 @@ class DeepseekV4AttnBackend(
         else:
             extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
             extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
+            extra_k_layout = token_to_kv_pool.get_extra_key_layout(layer_id)
             flat_token_ids, combined_indices, combined_lens = cache.layer_inputs(
                 compress_ratio, core_attn_metadata, extra_page_size
             )
@@ -4314,14 +4308,13 @@ class DeepseekV4AttnBackend(
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
-        extra_k_layout = token_to_kv_pool.get_extra_key_layout(layer_id)
         swa_k_layout = token_to_kv_pool.get_swa_key_layout()
         # HCU LightOp reads the packed V4 page bytes directly; the V4.1 layouts
         # keep the generic dequantizer.
         if (
             _is_hcu
             and envs.SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED.get()
-            and extra_k_layout is KVLayout.V4
+            and (compressed_slice is None or extra_k_layout is KVLayout.V4)
             and swa_k_layout is KVLayout.V4
         ):
             from lightop.kvcache import dsv4_dequantize_k_cache_paged_out

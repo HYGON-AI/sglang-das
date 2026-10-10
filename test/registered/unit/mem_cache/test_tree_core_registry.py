@@ -142,6 +142,9 @@ class TreeCoreRegistryTest(CustomTestCase):
 
 class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
     def setUp(self):
+        hcu_patcher = mock.patch.object(tree_core_registry, "_is_hcu", False)
+        hcu_patcher.start()
+        self.addCleanup(hcu_patcher.stop)
         self._registry_snapshot = dict(_TREE_CORE_REGISTRY)
 
     def tearDown(self):
@@ -349,6 +352,9 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
 
 class TreeCoreDefaultCompatibilityTest(CustomTestCase):
     def setUp(self):
+        hcu_patcher = mock.patch.object(tree_core_registry, "_is_hcu", False)
+        hcu_patcher.start()
+        self.addCleanup(hcu_patcher.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.workspace = Path(temporary.name)
@@ -590,6 +596,41 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "extension load failed"):
                 create_tree_core("rust", _cache_init_params(), {})
         python_factory.assert_not_called()
+
+
+class HcuTreeCoreSelectionTest(CustomTestCase):
+    def test_default_uses_python_without_probing_rust(self):
+        with (
+            mock.patch.object(tree_core_registry, "_is_hcu", True),
+            mock.patch.dict(os.environ),
+            mock.patch.object(tree_core_registry, "_rust_fallback_reason") as probe,
+        ):
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
+            self.assertEqual(select_tree_core_backend(_cache_init_params()), "python")
+        probe.assert_not_called()
+
+    def test_explicit_selections_keep_the_upstream_policy(self):
+        with (
+            mock.patch.object(tree_core_registry, "_is_hcu", True),
+            mock.patch.object(
+                tree_core_registry, "_rust_fallback_reason", return_value=None
+            ),
+        ):
+            for backend in ("rust", "python", "custom_backend"):
+                with (
+                    self.subTest(backend=backend),
+                    envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend),
+                ):
+                    self.assertEqual(
+                        select_tree_core_backend(_cache_init_params()), backend
+                    )
+            with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python"):
+                self.assertEqual(
+                    select_tree_core_backend(
+                        _cache_init_params(tree_core_backend="rust")
+                    ),
+                    "rust",
+                )
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 The unified cache constructs its TreeCore through `create_tree_core`, selected
 by its per-cache override or SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND (default
-"rust"). Rust selections use centralized compatibility fallbacks. To plug in a
+"rust", or "python" on HCU). Rust selections use centralized compatibility fallbacks. To plug in a
 custom implementation, register it via `register_tree_core_backend(name, factory)`.
 """
 
@@ -20,6 +20,9 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.utils import is_hcu
+
+_is_hcu = is_hcu()
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -123,6 +126,14 @@ def resolve_tree_core_backend(name: str, params: CacheInitParams) -> str:
 
 def select_tree_core_backend(params: CacheInitParams) -> str:
     """Resolve the instance override or default through the shared fallback policy."""
+    if (
+        _is_hcu
+        and params.tree_core_backend is None
+        and not envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.is_set()
+    ):
+        # HCU installations omit optional Rust extensions and use the Python core.
+        # Keep explicit instance/env selections available for Rust validation.
+        return "python"
     name = (
         params.tree_core_backend
         if params.tree_core_backend is not None

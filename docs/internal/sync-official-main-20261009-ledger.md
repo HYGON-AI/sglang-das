@@ -8,7 +8,7 @@
 - main 中上次 squash `ab43824b09055fc790bd5a9166a6a6182b1bccc3` 与原同步分支 `aa99d6ac5b51dd350e3447c1d54ac6b3ab94e6df` 的 tree 均为 `e58ad2befa77376afd17e0b0fa54a4f800d0728b`。
 - 因 squash 丢失上游祖先，先建立 tree 不变的祖先锚点 `8dd84693716a91af59a57f7361fda4e033213422`，避免重放旧同步。
 - 官方目标：`438df9a2a4645d39c87e33c4a27792e568ac2701`，增量 657 commits。整体 merge 有 110 个冲突文件，已中止并按 first-parent 分段。
-- 验收：基础纯 TP8，`bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel`；候选环境 nmz26/nmz22/nmz107 的 `rye_sglang_latest`。最终精度通过前不推进 main。
+- 最终验收：用户 2026-10-10 指定 nmz28/latest，`bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-FP8-Channel/`，精度运行 `bash run-all-acc.sh /models/DeepSeek-V4-Flash-FP8-Channel 10015`；全量 HumanEval 两轮通过历史基线。原 0731 / GSM8K 流程已替换，历史状态保留在各段记录中。
 
 ## Step 01：前 100 笔
 
@@ -305,7 +305,7 @@
 
 功能验收范围为本次用户指定的 DSV4 纯 TP8；其他模型、PD、CP、MTP 只完成代码与静态审查。
 
-## 最终接口审查与验收状态
+## 2026-10-09 接口审查与历史验证过程
 
 - 实际分成六段：30 / 40 / 34 / 20 / 18 / 34 个初始冲突；110 文件的全量尝试已 abort，未进入提交。前两段提交标题中的 `/7` 为规划时标签，实际终点为第六段，完整覆盖冻结的 657 commits。
 - 导入 AST delta 为 0；全仓可静态解析的调用关键字 delta 为 0。补上 `with_packed_draft_layer_mapping(target_device_layer_num=...)`，映射尾部使用 device layer 数而非压缩后的 host layer 数；HCU GLM `ModelNextMLP` 迁至 `parallel_group`。
@@ -323,10 +323,30 @@
 - batch 1/32 的实际 HCU fallback kernel 通过 FP32 reference 比较（BF16 rtol=0.008、atol=0.02）；静态 compile/diff-check/Ruff 新增错误为 0。日志：`runtime-shared-act-test.log`；失败日志：`server-attempt3-shared-act.log`。
 - 修正后的全模型验收待运行；八卡资源检查两次阻止与其他任务并发启动，正在进行本轮短时资源等待。
 
-### 当前最终状态：资源阻塞，精度未验收
+### 2026-10-09 收尾状态：资源阻塞，精度未验收（历史）
 
 - 第四次实际启动在其他任务切换的短空档发起；权重加载前 free 从正常 135.9 GiB 降至 51.5 GiB，加载同样 41.81 GiB 权重后仅剩 9.7 GiB。`_profile_available_bytes` 按原 `mem_fraction_static=0.8` 拒绝 KV 分配，未更改参数或绕过该检查。
 - 失败证据：`server-attempt4-resource-race.log`；最后等待证据：`resource-wait.log`，门槛为八卡连续空闲 120 秒。nmz107 八卡持续约 132 GiB/卡占用，nmz26 仍有卡被其他服务占用，nmz22 持续切换模型而无稳定窗口。
 - 当前服务未就绪，无三次推理、GSM8K 或 graph replay 通过结论。最后 runtime 代码修正、测试及文档已暂存；按用户“精度 ok 后 commit”的要求，最终修正提交、main 快进和 milestone tag 均等待精度通过。六段 merge tip 仍为 `af3a1c4fbe9e3c57013174de718cb3bca661251f`。
 - 指定完整 TP8 命令、GSM8K100 的 32 并发/greedy/4096 token 配置已保存。需要稳定约 20 分钟八卡窗口，之后继续从当前暂存状态重跑，无需重做官方合并。
 - 私有运行脚本末尾的 tee pipeline 会掩盖服务非零退出（`server.exit` 可能为 0）；判定依据实际日志及 HTTP readiness，不能将该状态码作为成功证据。
+
+## 2026-10-10 最终验收：nmz28 TP8 / HumanEval validated
+
+前述 pending 和占卡记录描述合并各阶段的历史状态。本节为最新状态；六段冲突解决作为一个集成单元完成用户指定 DSV4 基础 TP8 验收，不扩展为其他模型或拓扑的运行验证。
+
+| 新发现 | 策略 / 保留的语义 | 验证与证据 |
+|---|---|---|
+| unified TreeCore 默认 Rust JIT 构建失败 | `_is_hcu` 且无实例/env显式选择时用 Python；显式 Rust/Python/custom 继续走官方 resolver | 35 tests / 46 subtests；attempt1 Cargo edition2024 失败日志与后续完整启动 |
+| GrammarManager 访问移除的 `scheduler.enable_dp_attention` | 使用已发布 `get_parallel().attn_dp_size > 1`；保留 attention CP grammar 同步，避免读取发布后已清空的旧 bool | 1 test / 2 subtests，TP8 与 attnDP2×CP4；attempt2 与成功服务 |
+| c0 prefill 查询不存在的 compressed pool layout | extra-key layout 仅在存在 compressed slice 时读取；HCU LightOp 条件支持纯 SWA | c0/c4 × LightOp on/off 四种实际入口 probe；attempt3 assertion 失败日志与两轮 HumanEval |
+| HumanEval 子进程在共享 NFS TMPDIR 清理失败 | 客户端 TMPDIR 改为 `/tmp/sglang-sync-20261009-humaneval`；评测脚本、数据、generation config 均未修改 | 第一轮 90.24%；第二轮 89.02%，退出 0 且无清理 traceback |
+| launcher 的 tee 掩盖服务退出 | 私有 launcher 添加 `set -o pipefail`；源码 Git 之外的修改已记录 | 后续失败 `server.exit=137`，验收同时依据 HTTP readiness / 日志 / audit |
+
+- nmz28/latest：Torch 2.11.0 / HIP 6.3.26113 / gfx938，SGLang 0.5.21 editable + HIP AOT，LightOp 0.6.0；八卡空闲真实显存 guard 后启动，未终止其他用户任务。
+- 原脚本 HumanEval 164 题 / batch64 / greedy / stream / max_tokens4096 / seed42 / review_timeout30，两轮 148/164 与 146/164；历史 146/164，配置与 164 题 metadata 逐项一致。API error、空输出、截断均 0。
+- 八个 TP rank graph capture 到 bs32，至少三次重复短请求；服务日志已有 19 次 graph decode，无当前 VMFault/worker exit/traceback。5583 个运行源码 hash 与工作区匹配。
+- 最新全仓静态编译、Ruff 新增 F821/F811/F722=0、diff-check 和冲突标记通过。前序 `02b0aedab168a7e623a5332f6e76af051199657d` 已提交的 host mapping / ModelNextMLP / FlashMLA / shared-clamp 修复保留。
+- 用户改以 HumanEval 验收；GSM8K100 0.97/0.93 的批量空输出与非默认 NaN 检查轮的 VMFault 原样保存为后续观察，未声明解决。最终服务未启用 NaN 检查或 logits sanitization；不修改采样、答案或准确率判定。
+- 详细运行报告：[deepseek-v4-nmz28-tp8-20261010.md](deepseek-v4-nmz28-tp8-20261010.md)；最终 verdict / 源码 hash / 两轮样本审计位于 `sync-evidence/20261009/runtime-nmz28/`。
+- 通过精度后在 nmz26/open 提交本轮修复与记录，按流程将 main 快进至 daily sync tip 并打 `dcu-main-sync-official-20261009` annotated tag；未 push。最终提交以该 tag 为准。

@@ -10,7 +10,7 @@
 | 官方增量 | `8b2ca8e..438df9a`，657 commits |
 | 同步分支 | `sync/official-main-daily-20261009` |
 | 工作/提交环境 | `/home/proj_sglang_open/sglang-das`，`zz-nmz26 | rye_sglang_open` |
-| 验证范围 | DeepSeek-V4-Flash-0731-FP8-Channel 基础纯 TP8；nmz26/nmz22/nmz107 的 `rye_sglang_latest` 均为候选 |
+| 验证范围 | 用户 2026-10-10 指定 nmz28/latest，DeepSeek-V4-Flash-FP8-Channel 基础纯 TP8 + 全量 HumanEval |
 
 上次历史文档 `sync-official-main-20260928-summary.md`、原同步分支祖先和 main squash 内容一致：main 的 `ab43824b09055fc790bd5a9166a6a6182b1bccc3` 与同步分支 tip `aa99d6ac5b51dd350e3447c1d54ac6b3ab94e6df` 的 tree 均为 `e58ad2befa77376afd17e0b0fa54a4f800d0728b`。因此本次先建立不改变代码 tree 的官方祖先锚点，再仅同步上述 657 笔增量。
 
@@ -75,32 +75,37 @@
 
 ## 验证结果
 
-截至 2026-10-09 下午，完整纯 TP8 精度门槛尚未通过；当前阻塞为缺少稳定八卡验证窗口。
+**2026-10-10：用户指定的 DeepSeek-V4 基础纯 TP8 / HumanEval 验收通过。** 验证环境为 `zz-nmz28 | rye_sglang_latest`；本次沿用已冻结的 `sync/official-main-daily-20261009`，未重新选择官方终点。
 
-代码审查及 657 笔官方增量合并已完成，候选分支为 `sync/official-main-daily-20261009`，六段 merge tip 为 `af3a1c4fbe9e3c57013174de718cb3bca661251f`。最后的调用接口修正、HCU runtime 分派修正与本记录暂存，按用户要求在精度通过后完成最终 commit。`main` 保持 `fb46d17ad9f633aa7fee521484262b0c26de560d`；尚未快进、打 milestone tag 或 push。
+```bash
+# 服务：/home/proj_sglang_open/scripts_local
+bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-FP8-Channel/
+# 精度：原 /home/scripts/acc_test/run-all-acc.sh，隔离输出目录中建立同名软链接
+bash run-all-acc.sh /models/DeepSeek-V4-Flash-FP8-Channel 10015
+```
 
-| 验证项 | 实际结果与证据 |
+| 检查 | 实际结果 |
 |---|---|
-| Python compile / diff-check / unresolved markers | 通过；新增 F821/F811/F722 为 0，对照冻结原 main 和官方终点；`sync-evidence/20261009/final-static/` |
-| 导入与调用接口审查 | 新增缺失导入为 0；可静态解析的函数/构造器调用无新增不支持的关键字参数。此项不能证明动态属性或运行正确性 |
-| Linear parallel groups、KVLocPlan、ResidualStream | nmz22/latest：50 passed，115 subtests passed |
-| retired runtime getter census | nmz22/latest：3 passed；代码、导入与文档残留已清理 |
-| DSA CLI / registry / env aliases | nmz22/latest：14 tests passed |
-| Hybrid host assembler | nmz22/latest：42 tests、18 subtests passed；mock 迁到 host class 选择工厂 |
-| HCU suite 注册 | 281 个文件，注册结构通过；这不是运行模型测试 |
-| HIP AOT 构建与安装 | nmz22/latest、nmz107/latest 完整离线 wheel 构建和 editable 安装通过，sglang `0.5.21`，`sglang.__file__` 均解析当前工作目录 |
-| 基础纯 TP8 / GSM8K100 / graph replay | **尚未通过**。nmz22 实际启动四次：首轮 rocBLAS module 临时加载失败；第二轮 FlashMLA `auto` 和第三轮 shared-expert MLP AMD helper 分派问题已修正并通过定向检查；第四轮在加载期间遭遇其他任务占卡，KV budget 拒绝分配。最后连续空闲等待也未取得稳定窗口。三次推理和 GSM8K 未运行 |
+| 全量 HumanEval 第一次 | **90.24%，148/164**；退出 0 |
+| 全量 HumanEval 本地 TMPDIR 复跑 | **89.02%，146/164**；退出 0，无 NFS 清理 traceback |
+| 同名模型历史对照 | 2026-09-11 报告为 **89.02%，146/164**；两轮的 164 题输入、测试、metadata 与 generation/dataset 配置均逐项相同 |
+| 输出审计 | 两轮均 164 条 prediction / review；API error、空输出、max_tokens 截断均为 0；全部 review status 为 success，错误题为生成代码未通过单测 |
+| 服务 / graph | 八卡 capture bs=1/2/4/8/12/16/24/32 全部完成；两轮各三次短请求正常，记录 19 次 graph decode；当前服务日志无 VMFault、NaN 检查报错、worker exit 或 traceback |
+| 运行代码一致性 | 5583 个 `python/sglang` 文件 SHA256 与实际启动快照一致；运行基点 `02b0aedab168a7e623a5332f6e76af051199657d` 加本轮三个源码修复 |
+| Python / Ruff / diff | 完整 compile 与相对原 main/官方终点新增 F821/F811/F722 检查通过，新增错误 0，冲突标记与 diff-check 通过 |
+| 本轮回归测试 | TreeCore：35 passed / 46 subtests；GrammarManager：1 passed / 2 subtests；实际 sparse-prefill 入口 c0/c4 × LightOp on/off 四种 probe 全通过 |
+| 前序接口测试 | Linear/KVLocPlan/ResidualStream 50 passed / 115 subtests；getter census 3 passed；DSA alias 14 passed；Hybrid host assembler 42 passed / 18 subtests |
+| HIP AOT / 安装 | nmz22、nmz107、nmz28 的 latest 容器构建安装完成；nmz28 SGLang 0.5.21 解析本工作目录 |
 
-指定命令保持为 `bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel`，使用 `/home/proj_sglang_open/scripts_local/run_dpsk-v4.sh`（官方 graph CLI 已改为 `--cuda-graph-max-bs-decode`）。nmz107 网卡映射为 `ens65f0np0`，其模型从 `/models/DeepSeek-V4-Flash-0731-FP8-Channel` 建立同名 `/module` 软链接；配置和权重索引 SHA256 与 nmz22 相同。
+本轮修复了 HCU 无 Rust 扩展时默认 TreeCore 触发 Cargo edition2024 构建、GrammarManager 引用已删除 Scheduler 字段，以及 DSV4 c0 sparse-prefill 错误读取不存在的压缩 KV pool 三个问题。HCU 特例用 `_is_hcu`，显式 TreeCore 配置与非 HCU 官方策略保持有效。完整命令、模型 SHA、失败过程、风险和证据见 [nmz28 调试与验收报告](deepseek-v4-nmz28-tp8-20261010.md)。
 
-实际启动日志保存在 `sync-evidence/20261009/runtime-nmz22/`：`server-attempt1-rocblas.log` 与 `server-attempt2-backend-auto.log`、`server-attempt3-shared-act.log`、`server-attempt4-resource-race.log`。第一轮权重加载成功后，gfx938 rocBLAS FP16 small GEMM 报 Tensile module not found；独立 FP16/BF16/FP32 GEMM 和八卡并发同一 init_cublas 均通过，第二轮未再出现该错误。第二轮进入最大 batch 32 的 decode graph capture 后，HCU debug FlashMLA adapter 拒绝官方新增默认 `auto`。在 `_is_hcu` 分支将 `auto` 解析为内部 `kernel`，保留显式 Torch 参考和非 HCU 选择；实际 adapter 定向验证通过。第三轮继续 graph capture 后，shared-expert 的 `DeepseekV2MLP` fallback 错用未初始化 gfx950 FP8 grid 的 AMD activation helper；将该 helper 与其初始化条件一样限制为非 HCU，HCU 走既有 JIT clamp kernel。batch 1/32 实际 HCU kernel 与 FP32 reference 的 BF16 容差检查通过（`runtime-shared-act-test.log`）。完整模型重跑、graph replay 与精度仍待完成，不能因接口 probe 通过就视为服务验收通过。
+用户将验收切换为 HumanEval，个别题错误允许存在。先前 GSM8K100 的 0.97/0.93 与批量空输出仍作为未解决观察记录；启用临时 `SGLANG_ENABLE_NAN_LOGITS_CHECK=1` 的诊断轮发生 VMFault，也没有获得首次 NaN 的有效定位，不能声明这些观察已修复。最终服务未启用该诊断开关，且两轮 HumanEval 均无空输出或服务异常。本轮不宣称 EP/DP/CP/PD/MTP、其他模型或全部长请求负载通过。
 
-2026-10-09 下午重新启动前资源复查：nmz22 另一个 DeepSeek-V3-0324-Channel-INT8 八卡服务已启动，每卡约 86 GiB；nmz107 的 V4.1 PD decode 八卡服务每卡约 132 GiB；nmz26 有多个服务占卡。其他验证任务会持续切换模型，显存 guard 已两次阻止启动。第四次实际启动虽在空闲时触发，但到权重加载前仅剩约 51.5 GiB（前三次约 135.9 GiB），权重占用仍为同样的 41.81 GiB，加载后只剩约 9.7 GiB，KV budget 拒绝分配。这是启动期间资源竞争的证据，不能通过提高 memory fraction 或绕过预算检查解决。随后要求八卡连续空闲两分钟、最多等待十分钟；没有取得稳定窗口，已停止本次自己的等待客户端。短时等待与显存证据保留在 evidence。容器内 hy-smi 曾显示 0%，但宿主机 KFD PID 和 `torch.cuda.mem_get_info()` 证实实际占用；因此启动必须同时检查真实 free/total memory，不能只凭该面板。未终止任何其他任务，已停止本次自己的无服务等待客户端。
+原 0731 模型验收已被用户最新指令替换；当前 `/module` 与 `/models` 下同名模型 config / weight index SHA256 完全一致，但与原 0731 checkpoint 不同，不能把新模型分数直接与旧模型的 GSM8K 0.98/0.99 比较。2026-10-09 nmz22/nmz107 的占卡阻塞属于历史过程，已由本次 nmz28 完整验收接续。
 
-open 容器的拓展模型单测初次失败来自旧版 LightOp 缺少 `fuse_situ_mul_quant_contiguous`，同一套代码在 latest 环境通过；这属于容器依赖差异，不能据此改写 SITU 算子语义。组件/模型运行范围仍以用户指定的 DSV4 纯 TP8 为准；PD、CP、MTP、GLM、HYV3 等仅完成静态迁移。
+六段 merge 完整覆盖 657 个官方增量，tip 为 `af3a1c4fbe9e3c57013174de718cb3bca661251f`；前序接口修复已进入 `02b0aedab168a7e623a5332f6e76af051199657d`。本轮修复与文档在指定 `zz-nmz26 | rye_sglang_open` 提交，随后按 daily sync 流程快进 `main` 并建立 annotated tag `dcu-main-sync-official-20261009`；最终精确提交由该 tag 解析。未 push。
 
-精度流程沿用历史基线：GSM8K 前 100 题、32 并发、greedy、4096 token，客户端在 nmz26/open（evalscope 1.10.0）；上轮为 0.98，复跑 0.99。待获得约 20 分钟的稳定八卡窗口后启动、排障、验证至少三次 graph replay，再记录实际分数、错误样本与完整日志并提交。
-
+证据根目录：`/home/proj_sglang_open/sync-evidence/20261009/runtime-nmz28/`；最终审计为 `humaneval-final-verdict.json`，完整样本、报告、日志均保留。
 
 ## 精确官方增量提交索引
 

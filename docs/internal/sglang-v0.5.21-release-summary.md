@@ -87,6 +87,12 @@
 
 本次按用户要求只运行 DeepSeek-V4-Flash 基础纯 TP 验证，不能据此宣布全部 release 模型或 PD/CP/EP/MTP 特性已经在 HCU 通过。
 
+## 本次 HCU 集成验证（2026-10-10）
+
+本次同步到的是官方 main `438df9a2a4645d39c87e33c4a27792e568ac2701`，不是 release tag 的直接 merge。nmz28/latest 的 DeepSeek-V4-Flash-FP8-Channel 基础 TP8 服务、bs32 graph capture 与全量 HumanEval 已验收：90.24% / 89.02%，同名模型历史为 89.02%。仅验证该模型和拓扑，不能推断表中其他模型、PD/MTP 或组件全部通过运行验证。
+
+release 中的默认 Rust TreeCore 在本 HCU 安装（不带 Rust 扩展，Cargo1.75）无法 JIT edition2024；集成修复仅将无显式配置的 `_is_hcu` 默认设为 Python，保留显式配置与官方其他平台策略。另修复 Scheduler 并行字段迁移和 DSV4 c0 sparse-prefill layout contract。详见 [nmz28 调试与验收报告](deepseek-v4-nmz28-tp8-20261010.md)及 [daily sync 总结](sync-official-main-20261009-summary.md)。
+
 ## 完整版本提交索引
 
 下列索引精确覆盖 `v0.5.20..v0.5.21` 的 784 个 Git 提交对象（前者为 `94602c9c2b7cbdb8efd5c52802dac6a1c180089e`，后者为 `e00930c5489053f26d86b179cee0d087f846acbb`），按 Git log 拓扑顺序列出；该数值与 release 页面 779 PR 统计口径不同。索引用于覆盖性核对，官方模型、组件分类与性能口径见上述总结及[官方 release](https://github.com/sgl-project/sglang/releases/tag/v0.5.21)。
