@@ -1,0 +1,43 @@
+name: Cookbook deployment smoke
+
+on:
+  schedule:
+    - cron: "30 18 * * *" # 02:30 Asia/Shanghai daily
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: First run preflight; then execute
+        type: choice
+        options: [preflight, execute]
+        default: preflight
+      cases:
+        description: Exact cookbook section; empty tests all single-host deployments
+        type: string
+        default: qwen3-8b-ifb-bw1100-1x-sglang-0518
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cookbook-deployment-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, nmz4]
+    timeout-minutes: 840
+    steps:
+      - name: Checkout private test controller
+        uses: actions/checkout@v4
+        with:
+          repository: guochenyang99/ci-model-test
+          # The maintained main branch supplies all test behavior.
+          ref: main
+          token: ${{ secrets.MODEL_SMOKE_REPO_TOKEN }}
+          persist-credentials: false
+          path: model-ci
+      - name: Invoke maintained test controller
+        uses: ./model-ci/.github/actions/deployment-smoke
+        with:
+          cases: ${{ inputs.cases || '' }}
+          mode: ${{ inputs.mode || 'execute' }}

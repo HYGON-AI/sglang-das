@@ -1,8 +1,8 @@
 name: Nightly Test (HCU)
 
 on:
-  schedule:
-    - cron: "30 18 * * *" # 02:30 Beijing Time daily
+  # Automatic model testing moved to cookbook-deployment-smoke.yml.
+  # Keep this legacy workflow available for manual diagnosis.
   workflow_dispatch:
     inputs:
       ref:
