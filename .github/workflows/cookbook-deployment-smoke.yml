@@ -24,11 +24,7 @@ concurrency:
 
 jobs:
   smoke:
-    # Explicitly enable after confirming BW1100 hardware and configuring secrets/vars.
-    if: >-
-      vars.MODEL_SMOKE_ENABLED == 'true' &&
-      (github.event_name != 'schedule' || vars.MODEL_SMOKE_NIGHTLY_ENABLED == 'true')
-    runs-on: [self-hosted, "${{ vars.MODEL_SMOKE_RUNNER_LABEL || 'nmz4' }}"]
+    runs-on: [self-hosted, nmz4]
     timeout-minutes: 840
     steps:
       - name: Checkout private test controller
@@ -43,6 +39,5 @@ jobs:
       - name: Invoke maintained test controller
         uses: ./model-ci/.github/actions/deployment-smoke
         with:
-          host-config: ${{ vars.MODEL_SMOKE_HOST_CONFIG }}
           cases: ${{ inputs.cases || '' }}
           mode: ${{ inputs.mode || 'execute' }}
