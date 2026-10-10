@@ -493,6 +493,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
         elif (
             self.use_hcu_fp8_w8a8_moe
+            # The DeepGEMM branch below owns its weight layout.  Applying the
+            # LightOp Marlin transform first loses the logical [E, N, K] shape
+            # and then makes DeepGEMM pack an already-packed tensor again.
+            and not get_moe_runner_backend().is_deep_gemm()
             and _is_hcu
             and not getattr(layer, "_w8a8_fp8_packed", False)
         ):
