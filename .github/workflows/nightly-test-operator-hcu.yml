@@ -52,7 +52,13 @@ jobs:
 
       - name: 运行 optest
         timeout-minutes: 360
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
         run: |
+          if [ -z "${GITLAB_TOKEN}" ]; then
+            echo "::error::GITLAB_TOKEN 为空, 检查组织 secret 的可见性, 以及调用方是否 secrets: inherit"
+            exit 1
+          fi
           optest --op_name all --test_mode all
 
       - name: 汇总算子结果
