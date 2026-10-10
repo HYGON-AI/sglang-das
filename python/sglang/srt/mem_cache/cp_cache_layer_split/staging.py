@@ -33,15 +33,51 @@ def all_reduce_active_pages_mask(local_mask: torch.Tensor, pynccl_comm) -> torch
     return local_mask
 
 
+def contiguous_request_page_capacity(
+    total_tokens: int, num_reqs: int, page_size: int, max_pages: int
+) -> int:
+    """Bound pages touched by per-request contiguous token spans.
+
+    A span can touch at most ceil(length / page_size) + 1 pages. Summing across
+    requests is bounded by ceil(total_tokens / page_size) + 2 * num_reqs; the
+    extra per-request allowance also covers padded entries mapped to page 0.
+    """
+    if total_tokens == 0:
+        return min(max_pages, 1)
+    return min(
+        max_pages,
+        (total_tokens + page_size - 1) // page_size + 2 * num_reqs,
+    )
+
+
 @torch.compile(dynamic=True)
 def remap_indices_to_staging(
     indices: torch.Tensor,
     selected_pages: torch.Tensor,
     page_size: int,
     max_pages: int,
+    static_selected_pages: bool = False,
 ) -> torch.Tensor:
-    page_map = torch.full((max_pages,), -1, dtype=torch.int32, device=indices.device)
-    page_map[selected_pages.to(torch.long)] = torch.arange(
+    if static_selected_pages:
+        selected_valid = selected_pages >= 0
+        selected_slots = torch.where(
+            selected_valid,
+            selected_pages.to(torch.long),
+            max_pages
+            + torch.arange(
+                selected_pages.numel(), dtype=torch.long, device=indices.device
+            ),
+        )
+        page_map = torch.full(
+            (max_pages + selected_pages.numel(),),
+            -1,
+            dtype=torch.int32,
+            device=indices.device,
+        )
+    else:
+        selected_slots = selected_pages.to(torch.long)
+        page_map = torch.full((max_pages,), -1, dtype=torch.int32, device=indices.device)
+    page_map[selected_slots] = torch.arange(
         selected_pages.numel(), dtype=torch.int32, device=indices.device
     )
 
@@ -76,12 +112,16 @@ def active_pages_for_indices(
     page_size: int,
     max_pages: int,
     pynccl_comm,
+    static_size: Optional[int] = None,
 ) -> torch.Tensor:
     """Select pages touched by any CP rank; all ranks must call in the same order."""
     local_mask = build_active_pages_mask(indices, page_size, max_pages)
     local_mask = all_reduce_active_pages_mask(local_mask, pynccl_comm)
-    # TODO: replace torch.nonzero with bounded GPU compaction to avoid a
-    # dynamic-shape CUDA synchronization in this hot read path.
+    if static_size is not None:
+        return torch.nonzero_static(
+            local_mask, size=static_size, fill_value=-1
+        ).flatten()
+    # Dynamic output size causes a device-to-host synchronization on HCU.
     return torch.nonzero(local_mask, as_tuple=False).flatten()
 
 
