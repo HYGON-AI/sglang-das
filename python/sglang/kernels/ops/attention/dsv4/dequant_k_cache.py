@@ -21,8 +21,12 @@ import triton.language as tl
 from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.utils import get_bool_env_var, is_hcu
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+_use_hcu_dequant_k_cache_paged = is_hcu() and get_bool_env_var(
+    "SGLANG_HCU_OPT_DEQUANT_K_CACHE_PAGED", "true"
+)
 
 # v4 KV cache layout (see dsv4.index_buf_accessor._set_k_and_s_triton_kernel):
 #   per-token: 448 fp8 nope + 64 bf16 rope (= 576 contiguous bytes) +
@@ -87,6 +91,18 @@ def dequantize_k_cache_paged(
     else:
         assert out.shape == (num_tokens, 1, DIM_NOPE + DIM_ROPE)
         assert out.dtype == torch.bfloat16
+
+    if _use_hcu_dequant_k_cache_paged:
+        from lightop import dequantize_k_cache_paged_hcu
+
+        dequantize_k_cache_paged_hcu(
+            quant_k_cache_u8,
+            page_table_1_flattened,
+            out,
+            page_size,
+            fp8_dtype == torch.float8_e4m3fnuz,
+        )
+        return out
 
     _dequantize_k_cache_paged_kernel[(num_tokens,)](
         out,
