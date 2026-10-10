@@ -1160,7 +1160,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Seconds to wait for the CUDA coredump to finish before exiting.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Seconds to allow CUDA coredumps to finish after a successful trigger. Fatal shutdown adds this duration once to both its 20-second diagnostic budget and 30-second exit fallback (80/90 seconds with the default). No successful trigger means no extra wait. This delay does not verify that the dump file is complete.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>60.0</code></td>
     </tr>
   </tbody>
