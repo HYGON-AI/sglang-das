@@ -105,7 +105,11 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     is_moe_input_scattered_across_dp_ranks,
 )
-from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
+from sglang.srt.layers.moe.utils import (
+    get_deepep_mode,
+    get_moe_a2a_backend,
+    has_per_rank_fused_shared_slots,
+)
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -366,6 +370,54 @@ if _use_lightop_sqrtsoftplus_v41_gate:
         op_func=moe_fused_gate_sqrtsoftplus_v41_hcu,
         mutates_args=[],
         fake_impl=moe_fused_gate_sqrtsoftplus_fake,
+    )
+
+
+_use_lightop_moe_gate_pad_int64_fusion = (
+    _use_lightop_sqrtsoftplus_v41_gate
+    and get_bool_env_var("SGLANG_USE_LIGHTOP_MOE_GATE_PAD_INT64_FUSION", "false")
+    and hasattr(op, "moe_fused_gate_sqrtsoftplus_v41_hcu_fused")
+)
+
+if _use_lightop_moe_gate_pad_int64_fusion:
+
+    def moe_fused_gate_sqrtsoftplus_v41_hcu_fused(
+        gating_output: torch.Tensor,
+        correction_bias: torch.Tensor,
+        topk: int,
+        num_fused_shared_experts: int,
+        renormalize: bool,
+        routed_scaling_factor: float,
+        apply_routed_scaling_factor_on_output: bool,
+        num_token_non_padded: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return op.moe_fused_gate_sqrtsoftplus_v41_hcu_fused(
+            gating_output, correction_bias, topk, num_fused_shared_experts,
+            renormalize, routed_scaling_factor,
+            apply_routed_scaling_factor_on_output, num_token_non_padded,
+        )
+
+    def moe_fused_gate_sqrtsoftplus_v41_hcu_fused_fake(
+        gating_output: torch.Tensor,
+        correction_bias: torch.Tensor,
+        topk: int,
+        num_fused_shared_experts: int,
+        renormalize: bool,
+        routed_scaling_factor: float,
+        apply_routed_scaling_factor_on_output: bool,
+        num_token_non_padded: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        shape = (gating_output.size(0), topk)
+        return (
+            torch.empty(shape, dtype=torch.float32, device=gating_output.device),
+            torch.empty(shape, dtype=torch.int64, device=gating_output.device),
+        )
+
+    direct_register_custom_op(
+        op_name="moe_fused_gate_sqrtsoftplus_v41_hcu_fused",
+        op_func=moe_fused_gate_sqrtsoftplus_v41_hcu_fused,
+        mutates_args=[],
+        fake_impl=moe_fused_gate_sqrtsoftplus_v41_hcu_fused_fake,
     )
 
 
@@ -1642,6 +1694,28 @@ def _can_use_lightop_sqrtsoftplus_gate(
     )
 
 
+def _can_use_lightop_moe_gate_pad_int64_fusion(
+    gating_output: torch.Tensor,
+    topk: int,
+    num_fused_shared_experts: int,
+    routing_overridden: bool,
+) -> bool:
+    # Called only after the existing lightop V4.1 gate eligibility check.
+    # Tensor arguments are validated by the lightop operator entry point.
+    return (
+        _use_lightop_moe_gate_pad_int64_fusion
+        and not _use_aiter
+        and not _skip_hip_pad_mask
+        and get_moe_a2a_backend().is_deepep()
+        and get_deepep_mode().is_low_latency()
+        and num_fused_shared_experts == 0
+        and topk == 6
+        and gating_output.size(1) == 384
+        and not routing_overridden
+        and not _eplb_remap_enabled()
+    )
+
+
 def biased_topk_lightop_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -2584,7 +2658,7 @@ def _post_process_topk_ids(
             and use_per_rank_shared_slots
             and not _eplb_remap_enabled()
         )
-        if not _fold_pad_into_append:
+        if not _fold_pad_into_append and not padded_rows_masked:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
@@ -2693,7 +2767,7 @@ def _post_process_topk_ids(
             fused_shared_experts_scaling_factor
         )
 
-    if _is_hip and not _skip_hip_pad_mask:
+    if _is_hip and not _skip_hip_pad_mask and not padded_rows_masked:
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.
@@ -2871,9 +2945,7 @@ def select_experts(
             if topk_config.sqrtsoftplus_log1p:
                 _packed_kwargs["sqrtsoftplus_log1p"] = True
 
-            if _is_xpu:
-                _biased_topk = biased_topk_xpu
-            elif (
+            use_lightop_gate = (
                 scoring_func == "sqrtsoftplus"
                 and "packed_out" not in _packed_kwargs
                 and _can_use_lightop_sqrtsoftplus_gate(
@@ -2884,7 +2956,18 @@ def select_experts(
                     routed_scaling_factor,
                     topk_config.sqrtsoftplus_log1p,
                 )
-            ):
+            )
+            use_lightop_pad_int64_fusion = (
+                use_lightop_gate
+                and topk_config.sqrtsoftplus_log1p
+                and _can_use_lightop_moe_gate_pad_int64_fusion(
+                    router_logits, top_k, num_fused_shared_experts,
+                    routing_overridden,
+                )
+            )
+            if _is_xpu:
+                _biased_topk = biased_topk_xpu
+            elif use_lightop_gate:
                 _biased_topk = biased_topk_lightop_impl
             else:
                 _biased_topk = (
@@ -2892,21 +2975,34 @@ def select_experts(
                     if use_jit_fused_gate or _packed_kwargs
                     else biased_topk_impl
                 )
-            topk_weights, topk_ids = _biased_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                correction_bias=correction_bias,
-                topk=num_routed_topk if _use_aiter else top_k,
-                renormalize=renormalize,
-                scoring_func=scoring_func,
-                num_fused_shared_experts=num_fused_shared_experts_for_gate,
-                routed_scaling_factor=routed_scaling_factor,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=expert_location_dispatch_info,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-                **_packed_kwargs,
+            if use_lightop_pad_int64_fusion:
+                topk_weights, topk_ids = (
+                    torch.ops.sglang.moe_fused_gate_sqrtsoftplus_v41_hcu_fused(
+                        router_logits, correction_bias, top_k, 0, renormalize,
+                        routed_scaling_factor,
+                        bool(apply_routed_scaling_factor_on_output),
+                        num_token_non_padded,
+                    )
+                )
+            else:
+                topk_weights, topk_ids = _biased_topk(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    correction_bias=correction_bias,
+                    topk=num_routed_topk if _use_aiter else top_k,
+                    renormalize=renormalize,
+                    scoring_func=scoring_func,
+                    num_fused_shared_experts=num_fused_shared_experts_for_gate,
+                    routed_scaling_factor=routed_scaling_factor,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=expert_location_dispatch_info,
+                    apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                    **_packed_kwargs,
+                )
+            padded_rows_masked = (
+                use_lightop_pad_int64_fusion
+                or _fused_gate_masks_padded_rows(scoring_func)
             )
-            padded_rows_masked = _fused_gate_masks_padded_rows(scoring_func)
         elif (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
             and scoring_func == "softmax"
