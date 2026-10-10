@@ -24,7 +24,7 @@ from sglang.test.ci.ci_register import (
 from sglang.test.test_utils import publish_build_topology
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="2-gpu-large")
-register_xpu_ci(est_time=60, suite="nightly-xpu-2-gpu", nightly=True)
+register_xpu_ci(est_time=60, suite="nightly-xpu-kernel-main-2-gpu", nightly=True)
 
 # HCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
 register_hcu_ci(

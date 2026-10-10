@@ -28,7 +28,7 @@ from sglang.srt.layers.attention.qsa.qsa_indexer import _qsa_prefill_row_chunk_s
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
-from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 
 logger = logging.getLogger(__name__)
 

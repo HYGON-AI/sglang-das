@@ -22,6 +22,7 @@ import triton.language as tl
 from lightop.moe import get_moe_cuda_marlin_config_w16a16, moe_gemm_marlin_w16a16
 
 from sglang.srt.layers import zero_copy_context
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import direct_register_custom_op, is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -30,7 +31,10 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
-    from sglang.kernels.ops.activation.activation import silu_and_mul
+    from sglang.kernels.ops.activation.activation import (
+        silu_and_mul,
+        silu_and_mul_with_activation_rounding,
+    )
     from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
 
 from lightop import moe as op
@@ -134,6 +138,17 @@ def swiglu_limit_func(
     swiglu_limit: float = 0.0,
 ) -> None:
     d = input.shape[1] // 2
+    if (
+        _is_cuda
+        and get_platform().is_sm90
+        and input.is_cuda
+        and input.dtype in (torch.bfloat16, torch.float16)
+        and d % 16 == 0
+        and input.is_contiguous()
+        and output.is_contiguous()
+    ):
+        silu_and_mul_with_activation_rounding(input, output, clamp_limit=swiglu_limit)
+        return
     gate = input[:, :d]
     up = input[:, d:]
 

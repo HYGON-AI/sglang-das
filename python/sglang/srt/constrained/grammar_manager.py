@@ -90,7 +90,7 @@ class GrammarManager:
         # With DP attention, dp_tp_group contains only attention-TP ranks.
         # CP ranks share requests too and must admit compiled grammars together.
         self.grammar_cp_sync_size = (
-            get_parallel().attn_cp_size if scheduler.enable_dp_attention else 1
+            get_parallel().attn_cp_size if get_parallel().attn_dp_size > 1 else 1
         )
         self.pp_rank = get_parallel().pp_rank
         self.pp_size = get_parallel().pp_size

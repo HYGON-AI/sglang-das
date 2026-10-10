@@ -38,6 +38,10 @@ from sglang.srt.configs.interns2_mobius import (
     InternS2MobiusVisionConfig,
 )
 from sglang.srt.configs.interns2preview import InternS2PreviewConfig
+from sglang.srt.configs.iquest_q1 import (
+    IQuestQ1Config,
+    IQuestQ1MTPConfig,
+)
 from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
 from sglang.srt.configs.jet_vlm import JetVLMConfig
@@ -132,6 +136,8 @@ __all__ = [
     "Qwen3_5TextConfig",
     "Qwen3_5MoeTextConfig",
     "InternS2PreviewConfig",
+    "IQuestQ1Config",
+    "IQuestQ1MTPConfig",
     "InternS2MobiusConfig",
     "InternS2MobiusTextConfig",
     "InternS2MobiusVisionConfig",
