@@ -80,14 +80,8 @@ jobs:
         if: always()
         run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true
 
-  # 镜像推送成功后串行运行 nightly 测试, 把本次构建的具体镜像名传给测试 workflow
-  test-image:
-    needs: build
-    uses: ./.github/workflows/nightly-test-image-hcu.yml
-    with:
-      docker_image: ${{ needs.build.outputs.docker_image }}
-    secrets: inherit
-
+  # Model deployment checks are scheduled independently by cookbook-deployment-smoke.yml.
+  # Keep the image build and operator tests here.
   test-operator:
     needs: build
     uses: ./.github/workflows/nightly-test-operator-hcu.yml
