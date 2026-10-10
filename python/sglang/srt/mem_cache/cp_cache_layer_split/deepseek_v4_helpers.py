@@ -47,6 +47,7 @@ def maybe_prefetch_cp_kv_swa(pool, layer_id: int, forward_batch=None) -> None:
             layer_id,
             _get_core_attn_metadata().swa_page_indices,
             read_indices=cache.swa_token_ids if cache is not None else None,
+            num_reqs=cache.num_reqs if cache is not None else None,
         )
 
 
@@ -73,4 +74,5 @@ def maybe_prefetch_cp_kv_extra(pool, layer_id: int, forward_batch=None) -> None:
                 layer_id,
                 core.sparse_page_indices(ratio),
                 read_indices=read_indices,
+                num_reqs=cache.num_reqs if cache is not None else None,
             )

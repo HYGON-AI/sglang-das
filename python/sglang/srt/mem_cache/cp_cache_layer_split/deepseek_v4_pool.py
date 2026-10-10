@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
+from sglang.srt.utils import get_bool_env_var, is_hcu
 
 from sglang.srt.mem_cache.cp_cache_layer_split.broadcast import (
     BroadcastSlots,
@@ -22,6 +23,7 @@ from sglang.srt.mem_cache.cp_cache_layer_split.pool_base import (
 from sglang.srt.mem_cache.cp_cache_layer_split.staging import (
     StagingBufferManager,
     active_pages_for_indices,
+    contiguous_request_page_capacity,
     remap_indices_to_staging,
     remap_page_table_to_staging,
 )
@@ -42,6 +44,9 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 
 logger = logging.getLogger(__name__)
 
+_USE_STATIC_CP_LAYER_SPLIT_PAGES = is_hcu() and get_bool_env_var(
+    "SGLANG_HCU_OPT_LAYERSPLIT_STATIC_PAGES", default="true"
+)
 
 @dataclass
 class _BatchActivePages:
@@ -49,6 +54,7 @@ class _BatchActivePages:
 
     selected_pages: Optional[torch.Tensor] = None
     remapped: Optional[torch.Tensor] = None
+    static_selected_pages: bool = False
 
 
 class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
@@ -368,9 +374,10 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         indices: torch.Tensor,
         page_size: int,
         max_pages: int,
+        static_size: Optional[int] = None,
     ) -> torch.Tensor:
         return active_pages_for_indices(
-            indices, page_size, max_pages, get_pynccl_broadcast_comm()
+            indices, page_size, max_pages, get_pynccl_broadcast_comm(), static_size
         )
 
     def _compact_broadcast_for_read(
@@ -384,6 +391,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         max_pages: int,
         broadcast_kind: str,
         remap_indices: bool = True,
+        selected_pages_static: bool = False,
     ) -> torch.Tensor:
         """Broadcast owner's compact active pages and optionally remap indices."""
         if selected_pages.numel() > staging.shape[0]:
@@ -410,7 +418,10 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         if self.cp_rank == owner_cp:
             assert source is not None
             if active_pages > 0:
-                staging[:active_pages].copy_(source[selected_pages.to(torch.long)])
+                copy_pages = selected_pages
+                if selected_pages_static:
+                    copy_pages = selected_pages.clamp_min(0)
+                staging[:active_pages].copy_(source[copy_pages.to(torch.long)])
             else:
                 staging[:1].copy_(source[:1])
 
@@ -494,6 +505,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         for cache in self._batch_active_pages.values():
             cache.selected_pages = None
             cache.remapped = None
+            cache.static_selected_pages = False
 
     def _clear_swa_read_state(self) -> None:
         self._swa_remapped_indices: Optional[torch.Tensor] = None
@@ -563,6 +575,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         layer_id: int,
         indices: torch.Tensor,
         read_indices: Optional[torch.Tensor] = None,
+        num_reqs: Optional[int] = None,
     ) -> None:
         """Start current-layer SWA page broadcast; caller waits before attention."""
         self.wait_layer_transfer(layer_id)
@@ -571,13 +584,29 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         page_size = self.swa_kv_pool.page_size
         swa_cache = self._batch_active_pages["swa"]
         if swa_cache.selected_pages is None:
+            static_size = None
+            if (
+                _USE_STATIC_CP_LAYER_SPLIT_PAGES
+                and read_indices is not None
+                and num_reqs is not None
+                and getattr(self, "request_window", None) is None
+            ):
+                static_size = contiguous_request_page_capacity(
+                    read_indices.numel(), num_reqs, page_size, max_pages
+                )
+            swa_cache.static_selected_pages = static_size is not None
             swa_cache.selected_pages = self._active_pages_for_indices(
                 read_indices if read_indices is not None else indices,
                 page_size,
                 max_pages,
+                static_size,
             )
             swa_cache.remapped = remap_indices_to_staging(
-                indices, swa_cache.selected_pages, page_size, max_pages
+                indices,
+                swa_cache.selected_pages,
+                page_size,
+                max_pages,
+                static_selected_pages=swa_cache.static_selected_pages,
             )
         selected_pages = swa_cache.selected_pages
         staging = self._get_staging_buffer("swa")
@@ -595,6 +624,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             max_pages,
             broadcast_kind="swa",
             remap_indices=False,
+            selected_pages_static=swa_cache.static_selected_pages,
         )
         self._swa_remapped_indices = swa_cache.remapped
         self._swa_remapped_layer_id = layer_id
@@ -752,6 +782,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         layer_id: int,
         indices: torch.Tensor,
         read_indices: Optional[torch.Tensor] = None,
+        num_reqs: Optional[int] = None,
     ) -> None:
         """Fetch all pages read by attention or sparse-prefill dequantization."""
         ratio = self.compression_ratios[layer_id]
@@ -761,14 +792,25 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         pool = self.kv_pools[ratio]
         assert pool is not None
         max_pages = self._pool_num_pages(pool)
+        static_size = None
+        if (
+            _USE_STATIC_CP_LAYER_SPLIT_PAGES
+            and read_indices is not None
+            and num_reqs is not None
+            and getattr(self, "request_window", None) is None
+        ):
+            static_size = contiguous_request_page_capacity(
+                read_indices.numel(), num_reqs, pool.page_size, max_pages
+            )
         selected_pages = self._active_pages_for_indices(
             read_indices if read_indices is not None else indices,
             pool.page_size,
             max_pages,
+            static_size,
         )
-        self._batch_active_pages[self._extra_family_name(ratio)].selected_pages = (
-            selected_pages
-        )
+        selected_cache = self._batch_active_pages[self._extra_family_name(ratio)]
+        selected_cache.selected_pages = selected_pages
+        selected_cache.static_selected_pages = static_size is not None
         staging = self._get_staging_buffer(self._extra_family_name(ratio))
         source = self.source_layer_of(layer_id)
         owner_buf = None
@@ -784,10 +826,15 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             max_pages,
             broadcast_kind="extra",
             remap_indices=False,
+            selected_pages_static=selected_cache.static_selected_pages,
         )
         self._extra_staging_layer_id = layer_id
         self._extra_remapped_indices = remap_indices_to_staging(
-            indices, selected_pages, pool.page_size, max_pages
+            indices,
+            selected_pages,
+            pool.page_size,
+            max_pages,
+            static_selected_pages=selected_cache.static_selected_pages,
         )
         self._extra_remapped_layer_id = layer_id
 
@@ -910,7 +957,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         if family == "swa":
             assert self._swa_remapped_layer_id == layer_id
             pool = self.swa_kv_pool
-            selected = self._batch_active_pages["swa"].selected_pages
+            selected_cache = self._batch_active_pages["swa"]
         else:
             assert self._extra_staging_layer_id == layer_id
             ratio = self.compression_ratios[layer_id]
@@ -918,10 +965,15 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             key = (
                 "extra_c4_page_table" if ratio == 4 else self._extra_family_name(ratio)
             )
-            selected = self._batch_active_pages[key].selected_pages
+            selected_cache = self._batch_active_pages[key]
+        selected = selected_cache.selected_pages
         assert selected is not None
         return remap_indices_to_staging(
-            indices, selected, pool.page_size, self._pool_num_pages(pool)
+            indices,
+            selected,
+            pool.page_size,
+            self._pool_num_pages(pool),
+            static_selected_pages=selected_cache.static_selected_pages,
         )
 
     def set_swa_key_buffer(
