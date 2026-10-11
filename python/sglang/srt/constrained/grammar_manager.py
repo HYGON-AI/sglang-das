@@ -45,10 +45,22 @@ class GrammarManager:
             else False
         )
 
-        self.grammar_sync_group = scheduler.dp_tp_cpu_group
-        self.grammar_sync_size = scheduler.dp_tp_group.world_size
-        self.grammar_sync_entry = scheduler.dp_tp_group.first_rank
-        self.is_grammar_sync_entry = scheduler.dp_tp_group.is_first_rank
+        # DP1 prefill bootstrap includes every CP rank. Attention TP alone can
+        # release a grammar on only part of that group and mismatch collectives.
+        self._sync_prefill_cp_grammar = (
+            self.server_args.disaggregation_mode == "prefill"
+            and self.server_args.dp_size == 1
+            and scheduler.attn_cp_group.world_size > 1
+        )
+        grammar_group = (
+            scheduler.tp_group
+            if self._sync_prefill_cp_grammar
+            else scheduler.dp_tp_group
+        )
+        self.grammar_sync_group = grammar_group.cpu_group
+        self.grammar_sync_size = grammar_group.world_size
+        self.grammar_sync_entry = grammar_group.first_rank
+        self.is_grammar_sync_entry = grammar_group.is_first_rank
         self.pp_rank = scheduler.ps.pp_rank
         self.pp_size = scheduler.ps.pp_size
         self.pp_group = scheduler.pp_group
@@ -77,10 +89,13 @@ class GrammarManager:
     def _pp_sync_ready_failed(
         self,
         ready_req_idxs: set[int],
-        failed_req_idxs: set[int],
-    ) -> tuple[set[int], set[int]]:
+        failed_req_idxs: set[int] | dict[int, str],
+    ) -> tuple[set[int], set[int] | dict[int, str]]:
         """
         Synchronize ready/failed grammar request indexes across the PP pipeline.
+
+        CP prefill failures also carry the error selected by the first reporting
+        rank, so every PP stage rejects the request with the same reason.
 
         PP0 provides the data. Each later PP rank receives it from the previous
         rank and asynchronously forwards it to the next rank.
@@ -199,6 +214,7 @@ class GrammarManager:
         assert self.grammar_backend
         ready_req_idxs: set[int] = set()
         failed_req_idxs: set[int] = set()
+        failed_req_messages: dict[int, str] = {}
 
         if self.pp_rank == 0:
             # Poll for ready requests
@@ -217,6 +233,18 @@ class GrammarManager:
                     assert isinstance(req.grammar, futures.Future), f"{req=}"
                     if req.grammar.done():
                         ready_req_idxs.add(i)
+                        if self._sync_prefill_cp_grammar:
+                            # A completed Future can still contain a compiler
+                            # error. Include that outcome in admission consensus.
+                            try:
+                                grammar = req.grammar.result()
+                            except Exception as e:
+                                failed_req_messages[i] = (
+                                    f"Grammar compilation failed: {type(e).__name__}: {e}"
+                                )
+                            else:
+                                if isinstance(grammar, InvalidGrammarObject):
+                                    failed_req_messages[i] = grammar.error_message
 
                 if len(ready_req_idxs) == len(self.grammar_queue):
                     break
@@ -236,26 +264,59 @@ class GrammarManager:
                     ):
                         # Timeout after max poll iterations
                         # The actual waiting time is SGLANG_GRAMMAR_MAX_POLL_ITERATIONS * max(SGLANG_GRAMMAR_POLL_INTERVAL, GPU_forward_batch_latency)
-                        failed_req_idxs.add(i)
+                        if self._sync_prefill_cp_grammar:
+                            failed_req_messages[i] = "Grammar preprocessing timed out"
+                        else:
+                            failed_req_idxs.add(i)
 
             # Sync ready and failed requests across all TP ranks in PP0.
             if self.grammar_sync_size == 1:
                 synced_ready_req_idxs = ready_req_idxs
-                synced_failed_req_idxs = failed_req_idxs
+                synced_failed_req_idxs = (
+                    failed_req_messages
+                    if self._sync_prefill_cp_grammar
+                    else failed_req_idxs
+                )
             else:
                 all_gather_output = [None] * self.grammar_sync_size
                 torch.distributed.all_gather_object(
                     all_gather_output,
-                    (ready_req_idxs, failed_req_idxs),
+                    (
+                        ready_req_idxs,
+                        (
+                            failed_req_messages
+                            if self._sync_prefill_cp_grammar
+                            else failed_req_idxs
+                        ),
+                    ),
                     group=self.grammar_sync_group,
                 )
                 synced_ready_req_idxs = set.intersection(
                     *[x[0] for x in all_gather_output]
                 )
-                synced_failed_req_idxs = set.union(*[x[1] for x in all_gather_output])
+                if self._sync_prefill_cp_grammar:
+                    synced_failed_req_idxs = {}
+                    for _, failures in all_gather_output:
+                        for index, message in failures.items():
+                            synced_failed_req_idxs.setdefault(index, message)
+                else:
+                    synced_failed_req_idxs = set.union(
+                        *[x[1] for x in all_gather_output]
+                    )
+
+            if self._sync_prefill_cp_grammar:
+                # A failed compiler Future is also done: failure must win, and
+                # the request must be returned exactly once on every rank.
+                synced_ready_req_idxs = synced_ready_req_idxs.difference(
+                    synced_failed_req_idxs
+                )
         else:
             synced_ready_req_idxs = ready_req_idxs
-            synced_failed_req_idxs = failed_req_idxs
+            synced_failed_req_idxs = (
+                failed_req_messages
+                if self._sync_prefill_cp_grammar
+                else failed_req_idxs
+            )
 
         # Propagate PP0's grammar queue decision to later PP ranks.
         (
@@ -294,8 +355,21 @@ class GrammarManager:
             req = self.grammar_queue[i]
             return_reqs.append(req)
 
+            if self._sync_prefill_cp_grammar and (
+                req.finished() or req.grammar is None
+            ):
+                continue
             assert isinstance(req.grammar, futures.Future) and req.grammar_key
             req.grammar.cancel()
+            if self._sync_prefill_cp_grammar:
+                assert isinstance(synced_failed_req_idxs, dict)
+                message = synced_failed_req_idxs[i]
+                req.grammar = InvalidGrammarObject(message)
+                self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+                req.set_finish_with_abort(
+                    f"Failed to compile {req.grammar_key[0]} grammar: {message}"
+                )
+                continue
             self.grammar_backend.set_cache(
                 req.grammar_key, InvalidGrammarObject("Grammar preprocessing timed out")
             )

@@ -42,12 +42,16 @@ def _make_scheduler(grammar_backend_name="none", skip_tokenizer=False):
     scheduler.server_args.reasoning_parser = None
     scheduler.server_args.constrained_json_whitespace_pattern = None
     scheduler.server_args.constrained_json_disable_any_whitespace = False
+    scheduler.server_args.disaggregation_mode = "null"
+    scheduler.server_args.dp_size = 1
 
     # Distributed group mocks
     scheduler.dp_tp_cpu_group = MagicMock()
     scheduler.dp_tp_group.world_size = 1
     scheduler.dp_tp_group.first_rank = 0
     scheduler.dp_tp_group.is_first_rank = True
+    scheduler.dp_tp_group.cpu_group = scheduler.dp_tp_cpu_group
+    scheduler.attn_cp_group.world_size = 1
     scheduler.ps.pp_rank = 0
     scheduler.ps.pp_size = 1
     scheduler.pp_group = None
@@ -648,6 +652,176 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         self.assertEqual(len(mgr.grammar_queue), 0)
 
 
+class TestPrefillCPGrammarConsensus(unittest.TestCase):
+    def _make_mgr(self, mode="prefill", dp_size=1, cp_size=8):
+        scheduler = _make_scheduler(skip_tokenizer=True)
+        scheduler.server_args.disaggregation_mode = mode
+        scheduler.server_args.dp_size = dp_size
+        scheduler.attn_cp_group.world_size = cp_size
+        scheduler.tp_group.world_size = 8
+        scheduler.tp_group.first_rank = 8
+        scheduler.tp_group.is_first_rank = False
+        mgr = GrammarManager(scheduler)
+        mgr.grammar_backend = MagicMock(spec=BaseGrammarBackend)
+        mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 0.001
+        mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 3
+        return mgr, scheduler
+
+    def _enqueue(self, mgr, result=None, exception=None, pending=False):
+        future = Future()
+        if exception is not None:
+            future.set_exception(exception)
+        elif not pending:
+            future.set_result(result or BaseGrammarObject())
+        req = _make_req(json_schema="schema")
+        req.grammar = future
+        req.grammar_key = ("json", "schema")
+        mgr.grammar_queue.append(req)
+        return req
+
+    def test_dp1_prefill_uses_full_tp_group(self):
+        mgr, scheduler = self._make_mgr()
+        self.assertIs(mgr.grammar_sync_group, scheduler.tp_group.cpu_group)
+        self.assertEqual(mgr.grammar_sync_size, 8)
+        self.assertEqual(mgr.grammar_sync_entry, 8)
+        self.assertFalse(mgr.is_grammar_sync_entry)
+        self.assertIsNot(scheduler.dp_tp_group, scheduler.tp_group)
+
+    def test_other_deployments_keep_original_group(self):
+        for mode, dp_size, cp_size in [
+            ("decode", 1, 8),
+            ("null", 1, 8),
+            ("prefill", 2, 8),
+            ("prefill", 1, 1),
+        ]:
+            with self.subTest(mode=mode, dp_size=dp_size, cp_size=cp_size):
+                mgr, scheduler = self._make_mgr(mode, dp_size, cp_size)
+                self.assertFalse(mgr._sync_prefill_cp_grammar)
+                self.assertIs(mgr.grammar_sync_group, scheduler.dp_tp_cpu_group)
+                self.assertEqual(mgr.grammar_sync_size, 1)
+
+    @patch("sglang.srt.constrained.grammar_manager.torch.distributed.all_gather_object")
+    def test_pending_peer_prevents_admission_with_one_collective(self, gather):
+        mgr, scheduler = self._make_mgr()
+        req = self._enqueue(mgr)
+
+        def sync(output, status, group):
+            self.assertIs(group, scheduler.tp_group.cpu_group)
+            self.assertEqual(status, ({0}, {}))
+            output[:] = [({0}, {})] * 7 + [(set(), {})]
+
+        gather.side_effect = sync
+        self.assertEqual(mgr.get_ready_grammar_requests(), [])
+        self.assertEqual(mgr.grammar_queue, [req])
+        gather.assert_called_once()
+        mgr.grammar_backend.set_cache.assert_not_called()
+
+    @patch("sglang.srt.constrained.grammar_manager.torch.distributed.all_gather_object")
+    def test_invalid_peer_rejects_successful_local_compile_once(self, gather):
+        mgr, _ = self._make_mgr()
+        req = self._enqueue(mgr)
+
+        def sync(output, status, group):
+            output[:] = [({0}, {})] * 7 + [({0}, {0: "peer compile error"})]
+
+        gather.side_effect = sync
+        self.assertEqual(mgr.get_ready_grammar_requests(), [req])
+        self.assertEqual(mgr.grammar_queue, [])
+        req.set_finish_with_abort.assert_called_once_with(
+            "Failed to compile json grammar: peer compile error"
+        )
+        self.assertIsInstance(req.grammar, InvalidGrammarObject)
+        self.assertEqual(req.grammar.error_message, "peer compile error")
+        mgr.grammar_backend.set_cache.assert_called_once()
+
+    @patch("sglang.srt.constrained.grammar_manager.torch.distributed.all_gather_object")
+    def test_local_exception_is_rejected_while_peer_is_pending(self, gather):
+        mgr, _ = self._make_mgr()
+        req = self._enqueue(mgr, exception=RuntimeError("compiler crashed"))
+
+        def sync(output, status, group):
+            self.assertIn("RuntimeError: compiler crashed", status[1][0])
+            output[:] = [status] + [(set(), {})] * 7
+
+        gather.side_effect = sync
+        self.assertEqual(mgr.get_ready_grammar_requests(), [req])
+        self.assertIn("RuntimeError: compiler crashed", req.grammar.error_message)
+        req.set_finish_with_abort.assert_called_once()
+        self.assertEqual(mgr.grammar_queue, [])
+
+    @patch("sglang.srt.constrained.grammar_manager.torch.distributed.all_gather_object")
+    def test_local_invalid_grammar_enters_consensus(self, gather):
+        mgr, _ = self._make_mgr()
+        req = self._enqueue(mgr, result=InvalidGrammarObject("invalid schema"))
+
+        def sync(output, status, group):
+            self.assertEqual(status, ({0}, {0: "invalid schema"}))
+            output[:] = [status] + [({0}, {})] * 7
+
+        gather.side_effect = sync
+        self.assertEqual(mgr.get_ready_grammar_requests(), [req])
+        self.assertEqual(req.grammar.error_message, "invalid schema")
+
+    @patch("sglang.srt.constrained.grammar_manager.torch.distributed.all_gather_object")
+    def test_first_reporting_rank_selects_same_error(self, gather):
+        mgr, _ = self._make_mgr()
+        req = self._enqueue(mgr)
+
+        def sync(output, status, group):
+            output[:] = [({0}, {})] * 8
+            output[2] = ({0}, {0: "rank two error"})
+            output[7] = ({0}, {0: "rank seven error"})
+
+        gather.side_effect = sync
+        self.assertEqual(mgr.get_ready_grammar_requests(), [req])
+        self.assertEqual(req.grammar.error_message, "rank two error")
+
+    @patch("sglang.srt.constrained.grammar_manager.torch.distributed.all_gather_object")
+    def test_peer_timeout_cancels_local_pending_future(self, gather):
+        mgr, _ = self._make_mgr()
+        req = self._enqueue(mgr, pending=True)
+        future = req.grammar
+
+        def sync(output, status, group):
+            output[:] = [(set(), {})] * 7 + [
+                (set(), {0: "Grammar preprocessing timed out"})
+            ]
+
+        gather.side_effect = sync
+        self.assertEqual(mgr.get_ready_grammar_requests(), [req])
+        self.assertTrue(future.cancelled())
+        self.assertEqual(req.grammar.error_message, "Grammar preprocessing timed out")
+
+    @patch("sglang.srt.constrained.grammar_manager.torch.distributed.all_gather_object")
+    def test_local_timeout_message_enters_consensus(self, gather):
+        mgr, _ = self._make_mgr()
+        mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 1
+        req = self._enqueue(mgr, pending=True)
+
+        def sync(output, status, group):
+            self.assertEqual(status, (set(), {0: "Grammar preprocessing timed out"}))
+            output[:] = [status] + [({0}, {})] * 7
+
+        gather.side_effect = sync
+        self.assertEqual(mgr.get_ready_grammar_requests(), [req])
+        req.set_finish_with_abort.assert_called_once()
+
+    @patch("sglang.srt.constrained.grammar_manager.torch.distributed.all_gather_object")
+    def test_already_finished_request_survives_peer_failure(self, gather):
+        mgr, _ = self._make_mgr()
+        req = self._enqueue(mgr)
+        req.finished.return_value = True
+        req.grammar = None
+
+        def sync(output, status, group):
+            output[:] = [({0}, {})] * 7 + [({0}, {0: "peer failure"})]
+
+        gather.side_effect = sync
+        self.assertEqual(mgr.get_ready_grammar_requests(), [req])
+        req.set_finish_with_abort.assert_not_called()
+        self.assertEqual(mgr.grammar_queue, [])
+
+
 class _FakePPSendWork:
     def __init__(self):
         self.waited = False
@@ -732,6 +906,19 @@ class TestGrammarManagerPPSync(unittest.TestCase):
         mgr._pp_sync_ready_failed({1}, set())
 
         self.assertTrue(work.waited)
+
+    def test_pp_sync_preserves_cp_failure_details(self):
+        pp0_data = (set(), {0: "rank-local compiler exception"})
+        pp_group = _FakePPGroup(recv_data=pp0_data)
+        mgr = self._make_mgr_for_pp(pp_rank=1, pp_size=3, pp_group=pp_group)
+
+        data = mgr._pp_sync_ready_failed(set(), {})
+
+        self.assertEqual(data, pp0_data)
+        self.assertEqual(
+            pp_group.send_calls,
+            [(pp0_data, 2, True, P2PTag.GRAMMAR_PP_SYNC)],
+        )
 
 
 class TestStrictReasoningPaths(unittest.TestCase):
