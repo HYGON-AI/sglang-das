@@ -195,6 +195,10 @@ def _hcu_deepgemm_is_selected() -> bool:
     return (
         deep_gemm_wrapper.ENABLE_HCU_DEEPGEMM
         and get_moe_runner_backend().is_deep_gemm()
+        # SlimQuant's legacy HCU grouped kernels consume INT8 activations.
+        # Selecting DeepGEMM must not change their vendor quant_type ABI.
+        and get_model().quantization
+        not in ("slimquant_marlin", "slimquant_w4a8_marlin")
     )
 
 

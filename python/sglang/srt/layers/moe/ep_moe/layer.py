@@ -178,11 +178,23 @@ def _get_hcu_ll_graph_bridge(
     return bridge
 
 
-def _should_use_hcu_deepgemm_runner() -> bool:
-    """Route DTK/HCU DeepGEMM through the modern dispatcher/runner stack."""
+def _should_use_hcu_deepgemm_runner(
+    quant_config: Optional[QuantizationConfig] = None,
+) -> bool:
+    """Use the modern HCU runner without bypassing legacy INT8 MoE kernels.
+
+    SlimQuant W4A8/W8A8 already implement DeepEP normal/LL dispatch in
+    DeepEPMoE. Their quant methods use a Triton runner for standard dispatch,
+    which has no DeepEP permutation adapter. Keep these packed INT8 formats
+    on the legacy path even when --moe-runner-backend is deep_gemm.
+    """
     return (
         deep_gemm_wrapper.ENABLE_HCU_DEEPGEMM
         and get_moe_runner_backend().is_deep_gemm()
+        and not isinstance(
+            quant_config,
+            (SlimQuantW4A8Int8MarlinConfig, SlimQuantCompressedTensorsMarlinConfig),
+        )
     )
 
 
@@ -193,7 +205,9 @@ elif _is_npu:
     import torch_npu
 
 
-def _should_break_only_hcu_deepgemm_core() -> bool:
+def _should_break_only_hcu_deepgemm_core(
+    quant_config: Optional[QuantizationConfig] = None,
+) -> bool:
     """Keep DeepEP LL dispatch/combine captured and break only HCU GEMMs.
 
     The DTK/HCU masked grouped GEMM works eagerly but segfaults when invoked
@@ -202,7 +216,7 @@ def _should_break_only_hcu_deepgemm_core() -> bool:
     backend the narrow safe boundary is the MoE core, not the whole A2A layer.
     """
     return (
-        _should_use_hcu_deepgemm_runner()
+        _should_use_hcu_deepgemm_runner(quant_config)
         and get_deepep_mode().resolve(get_is_extend_in_batch()).is_low_latency()
     )
 
@@ -712,7 +726,7 @@ class DeepEPMoE(FusedMoE):
         # opt the MoE runner in explicitly.
         elif should_use_aiter_runner():
             self.deprecate_flag = True
-        elif _should_use_hcu_deepgemm_runner():
+        elif _should_use_hcu_deepgemm_runner(quant_config):
             # The legacy DeepEPMoE core contains only old CUTLASS branches and
             # deliberately rejects DeepGEMM normal/LL outputs.  The HCU
             # channel-FP8 adapter lives in MoeRunner(DEEP_GEMM), so select the
@@ -975,7 +989,7 @@ class DeepEPMoE(FusedMoE):
     ):
         # DeepEP NORMAL mode is not capturable; run it as an eager node.
         if is_in_breakable_cuda_graph():
-            if _should_break_only_hcu_deepgemm_core():
+            if _should_break_only_hcu_deepgemm_core(self.quant_config):
                 # Low-latency DeepEP is graph-capturable on HCU.  Let the
                 # modern FusedMoE forward capture dispatch/combine and insert
                 # its eager break only around the vendor grouped GEMMs.
@@ -1064,7 +1078,7 @@ class DeepEPMoE(FusedMoE):
             DeepGemmRunnerInput,
         )
 
-        if not _should_use_hcu_deepgemm_runner():
+        if not _should_use_hcu_deepgemm_runner(self.quant_config):
             raise RuntimeError(
                 "DeepEP local shared grouping currently requires HCU DeepGEMM."
             )
@@ -1219,7 +1233,9 @@ class DeepEPMoE(FusedMoE):
         i_s: Optional[torch.Tensor] = None,
     ):
         if self.deprecate_flag:
-            if is_in_breakable_cuda_graph() and _should_break_only_hcu_deepgemm_core():
+            if is_in_breakable_cuda_graph() and _should_break_only_hcu_deepgemm_core(
+                self.quant_config
+            ):
                 return self.hcu_ll_moe_core(dispatch_output)
             return super().run_moe_core(
                 dispatch_output,
