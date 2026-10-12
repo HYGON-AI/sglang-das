@@ -1771,28 +1771,12 @@ class Qwen4ExpPLELayer(nn.Module):
                     buffer is None or candidate.shape[0] < buffer.shape[0]
                 ):
                     buffer = candidate
-        if not getattr(self, "_logged_ple_fill", False):
-            logger.info(
-                "PLE HIP eager-fill lookup_tokens=%s keys=%s found=%s",
-                lookup_tokens,
-                sorted(self._graph_prefetch_buffers),
-                None if buffer is None else tuple(buffer.shape),
-            )
-            self._logged_ple_fill = True
         if buffer is None:
             return
         output_view = buffer[:lookup_tokens].view(
             lookup_tokens, self.ple_embedding.ngram_heads, -1
         )
         self.ple_embedding.ngram_embedding.gather(lookup_ids, out=output_view)
-        if not getattr(self, "_logged_ple_fill_val", False):
-            logger.info(
-                "PLE HIP eager-fill val maxabs=%s lookup_ids[:8]=%s mode=%s",
-                float(output_view.detach().float().abs().max().cpu()),
-                lookup_ids.detach().flatten()[:8].cpu().tolist(),
-                getattr(forward_batch.forward_mode, "name", forward_batch.forward_mode),
-            )
-            self._logged_ple_fill_val = True
 
     def _consume_prefetched_embeddings(
         self, forward_batch: ForwardBatch
