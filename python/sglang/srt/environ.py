@@ -608,6 +608,9 @@ class Envs:
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.
     SGLANG_ENABLE_DELAY_SAMPLE = EnvBool(False)
+    # Stage prebuilt bonus tokens in pinned CPU memory for asynchronous H2D.
+    # The prebuilt caller must retain its schedule/forward stream reuse fence.
+    SGLANG_PREBUILT_ASYNC_TOKEN_H2D = EnvBool(False)
     # Force-enable the WAR (write-after-read) barrier for the overlap scheduler
     # even when is_cuda() is False (e.g. AMD/ROCm). On CUDA the barrier is
     # already enabled regardless of this flag (see start_event_loop).

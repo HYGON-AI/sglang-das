@@ -6,10 +6,12 @@ from typing import TYPE_CHECKING, List
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.utils.common import is_pin_memory_available
 
 logger = logging.getLogger(__name__)
 
@@ -138,9 +140,20 @@ class ScheduleBatchDisaggregationDecodeMixin:
                         error_message, HTTPStatus.INTERNAL_SERVER_ERROR
                     )
                 req.grammar.finished = req.finished()
-        last_tokens_tensor = torch.tensor(
-            last_tokens, dtype=torch.int64, device=self.device
-        )
+        if envs.SGLANG_PREBUILT_ASYNC_TOKEN_H2D.get() and is_pin_memory_available(
+            self.device
+        ):
+            # Keep H2D and relay writes on the caller's current stream, behind
+            # its request-slot reuse fence. Each call owns fresh staging; the
+            # PyTorch pinned allocator tracks the outstanding async copy.
+            last_tokens_cpu = torch.tensor(
+                last_tokens, dtype=torch.int64, device="cpu", pin_memory=True
+            )
+            last_tokens_tensor = last_tokens_cpu.to(self.device, non_blocking=True)
+        else:
+            last_tokens_tensor = torch.tensor(
+                last_tokens, dtype=torch.int64, device=self.device
+            )
 
         spec_info = self.spec_algorithm.build_disagg_draft_input(
             self,
