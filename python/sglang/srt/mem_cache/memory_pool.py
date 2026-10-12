@@ -2650,6 +2650,9 @@ class MHATokenToKVPool(KVCache):
             and v_scale is not None
             and dcp_kv_mask is None
             and not self.use_hnd
+            # Fused writer is NHD token-major; HCU FA is paged
+            # (pages, heads, page, dim) / V (pages, heads, dim, page).
+            and not _kv_layout_hcu_fa
         )
         if use_scaled_fp8_store:
             k_buffer = self.k_buffer[layer_id - self.start_layer]

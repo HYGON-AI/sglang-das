@@ -161,6 +161,11 @@ class QSAMTPSharedSparseIndices:
             dtype=torch.int32,
             device=device,
         )
+        self.has_captured = torch.zeros(
+            (len(self.layer_slots), num_requests + 1),
+            dtype=torch.bool,
+            device=device,
+        )
         self._tail_offsets = torch.arange(tail_width, device=device)
 
     def capture(
@@ -176,6 +181,7 @@ class QSAMTPSharedSparseIndices:
             0, rows, topk_indices.to(self.indices.dtype)
         )
         self.captured_len[slot].index_copy_(0, rows, captured_lens.to(torch.int32))
+        self.has_captured[slot].index_fill_(0, rows, True)
 
     def lookup(
         self,
@@ -273,11 +279,79 @@ class QwenSparseAttnBackend(AttentionBackend):
             v_scale if v_scale > 0.0 else 1.0,
         )
 
+    @staticmethod
+    def _maybe_calibrate_fp8_e4m3_kv_scales(layer, k: torch.Tensor, v: torch.Tensor, cache_dtype: torch.dtype) -> None:
+        """Replace implicit e4m3 scale=1.0 with a per-layer amax scale.
+
+        BF16 checkpoints have no k_scale/v_scale.  e4m3fn/fnuz then clamp at
+        448/224, which saturates Qwen K/V and collapses 1-layer MTP accept
+        while e5m2 (max ~57k) still looks fine.  Skip CUDA-graph capture so a
+        dummy fill cannot freeze the scale; the first real store wins.
+        """
+        e4m3_dtypes = tuple(
+            dt
+            for dt in (
+                getattr(torch, "float8_e4m3fn", None),
+                getattr(torch, "float8_e4m3fnuz", None),
+            )
+            if dt is not None
+        )
+        if cache_dtype not in e4m3_dtypes:
+            return
+        if getattr(layer, "_qsa_fp8_e4m3_kv_calibrated", False):
+            return
+        k_scale, v_scale = QwenSparseAttnBackend._kv_descales(layer, cache_dtype)
+        # A real checkpoint scale is not the implicit 1.0 fallback.
+        if not (k_scale == 1.0 and v_scale == 1.0):
+            layer._qsa_fp8_e4m3_kv_calibrated = True
+            return
+        try:
+            from sglang.srt.model_executor.runner import get_is_capture_mode
+
+            if get_is_capture_mode():
+                return
+        except Exception:
+            pass
+        k_amax = float(k.detach().float().abs().amax().item())
+        v_amax = float(v.detach().float().abs().amax().item())
+        if not math.isfinite(k_amax) or not math.isfinite(v_amax):
+            return
+        if k_amax <= 1e-4 and v_amax <= 1e-4:
+            return
+        fp8_max = float(torch.finfo(cache_dtype).max)
+        # Floor keeps a 1-token warmup from locking a too-small scale; 1.5x
+        # leaves headroom for later tokens without changing the dequant
+        # contract used by compact HCU FA.
+        margin = 1.5
+        floor_amax = 16.0
+        k_scale = max(k_amax, floor_amax) * margin / fp8_max
+        v_scale = max(v_amax, floor_amax) * margin / fp8_max
+        k_scale = max(k_scale, 1e-6)
+        v_scale = max(v_scale, 1e-6)
+        layer.k_scale_float = k_scale
+        layer.v_scale_float = v_scale
+        for name, value in (("k_scale", k_scale), ("v_scale", v_scale)):
+            param = getattr(layer, name, None)
+            if torch.is_tensor(param) and param.numel() == 1:
+                param.fill_(value)
+        layer._qsa_fp8_e4m3_kv_calibrated = True
+        logger.info(
+            "QSA e4m3 KV calibrated layer %s: k_scale=%.6g v_scale=%.6g "
+            "(amax k=%.5g v=%.5g fp8_max=%.5g)",
+            getattr(layer, "layer_id", "?"),
+            k_scale,
+            v_scale,
+            k_amax,
+            v_amax,
+            fp8_max,
+        )
+
     def _store_kv(self, layer, loc, k: torch.Tensor, v: torch.Tensor) -> None:
         cache_dtype = getattr(self.token_to_kv_pool, "dtype", k.dtype)
         if not is_fp8_kv_dtype(cache_dtype):
             self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v)
             return
+        self._maybe_calibrate_fp8_e4m3_kv_scales(layer, k, v, cache_dtype)
         k_scale, v_scale = self._kv_descales(layer, cache_dtype)
         if k_scale == 1.0 and v_scale == 1.0:
             self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v)
@@ -330,9 +404,13 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return max(1, int(sequence_lengths.max()))
         spec_info = forward_batch.spec_info
-        draft_window = (
-            int(spec_info.draft_token_num) if spec_info is not None else 0
-        )
+        draft_window = 0
+        if spec_info is not None:
+            draft_window = int(getattr(spec_info, "draft_token_num", 0) or 0)
+            if draft_window <= 0:
+                draft_window = int(getattr(spec_info, "num_tokens_per_req", 0) or 0)
+            if draft_window < 0:
+                draft_window = 0
         return max(1, int(seq_lens_cpu.max()) + draft_window)
 
     @staticmethod
@@ -1287,10 +1365,18 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     def should_reuse_mtp_sparse_indices(self, forward_batch) -> bool:
         """Draft decode steps reuse the draft-extend selection."""
-        return (
-            self._mtp_shared_sparse_indices is not None
-            and forward_batch.forward_mode.is_decode()
-        )
+        state = self._mtp_shared_sparse_indices
+        if state is None or not forward_batch.forward_mode.is_decode():
+            return False
+        # Init buffers are zeros/ones. Reusing an uncaptured row attends
+        # token 0 and collapses MTP accept rate. Skip reuse until every
+        # request in this batch has a real extend capture.
+        has_captured = getattr(state, "has_captured", None)
+        if has_captured is None:
+            return True
+        rows = forward_batch.req_pool_indices.to(torch.long)
+        slot = next(iter(state.layer_slots.values()))
+        return bool(has_captured[slot].index_select(0, rows).all().item())
 
     def should_capture_mtp_sparse_indices(self, forward_batch) -> bool:
         """Both draft-extend flavors seed the next decode loop: the post-verify
@@ -2078,6 +2164,29 @@ class QwenSparseMultiStepDraftBackend:
     def set_mtp_shared_sparse_indices(self, state) -> None:
         for backend in self.attn_backends:
             backend.set_mtp_shared_sparse_indices(state)
+
+    def should_reuse_mtp_sparse_indices(self, forward_batch) -> bool:
+        return self.attn_backends[0].should_reuse_mtp_sparse_indices(forward_batch)
+
+    def lookup_mtp_sparse_indices(self, forward_batch, layer_id: int):
+        return self.attn_backends[0].lookup_mtp_sparse_indices(
+            forward_batch, layer_id
+        )
+
+    def should_capture_mtp_sparse_indices(self, forward_batch) -> bool:
+        return self.attn_backends[0].should_capture_mtp_sparse_indices(
+            forward_batch
+        )
+
+    def capture_mtp_sparse_indices(
+        self, topk_indices, forward_batch, layer_id: int, metadata=None
+    ) -> None:
+        self.attn_backends[0].capture_mtp_sparse_indices(
+            topk_indices, forward_batch, layer_id, metadata=metadata
+        )
+
+    def get_indexer_metadata(self, layer_id: int, forward_batch):
+        return self.attn_backends[0].get_indexer_metadata(layer_id, forward_batch)
 
     def init_forward_metadata(self, forward_batch):
         for step, backend in enumerate(self.attn_backends):
