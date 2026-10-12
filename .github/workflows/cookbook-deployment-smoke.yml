@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   smoke:
-    runs-on: [self-hosted, nmz4]
+    runs-on: bw1100
     timeout-minutes: 840
     steps:
       - name: Checkout private test controller
