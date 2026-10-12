@@ -8,6 +8,9 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.kernels.ops.mamba.mamba_state_indices import (
     prepare_fused_replay_state_indices,
 )
+from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
+    fused_replay_state_indices,
+)
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     fused_mamba_state_scatter_with_mask,
     scatter_mamba_states_after_mtp_verify,
@@ -54,18 +57,22 @@ class MambaAttnBackendBase(AttentionBackend):
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.enable_unified_memory = model_runner.server_args.enable_unified_memory
-        # Opt-in fused replay indices; requires a static pool with identity v2p.
-        self._fused_state_indices_ok = get_bool_env_var(
+        # Fused replay requires a static hybrid pool with identity v2p.
+        self._fused_state_indices_ok = (
+            str(self.device).startswith("cuda")
+            and isinstance(self.req_to_token_pool, HybridReqToTokenPool)
+            and type(self.req_to_token_pool).translate_mamba_indices
+            is HybridReqToTokenPool.translate_mamba_indices
+        )
+        # Keep the original Triton fusion unless HIP C++ is explicitly enabled.
+        self._fused_replay_state_indices = fused_replay_state_indices
+        if self._fused_state_indices_ok and get_bool_env_var(
             "SGLANG_USE_FUSED_REPLAY_STATE_INDICES", default="false"
-        )
-        # Prepare once, before graph capture/replay: the HIP C++ kernel has no
-        # shape specialization and cannot compile/load on the first live step.
-        # SGLANG_REPLAY_STATE_INDICES_BACKEND=triton keeps the original path.
-        self._fused_replay_state_indices = (
-            prepare_fused_replay_state_indices(self.device)
-            if self._fused_state_indices_ok
-            else None
-        )
+        ):
+            # Prepare before graph capture/replay; never build on a live step.
+            self._fused_replay_state_indices = prepare_fused_replay_state_indices(
+                self.device
+            )
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
         # Static (max_bs,) track-dest buffer captured by pointer, refreshed in-place
