@@ -1285,6 +1285,16 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
+        if getattr(param, "compressed_tensors_packed_int4", False):
+            if param.dtype == torch.int8 and loaded_weight.dtype == torch.int32:
+                # compressed-tensors stores offset-8 nibbles, even K in low bits.
+                # SlimQuant expects signed nibbles, even K in high bits.
+                packed = loaded_weight.contiguous().view(torch.uint8) ^ 0x88
+                loaded_weight = ((packed << 4) | (packed >> 4)).view(torch.int8)
+            elif weight_name.endswith("weight_scale"):
+                # The SlimQuant native kernels apply the factor 16 internally.
+                loaded_weight = loaded_weight.float() / 16.0
+
         # Special case for GGUF weights
         if self._load_gguf_weight(param, loaded_weight, shard_id, expert_id):
             return
