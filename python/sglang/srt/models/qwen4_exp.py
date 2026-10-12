@@ -1,6 +1,9 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
+import ctypes
+import fcntl
 import math
+import os
 from contextlib import nullcontext
 from typing import Any, Iterable, Optional, Set, Tuple
 
@@ -56,6 +59,9 @@ from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
@@ -890,13 +896,55 @@ def _drop_module_weight(embedding) -> None:
             pass
 
 
-def _cuda_error_ok(err) -> bool:
-    if err is None or err == 0:
-        return True
-    value = getattr(err, "value", err)
-    if value == 0:
-        return True
-    return "Success" in str(err)
+_HIP_RUNTIME = None
+_HOST_REGISTER_LOCK = "/tmp/sglang_ple_bf16_hostregister.lock"
+# hipHostRegisterMapped / cudaHostRegisterMapped, then Portable|Mapped, then Default.
+_HOST_REGISTER_FLAGS = (0x02, 0x03, 0x00)
+
+
+def _hip_runtime():
+    global _HIP_RUNTIME
+    if _HIP_RUNTIME is False:
+        return None
+    if _HIP_RUNTIME is not None:
+        return _HIP_RUNTIME
+    for library in ("libamdhip64.so", "libamdhip64.so.6", "libamdhip64.so.5"):
+        try:
+            lib = ctypes.CDLL(library)
+        except OSError:
+            continue
+        lib.hipHostRegister.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_uint,
+        ]
+        lib.hipHostRegister.restype = ctypes.c_int
+        lib.hipHostGetDevicePointer.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_void_p,
+            ctypes.c_uint,
+        ]
+        lib.hipHostGetDevicePointer.restype = ctypes.c_int
+        _HIP_RUNTIME = lib
+        return lib
+    _HIP_RUNTIME = False
+    return None
+
+
+def _host_register_err_text(err) -> str:
+    try:
+        code = int(err)
+    except Exception:
+        code = err
+    msg = str(err)
+    try:
+        raw = torch.cuda.cudart().cudaGetErrorString(err)
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        msg = raw
+    except Exception:
+        pass
+    return f"rc={code} {err} {msg}"
 
 
 def _try_host_register(tensor: torch.Tensor) -> bool:
@@ -904,7 +952,8 @@ def _try_host_register(tensor: torch.Tensor) -> bool:
 
     Full-table pin_memory=True OOMs BF16 PLE on HCU (~12.8GB/rank GTT).
     hostRegister reuses the pageable allocation so the Triton UVA gather
-    stays CUDA-graph-safe.
+    stays CUDA-graph-safe. HCU's CUDA DeviceContext hijack rejects large
+    cudaHostRegister on non-0 devices / concurrent ranks, so prefer HIP.
     """
     if tensor.device.type != "cpu" or tensor.numel() == 0:
         return False
@@ -914,36 +963,68 @@ def _try_host_register(tensor: torch.Tensor) -> bool:
         return False
     if not torch.cuda.is_available():
         return False
-    register = getattr(torch.cuda.cudart(), "cudaHostRegister", None)
-    if register is None:
-        return False
     nbytes = tensor.numel() * tensor.element_size()
     ptr = int(tensor.data_ptr())
-    # Prefer Mapped so device kernels can dereference the host pointer.
-    # Fall back to Default if the platform rejects Mapped.
-    for flags in (0x02, 0x00):
+    device = torch.cuda.current_device() if torch.cuda.is_initialized() else -1
+    hip = _hip_runtime()
+    register = getattr(torch.cuda.cudart(), "cudaHostRegister", None)
+    for flags in _HOST_REGISTER_FLAGS:
+        if hip is not None:
+            try:
+                rc = int(hip.hipHostRegister(ptr, nbytes, flags))
+            except Exception as exc:
+                logger.warning(
+                    "PLE BF16 hipHostRegister raised flags=%s nbytes=%s: %s",
+                    flags,
+                    nbytes,
+                    exc,
+                )
+            else:
+                if rc == 0:
+                    logger.info(
+                        "PLE BF16 hipHostRegister ok flags=%s nbytes=%.2fGB ptr=%#x device=%s",
+                        flags,
+                        nbytes / (1024**3),
+                        ptr,
+                        device,
+                    )
+                    return True
+                logger.warning(
+                    "PLE BF16 hipHostRegister failed flags=%s nbytes=%s ptr=%#x device=%s rc=%s",
+                    flags,
+                    nbytes,
+                    ptr,
+                    device,
+                    rc,
+                )
+        if register is None:
+            continue
         try:
             err = register(ptr, nbytes, flags)
         except Exception as exc:
             logger.warning(
-                "PLE BF16 hostRegister raised flags=%s nbytes=%s: %s",
+                "PLE BF16 cudaHostRegister raised flags=%s nbytes=%s: %s",
                 flags,
                 nbytes,
                 exc,
             )
             continue
-        if _cuda_error_ok(err):
+        if err is None or int(err) == 0:
             logger.info(
-                "PLE BF16 hostRegister ok flags=%s nbytes=%.2fGB",
+                "PLE BF16 cudaHostRegister ok flags=%s nbytes=%.2fGB ptr=%#x device=%s",
                 flags,
                 nbytes / (1024**3),
+                ptr,
+                device,
             )
             return True
         logger.warning(
-            "PLE BF16 hostRegister failed flags=%s nbytes=%s err=%s",
+            "PLE BF16 cudaHostRegister failed flags=%s nbytes=%s ptr=%#x device=%s %s",
             flags,
             nbytes,
-            err,
+            ptr,
+            device,
+            _host_register_err_text(err),
         )
     return False
 
@@ -951,30 +1032,98 @@ def _try_host_register(tensor: torch.Tensor) -> bool:
 def _register_bf16_table_for_uva(tensor: torch.Tensor) -> bool:
     if tensor.is_pinned():
         return True
+    # Serialize across TP ranks. A barrier during construct can no-op, and
+    # concurrent large hipHostRegister on HCU returns hipErrorInvalidValue.
+    lock_path = os.environ.get("SGLANG_PLE_HOSTREGISTER_LOCK", _HOST_REGISTER_LOCK)
+    lock_file = None
     try:
-        tp_group = get_tp_group()
-        rank = tp_group.rank_in_group
-        world = tp_group.world_size
-    except Exception:
+        lock_file = open(lock_path, "w")
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+    except Exception as exc:
+        logger.warning("PLE BF16 hostRegister lock unavailable: %s", exc)
+        lock_file = None
+    try:
         return _try_host_register(tensor)
-    success = False
-    # Serialize the map so 8 ranks do not hit GTT at once.
-    for r in range(world):
-        if r == rank:
-            success = _try_host_register(tensor)
-        try:
-            tp_group.barrier()
-        except Exception:
-            return success if r == rank else False
-    return success
+    finally:
+        if lock_file is not None:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            lock_file.close()
+
+
+def _device_ptr_for_host_tensor(tensor: torch.Tensor) -> int:
+    """HCU kernels cannot dereference the raw host pointer; translate it."""
+    host_ptr = int(tensor.data_ptr())
+    hip = _hip_runtime()
+    if hip is None:
+        return host_ptr
+    device_ptr = ctypes.c_void_p()
+    rc = int(
+        hip.hipHostGetDevicePointer(
+            ctypes.byref(device_ptr), ctypes.c_void_p(host_ptr), ctypes.c_uint(0)
+        )
+    )
+    if rc == 0 and device_ptr.value:
+        return int(device_ptr.value)
+    logger.warning(
+        "PLE hipHostGetDevicePointer failed rc=%s host=%#x; using host pointer",
+        rc,
+        host_ptr,
+    )
+    return host_ptr
+
+
+class _CudaArrayInterface:
+    """Non-owning CUDA array interface over a mapped host allocation."""
+
+    def __init__(self, ptr: int, shape: Tuple[int, ...], typestr: str) -> None:
+        self.__cuda_array_interface__ = {
+            "data": (int(ptr), False),
+            "shape": tuple(shape),
+            "typestr": typestr,
+            "version": 3,
+        }
+
+
+def _wrap_mapped_host_as_cuda_tensor(
+    ptr: int,
+    shape: Tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Tuple[torch.Tensor, _CudaArrayInterface]:
+    """Expose mapped GTT as a CUDA tensor so ATen gather is HIP-graph-safe.
+
+    Triton ``tl.load`` from a host-mapped pointer is not replayed correctly
+    inside HIP full CUDA graphs (decode collapses to token 0). ``F.embedding``
+    on this view is captured and replays the current ids.
+    """
+    if dtype == torch.bfloat16:
+        typestr = "|u2"
+    elif dtype == torch.int8:
+        typestr = "|i1"
+    elif dtype == torch.float8_e4m3fn:
+        typestr = "|u1"
+    else:
+        raise TypeError(f"unsupported PLE mapped-view dtype: {dtype}")
+    holder = _CudaArrayInterface(ptr, shape, typestr)
+    tensor = torch.as_tensor(holder, device=device)
+    if dtype == torch.bfloat16:
+        tensor = tensor.view(torch.bfloat16)
+    elif dtype == torch.float8_e4m3fn:
+        tensor = tensor.view(torch.float8_e4m3fn)
+    return tensor, holder
 
 
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     """CPU-resident PLE table.
 
     INT8/FP8 allocate pinned host memory for UVA gathers. BF16 reuses a
-    pageable CPU table and hostRegister-maps it so the same UVA kernel is
-    CUDA-graph-safe without a second multi-GB hipHostMalloc.
+    pageable CPU table and hostRegister-maps it without a second multi-GB
+    hipHostMalloc. On HIP the mapped table is wrapped as a CUDA tensor and
+    gathered with ATen embedding so full decode CUDA graphs replay the
+    current ids; Triton ``tl.load`` from mapped host is not graph-safe.
 
     The table stays in its checkpoint storage dtype (int8/fp8 with per-row
     channel scales, fp8/bf16 with a scalar scale, or bf16); gathers emit bf16.
@@ -1100,13 +1249,80 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             )
         if (not released_source_weight) and cpu_weight is not source_weight:
             del embedding.weight
+        self._kernel_weight_ptr = None
+        self._kernel_scale_ptr = None
+        self._device_weight_view = None
+        self._device_weight_holder = None
+        self._uva_register_pending = False
         if cpu_weight.dtype == torch.bfloat16 and not cpu_weight.is_pinned():
-            self._use_uva_gather = _register_bf16_table_for_uva(cpu_weight)
+            self._use_uva_gather = False
+            self._uva_register_pending = True
+            self._maybe_register_uva()
         else:
             self._use_uva_gather = cpu_weight.is_pinned()
+            if self._use_uva_gather:
+                self._kernel_weight_ptr = _device_ptr_for_host_tensor(cpu_weight)
+                if cpu_scale.device.type == "cpu":
+                    self._kernel_scale_ptr = _device_ptr_for_host_tensor(cpu_scale)
+                self._bind_mapped_cuda_view()
         self._pageable_id_scratch = None
         self._pageable_row_scratch = None
         self._block_d = triton.next_power_of_2(self.embedding_dim)
+
+    def _maybe_register_uva(self) -> None:
+        if not getattr(self, "_uva_register_pending", False):
+            return
+        # hostRegister is a host-side map; skipping it during CUDA graph
+        # capture leaves the pageable D2H path inside the graph.
+        logger.info(
+            "PLE BF16 hostRegister begin nbytes=%.2fGB device=%s",
+            self.weight.numel() * self.weight.element_size() / (1024**3),
+            torch.cuda.current_device() if torch.cuda.is_available() else None,
+        )
+        ok = _register_bf16_table_for_uva(self.weight)
+        if ok:
+            self._uva_register_pending = False
+            self._use_uva_gather = True
+            self._kernel_weight_ptr = _device_ptr_for_host_tensor(self.weight)
+            if self.weight_scale.device.type == "cpu":
+                self._kernel_scale_ptr = _device_ptr_for_host_tensor(self.weight_scale)
+            self._bind_mapped_cuda_view()
+        else:
+            logger.warning(
+                "PLE BF16 hostRegister failed; will retry, else pageable gather (not full-graph-safe)"
+            )
+
+    def _bind_mapped_cuda_view(self) -> None:
+        if torch.version.hip is None:
+            return
+        if self.weight.dtype != torch.bfloat16:
+            return
+        if not torch.cuda.is_available():
+            return
+        ptr = self._kernel_weight_ptr or _device_ptr_for_host_tensor(self.weight)
+        try:
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
+            view, holder = _wrap_mapped_host_as_cuda_tensor(
+                ptr, tuple(self.weight.shape), self.weight.dtype, device
+            )
+        except Exception as exc:
+            logger.warning("PLE BF16 mapped CUDA view wrap failed: %s", exc)
+            self._device_weight_view = None
+            self._device_weight_holder = None
+            return
+        self._device_weight_view = view
+        self._device_weight_holder = holder
+        logger.info(
+            "PLE BF16 mapped CUDA view ok shape=%s ptr=%#x device=%s",
+            tuple(view.shape),
+            int(view.data_ptr()),
+            view.device,
+        )
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        super().weight_loader(param, loaded_weight)
+        if int(param.data_ptr()) == int(self.weight.data_ptr()):
+            self._maybe_register_uva()
 
     def allocate_output(
         self, shape: Tuple[int, ...], device: torch.device
@@ -1154,6 +1370,23 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             self._pageable_row_scratch[:n], non_blocking=False
         )
 
+    def _gather_from_mapped_cuda_view(
+        self, flat_ids: torch.Tensor, output: torch.Tensor
+    ) -> None:
+        weight = self._device_weight_view
+        start = self.shard_indices.org_vocab_start_index
+        end = self.shard_indices.org_vocab_end_index
+        in_range = (flat_ids >= start) & (flat_ids < end)
+        local = torch.where(in_range, flat_ids - start, torch.zeros_like(flat_ids))
+        nrows = int(weight.shape[0])
+        if nrows > 0:
+            local = local.clamp(0, nrows - 1)
+        rows = F.embedding(local, weight)
+        if rows.dtype != torch.bfloat16:
+            rows = rows.to(torch.bfloat16)
+        rows = torch.where(in_range.unsqueeze(-1), rows, torch.zeros_like(rows))
+        output.view(rows.shape).copy_(rows)
+
     def gather(
         self, input_ids: torch.Tensor, out: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
@@ -1172,14 +1405,21 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 )
             output = out
 
+        self._maybe_register_uva()
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
             if not self._use_uva_gather:
                 self._gather_from_pageable_host(flat_ids, output)
+            elif self._device_weight_view is not None:
+                self._gather_from_mapped_cuda_view(flat_ids, output)
             else:
+                weight_ptr = self._kernel_weight_ptr or int(self.weight.data_ptr())
+                scale_ptr = self._kernel_scale_ptr or int(
+                    self.weight_scale.data_ptr()
+                )
                 _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                    self.weight.data_ptr(),
-                    self.weight_scale.data_ptr(),
+                    weight_ptr,
+                    scale_ptr,
                     flat_ids,
                     output,
                     embedding_dim=self.embedding_dim,
@@ -1280,6 +1520,10 @@ class Qwen4ExpPLELayer(nn.Module):
             torch.cuda.Stream() if config.ple_offload_embedding else None
         )
         self._graph_prefetch_buffers = {}
+        # Default-allocator staging for HIP full graphs. The graph records a
+        # copy_ from this tensor; replay fills it eagerly so the mapped gather
+        # never sits inside the capture.
+        self._graph_prefetch_inputs = {}
         self._eager_prefetch_buffer = None
         self._prefetch_state = None
 
@@ -1445,9 +1689,10 @@ class Qwen4ExpPLELayer(nn.Module):
     ) -> None:
         """Gather PLE rows on a side stream while the preceding decoder layer runs.
 
-        INT8/FP8 use UVA from the pinned table. BF16 pageable tables gather on
-        CPU through a small pinned scratch (not UVA), so this path graph-breaks
-        under breakable CUDA graphs and otherwise runs eagerly.
+        INT8/FP8 use UVA from the pinned table. BF16 mapped tables on HIP use
+        ATen embedding on a CUDA view of GTT so the gather is captured in the
+        full decode graph (HIP drops side-stream launches). Pageable tables
+        still graph-break under breakable CUDA graphs.
         """
         if self._prefetch_stream is None:
             return
@@ -1473,26 +1718,81 @@ class Qwen4ExpPLELayer(nn.Module):
         prefetched = self._get_prefetch_buffer(lookup_tokens, lookup_ids)
         output_view = prefetched.view(lookup_tokens, self.ple_embedding.ngram_heads, -1)
         offloaded_embedding = self.ple_embedding.ngram_embedding
+        if hasattr(offloaded_embedding, "_maybe_register_uva"):
+            offloaded_embedding._maybe_register_uva()
 
-        if not getattr(offloaded_embedding, "_use_uva_gather", True):
-            def _pageable_gather():
-                offloaded_embedding.gather(lookup_ids, out=output_view)
+        def _do_gather():
+            offloaded_embedding.gather(lookup_ids, out=output_view)
 
-            try:
-                from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
-                    eager_on_graph,
-                )
-
-                eager_on_graph(True)(_pageable_gather)()
-            except Exception:
-                _pageable_gather()
+        use_uva = getattr(offloaded_embedding, "_use_uva_gather", True)
+        has_cuda_view = (
+            getattr(offloaded_embedding, "_device_weight_view", None) is not None
+        )
+        # HIP mapped GTT gathers cannot sit inside a captured HIP graph
+        # (replay collapses to token 0). Breakable decode graphs wrap this
+        # method with eager_on_graph so the gather reruns on every replay.
+        # NVIDIA UVA still overlaps on the prefetch stream.
+        if not use_uva or has_cuda_view or torch.version.hip is not None:
+            _do_gather()
         else:
             stream = self._prefetch_stream
             stream.wait_stream(torch.cuda.current_stream())
             lookup_ids.record_stream(stream)
             with torch.cuda.stream(stream):
-                offloaded_embedding.gather(lookup_ids, out=output_view)
+                _do_gather()
         self._prefetch_state = prefetched, semantic_tokens, physical_tokens
+
+    def fill_cuda_graph_prefetch(
+        self,
+        batch: Optional[_PLEBatch],
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Eagerly gather into the CUDA-graph prefetch buffer before replay."""
+        if batch is None:
+            if not self.ple_embedding.gather_dp_tokens:
+                return
+            physical_tokens = forward_batch.input_ids.numel()
+            ngram_ids = forward_batch.input_ids.new_zeros(
+                (physical_tokens, self.ple_embedding.ngram_heads)
+            )
+        else:
+            physical_tokens = batch.physical_tokens
+            ngram_ids = self.ple_embedding.compute_ngram_ids(batch)
+        lookup_ids, _semantic_tokens = self.ple_embedding._prepare_embedding_lookup(
+            ngram_ids, forward_batch, physical_tokens
+        )
+        lookup_tokens = lookup_ids.shape[0]
+        if lookup_tokens == 0:
+            return
+        buffer = self._graph_prefetch_buffers.get(lookup_tokens)
+        if buffer is None:
+            for key, candidate in self._graph_prefetch_buffers.items():
+                if candidate.shape[0] >= lookup_tokens and (
+                    buffer is None or candidate.shape[0] < buffer.shape[0]
+                ):
+                    buffer = candidate
+        if not getattr(self, "_logged_ple_fill", False):
+            logger.info(
+                "PLE HIP eager-fill lookup_tokens=%s keys=%s found=%s",
+                lookup_tokens,
+                sorted(self._graph_prefetch_buffers),
+                None if buffer is None else tuple(buffer.shape),
+            )
+            self._logged_ple_fill = True
+        if buffer is None:
+            return
+        output_view = buffer[:lookup_tokens].view(
+            lookup_tokens, self.ple_embedding.ngram_heads, -1
+        )
+        self.ple_embedding.ngram_embedding.gather(lookup_ids, out=output_view)
+        if not getattr(self, "_logged_ple_fill_val", False):
+            logger.info(
+                "PLE HIP eager-fill val maxabs=%s lookup_ids[:8]=%s mode=%s",
+                float(output_view.detach().float().abs().max().cpu()),
+                lookup_ids.detach().flatten()[:8].cpu().tolist(),
+                getattr(forward_batch.forward_mode, "name", forward_batch.forward_mode),
+            )
+            self._logged_ple_fill_val = True
 
     def _consume_prefetched_embeddings(
         self, forward_batch: ForwardBatch
@@ -1809,6 +2109,16 @@ class Qwen4ExpAttentionDecoderLayer(
             )
         self._init_qwen4_exp_layer_extensions(config, layer_id, quant_config, prefix)
 
+    def _qsa_sparse_backend(self):
+        from sglang.srt.layers.attention.qsa.glue import resolve_qsa_sparse_backend
+
+        return resolve_qsa_sparse_backend(get_attn_backend())
+
+    def _should_reuse_mtp_sparse_indices(self, forward_batch: ForwardBatch) -> bool:
+        sparse_backend = self._qsa_sparse_backend()
+        should_reuse = getattr(sparse_backend, "should_reuse_mtp_sparse_indices", None)
+        return should_reuse is not None and should_reuse(forward_batch)
+
     def _compute_qsa_topk_indices(
         self,
         hidden_states: torch.Tensor,
@@ -1829,9 +2139,19 @@ class Qwen4ExpAttentionDecoderLayer(
             return sparse_backend.lookup_mtp_sparse_indices(
                 forward_batch, self.layer_id
             )
-        indexer_metadata = get_qsa_indexer_metadata(
-            backend, self.layer_id, forward_batch
-        )
+        try:
+            indexer_metadata = get_qsa_indexer_metadata(
+                backend, self.layer_id, forward_batch
+            )
+        except RuntimeError:
+            # Breakable HIP replay of MTP used to reach here with the target
+            # attn backend (no indexer metadata). Shared MTP indices are still
+            # the correct decode selection.
+            if getattr(sparse_backend, "_mtp_shared_sparse_indices", None) is not None:
+                return sparse_backend.lookup_mtp_sparse_indices(
+                    forward_batch, self.layer_id
+                )
+            raise
         topk_indices = self.indexer(
             hidden_states,
             positions,
@@ -1853,8 +2173,12 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        reuse_mtp_indices = self.is_qsa and self._should_reuse_mtp_sparse_indices(
+            forward_batch
+        )
         overlap_indexer = (
             self.is_qsa
+            and not reuse_mtp_indices
             and self.alt_stream is not None
             and get_is_capture_mode()
             and hidden_states.shape[0] < _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
@@ -1955,6 +2279,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         is_nextn: bool = False,
     ) -> None:
         super().__init__(config, quant_config, prefix, is_nextn)
+        self.is_nextn = is_nextn
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
         self.has_ple = bool(config.ple_layer_ids)
@@ -1998,6 +2323,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         )
         residual = None
         aux_hidden_states = []
+        start_ple = getattr(self.layers[self.start_layer], "ple", None)
+        if start_ple is not None:
+            start_ple.start_prefetch(ple_batch, forward_batch)
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             if i + 1 < self.end_layer:
@@ -2020,7 +2348,10 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
 
         _commit_ple_batch(ple_batch, forward_batch)
 
-        hc_hidden_states = hidden_states
+        # Clone the pre-mix mHC residual before mix(). HIP grouped RMSNorm /
+        # fused mix may reuse the residual storage; EAGLE fusion needs the
+        # unmodified hc_count * hidden_size stream.
+        hc_hidden_states = hidden_states.detach().contiguous().clone()
         hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
         if not forward_batch.forward_mode.is_idle():
             return hidden_states, hc_hidden_states
@@ -2028,6 +2359,20 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
+
+    def fill_ple_cuda_graph_buffers(self, forward_batch: ForwardBatch) -> None:
+        if torch.version.hip is None or not self.has_ple:
+            return
+        ple_batch = _prepare_ple_batch(
+            forward_batch.input_ids,
+            forward_batch,
+            ngram_size=self.ple_ngram_size,
+            ngram_eos_token_id=self.ple_ngram_eos_token_id,
+        )
+        for i in range(self.start_layer, self.end_layer):
+            ple = getattr(self.layers[i], "ple", None)
+            if ple is not None:
+                ple.fill_cuda_graph_prefetch(ple_batch, forward_batch)
 
 
 class Qwen4ExpVLModel(Qwen4ExpModel):
@@ -2091,12 +2436,21 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.visual.deepstack_visual_indexes if self.visual is not None else []
         )
 
+    def fill_ple_cuda_graph_buffers(self, forward_batch: ForwardBatch) -> None:
+        model = getattr(self, "model", None)
+        fill = getattr(model, "fill_ple_cuda_graph_buffers", None)
+        if fill is not None:
+            fill(forward_batch)
+
     @torch.no_grad()
     def forward(self, *args, **kwargs):
         output = super().forward(*args, **kwargs)
         hc_hidden_states = self.model.last_hc_hidden_states
         if hc_hidden_states is not None and isinstance(output, LogitsProcessorOutput):
-            output.hidden_states = hc_hidden_states
+            # Do not alias the decoder residual or the BCG shared output
+            # buffer. Overlap + graph replay would otherwise clobber the
+            # MTP recurrent state while draft-extend still reads it.
+            output.hidden_states = hc_hidden_states.detach().contiguous().clone()
         return output
 
     def _load_qwen4_exp_ple_buffer(
@@ -2525,6 +2879,15 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             num_logical_experts=text_config.num_experts,
             num_groups=None,
         )
+
+
+# Wrap the full target forward (logits + HC hidden_states assignment).
+# Wrapping only Qwen4ExpModel.forward left last_hc_hidden_states / EAGLE
+# hidden_states stuck at capture-time dummy values, so MTP accept rate
+# collapsed even when sampled tokens were correct.
+Qwen4ExpForConditionalGeneration.forward = eager_on_graph(True)(
+    Qwen4ExpForConditionalGeneration.forward
+)
 
 
 EntryClass = [Qwen4ExpForConditionalGeneration]

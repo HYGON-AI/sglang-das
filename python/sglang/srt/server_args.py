@@ -4055,6 +4055,7 @@ class ServerArgs:
         # resolution (the declarative registry materializes too late to affect
         # it). Inkling opts into full-graph prefill capture here.
         self._apply_inkling_prefill_cuda_graph_default()
+        self._apply_qwen4_exp_hip_ple_decode_cuda_graph_default()
         self._apply_muse_glimmer_prefill_cuda_graph_max_bs_default()
 
         # must run before _handle_cuda_graph_config and _handle_data_parallelism
@@ -4967,6 +4968,37 @@ class ServerArgs:
                 "_apply_inkling_prefill_cuda_graph_default",
                 cuda_graph_backend_prefill=Backend.FULL,
             )
+
+    def _apply_qwen4_exp_hip_ple_decode_cuda_graph_default(self):
+        """HIP/HCU mapped-host PLE gathers collapse under full decode graphs.
+
+        Force breakable decode graphs so PLE re-runs eagerly between MoE
+        segments. Must run before _handle_cuda_graph_config. Honors an
+        explicit --cuda-graph-backend-decode / --disable-decode-cuda-graph.
+        """
+        if (
+            self.cuda_graph_backend_decode is not None
+            or self.disable_decode_cuda_graph
+            or self.disable_cuda_graph
+            or not self.ple_offload_embedding
+            or parse_connector_type(self.model_path) == ConnectorType.INSTANCE
+        ):
+            return
+        if not (is_hip() or is_hcu()):
+            return
+        arch = self.get_model_config().hf_config.architectures[0]
+        if arch not in (
+            "Qwen4ExpForConditionalGeneration",
+            "Qwen4ExpForCausalLMMTP",
+        ):
+            return
+        logger.info(
+            "Using breakable decode CUDA graphs for Qwen4Exp PLE offload on HIP/HCU."
+        )
+        self._declare(
+            "_apply_qwen4_exp_hip_ple_decode_cuda_graph_default",
+            cuda_graph_backend_decode=Backend.BREAKABLE,
+        )
 
     def _apply_muse_glimmer_prefill_cuda_graph_max_bs_default(self):
         if (

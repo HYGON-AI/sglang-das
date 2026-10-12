@@ -127,8 +127,14 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
         )
         size = shape_key.size
+        # Verify / MTP graphs key on bs, but logits are bs * tokens_per_req.
+        # Clamping the buffer to size drops draft rows and EAGLE reshape-crashes.
+        warmup_rows = self._output_rows(warmup_out)
+        alloc_rows = max(size, warmup_rows)
         if self._shared_output_buffer is None:
-            self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
+            self._shared_output_buffer = self._alloc_full_buffer(
+                warmup_out, alloc_rows
+            )
         with graph_pool_capture_scope(), BreakableCUDAGraphCapture(
             cuda_graph=graph,
             pool=self._pool,
@@ -136,7 +142,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             barrier_fn=self._tp_group.barrier,
         ):
             out = captured_fn()
-            out_rows = self._output_rows(out, size)
+            out_rows = self._output_rows(out)
             self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
 
         stored = self._slice_output(self._shared_output_buffer, out_rows)
@@ -145,27 +151,37 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
         self._capture_inputs[shape_key] = capture_inputs
 
-    def _output_rows(self, output: Any, cap: int) -> int:
-        """Leading-dim row count actually produced by the body, clamped to ``cap``.
+    def _output_rows(self, output: Any, cap: Optional[int] = None) -> int:
+        """Leading-dim row count actually produced by the body.
 
-        A body that shards or prunes its output along dim 0 returns fewer than
-        ``cap`` rows; everything else returns exactly ``cap``.
+        Do not clamp to ShapeKey.size: decode keys on bs, but EAGLE target
+        verify logits are ``bs * draft_token_num``. Prefer next_token_logits
+        so a 1-row hidden_states field cannot shrink verify logits to 1.
         """
+        logits = getattr(output, "next_token_logits", None)
+        if torch.is_tensor(logits):
+            rows = logits.shape[0]
+            return min(cap, rows) if cap is not None else rows
         if torch.is_tensor(output):
-            return min(cap, output.shape[0])
+            rows = output.shape[0]
+            return min(cap, rows) if cap is not None else rows
         if isinstance(output, PPProxyTensors):
             rows = [t.shape[0] for t in output.tensors.values()]
-            return min([cap, *rows])
+            actual = min(rows) if rows else 0
+            return min(cap, actual) if cap is not None else actual
         if dataclasses.is_dataclass(output) and not isinstance(output, type):
             rows = [
                 self._output_rows(value, cap)
                 for field in dataclasses.fields(output)
                 if (value := getattr(output, field.name)) is not None
             ]
-            return min(rows) if rows else cap
+            actual = min(rows) if rows else 0
+            if cap is None:
+                return actual
+            return min(cap, actual) if actual else cap
         if isinstance(output, (list, tuple)) and output:
             return min(self._output_rows(o, cap) for o in output if o is not None)
-        return cap
+        return 0 if cap is None else cap
 
     def _alloc_full_buffer(self, output: Any, size: int) -> Any:
         """A same-structure buffer as ``output`` but with ``size`` leading rows."""
@@ -232,7 +248,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 f"{type(output)} vs {type(output_buffer)}"
             )
         if torch.is_tensor(output) and torch.is_tensor(output_buffer):
-            output_buffer[:num_tokens].copy_(output[:num_tokens])
+            rows = min(num_tokens, output.shape[0], output_buffer.shape[0])
+            output_buffer[:rows].copy_(output[:rows])
             return
         if isinstance(output, PPProxyTensors) and isinstance(
             output_buffer, PPProxyTensors

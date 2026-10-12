@@ -12,12 +12,16 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.hyperconnection import GroupedGemmaRMSNorm
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_config
 from sglang.srt.models.qwen4_exp import Qwen4ExpModel
 from sglang.srt.runtime_context import get_model, get_parallel
@@ -75,12 +79,20 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         self.pre_fc_norm_embedding = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        hidden_norm_size = (
-            self.hc_count * config.hidden_size
-            if self.hc_count > 1
-            else config.hidden_size
-        )
-        self.pre_fc_norm_hidden = GemmaRMSNorm(hidden_norm_size, eps=config.rms_norm_eps)
+        # mHC residual is hc_count independent streams. Checkpoint
+        # pre_fc_norm_hidden.weight is stored flat (10240,) but the four
+        # hidden_size slices have disjoint statistics; RMS over the concatenated
+        # 10240-d vector mixes branches and collapses MTP accept rate.
+        if self.hc_count > 1:
+            self.pre_fc_norm_hidden = GroupedGemmaRMSNorm(
+                self.hc_count * config.hidden_size,
+                eps=config.rms_norm_eps,
+                group_size=config.hidden_size,
+            )
+        else:
+            self.pre_fc_norm_hidden = GemmaRMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
 
     def _init_linear_projections(
         self, config: PretrainedConfig, prefix: str
@@ -244,6 +256,13 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         )
         self._set_hc_logits_hidden_states(logits_output, hc_hidden_states, forward_batch)
         return logits_output
+
+
+# Same HIP-graph issue as the target decoder: fusion GEMMs + QSA sitting in
+# one captured graph replay as token-0 / garbage drafts. Breakable capture
+# eager-runs the whole MTP forward; the graph remains the outer decode/extend
+# scaffolding.
+Qwen4ExpForCausalLMMTP.forward = eager_on_graph(True)(Qwen4ExpForCausalLMMTP.forward)
 
 
 EntryClass = [Qwen4ExpForCausalLMMTP]
