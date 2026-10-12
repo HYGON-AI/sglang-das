@@ -288,3 +288,7 @@ test-results/
 
 # Internal, non-published docs
 internal-docs/
+
+# Replay metadata kernels shipped with the Python package.
+!python/sglang/kernels/ops/mamba/mamba_state_indices_hip.py
+!python/sglang/kernels/ops/mamba/csrc/mamba_state_indices_hip.cu

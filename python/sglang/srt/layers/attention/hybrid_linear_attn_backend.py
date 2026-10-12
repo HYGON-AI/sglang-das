@@ -4,10 +4,9 @@ import logging
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
-
 from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
-from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
-    fused_replay_state_indices,
+from sglang.kernels.ops.mamba.mamba_state_indices import (
+    prepare_fused_replay_state_indices,
 )
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     fused_mamba_state_scatter_with_mask,
@@ -37,6 +36,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
@@ -54,15 +54,17 @@ class MambaAttnBackendBase(AttentionBackend):
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.enable_unified_memory = model_runner.server_args.enable_unified_memory
-        # Fused replay-prep state-indices fast path (fused_replay_state_indices):
-        # requires the static hybrid pool whose v2p translate is the identity —
-        # the unified pool overrides translate_mamba_indices with an allocator
-        # lookup that is not a flat table gather.
-        self._fused_state_indices_ok = (
-            str(self.device).startswith("cuda")
-            and isinstance(self.req_to_token_pool, HybridReqToTokenPool)
-            and type(self.req_to_token_pool).translate_mamba_indices
-            is HybridReqToTokenPool.translate_mamba_indices
+        # Opt-in fused replay indices; requires a static pool with identity v2p.
+        self._fused_state_indices_ok = get_bool_env_var(
+            "SGLANG_USE_FUSED_REPLAY_STATE_INDICES", default="false"
+        )
+        # Prepare once, before graph capture/replay: the HIP C++ kernel has no
+        # shape specialization and cannot compile/load on the first live step.
+        # SGLANG_REPLAY_STATE_INDICES_BACKEND=triton keeps the original path.
+        self._fused_replay_state_indices = (
+            prepare_fused_replay_state_indices(self.device)
+            if self._fused_state_indices_ok
+            else None
         )
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
@@ -574,7 +576,7 @@ class MambaAttnBackendBase(AttentionBackend):
             # Single-launch fast path: mapping gather + padding sentinel + store
             # into the static buffer, plus zeroing padded req_pool_indices rows —
             # bit-identical to the reference chain below.
-            mamba_indices = fused_replay_state_indices(
+            mamba_indices = self._fused_replay_state_indices(
                 req_pool_indices=req_pool_indices,
                 mamba_index_mapping=self.req_to_token_pool.req_index_to_mamba_index_mapping,
                 out_state_indices=self.state_indices_list[bs - 1],
@@ -1032,9 +1034,7 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         if layer_id in self.full_attn_layers:
-            return self.full_attn_backend.get_indexer_metadata(
-                layer_id, forward_batch
-            )
+            return self.full_attn_backend.get_indexer_metadata(layer_id, forward_batch)
         return None
 
     def on_after_cuda_graph_warmup(self):

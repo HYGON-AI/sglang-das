@@ -2823,7 +2823,7 @@ def initialize_model_parallel(
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
             max_world_size=max_world_size,
-            custom_all_reduce_backend="off",
+            custom_all_reduce_backend=None if _ATTN_TP_USE_AITER_CUSTOM_COMM else "off",
         )
 
     # CP-v2 DP gather: for each CP index, span all attention-DP replicas and
