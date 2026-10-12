@@ -36,7 +36,10 @@ _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
 _FAST_SUPPORTED = None
 _HIP_SHAPE_GATE = None
 
-_USE_HCU_ATTN_RES = _is_hcu and get_bool_env_var("SGLANG_K3_ATTN_RESIDUAL_HCU", default="true")
+_USE_HCU_ATTN_RES = _is_hcu and get_bool_env_var(
+    "SGLANG_K3_ATTN_RESIDUAL_HCU", default="true"
+)
+
 
 def _supports_attn_res_tma(capability: tuple[int, int]) -> bool:
     """Return whether the device is eligible for the TMA fast path."""
@@ -44,13 +47,40 @@ def _supports_attn_res_tma(capability: tuple[int, int]) -> bool:
     return major >= 10 and major != 12
 
 
-def _use_hcu_aggregate(num_tokens: int, nvb: int) -> bool:
-    """Route aggregation to the boltops HCU single-kernel mix when it beats
-    the official HIP kernel. Benchmark (H=7168): boltops attn_res wins for
-    nvb >= 5 and T >= 256 (its online softmax avoids the official kernel's
-    next_pow2(nvb) x 8192 register tile); official wins at small T, so keep
-    the official path there. Requires the HCU env switch."""
-    return _USE_HCU_ATTN_RES # and num_tokens >= 256 and nvb >= 5
+_USE_FUSED_HCU_ATTN_RES = _is_hcu and get_bool_env_var(
+    "SGLANG_K3_FUSED_ATTN_RES", default="false"
+)
+
+
+def _use_hcu_aggregate(
+    num_tokens: int,
+    hidden_size: int,
+    nvb: int,
+    *,
+    apply_out_norm: bool,
+) -> bool:
+    """Choose BoltOps or the fused Triton kernel on HCU.
+
+    Fusion is disabled by default. With SGLANG_K3_FUSED_ATTN_RES=1,
+    BW1100 CUDA Graph microbenchmarks of the full aggregation chain with
+    H=7168, T=1/8/64/128/256, and nvb=1..8 favor the fused kernel whenever
+    output RMSNorm is present. The nvb>=7 kernel uses 8 warps. Pre-norm
+    auxiliary aggregation and unmeasured shapes retain BoltOps.
+    """
+    if not _USE_HCU_ATTN_RES:
+        return False
+    if not _USE_FUSED_HCU_ATTN_RES:
+        return True
+    # T<=256 covers the profiled bs<=32, 8-token DSpark verify workload;
+    # it is a measured range, not a speed crossover.
+    if (
+        0 < num_tokens <= 256
+        and hidden_size == 7168
+        and 1 <= nvb <= 8
+        and apply_out_norm
+    ):
+        return False
+    return True
 
 
 def _use_fast(hidden_size: int) -> bool:
@@ -343,9 +373,8 @@ def _aggregate_hcu(
     Same contract as ``_aggregate_hip``: returns ``(out, prefix)`` with
     ``prefix = prefix_a + prefix_b`` (rounded to the storage dtype) and
     ``out = out_norm(mix)`` or the pre-norm mixture when ``out_norm`` is None.
-    Used when boltops ``attn_res`` beats the official HIP kernel (T >= 256,
-    nvb >= 5); the extra out-norm launch is already included in the bench's
-    ``B_full`` numbers.
+    The dispatcher uses this baseline when HCU fusion is disabled, or for
+    shapes outside the measured fusion range.
     """
     if prefix_b is None:
         prefix = prefix_a
@@ -399,7 +428,12 @@ def aggregate_stream(
     raw wire only carries the current block's running prefix."""
     if nvb == 0:
         return prefix_sum
-    if _use_hcu_aggregate(prefix_sum.shape[0], nvb):
+    if _use_hcu_aggregate(
+        prefix_sum.shape[0],
+        prefix_sum.shape[1],
+        nvb,
+        apply_out_norm=False,
+    ):
         return _aggregate_hcu(
             prefix_sum, None, bank, nvb, score_proj, score_norm, None
         )[0]
@@ -424,8 +458,13 @@ def _aggregate_fused_add(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Aggregation point with a pending upstream residual add: materialize
     prefix = prefix_a + prefix_b, then aggregate. Returns (normed, prefix).
-    write_bank_row rides _aggregate (fast path only)."""
-    if _use_hcu_aggregate(prefix_a.shape[0], nvb):
+    write_bank_row is handled by the selected aggregation path."""
+    if _use_hcu_aggregate(
+        prefix_a.shape[0],
+        prefix_a.shape[1],
+        nvb,
+        apply_out_norm=out_norm is not None,
+    ):
         return _aggregate_hcu(
             prefix_a,
             prefix_b,
@@ -475,9 +514,8 @@ def _aggregate(
     """Single aggregation point: score → softmax → mix → norm.
 
     Caller handles nvb == 0 (layer 0 attn side: just out_norm(prefix_sum)).
-    write_bank_row is fast-path only (in-kernel snapshot of the prefix row
-    into bank[:, nvb, :]); the triton path keeps the standalone .write() copy —
-    the caller (AttnResidual.forward) owns that fallback.
+    write_bank_row is handled by the selected fast, HIP, or HCU path; the
+    two-kernel fallback requires the caller to issue a separate .write().
     """
     if prefix_sum.shape[0] == 0:
         return prefix_sum
@@ -491,7 +529,12 @@ def _aggregate(
             out_norm,
             write_bank_row=write_bank_row,
         )
-    if _use_hcu_aggregate(prefix_sum.shape[0], nvb):
+    if _use_hcu_aggregate(
+        prefix_sum.shape[0],
+        prefix_sum.shape[1],
+        nvb,
+        apply_out_norm=out_norm is not None,
+    ):
         return _aggregate_hcu(
             prefix_sum,
             None,

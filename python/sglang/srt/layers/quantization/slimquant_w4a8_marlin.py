@@ -501,6 +501,8 @@ def _hf_architectures(hf_config) -> list[str]:
 
 
 class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
+    supports_kimi_k3_quantized_latent_projections = True
+
     """Config class for W4A8 Int8 Quantization.
     - Weight: static, per-channel, symmetric
     - Activation: dynamic, per-token, symmetric

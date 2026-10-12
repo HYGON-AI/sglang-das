@@ -15,6 +15,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_hcu
+
 # _agg_kernel keeps a next_pow2(nvb) x next_pow2(H) fp32 tile in registers, and
 # that is the whole basis of its speed. Past this budget it spills and loses to
 # the 2-kernel Triton pipeline it replaces: measured at T=4 on MI355X,
@@ -179,6 +181,34 @@ def attn_res_hip(
     has_add = addend is not None
     assert not has_add or prefix_out is not None, "addend requires prefix_out"
 
+    # Packed layout for the validated BF16 HCU K3 no-add shapes. The caller
+    # selects this HIP path with SGLANG_K3_FUSED_ATTN_RES; no extra switch is
+    # needed. Pending-add, auxiliary and nvb=8 paths keep the original layout.
+    if (
+        is_hcu()
+        and not has_add
+        and ow is not None
+        and prefix_sum.dtype == torch.bfloat16
+        and H == 7168
+        and 32 <= T <= 256
+        and nvb < 8
+    ):
+        attn_res_hip_packed(
+            prefix_sum,
+            bank,
+            cw,
+            ow,
+            out,
+            nvb,
+            score_eps,
+            out_eps,
+            write_prefix=write_prefix,
+            # At 6+ rows, the packed 4-warp tile spills; 8 warps wins in
+            # the T32/64/128/256 decode candidates. Smaller banks keep 4 warps.
+            num_warps=8 if nvb >= 6 else 4,
+        )
+        return
+
     # Triton needs a real pointer for every argument; the flags decide whether
     # these are ever dereferenced.
     addend_arg = addend if has_add else prefix_sum
@@ -208,5 +238,104 @@ def attn_res_hip(
         HAS_ADD=has_add,
         WRITE_BANK=write_prefix,
         APPLY_OUT_NORM=ow is not None,
-        num_warps=4,
+        # Previous launch used 4 warps for every bank size:
+        # num_warps=4,
+        # HCU's 8-row, H=7168 register tile spills heavily at 4 warps.
+        # Eight warps wins for nvb>=7 while smaller banks retain 4.
+        num_warps=8 if is_hcu() and nvb >= 7 else 4,
+    )
+
+
+@triton.jit
+def _agg_packed_kernel(
+    prefix_ptr,
+    bank_ptr,
+    cw_ptr,
+    ow_ptr,
+    out_ptr,
+    score_eps,
+    out_eps,
+    stride_pm,
+    stride_bm,
+    stride_bb,
+    stride_o,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    NVB: tl.constexpr,
+    R_PAD: tl.constexpr,
+    WRITE_BANK: tl.constexpr,
+):
+    """Score prefix and bank in one tile, with one softmax/mix reduction.
+
+    Most K3 bank sizes leave masked rows in the power-of-two bank tile. The
+    prefix can occupy one of these rows without growing the register tile.
+    """
+    t = tl.program_id(0)
+    h = tl.arange(0, BLOCK_H)
+    r = tl.arange(0, R_PAD)
+    valid_h, valid_r = h < H, r <= NVB
+    bank_values = tl.load(
+        bank_ptr + t * stride_bm + r[:, None] * stride_bb + h[None, :],
+        (r < NVB)[:, None] & valid_h[None, :],
+        0,
+    )
+    prefix_values = tl.load(prefix_ptr + t * stride_pm + h, valid_h, 0)
+    # HCU Triton 3.6 cannot lower a select between these two pointer bases.
+    # Select BF16 values instead; prefix is converted only as part of the tile.
+    tile = tl.where(r[:, None] == NVB, prefix_values[None, :], bank_values).to(
+        tl.float32
+    )
+    cw = tl.load(cw_ptr + h, valid_h, 0).to(tl.float32)
+    scores = tl.sum(tile * cw[None, :], 1) / tl.sqrt(
+        tl.sum(tile * tile, 1) / H + score_eps
+    )
+    scores = tl.where(valid_r, scores, -float("inf"))
+    weights = tl.exp(scores - tl.max(scores, 0))
+    inv = 1.0 / tl.sum(weights, 0)
+    acc = tl.sum((weights * inv)[:, None] * tile, 0)
+    scale = 1.0 / tl.sqrt(tl.sum(acc * acc, 0) / H + out_eps)
+    ow = tl.load(ow_ptr + h, valid_h, 0).to(tl.float32)
+    acc = acc * scale * ow
+    tl.store(out_ptr + t * stride_o + h, acc.to(out_ptr.dtype.element_ty), valid_h)
+    if WRITE_BANK:
+        # Copy storage bits directly; scoring/mixing need no bank row NVB.
+        prefix = tl.load(prefix_ptr + t * stride_pm + h, valid_h, 0)
+        tl.store(bank_ptr + t * stride_bm + NVB * stride_bb + h, prefix, valid_h)
+
+
+def attn_res_hip_packed(
+    prefix_sum: torch.Tensor,
+    bank: torch.Tensor,
+    cw: torch.Tensor,
+    ow: torch.Tensor,
+    out: torch.Tensor,
+    nvb: int,
+    score_eps: float,
+    out_eps: float,
+    *,
+    write_prefix: bool = False,
+    num_warps: int = 8,
+) -> None:
+    """No-add candidate; prefix occupies bank tile's padding when available."""
+    T, H = prefix_sum.shape
+    assert 1 <= nvb <= bank.shape[1]
+    assert not write_prefix or nvb < bank.shape[1]
+    _agg_packed_kernel[(T,)](
+        prefix_sum,
+        bank,
+        cw,
+        ow,
+        out,
+        score_eps,
+        out_eps,
+        prefix_sum.stride(0),
+        bank.stride(0),
+        bank.stride(1),
+        out.stride(0),
+        H=H,
+        BLOCK_H=triton.next_power_of_2(H),
+        NVB=nvb,
+        R_PAD=triton.next_power_of_2(nvb + 1),
+        WRITE_BANK=write_prefix,
+        num_warps=num_warps,
     )

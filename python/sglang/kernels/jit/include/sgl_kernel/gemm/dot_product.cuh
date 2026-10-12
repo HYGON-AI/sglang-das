@@ -27,10 +27,11 @@ SGL_DEVICE void dot_product_vec(AlignedVector<bf16x2_t, N> a, AlignedVector<bf16
     acc = math::fma_f32_bf16(a[i].x, b[i].x, acc);
     acc = math::fma_f32_bf16(a[i].y, b[i].y, acc);
 #else
-    const auto [a0, a1] = cast<fp32x2_t>(a[i]);
-    const auto [b0, b1] = cast<fp32x2_t>(b[i]);
-    acc += a0 * b0;
-    acc += a1 * b1;
+    // HIP vector types contain an anonymous union and cannot be decomposed.
+    const auto af = cast<fp32x2_t>(a[i]);
+    const auto bf = cast<fp32x2_t>(b[i]);
+    acc += af.x * bf.x;
+    acc += af.y * bf.y;
 #endif
   }
 }

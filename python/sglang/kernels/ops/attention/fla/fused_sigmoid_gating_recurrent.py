@@ -133,6 +133,283 @@ def _cutedsl_qk_sum_squares(x, BK: tl.constexpr):
     return tl.sum(lane_sum, axis=0)
 
 
+from sglang.srt.utils import is_hcu
+
+_is_hcu = is_hcu()
+
+
+@triton.jit(do_not_specialize=["TOTAL"])
+def _prepare_sigmoid_gating_delta_rule_opt(
+    q,
+    k,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    prepared,
+    scale,
+    softplus_beta,
+    softplus_threshold,
+    lower_bound,
+    TOTAL,
+    stride_q: tl.constexpr,
+    stride_k: tl.constexpr,
+    stride_a: tl.constexpr,
+    stride_b: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    BK: tl.constexpr,
+    PITCH: tl.constexpr,
+    GROUP: tl.constexpr,
+    IS_KDA: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    CACHE_RING: tl.constexpr,
+):
+    """Compute shared FP32 Q/K normalization, decay and beta once per token/head."""
+    flat = tl.program_id(0) * GROUP + tl.arange(0, GROUP)
+    token, head = flat // HV, flat % HV
+    qk_head = head // (HV // H)
+    kk = tl.arange(0, BK)
+    valid = flat < TOTAL
+    mask = valid[:, None] & (kk[None, :] < K)
+    qv = tl.load(
+        q + token[:, None].to(tl.int64) * stride_q + qk_head[:, None] * K + kk[None, :],
+        mask,
+        0,
+    ).to(tl.float32)
+    kv = tl.load(
+        k + token[:, None].to(tl.int64) * stride_k + qk_head[:, None] * K + kk[None, :],
+        mask,
+        0,
+    ).to(tl.float32)
+    av_log = tl.load(A_log + head, valid, 0).to(tl.float32)
+    if IS_KDA:
+        av = tl.load(
+            a
+            + token[:, None].to(tl.int64) * stride_a
+            + head[:, None] * K
+            + kk[None, :],
+            mask,
+            0,
+        ).to(tl.float32)
+        bias = tl.load(
+            dt_bias + head[:, None] * K + kk[None, :],
+            kk[None, :] < K,
+            0,
+        ).to(tl.float32)
+        x = av + bias
+        exp_a = tl.exp(av_log)[:, None]
+    else:
+        av = tl.load(a + token.to(tl.int64) * stride_a + head, valid, 0).to(tl.float32)
+        bias = tl.load(dt_bias + head).to(tl.float32)
+        x = av + bias
+        exp_a = tl.exp(av_log)
+    if USE_LOWER_BOUND:
+        gate = lower_bound * tl.sigmoid(exp_a * x)
+    else:
+        beta_x = softplus_beta * x
+        softplus_x = tl.where(
+            beta_x <= softplus_threshold,
+            (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
+            x,
+        )
+        gate = -exp_a * softplus_x
+    beta = 1.0 / (
+        1.0
+        + tl.exp(
+            -tl.load(b + token.to(tl.int64) * stride_b + head, valid, 0).to(tl.float32)
+        )
+    )
+    if USE_QK_L2NORM_IN_KERNEL:
+        qv = qv / tl.sqrt(tl.sum(qv * qv, 1)[:, None] + 1e-6)
+        kv = kv / tl.sqrt(tl.sum(kv * kv, 1)[:, None] + 1e-6)
+    qv *= scale
+    base = prepared + flat[:, None].to(tl.int64) * PITCH + kk[None, :]
+    tl.store(base, qv, mask)
+    tl.store(base + BK, kv, mask)
+    if IS_KDA:
+        tl.store(base + 2 * BK, tl.exp(gate), mask)
+        if CACHE_RING:
+            tl.store(base + 3 * BK + 16, gate, mask)
+    else:
+        tl.store(prepared + flat.to(tl.int64) * PITCH + 2 * BK, tl.exp(gate), valid)
+        if CACHE_RING:
+            tl.store(prepared + flat.to(tl.int64) * PITCH + 3 * BK + 16, gate, valid)
+    tl.store(prepared + flat.to(tl.int64) * PITCH + 3 * BK, beta, valid)
+
+
+@triton.jit(do_not_specialize=["T"])
+def fused_sigmoid_gating_delta_rule_update_kernel_opt(
+    v,
+    k,
+    prepared,
+    o,
+    h0_source,
+    h0_indices,
+    cu_seqlens,
+    intermediate_states_buffer,
+    intermediate_state_indices,
+    retrieve_parent_token_ptr,
+    replayssm_rawv,
+    replayssm_rawk,
+    replayssm_g,
+    replayssm_beta,
+    T,
+    stride_h0_source: tl.constexpr,
+    stride_v: tl.constexpr,
+    stride_k: tl.constexpr,
+    cache_steps: tl.constexpr,
+    stride_retrieve_parent_token_seq: tl.constexpr,
+    stride_retrieve_parent_token_token: tl.constexpr,
+    stride_rawv_slot: tl.constexpr,
+    stride_rawk_slot: tl.constexpr,
+    stride_g_slot: tl.constexpr,
+    stride_beta_slot: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    PITCH: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    IS_KDA: tl.constexpr,
+    DISABLE_STATE_UPDATE: tl.constexpr,
+    CACHE_INTERMEDIATE_STATES: tl.constexpr,
+    HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
+    CACHE_RING: tl.constexpr,
+    MAX_CACHE_LEN: tl.constexpr,
+):
+    """Low-register V-major recurrence with the original state/cache semantics."""
+    iv, nh = tl.program_id(0), tl.program_id(1)
+    row, head = nh // HV, nh % HV
+    qk_head = head // (HV // H)
+    if IS_VARLEN:
+        bos = tl.load(cu_seqlens + row).to(tl.int64)
+        eos = tl.load(cu_seqlens + row + 1).to(tl.int64)
+    else:
+        bos = row.to(tl.int64) * T
+        eos = bos + T
+    kk = tl.arange(0, BK)
+    vv = iv * BV + tl.arange(0, BV)
+    mask_k = kk < K
+    if V % BV == 0:
+        mask_v = tl.full((BV,), True, tl.int1)
+    else:
+        mask_v = vv < V
+    mask_h = mask_v[:, None] & mask_k[None, :]
+    offsets = vv[:, None] * K + kk[None, :]
+    slot = tl.full((), -1, tl.int64)
+    if USE_INITIAL_STATE or CACHE_RING:
+        slot = tl.load(h0_indices + row).to(tl.int64)
+    state = tl.zeros((BV, BK), tl.float32)
+    if USE_INITIAL_STATE:
+        state += tl.load(
+            h0_source + slot * stride_h0_source + head * V * K + offsets,
+            mask=(slot >= 0) & mask_h,
+            other=0,
+        ).to(tl.float32)
+    cache_slot = tl.full((), -1, tl.int64)
+    if CACHE_INTERMEDIATE_STATES:
+        cache_slot = tl.load(intermediate_state_indices + row).to(tl.int64)
+    for step in range(eos - bos):
+        if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
+            if step != 0 and cache_slot >= 0:
+                parent = tl.load(
+                    retrieve_parent_token_ptr
+                    + row * stride_retrieve_parent_token_seq
+                    + step * stride_retrieve_parent_token_token
+                ).to(tl.int64)
+                state = tl.load(
+                    intermediate_states_buffer
+                    + ((cache_slot * cache_steps + parent) * HV + head) * V * K
+                    + offsets,
+                    mask_h,
+                    0,
+                ).to(tl.float32)
+        token = bos + step
+        base = (token * HV + head) * PITCH
+        kn = tl.load(prepared + base + BK + kk, mask_k, 0)
+        beta = tl.load(prepared + base + 3 * BK)
+        value = tl.load(v + token * stride_v + head * V + vv, mask_v, 0).to(tl.float32)
+        if IS_KDA:
+            decay = tl.load(prepared + base + 2 * BK + kk, mask_k, 0)
+            state *= decay[None, :]
+        else:
+            state *= tl.load(prepared + base + 2 * BK)
+        if CACHE_RING:
+            if slot >= 0 and step < MAX_CACHE_LEN:
+                tl.store(
+                    replayssm_rawv
+                    + slot * stride_rawv_slot
+                    + head * MAX_CACHE_LEN * V
+                    + step * V
+                    + vv,
+                    value.to(replayssm_rawv.dtype.element_ty),
+                    mask_v,
+                )
+                if iv == 0:
+                    raw_k = tl.load(k + token * stride_k + qk_head * K + kk, mask_k, 0)
+                    tl.store(
+                        replayssm_rawk
+                        + slot * stride_rawk_slot
+                        + qk_head * MAX_CACHE_LEN * K
+                        + step * K
+                        + kk,
+                        raw_k.to(replayssm_rawk.dtype.element_ty),
+                        mask_k,
+                    )
+                    if IS_KDA:
+                        gate = tl.load(prepared + base + 3 * BK + 16 + kk, mask_k, 0)
+                        tl.store(
+                            replayssm_g
+                            + slot * stride_g_slot
+                            + head * MAX_CACHE_LEN * K
+                            + step * K
+                            + kk,
+                            gate,
+                            mask_k,
+                        )
+                    else:
+                        gate = tl.load(prepared + base + 3 * BK + 16)
+                        tl.store(
+                            replayssm_g
+                            + slot * stride_g_slot
+                            + head * MAX_CACHE_LEN
+                            + step,
+                            gate,
+                        )
+                    tl.store(
+                        replayssm_beta
+                        + slot * stride_beta_slot
+                        + head * MAX_CACHE_LEN
+                        + step,
+                        beta,
+                    )
+        delta = (value - tl.sum(state * kn[None, :], 1)) * beta
+        state += kn[None, :] * delta[:, None]
+        qn = tl.load(prepared + base + kk, mask_k, 0)
+        out = tl.sum(state * qn[None, :], 1)
+        tl.store(o + (token * HV + head) * V + vv, out, mask_v)
+        if CACHE_INTERMEDIATE_STATES:
+            tl.store(
+                intermediate_states_buffer
+                + ((cache_slot * cache_steps + step) * HV + head) * V * K
+                + offsets,
+                state.to(intermediate_states_buffer.dtype.element_ty),
+                (cache_slot >= 0) & mask_h,
+            )
+    if not DISABLE_STATE_UPDATE and USE_INITIAL_STATE:
+        tl.store(
+            h0_source + slot * stride_h0_source + head * V * K + offsets,
+            state.to(h0_source.dtype.element_ty),
+            (slot >= 0) & mask_h,
+        )
+
+
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel(
     A_log,
@@ -568,8 +845,8 @@ def fused_sigmoid_gating_delta_rule_update(
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
-    This function uses a single fused kernel that combines both sigmoid gating computation
-    and the recurrent delta rule update for better performance.
+    The original fused kernel is retained. HCU verify optimization
+    shares FP32 Q/K normalization and gates across the recurrent V tiles.
 
     Supports both decode and target_verify modes:
     - decode: standard single-step update with state write-back
@@ -687,6 +964,98 @@ def fused_sigmoid_gating_delta_rule_update(
     round_state_to_bf16 = match_cutedsl_decode and (
         initial_state_source is None or initial_state_source.dtype == torch.bfloat16
     )
+
+    # Select by execution mode only: no head/BS/length/dtype whitelist. Normal
+    # decode retains one launch; verify keeps dynamic sequence/tree/ring support.
+    if _is_hcu and (
+        disable_state_update or intermediate_states_buffer is not None or cache_ring
+    ):
+        pitch = 3 * BK + 16 + (BK if cache_ring else 0)
+        prepared = torch.empty(
+            (B * T * HV, pitch), device=q.device, dtype=torch.float32
+        )
+        _prepare_sigmoid_gating_delta_rule_opt[(triton.cdiv(B * T * HV, 4),)](
+            q,
+            k,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            prepared,
+            scale,
+            softplus_beta,
+            softplus_threshold,
+            lower_bound if lower_bound is not None else 0.0,
+            B * T * HV,
+            stride_q=stride_q,
+            stride_k=stride_k,
+            stride_a=stride_a,
+            stride_b=stride_b,
+            H=H,
+            HV=HV,
+            K=K,
+            BK=BK,
+            PITCH=pitch,
+            GROUP=4,
+            IS_KDA=is_kda,
+            USE_LOWER_BOUND=lower_bound is not None,
+            USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+            CACHE_RING=cache_ring,
+            num_warps=4,
+            num_stages=1,
+        )
+        opt_bv = min(triton.next_power_of_2(V), 16)
+        fused_sigmoid_gating_delta_rule_update_kernel_opt[
+            (triton.cdiv(V, opt_bv), N * HV)
+        ](
+            v,
+            k,
+            prepared,
+            o,
+            initial_state_source,
+            initial_state_indices,
+            cu_seqlens,
+            intermediate_states_buffer,
+            intermediate_state_indices,
+            retrieve_parent_token,
+            replayssm_rawv,
+            replayssm_rawk,
+            replayssm_g,
+            replayssm_beta,
+            T,
+            stride_h0_source=(
+                initial_state_source.stride(0)
+                if initial_state_source is not None
+                else 0
+            ),
+            stride_v=stride_v,
+            stride_k=stride_k,
+            cache_steps=cache_stride_steps,
+            stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
+            stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
+            stride_rawv_slot=stride_rawv_slot,
+            stride_rawk_slot=stride_rawk_slot,
+            stride_g_slot=stride_g_slot,
+            stride_beta_slot=stride_beta_slot,
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
+            BK=BK,
+            BV=opt_bv,
+            PITCH=pitch,
+            USE_INITIAL_STATE=initial_state_source is not None,
+            IS_VARLEN=cu_seqlens is not None,
+            IS_KDA=is_kda,
+            DISABLE_STATE_UPDATE=disable_state_update,
+            CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
+            HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+            CACHE_RING=cache_ring,
+            MAX_CACHE_LEN=max_cache_len,
+            num_warps=1,
+            num_stages=1,
+        )
+        return o.squeeze(0)
 
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,

@@ -45,7 +45,14 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hcu, is_hip, is_npu, set_weight_attrs
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cpu,
+    is_hcu,
+    is_hip,
+    is_npu,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -180,7 +187,9 @@ def _resolve_linear_group(
     if parallel_group == "replicated":
         return None
     name = "tp" if parallel_group is None else parallel_group
-    if name not in ("tp", "attn_tp", "shared_experts_tp") and not (_is_hcu and name == "attn_cp"):
+    if name not in ("tp", "attn_tp", "shared_experts_tp") and not (
+        _is_hcu and name == "attn_cp"
+    ):
         raise ValueError(f"Unknown linear parallel_group: {parallel_group!r}")
     parallel = get_parallel()
     try:
@@ -444,6 +453,10 @@ class ReplicatedLinear(LinearBase):
         input_quant_args: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         rms_norm_eps: Optional[float] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if quant_args is not None:
+            if input_quant_args is not None:
+                raise ValueError("Specify only one prequantized input argument")
+            input_quant_args = quant_args
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
         if input_quant_args is not None:
@@ -702,20 +715,37 @@ class ColumnParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_column_parallel_weight(loaded_weight)
 
-    def forward(self, input_, rms_weight=None, residual=None, update_hd=True, input_quant_args=None):
+    def forward(
+        self,
+        input_,
+        rms_weight=None,
+        residual=None,
+        update_hd=True,
+        input_quant_args=None,
+    ):
         bias = self.bias if not self.skip_bias_add else None
 
-        if input_quant_args is not None or (_is_hcu and _use_fused_rms_quant and rms_weight is not None):
+        if input_quant_args is not None or (
+            _is_hcu and _use_fused_rms_quant and rms_weight is not None
+        ):
             if input_quant_args is None:
                 i_q, scales = lm_faster_rmsquant(
-                    input=input_, rms_weight=rms_weight, epsilon=self.eps,
-                    quant_dtype=torch.int8, residual=residual, update_input=update_hd,
+                    input=input_,
+                    rms_weight=rms_weight,
+                    epsilon=self.eps,
+                    quant_dtype=torch.int8,
+                    residual=residual,
+                    update_input=update_hd,
                 )
                 input_quant_args = [i_q, scales]
             assert self.quant_method is not None
             if not getattr(self.quant_method, "supports_prequantized_input", False):
-                raise TypeError(f"{type(self.quant_method).__name__} does not support prequantized input")
-            output_parallel = self.quant_method.apply(self, input_, bias, input_quant_args=input_quant_args)
+                raise TypeError(
+                    f"{type(self.quant_method).__name__} does not support prequantized input"
+                )
+            output_parallel = self.quant_method.apply(
+                self, input_, bias, input_quant_args=input_quant_args
+            )
         else:
             # Megatron SP "g": the input is this rank's [M_pad/tp, K] sequence shard;
             # all-gather to the full sequence and matmul. Participants (qkv/gate_up)
@@ -743,7 +773,6 @@ class ColumnParallelLinear(LinearBase):
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
-
 
     def extra_repr(self) -> str:
         s = f"in_features={self.input_size}"
@@ -1925,6 +1954,7 @@ class RowParallelLinear(LinearBase):
         use_fused_silu_mul_fp8_quant: Optional[bool] = False,
         swiglu_limit: Optional[float] = None,
         output_tensor=None,
+        input_quant_args=None,
     ):
         tp_rank, tp_size = get_group_rank_size(self.tp_group)
         if self.input_is_parallel:
@@ -1938,6 +1968,11 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (tp_rank > 0 or self.skip_bias_add) else self.bias
+
+        if input_quant_args is not None and get_forward().sp_active and tp_size > 1:
+            raise ValueError(
+                "Prequantized row input is unsupported by sequence-parallel reduction"
+            )
 
         # Megatron SP "g-bar": reduce-scatter along the token dim instead of
         # all-reduce, leaving the output sharded for the next SP LayerNorm region.
@@ -1960,7 +1995,30 @@ class RowParallelLinear(LinearBase):
                 get_parallel().tp_group, disabled=not is_allocation_symmetric()
             )
 
-        if use_fused_silu_mul_quant:
+        if input_quant_args is not None:
+            if not self.input_is_parallel:
+                raise ValueError(
+                    "Prequantized row-parallel input must already be local"
+                )
+            if (
+                use_fused_silu_mul_quant
+                or use_fused_silu_mul_fp8_quant
+                or output_tensor is not None
+            ):
+                raise ValueError(
+                    "Prequantized input conflicts with other fused/output modes"
+                )
+            if not getattr(self.quant_method, "supports_prequantized_input", False):
+                raise TypeError(
+                    "Quantization method does not support prequantized input"
+                )
+            with symm_ctx as sm:
+                output_parallel = self.quant_method.apply(
+                    self, input_parallel, bias=bias_, input_quant_args=input_quant_args
+                )
+                if sm is not None:
+                    sm.tag(output_parallel)
+        elif use_fused_silu_mul_quant:
             if swiglu_limit is None:
                 xq, xs = lm_fuse_silu_mul_quant(input_parallel)
                 quant_kwargs = {"silu_quant_args": [xq, xs]}

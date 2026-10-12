@@ -151,6 +151,7 @@ from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
     get_bool_env_var,
+    is_hcu,
     rank0_log,
     set_weight_attrs,
 )
@@ -161,11 +162,28 @@ logger = logging.getLogger(__name__)
 # key FusedMoE.make_expert_params_mapping entries match on.
 _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
+_is_hcu = is_hcu()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 # Legacy env aliases of --enable-dense-mlp-attn-tp / --enable-shared-experts-attn-tp.
 _k3_dense_mlp_attn_tp = get_bool_env_var("SGLANG_K3_DENSE_MLP_ATTN_TP")
 _k3_shared_experts_attn_tp = get_bool_env_var("SGLANG_K3_SHARED_EXPERTS_ATTN_TP")
+# Optional HCU fusions, independent of the global RMS/SiLU switches.
+_k3_fused_situ_int8 = get_bool_env_var("SGLANG_K3_FUSED_SITU_INT8", "false")
+_k3_fused_latent_rms_int8 = get_bool_env_var("SGLANG_K3_FUSED_LATENT_RMS_INT8", "false")
+_k3_reuse_input_int8 = get_bool_env_var("SGLANG_K3_REUSE_INPUT_INT8", "false")
+
+
+def _lightop_int8_input_supported(x: torch.Tensor) -> bool:
+    """Runtime input requirements for the vectorized HCU fusion kernels."""
+    return (
+        x.is_cuda
+        and x.ndim == 2
+        and x.shape[0] > 0
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+    )
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -190,19 +208,17 @@ _KIMI_K3_PACKED_MODULES_MAPPING: Dict[str, List[str]] = {
 }
 
 
-def kimi_k3_fuse_g_into_qkvg(quant_config: Optional[QuantizationConfig]) -> bool:
-    """Whether full-rank KDA may fuse g into ``fused_qkvg_proj``.
+def _kimi_k3_fuse_g_into_qkvg_from_quant_description(
+    quant_config: QuantizationConfig,
+) -> Optional[bool]:
+    """ModelSlim path: mix of FLOAT ``g_proj`` and quantized ``q_proj``.
 
-    ModelSlim W4A8 keeps ``g_proj`` as FLOAT while ``q/k/v_proj`` are
-    ``W8A8_DYNAMIC``. Fusing them into one MergedColumnParallelLinear makes
-    the whole GEMM use W8A8 (``weight_scale`` allocated for all shards) while
-    g's scale is never loaded → NaN. In that mixed case keep g separate.
+    Returns False to skip fusion, True if description exists but is not mixed,
+    or None if this config has no ``quant_description`` (leave to other paths).
     """
-    if quant_config is None:
-        return True
     desc = getattr(quant_config, "quant_description", None)
     if not isinstance(desc, dict):
-        return True
+        return None
     for key, scheme in desc.items():
         if not isinstance(key, str) or not key.endswith(".g_proj.weight"):
             continue
@@ -212,6 +228,55 @@ def kimi_k3_fuse_g_into_qkvg(quant_config: Optional[QuantizationConfig]) -> bool
         if q_scheme and q_scheme != "FLOAT":
             return False
     return True
+
+
+def _kimi_k3_fuse_g_into_qkvg_from_ignore(
+    quant_config: QuantizationConfig,
+) -> Optional[bool]:
+    """SlimQuant ignore-list path: ``g_proj`` ignored, ``q_proj`` quantized.
+
+    Same mixed-precision constraint as ModelSlim: fused ``[q,k,v,g]`` cannot
+    mix UnquantizedLinearMethod (g) with W8A8 (q/k/v). Returns None if there
+    is no ignore list so callers fall through to the default (fuse).
+    """
+    ignore = getattr(quant_config, "ignore", None)
+    if not ignore:
+        return None
+    from sglang.srt.layers.quantization.compressed_tensors.utils import (
+        check_equal_or_regex_match,
+    )
+
+    # Representative full-rank KDA names; ignore regexes are layer-agnostic.
+    g_name = "model.layers.0.self_attn.g_proj"
+    q_name = "model.layers.0.self_attn.q_proj"
+    g_ignored = check_equal_or_regex_match(g_name, ignore)
+    q_ignored = check_equal_or_regex_match(q_name, ignore)
+    if g_ignored and not q_ignored:
+        return False
+    return True
+
+
+def kimi_k3_fuse_g_into_qkvg(quant_config: Optional[QuantizationConfig]) -> bool:
+    """Whether full-rank KDA may fuse g into ``fused_qkvg_proj``.
+
+    ModelSlim W4A8 keeps ``g_proj`` as FLOAT while ``q/k/v_proj`` are
+    ``W8A8_DYNAMIC``. SlimQuant mixed W4/W8 lists ``g_proj`` in
+    ``compression_config.ignore`` while ``q/k/v_proj`` stay quantized.
+    Fusing them into one MergedColumnParallelLinear makes the whole GEMM
+    use W8A8 (``weight_scale`` allocated for all shards) while g's scale
+    is never loaded → NaN (or a fused-scheme ValueError). In that mixed
+    case keep g separate.
+
+    ``quant_description`` (ModelSlim) is evaluated first and, when present,
+    is the only source of truth so existing W4A8-huawei behavior is unchanged.
+    """
+    if quant_config is None:
+        return True
+    desc_decision = _kimi_k3_fuse_g_into_qkvg_from_quant_description(quant_config)
+    if desc_decision is not None:
+        return desc_decision
+    ignore_decision = _kimi_k3_fuse_g_into_qkvg_from_ignore(quant_config)
+    return True if ignore_decision is None else ignore_decision
 
 
 def kimi_k3_packed_modules_mapping(
@@ -393,11 +458,67 @@ class KimiK3MLP(nn.Module):
             )
         else:
             raise ValueError(f"Unsupported activation: {hidden_act}")
+        # Decide fixed fusion requirements once; forward checks only its input.
+        local_h = self.down_proj.input_size_per_partition
+        if _k3_fused_situ_int8 and _is_hcu:
+            from sglang.srt.layers.quantization.slimquant_w4a8 import (
+                SlimQuantW4A8Int8LinearMethod,
+            )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(hidden_states)
-        hidden_states = self.act_fn(gate_up)
-        hidden_states, _ = self.down_proj(hidden_states)
+        self._use_fused_situ_int8 = (
+            _k3_fused_situ_int8
+            and _is_hcu
+            and isinstance(self.act_fn, SituAndMul)
+            and isinstance(self.down_proj.quant_method, SlimQuantW4A8Int8LinearMethod)
+            and self.down_proj.input_is_parallel
+            and 0 < local_h <= 8192
+            and local_h % 16 == 0
+            and self.act_fn.beta > 0
+            and self.act_fn.linear_beta is not None
+            and self.act_fn.linear_beta > 0
+        )
+
+    @cached_property
+    def _fused_situ_int8_op(self):
+        if not self._use_fused_situ_int8:
+            return None
+        try:
+            from lightop import fuse_situ_mul_quant_contiguous
+        except ImportError:
+            logger.warning(
+                "LightOp SiTU INT8 fusion is unavailable; using unfused SiTU"
+            )
+            return None
+        return fuse_situ_mul_quant_contiguous
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        input_quant_args=None,
+    ) -> torch.Tensor:
+        # This q/scale belongs to the MLP input, before gate/up and SiTU.
+        if input_quant_args is None:
+            gate_up, _ = self.gate_up_proj(hidden_states)
+        else:
+            gate_up, _ = self.gate_up_proj(
+                hidden_states, input_quant_args=input_quant_args
+            )
+        situ_int8_op = self._fused_situ_int8_op
+        if situ_int8_op is not None and _lightop_int8_input_supported(gate_up):
+            # Existing HIPC quantizes FP32 SiTU directly: intentionally opt-in.
+            x_q, x_scale = situ_int8_op(
+                gate_up, self.act_fn.beta, self.act_fn.linear_beta
+            )
+            hidden_size = gate_up.shape[1] // 2
+            # This view carries shape/dtype only; the GEMM consumes x_q/x_scale.
+            hidden_states, _ = self.down_proj(
+                gate_up[:, :hidden_size], input_quant_args=(x_q, x_scale)
+            )
+
+        else:
+            hidden_states = self.act_fn(gate_up)
+            hidden_states, _ = self.down_proj(hidden_states)
         return hidden_states
 
 
@@ -755,10 +876,49 @@ class KimiK3MoE(nn.Module):
             self.routed_expert_norm = None
             self.routed_expert_up_proj = None
 
-        # Static eligibility for fusing the latent all-reduce with the RMSNorm
-        # epilogue (SGLANG_K3_AR_FUSION): kernel needs latent == NORM_DIM and
-        # shared == 2*NORM_DIM (3584 / 7168). Decided once so the hot path
-        # reads a bool.
+        if _is_hcu and (_k3_reuse_input_int8 or _k3_fused_latent_rms_int8):
+            from sglang.srt.layers.quantization.slimquant_w4a8 import (
+                SlimQuantW4A8Int8LinearMethod,
+            )
+
+        # Both current SlimQuant methods use the same unsmoothed per-token
+        # quantizer. Restrict reuse to the EP TP1 shared branch without streams
+        # or gathers; merged fronts retain their existing path.
+        self._reuse_input_int8_enabled = (
+            _k3_reuse_input_int8
+            and _is_hcu
+            and self._shared_experts_tp1
+            and self.shared_experts is not None
+            and self.use_latent_moe
+            and self.alt_stream is None
+            and isinstance(
+                self.shared_experts.gate_up_proj.quant_method,
+                SlimQuantW4A8Int8LinearMethod,
+            )
+            and isinstance(
+                self.routed_expert_down_proj.quant_method,
+                SlimQuantW4A8Int8LinearMethod,
+            )
+        )
+
+        self._use_fused_latent_rms_int8 = (
+            _k3_fused_latent_rms_int8
+            and _is_hcu
+            and self.routed_expert_norm is not None
+            and isinstance(
+                self.routed_expert_up_proj.quant_method,
+                SlimQuantW4A8Int8LinearMethod,
+            )
+            and 0 < self.moe_hidden_size <= 8192
+            and self.moe_hidden_size % 16 == 0
+        )
+
+        # Static eligibility for fusing the fused-front latent all-reduce with
+        # the RMSNorm epilogue (SGLANG_K3_AR_FUSION). The kernel views the flat
+        # [latent | shared] buffer as [3N, NORM_DIM] rows and norms the first N,
+        # so it requires latent width == NORM_DIM and shared width == 2*NORM_DIM
+        # (K3: 3584 / 7168). Decided once here so the hot path only reads a bool
+        # and never re-validates dims per forward.
         self.fuse_ar_norm = (
             self.routed_expert_norm is not None
             and self.moe_hidden_size == k3_ar_fusion.NORM_DIM
@@ -949,10 +1109,63 @@ class KimiK3MoE(nn.Module):
                 y.mul_(self.routed_scaling_factor)
         return y
 
+    @cached_property
+    def _fused_latent_rms_int8_op(self):
+        if not self._use_fused_latent_rms_int8:
+            return None
+        try:
+            from lightop import rms_norm_dynamic_per_token_quant_sglang
+        except ImportError:
+            logger.warning(
+                "LightOp RMS INT8 fusion is unavailable; using unfused RMSNorm"
+            )
+            return None
+        return rms_norm_dynamic_per_token_quant_sglang
+
+    @cached_property
+    def _reuse_input_int8_op(self):
+        if not self._reuse_input_int8_enabled:
+            return None
+        try:
+            from lightop.quant import per_token_quant_int8
+        except ImportError:
+            logger.warning(
+                "LightOp INT8 input reuse is unavailable; quantizing per layer"
+            )
+            return None
+        return per_token_quant_int8
+
     def _latent_norm(self, latent: torch.Tensor) -> torch.Tensor:
         if self.routed_expert_norm is None:
             return latent
         return self.routed_expert_norm(latent)
+
+    def _forward_latent_up(
+        self, latent: torch.Tensor, *, already_normed: bool = False
+    ) -> torch.Tensor:
+        norm = self.routed_expert_norm
+        rms_int8_op = self._fused_latent_rms_int8_op
+        if (
+            rms_int8_op is not None
+            and not already_normed
+            and _lightop_int8_input_supported(latent)
+            and norm.weight.dtype == latent.dtype
+        ):
+            x_q, x_scale = rms_int8_op(
+                latent,
+                norm.weight,
+                epsilon=norm.variance_epsilon,
+                quant_dtype=torch.int8,
+                residual=None,
+                update_input=False,
+            )
+            out, _ = self.routed_expert_up_proj(latent, quant_args=(x_q, x_scale))
+
+            return out
+        if not already_normed:
+            latent = self._latent_norm(latent)
+        out, _ = self.routed_expert_up_proj(latent)
+        return out
 
     @cached_property
     def _routing_contract_ok(self) -> bool:
@@ -1102,12 +1315,16 @@ class KimiK3MoE(nn.Module):
         """The fused front's [latent | shared] pair in one collective."""
         return tensor_model_parallel_all_reduce(buf)
 
-    def _reduce_latent(self, latent: torch.Tensor) -> torch.Tensor:
+    def _reduce_latent(
+        self, latent: torch.Tensor, *, apply_norm: bool = True
+    ) -> torch.Tensor:
         """Unfused-front latent tail: TP-partial routed sums must be reduced
         in latent space BEFORE the RMSNorm (sum(norm(x_i)) != norm(sum(x_i)))."""
-        if not self._routed_needs_reduce:
-            return self._latent_norm(latent)
-        return self._latent_norm(tensor_model_parallel_all_reduce(latent))
+
+        # Reduction must finish before either separate or fused normalization.
+        if self._routed_needs_reduce:
+            latent = tensor_model_parallel_all_reduce(latent)
+        return self._latent_norm(latent) if apply_norm else latent
 
     def _gather_shared_expert_inputs(self, hidden_states: torch.Tensor) -> torch.Tensor:
         group = self._shared_experts_tp_group
@@ -1127,10 +1344,16 @@ class KimiK3MoE(nn.Module):
         self._shared_experts_tp_group.reduce_scatter_tensor(output, shared_output)
         return output
 
-    def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _forward_shared_experts(
+        self, hidden_states: torch.Tensor, input_quant_args=None
+    ) -> torch.Tensor:
         """Run TP-sharded shared experts while DeepEP tokens stay scattered."""
         if not self._shared_experts_tp_comm:
-            return self.shared_experts(hidden_states)
+            if input_quant_args is None:
+                return self.shared_experts(hidden_states)
+            return self.shared_experts(hidden_states, input_quant_args=input_quant_args)
+        if input_quant_args is not None:
+            raise ValueError("Local prequantized input cannot precede shared TP gather")
 
         gathered_hidden_states = self._gather_shared_expert_inputs(hidden_states)
         gathered_shared_output = self.shared_experts(gathered_hidden_states)
@@ -1186,6 +1409,7 @@ class KimiK3MoE(nn.Module):
         shared_output = None
         shared_event = None
         shared_compute_event = None
+        input_quant_args = None
 
         def issue_shared():
             nonlocal shared_input, shared_output, shared_event
@@ -1213,7 +1437,9 @@ class KimiK3MoE(nn.Module):
                     shared_output = self.shared_experts(shared_input)
                     shared_event = self.alt_stream.record_event()
             else:
-                shared_output = self._forward_shared_experts(hidden_states)
+                shared_output = self._forward_shared_experts(
+                    hidden_states, input_quant_args=input_quant_args
+                )
 
         def run_experts(expert_input, topk_output):
             if not fine_grained_overlap:
@@ -1298,6 +1524,15 @@ class KimiK3MoE(nn.Module):
                     layer_id=self.layer_idx
                 ),
             )
+
+        if (
+            self._reuse_input_int8_enabled
+            and routed_input is None
+            and _lightop_int8_input_supported(hidden_states)
+        ):
+            quantize_input = self._reuse_input_int8_op
+            if quantize_input is not None:
+                input_quant_args = quantize_input(hidden_states)
         if not (_is_npu and self._sbo_shared_overlap):
             issue_shared()
 
@@ -1323,7 +1558,9 @@ class KimiK3MoE(nn.Module):
                 # materialize its shape-only result without launching GEMM.
                 routed_input = hidden_states.new_empty((0, self.moe_hidden_size))
             else:
-                routed_input, _ = self.routed_expert_down_proj(hidden_states)
+                routed_input, _ = self.routed_expert_down_proj(
+                    hidden_states, input_quant_args=input_quant_args
+                )
         expert_output = run_experts(routed_input, topk_output)
         if expert_output.shape[0] == 0:
             # The EP combine returns one row per source token.  Keep the
@@ -1331,9 +1568,8 @@ class KimiK3MoE(nn.Module):
             # launches; the collective itself has already completed above.
             out = hidden_states.new_empty((0, hidden_states.shape[1]))
         else:
-            latent = self._reduce_latent(expert_output)
-            # up_proj is replicated, so the routed output is now fully reduced.
-            out, _ = self.routed_expert_up_proj(latent)
+            latent = self._reduce_latent(expert_output, apply_norm=False)
+            out = self._forward_latent_up(latent)
         wait_and_finalize_shared_experts()
         if shared_output is not None:
             # tp1 shared experts (SP-MoE) are complete per-rank; TP-sharded
@@ -1568,9 +1804,9 @@ class KimiK3MoE(nn.Module):
 
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
-        if not fused_norm:
-            latent = self._latent_norm(latent)
-        out, _ = self.routed_expert_up_proj(latent)
+
+        # A collective may already have normalized latent; never normalize twice.
+        out = self._forward_latent_up(latent, already_normed=fused_norm)
 
         # prefetch_bc: b and c complete before the norm / up_proj chain
         # starts; only `a`'s producer can still be in flight at PDL entry.

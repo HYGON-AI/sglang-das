@@ -280,7 +280,14 @@ test-results/
 # hip_kernel
 *.hip
 *_hip.*
+# Handwritten K3 HIP sources belong in version control.
+!python/sglang/kernels/ops/attention/mla_post_hip.py
+!python/sglang/kernels/ops/attention/csrc/mla_post_hip.cu
 .humanize/
 
 # Internal, non-published docs
 internal-docs/
+
+# Replay metadata kernels shipped with the Python package.
+!python/sglang/kernels/ops/mamba/mamba_state_indices_hip.py
+!python/sglang/kernels/ops/mamba/csrc/mamba_state_indices_hip.cu
