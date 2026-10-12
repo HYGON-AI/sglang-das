@@ -9,7 +9,7 @@ from concurrent.futures import Future
 from queue import Empty, Queue
 
 import torch
-
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
@@ -389,6 +389,30 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.host_prefetch_enabled = self._resolve_host_prefetch_enabled(
             params, requested=self.host_prefetch_enabled
         )
+        requested_async_lookup = envs.SGLANG_MOONCAKE_ASYNC_LOOKUP.get()
+        if requested_async_lookup and params.pp_size != 1:
+            raise ValueError("SGLANG_MOONCAKE_ASYNC_LOOKUP currently requires PP1")
+        # Waiting-queue DFS prefetch already starts from an eager lookup and
+        # owns a private Mooncake session. Preserve that existing path when
+        # both opt-ins are set rather than turning its initial lookup into an
+        # unfinished asynchronous probe.
+        self.async_lookup_enabled = (
+            requested_async_lookup and not self.host_prefetch_enabled
+        )
+        if requested_async_lookup and self.host_prefetch_enabled:
+            logger.warning(
+                "Mooncake asynchronous lookup disabled because waiting-queue "
+                "DFS prefetch is enabled"
+            )
+        self.async_lookup_workers = 1
+        if self.async_lookup_enabled:
+            self.async_lookup_workers = envs.SGLANG_MOONCAKE_ASYNC_LOOKUP_WORKERS.get()
+            if self.async_lookup_workers < 1:
+                raise ValueError("SGLANG_MOONCAKE_ASYNC_LOOKUP_WORKERS must be >= 1")
+            logger.info(
+                "Mooncake asynchronous L3 lookup enabled (PP1, workers=%d)",
+                self.async_lookup_workers,
+            )
 
         self.storage_metrics_collector = None
         if params.enable_metrics:
@@ -610,6 +634,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 len(restorable),
             )
         return restorable
+
+    def lookup_in_worker(
+        self, rid: str, transfers: list[PoolTransfer]
+    ) -> list[int]:
+        """Query Mooncake metadata without scheduler-thread cache mutation."""
+        return self.lookup(rid, transfers)
 
     def revalidate_load(self, transfers: list[PoolTransfer]) -> bool:
         valid = self._revalidate_load_local(transfers)

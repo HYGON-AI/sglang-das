@@ -4238,6 +4238,15 @@ class Scheduler(
                     running_batch.reqs,
                 )
 
+        if self.enable_unified_cache_external_linker:
+            # Bound speculative probes by available request slots. Submit the
+            # whole cohort before waiting so worker timing cannot fragment the
+            # resulting prefill batch.
+            lookup_limit = max(0, self.get_num_allocatable_reqs(running_bs))
+            self.tree_cache.prepare_external_lookups(
+                self.waiting_queue[:lookup_limit]
+            )
+
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
@@ -4287,6 +4296,20 @@ class Scheduler(
                 self.tree_cache.cancel_waiting_queue_prefetch(req.rid)
 
             req.init_next_round_input(self.tree_cache)
+            if (
+                self.enable_unified_cache_external_linker
+                and self.tree_cache.is_external_lookup_pending(req.rid)
+            ):
+                # A changed request can invalidate the prepared query. Do not
+                # admit that replacement as a miss in the same scheduler pass.
+                req.mamba_cow_src_index = None
+                req.mamba_needs_clear = False
+                if req.mamba_pool_idx is not None and not getattr(req, "session", None):
+                    self.tree_cache.req_to_token_pool.mamba_allocator.free(
+                        req.mamba_pool_idx.unsqueeze(-1)
+                    )
+                    req.mamba_pool_idx = None
+                continue
             if (
                 self.enable_hicache_storage
                 and self.server_args.hicache_host_memory_mode == "buffer_only"

@@ -539,6 +539,32 @@ class UnifiedRadixCache(BasePrefixCache):
             result = self.linker.match(params.key, params.req, result)
         return result
 
+    def prepare_external_lookups(self, requests: Sequence[Req]) -> None:
+        if self.submit_external_lookups(requests):
+            # Publish on the scheduler thread through the existing rank
+            # intersection before any request in this cohort is admitted.
+            self.check_hicache_events()
+
+    def submit_external_lookups(self, requests: Sequence[Req]) -> bool:
+        """Stage a cohort of storage probes, then let the caller publish it."""
+        if (
+            self.linker is None
+            or not self.linker.async_lookup_enabled
+            or self.disable
+            or self.pp_size != 1
+            or envs.SGLANG_RADIX_FORCE_MISS.get()
+        ):
+            return False
+        # Submit every request before waiting so the executor can overlap them.
+        for req in requests:
+            params = req.prepare_external_lookup(self)
+            if params is not None:
+                self.match_prefix(params)
+        return True
+
+    def is_external_lookup_pending(self, rid: str) -> bool:
+        return self.linker is not None and self.linker.has_pending_lookup(rid)
+
     def waiting_queue_prefetch_enabled(self) -> bool:
         """Rank-consistent switch resolved when the linker was built."""
         return (
@@ -2787,12 +2813,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 [
                     self.linker.num_completed_loads(),
                     self.linker.num_completed_offloads(),
+                    self.linker.wait_pending_lookups(),
                 ],
                 dtype=torch.int,
                 device="cpu",
             )
             self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
-            load_count, offload_count = map(int, finish_counts.tolist())
+            load_count, offload_count, lookup_count = map(int, finish_counts.tolist())
+            self.linker.drain_lookups(lookup_count)
             self._collect_failed_linker_loads(load_count)
             local_successes = self.linker.take_completed_offloads(offload_count)
             if local_successes:

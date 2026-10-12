@@ -1,7 +1,10 @@
 import torch
 
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.paged import (
+    PagedTokenToKVPoolAllocator,
+    _page_membership,
+)
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.utils import is_npu
@@ -380,15 +383,30 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         freed_swa_pages = torch.unique(unique_swa // page_size)
         if len(self.swa_attn_allocator.release_pages) > 0:
             self.swa_attn_allocator.merge_and_sort_free()
-        already_free = torch.isin(
-            unique_swa // page_size, self.swa_attn_allocator.free_pages
-        )
+        use_page_table = getattr(self.swa_attn_allocator, "use_page_table", False)
+        if use_page_table:
+            already_free = _page_membership(
+                unique_swa // page_size,
+                self.swa_attn_allocator.num_pages,
+                self.swa_attn_allocator.free_pages,
+            )
+        else:
+            already_free = torch.isin(
+                unique_swa // page_size, self.swa_attn_allocator.free_pages
+            )
         unique_swa = unique_swa[~already_free]
         if unique_swa.numel() > 0:
             self.swa_attn_allocator.free(unique_swa)
 
         all_swa_pages = mapping // page_size
-        stale = torch.isin(all_swa_pages, freed_swa_pages) & (mapping > 0)
+        if use_page_table:
+            stale = _page_membership(
+                all_swa_pages,
+                self.swa_attn_allocator.num_pages,
+                freed_swa_pages,
+            ) & (mapping > 0)
+        else:
+            stale = torch.isin(all_swa_pages, freed_swa_pages) & (mapping > 0)
         mapping[stale] = 0
 
     def free_group_begin(self):
