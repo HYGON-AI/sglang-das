@@ -20,6 +20,7 @@ Page-aligned memory pool.
 """
 
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -42,6 +43,7 @@ from sgl_kernel.kvcacheio import (
 )
 
 _is_hip = is_hip()
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -130,6 +132,19 @@ def alloc_extend_naive(
             ).view(-1)
 
 
+def _page_membership(queries, num_pages, *members):
+    """Return membership for allocator page IDs in ``[0, num_pages]``.
+
+    The final table entry remains false for the SWA mapping's ``-1`` sentinel.
+    Rebuilding this small table per operation avoids persistent allocator state
+    and the lifecycle bookkeeping that would otherwise accompany it.
+    """
+    table = torch.zeros(num_pages + 2, dtype=torch.bool, device=queries.device)
+    for pages in members:
+        table.index_fill_(0, pages.to(device=queries.device, dtype=torch.int64), True)
+    return table[queries]
+
+
 class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """
     An allocator managing the indices to kv cache data.
@@ -151,6 +166,14 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     ):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
+        self.use_page_table = envs.SGLANG_KV_FREE_PAGE_TABLE.get()
+        if _is_hip or self.use_page_table:
+            logger.info(
+                "KV allocator page table=%s, num_pages=%d, page_size=%d",
+                self.use_page_table,
+                self.num_pages,
+                self.page_size,
+            )
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
         self.sglang_kvalloc_kernel = get_bool_env_var(
             "SGLANG_KVALLOC_KERNEL", default="true"
@@ -337,13 +360,23 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             free_page_indices = free_page_indices[free_page_indices > 0]
             if free_page_indices.numel() == 0:
                 return
-            free_page_indices = free_page_indices[
-                ~torch.isin(free_page_indices, self.free_pages)
-            ]
-            if self.release_pages.numel() > 0:
+            if self.use_page_table:
                 free_page_indices = free_page_indices[
-                    ~torch.isin(free_page_indices, self.release_pages)
+                    ~_page_membership(
+                        free_page_indices,
+                        self.num_pages,
+                        self.free_pages,
+                        self.release_pages,
+                    )
                 ]
+            else:
+                free_page_indices = free_page_indices[
+                    ~torch.isin(free_page_indices, self.free_pages)
+                ]
+                if self.release_pages.numel() > 0:
+                    free_page_indices = free_page_indices[
+                        ~torch.isin(free_page_indices, self.release_pages)
+                    ]
             if free_page_indices.numel() == 0:
                 return
             self._release_page_ids(free_page_indices)
