@@ -1024,12 +1024,17 @@ class TestTritonAttention(CustomTestCase):
             v_scale=1.0,
         )
 
-        # Build unified KV indices
-        extend_kv_indices = torch.arange(
-            total_token_num - extend_token_num,
-            total_token_num,
-            dtype=torch.int64,
-            device=device,
+        # Each request's extend KV follows its prefix in the shared buffer.
+        extend_kv_indices = torch.cat(
+            [
+                torch.arange(
+                    (b_start_loc[i] + b_seq_len_prefix[i]).item(),
+                    (b_start_loc[i] + b_seq_len[i]).item(),
+                    dtype=torch.int64,
+                    device=device,
+                )
+                for i in range(B)
+            ]
         )
         extend_start_loc = torch.zeros((B,), dtype=torch.int32, device=device)
         extend_start_loc[1:] = torch.cumsum(b_seq_len_extend[:-1], 0)

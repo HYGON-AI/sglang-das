@@ -27,6 +27,7 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
+    get_deepgemm_marlin_weight_pack_fn,
     get_moe_a2a_backend,
     get_moe_runner_backend,
     get_moe_weight_sizes,
@@ -90,6 +91,27 @@ def is_moe_prefill_or_normal():
     return args.disaggregation_mode == "prefill" or args.deepep_mode == "normal"
 
 
+def _should_use_hcu_fp8_w8a8_moe(
+    *,
+    enabled: bool,
+    in_speculative_a2a_scope: bool,
+    speculative_algorithm: Optional[str],
+    use_deepep: bool,
+) -> bool:
+    """Keep the HCU LightOp path for non-DSpark speculative workers.
+
+    DSpark can intentionally pair a DeepEP target with a standalone draft that
+    needs canonical weights.  EAGLE and the other speculative workers do not
+    have that constraint and must retain the configured HCU W8A8 fast path.
+    """
+    is_standalone_dspark_draft = (
+        in_speculative_a2a_scope
+        and (speculative_algorithm or "").upper() == "DSPARK"
+        and not use_deepep
+    )
+    return enabled and not is_standalone_dspark_draft
+
+
 class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
     def __init__(self, weight_quant, input_quant):
@@ -114,10 +136,14 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         self.block_quant = self.weight_block_size is not None
         self.use_deepep = get_moe_a2a_backend().is_deepep()
         # The target and DSpark draft share process-wide HCU env flags, but
-        # may intentionally use different MoE backends.  Keep the standalone
-        # draft on its canonical/AITER-fallback layout.
-        self.use_hcu_fp8_w8a8_moe = _use_fp8_w8a8_moe and not (
-            get_flags().moe.in_speculative_a2a_scope and not self.use_deepep
+        # may intentionally use different MoE backends. Keep only a standalone
+        # DSpark draft on its canonical/AITER-fallback layout; EAGLE and other
+        # speculative workers use the configured HCU LightOp path.
+        self.use_hcu_fp8_w8a8_moe = _should_use_hcu_fp8_w8a8_moe(
+            enabled=_use_fp8_w8a8_moe,
+            in_speculative_a2a_scope=get_flags().moe.in_speculative_a2a_scope,
+            speculative_algorithm=get_global_server_args().speculative_algorithm,
+            use_deepep=self.use_deepep,
         )
 
         self.static_input_scales = not self.input_quant.dynamic
@@ -309,11 +335,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         w13 = layer.w13_weight
         w2 = layer.w2_weight
 
-        from deepgemm import marlin_fp8_masked_weight
+        pack_fn = get_deepgemm_marlin_weight_pack_fn("fp8")
 
         with torch.no_grad():
-            w13_deepgemm = marlin_fp8_masked_weight(w13).detach()
-            w2_deepgemm = marlin_fp8_masked_weight(w2).detach()
+            w13_deepgemm = pack_fn(w13).detach()
+            w2_deepgemm = pack_fn(w2).detach()
 
         self._register_runtime_buffer(layer, "w13_weight_deepgemm", w13_deepgemm)
         self._register_runtime_buffer(layer, "w2_weight_deepgemm", w2_deepgemm)
@@ -467,6 +493,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
         elif (
             self.use_hcu_fp8_w8a8_moe
+            # The DeepGEMM branch below owns its weight layout.  Applying the
+            # LightOp Marlin transform first loses the logical [E, N, K] shape
+            # and then makes DeepGEMM pack an already-packed tensor again.
+            and not get_moe_runner_backend().is_deep_gemm()
             and _is_hcu
             and not getattr(layer, "_w8a8_fp8_packed", False)
         ):
@@ -556,18 +586,14 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     "channel-FP8 --moe-runner-backend deep_gemm requires the "
                     "DTK/HCU deepgemm runtime"
                 )
-            from deepgemm import marlin_fp8_masked_weight
+            pack_fn = get_deepgemm_marlin_weight_pack_fn("fp8")
 
             if not getattr(layer, "_hcu_deepgemm_channel_fp8_packed", False):
                 layer._hcu_deepgemm_logical_w13_shape = tuple(layer.w13_weight.shape)
                 layer._hcu_deepgemm_logical_w2_shape = tuple(layer.w2_weight.shape)
                 with torch.no_grad():
-                    w13_packed = marlin_fp8_masked_weight(
-                        layer.w13_weight.data.contiguous()
-                    )
-                    w2_packed = marlin_fp8_masked_weight(
-                        layer.w2_weight.data.contiguous()
-                    )
+                    w13_packed = pack_fn(layer.w13_weight.data.contiguous())
+                    w2_packed = pack_fn(layer.w2_weight.data.contiguous())
                 layer.w13_weight = torch.nn.Parameter(w13_packed, requires_grad=False)
                 layer.w2_weight = torch.nn.Parameter(w2_packed, requires_grad=False)
                 layer._hcu_deepgemm_channel_fp8_packed = True

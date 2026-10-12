@@ -40,16 +40,29 @@ _is_musa = is_musa()
 logger = logging.getLogger(__name__)
 
 
-def _aiter_enable_register_for_capturing(tms_cudagraph: bool) -> bool:
-    """Resolve AITER's direct graph-input registration mode.
-
-    Memory-saver graphs require copy-in mode.  Outside memory-saver mode,
-    honor AITER's documented environment switch instead of forcing direct
-    registration unconditionally.
-    """
-    return not tms_cudagraph and get_bool_env_var(
-        "AITER_AR_ENABLE_REG_CAPTURE", default="true"
-    )
+def _aiter_enable_register_for_capturing(
+    tms_cudagraph: bool, hf_config: Optional[Any] = None
+) -> bool:
+    """Legacy IPC opt-in, with model-specific HCU copy-in safeguards."""
+    # On HCU, registering the AITER all-reduce input directly into the decode
+    # graph replays the capture warmup instead of the live residual. Copy-in
+    # uses the pre-registered workspace and matches eager execution.
+    #
+    # DeepSeek-V3 / V3.1 uses model_type deepseek_v3. GLM-5.2 DSA shares TopK
+    # every four layers; its raw head_dim=192 is normalized to 64 by HF config
+    # loading, so identify that checkpoint by the indexer topology instead.
+    # Other models retain the legacy memory-saver opt-in.
+    model_type = getattr(hf_config, "model_type", None)
+    if _is_hcu and model_type == "deepseek_v3":
+        return False
+    if (
+        _is_hcu
+        and model_type == "glm_moe_dsa"
+        and getattr(hf_config, "index_topk_freq", None) == 4
+        and getattr(hf_config, "index_skip_topk_offset", None) == 3
+    ):
+        return False
+    return tms_cudagraph
 
 
 def _aiter_max_size_bytes() -> Optional[int]:
@@ -493,8 +506,13 @@ def dispatch_custom_allreduce(
 
         transport = os.environ.get("AITER_AR_TRANSPORT", "ipc").lower()
         if transport == "ipc":
+            hf_config = None
+            if _is_hcu:
+                from sglang.srt.runtime_context import get_server_args
+
+                hf_config = get_server_args().get_model_config().hf_config
             enable_reg = _aiter_enable_register_for_capturing(
-                envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+                envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get(), hf_config
             )
         elif transport in ("fabric", "auto"):
             # Fabric cannot register arbitrary graph allocations; auto may

@@ -145,6 +145,20 @@ def enable_cp_v2() -> bool:
     return bool(envs.SGLANG_ENABLE_CP_V2.get())
 
 
+def cp_v2_dp_token_counts_for_strategy(
+    global_cp_num_tokens: Optional[list[int]],
+) -> Optional[list[int]]:
+    """Expose synchronized CP shard counts only for the Zigzag DP layout.
+
+    The scheduler computes these counts only for Zigzag. Interleave's zero
+    placeholders must not disable its existing CP-v2 path or remap its DP
+    buffer as though it had Zigzag-local shards.
+    """
+    if isinstance(get_cp_strategy(), ZigzagCPStrategy):
+        return global_cp_num_tokens
+    return None
+
+
 def is_cp_v2_active(forward_batch) -> bool:
     """Return whether the current forward batch is running through CP-v2."""
     if not enable_cp_v2():
@@ -263,6 +277,15 @@ def prepare_cp_forward(forward_batch) -> None:
                 f"metadata={actual}, scheduled={expected}, "
                 f"global_cp_tokens={global_cp_tokens}"
             )
+    elif getattr(forward_batch, "global_num_tokens_cpu", None) is not None:
+        # Interleave CP-v2 retains the original full-TP DP collective layout.
+        # Its model body runs on a padded CP shard, while the shared DP buffer
+        # must be large enough for all CP ranks before the MoE/MLA exchange.
+        from sglang.srt.layers.dp_attention import set_local_dp_buffer_len
+
+        set_local_dp_buffer_len(
+            sum(forward_batch.attn_cp_metadata.per_rank_actual_token)
+        )
 
     if getattr(forward_batch, "out_cache_loc", None) is not None:
         forward_batch.out_cache_loc = forward_batch.out_cache_loc[:num_tokens]
@@ -519,6 +542,7 @@ __all__ = [
     "ZigzagContextParallelMetadata",
     "CP_V2_DEFAULT_MODEL_CLASSES",
     "enable_cp_v2",
+    "cp_v2_dp_token_counts_for_strategy",
     "get_cp_v2_physical_token_count",
     "normalize_dp_cp_token_counts",
     "get_cp_strategy",

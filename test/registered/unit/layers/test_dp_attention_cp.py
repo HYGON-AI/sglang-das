@@ -7,7 +7,12 @@ import torch
 
 from sglang.srt.layers import communicator, dp_attention
 from sglang.srt.layers.cp import utils as cp_utils
-from sglang.srt.layers.cp.zigzag import compute_zigzag_cp_physical_token_count
+from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
+from sglang.srt.layers.cp.zigzag import (
+    ZigzagCPStrategy,
+    compute_zigzag_cp_physical_token_count,
+)
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-c-test-cpu")
@@ -141,6 +146,91 @@ def test_synchronized_dp_fallback_disables_locally_eligible_cp_batch():
 
     with patch.object(cp_utils, "enable_cp_v2", return_value=True):
         assert not cp_utils.is_cp_v2_active(forward_batch)
+
+
+def test_interleave_cp_v2_ignores_zigzag_dp_zero_placeholders():
+    forward_batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_context_parallel_extend=lambda: True),
+        input_ids=torch.empty(16, dtype=torch.int64),
+        extend_seq_lens_cpu=[16],
+    )
+    counts = [0]
+    with (
+        patch.object(cp_utils, "get_cp_strategy", return_value=InterleaveCPStrategy(8)),
+        patch.object(cp_utils, "enable_cp_v2", return_value=True),
+    ):
+        forward_batch.global_cp_num_tokens_cpu = (
+            cp_utils.cp_v2_dp_token_counts_for_strategy(counts)
+        )
+        assert forward_batch.global_cp_num_tokens_cpu is None
+        assert cp_utils.is_cp_v2_active(forward_batch)
+
+    with patch.object(cp_utils, "get_cp_strategy", return_value=ZigzagCPStrategy(8)):
+        assert cp_utils.cp_v2_dp_token_counts_for_strategy(counts) is counts
+
+
+def test_interleave_cp_v2_respects_per_sequence_minimum():
+    strategy = InterleaveCPStrategy(8)
+    forward_batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_context_parallel_extend=lambda: True),
+        extend_seq_lens_cpu=[128] * 16,
+        seq_lens_cpu=torch.tensor([128] * 16),
+    )
+
+    with envs.SGLANG_PREFILL_CP_MIN_TOKENS_PER_SEQUENCE.override(0):
+        assert strategy.can_apply(2048, forward_batch)
+
+    with envs.SGLANG_PREFILL_CP_MIN_TOKENS_PER_SEQUENCE.override(256):
+        assert not strategy.can_apply(2048, forward_batch)
+        forward_batch.extend_seq_lens_cpu = [128, 512]
+        forward_batch.seq_lens_cpu = torch.tensor([128, 512])
+        assert not strategy.can_apply(640, forward_batch)
+        forward_batch.extend_seq_lens_cpu = [256, 512]
+        forward_batch.seq_lens_cpu = torch.tensor([256, 512])
+        assert strategy.can_apply(768, forward_batch)
+
+
+def test_interleave_cp_v2_keeps_long_cached_tail_eligible():
+    strategy = InterleaveCPStrategy(8)
+    forward_batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_context_parallel_extend=lambda: True),
+        extend_seq_lens_cpu=[64, 7680],
+        seq_lens_cpu=torch.tensor([8192, 8192]),
+    )
+
+    with envs.SGLANG_PREFILL_CP_MIN_TOKENS_PER_SEQUENCE.override(256):
+        assert strategy.can_apply(7744, forward_batch)
+
+        # A genuinely short request still prevents the whole batch from
+        # entering CP, even when it is paired with a long cached request.
+        forward_batch.seq_lens_cpu = torch.tensor([128, 8192])
+        assert not strategy.can_apply(7744, forward_batch)
+
+        # Keep the original per-extend fallback for callers without a
+        # corresponding host-side full sequence length.
+        forward_batch.seq_lens_cpu = None
+        assert not strategy.can_apply(7744, forward_batch)
+
+
+def test_interleave_cp_v2_keeps_full_tp_dp_buffer_length():
+    forward_batch = SimpleNamespace(
+        seq_lens_cpu=torch.tensor([12]),
+        extend_seq_lens_cpu=[12],
+        input_ids=torch.empty(12, dtype=torch.int64),
+        attn_cp_metadata=SimpleNamespace(per_rank_actual_token=[8] * 8),
+        global_cp_num_tokens_cpu=None,
+        global_num_tokens_cpu=[12],
+        out_cache_loc=None,
+    )
+
+    with (
+        patch.object(cp_utils, "is_cp_v2_active", return_value=True),
+        patch.object(cp_utils, "get_cp_strategy", return_value=object()),
+        patch.object(dp_attention, "set_local_dp_buffer_len") as set_local_len,
+    ):
+        cp_utils.prepare_cp_forward(forward_batch)
+
+    set_local_len.assert_called_once_with(64)
 
 
 def test_cp_local_dp_state_uses_per_dp_shards_and_restores_counts():

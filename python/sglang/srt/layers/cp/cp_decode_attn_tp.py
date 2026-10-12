@@ -74,30 +74,56 @@ class CpDecodeAttnTpContext:
             self.use_decode_attn_tp = False
             return
         # Skip during prefill context parallel (needs all heads); apply on every
-        # other forward, which includes decode.
+        # other forward, which includes decode and speculative target/draft.
         self.use_decode_attn_tp = not is_cp_v2_active(
             forward_batch
         ) and not dsa_use_prefill_cp(forward_batch)
 
-    def _slice(self, tensor: torch.Tensor, dim: int) -> torch.Tensor:
+    def _slice(
+        self,
+        tensor: torch.Tensor,
+        dim: int,
+        transposed_weight: bool = False,
+    ) -> torch.Tensor:
         assert dim in (0, 1)
         chunk = tensor.shape[dim] // self.decode_tp_size
         sliced = tensor.narrow(dim, self.decode_tp_rank * chunk, chunk)
+        if transposed_weight:
+            # HCU FP8 linears store logical [output, input] weights as
+            # [input, output]. Match the load-time shard layout used by the
+            # proven GLM path: a column-linear output slice remains a view,
+            # while a row-linear input slice is repacked with its reduced K
+            # dimension as the leading physical stride.
+            return sliced if dim == 1 else sliced.t().contiguous().t()
         return sliced if dim == 0 else sliced.contiguous()
 
     # ==================== Unified activate/restore ====================
 
-    def _activate(self, obj, attr_name: str, dim: int):
-        """Replace obj.attr_name with its TP-sliced version. No-op if attr is None."""
+    def _activate(
+        self,
+        obj,
+        attr_name: str,
+        dim: int,
+        allow_replicated_singleton: bool = False,
+        transposed_weight: bool = False,
+    ) -> bool:
+        """Replace obj.attr_name with its TP-sliced version.
+
+        A singleton scale on the partitioned axis is a per-tensor or
+        per-output-channel value shared by every decode TP rank. Keep that
+        scale replicated instead of trying to split its size-one dimension.
+        """
         tensor = getattr(obj, attr_name, None)
         if tensor is None:
-            return
+            return False
         is_param = isinstance(tensor, torch.nn.Parameter)
         raw = tensor.data if is_param else tensor
         assert isinstance(raw, torch.Tensor) and raw.dim() > dim, (
             f"CP decode attn TP: {type(obj).__name__}.{attr_name} is not sliceable "
             f"(type={type(tensor).__name__}, dim={raw.dim()}, required_dim>{dim})"
         )
+        if allow_replicated_singleton and raw.shape[dim] == 1:
+            return False
         assert raw.shape[dim] % self.decode_tp_size == 0, (
             f"CP decode attn TP: {type(obj).__name__}.{attr_name}.shape[{dim}]={raw.shape[dim]} "
             f"not divisible by decode_tp_size={self.decode_tp_size}"
@@ -106,13 +132,18 @@ class CpDecodeAttnTpContext:
         cache_key = (id(obj), attr_name)
         cache = self._slice_cache.get(cache_key)
         if cache is None:
-            cache = (raw, self._slice(raw, dim), is_param)
+            cache = (
+                raw,
+                self._slice(raw, dim, transposed_weight=transposed_weight),
+                is_param,
+            )
             self._slice_cache[cache_key] = cache
 
         if cache[2]:
             tensor.data = cache[1]
         else:
             setattr(obj, attr_name, cache[1])
+        return True
 
     def _restore(self, obj, attr_name: str):
         cache = self._slice_cache.get((id(obj), attr_name))
@@ -126,6 +157,36 @@ class CpDecodeAttnTpContext:
 
     # ==================== Linear helpers ====================
 
+    @staticmethod
+    def _weight_partition_dim(linear_instance, default_dim: int) -> int:
+        """Return the physical weight axis for the linear partition.
+
+        Some HCU FP8 methods transpose weights after loading from the logical
+        ``[output, input]`` layout to ``[input, output]``.  Linear class type
+        alone therefore cannot determine the physical partition axis.
+        """
+        weight = getattr(linear_instance, "weight", None)
+        if not isinstance(weight, torch.Tensor) or weight.dim() != 2:
+            return default_dim
+
+        input_size = getattr(
+            linear_instance,
+            "input_size_per_partition",
+            getattr(linear_instance, "input_size", None),
+        )
+        output_size = getattr(
+            linear_instance,
+            "output_size_per_partition",
+            getattr(linear_instance, "output_size", None),
+        )
+        if input_size is None or output_size is None or input_size == output_size:
+            return default_dim
+
+        shape = tuple(weight.shape)
+        if shape == (input_size, output_size):
+            return 1 - default_dim
+        return default_dim
+
     def _get_linear_attrs(self, linear_instance) -> List[Tuple]:
         """Return (obj, attr_name, dim) list for a linear layer."""
         from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -137,10 +198,13 @@ class CpDecodeAttnTpContext:
         else:
             return []
 
-        attrs = [(linear_instance, "weight", dim)]
+        weight_dim = self._weight_partition_dim(linear_instance, dim)
+        attrs = [
+            (linear_instance, "weight", weight_dim, False, weight_dim != dim)
+        ]
         for scale_name in ("weight_scale_inv", "weight_scale"):
             if getattr(linear_instance, scale_name, None) is not None:
-                attrs.append((linear_instance, scale_name, dim))
+                attrs.append((linear_instance, scale_name, dim, True, False))
         return attrs
 
     # ==================== Context manager ====================
@@ -172,9 +236,21 @@ class CpDecodeAttnTpContext:
         orig_tp_q_head_num = None
         try:
             for linear in modules:
-                for obj, attr_name, dim in self._get_linear_attrs(linear):
-                    self._activate(obj, attr_name, dim)
-                    all_attrs.append((obj, attr_name))
+                for (
+                    obj,
+                    attr_name,
+                    dim,
+                    allow_singleton,
+                    transposed_weight,
+                ) in self._get_linear_attrs(linear):
+                    if self._activate(
+                        obj,
+                        attr_name,
+                        dim,
+                        allow_replicated_singleton=allow_singleton,
+                        transposed_weight=transposed_weight,
+                    ):
+                        all_attrs.append((obj, attr_name))
                 from sglang.srt.layers.linear import RowParallelLinear
 
                 size_attr = (
@@ -195,8 +271,14 @@ class CpDecodeAttnTpContext:
 
             if tensor_attrs:
                 for obj, attr_name, dim in tensor_attrs:
-                    self._activate(obj, attr_name, dim)
-                    all_attrs.append((obj, attr_name))
+                    if self._activate(
+                        obj,
+                        attr_name,
+                        dim,
+                        allow_replicated_singleton=attr_name
+                        in ("w_scale_k", "w_scale_v"),
+                    ):
+                        all_attrs.append((obj, attr_name))
 
             if radix_attn is not None:
                 orig_tp_q_head_num = radix_attn.tp_q_head_num

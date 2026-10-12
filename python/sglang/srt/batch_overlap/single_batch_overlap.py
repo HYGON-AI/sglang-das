@@ -103,7 +103,10 @@ def compute_overlap_args(dispatch_output, alt_stream):
         return None, None, {}
 
     hidden_states = dispatch_output.hidden_states
-
+    # DeepEP normal dispatch returns a flat [tokens, hidden] tensor. The
+    # combine/down-GEMM overlap protocol requires expert-major output.
+    if hidden_states.dim() != 3:
+        return None, None, {}
     num_local_experts, num_tokens_static, hidden_dim = hidden_states.shape
 
     total_num_sms = torch.cuda.get_device_properties(

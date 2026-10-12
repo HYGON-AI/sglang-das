@@ -11,7 +11,7 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import (
-    _get_deepgemm_shuffle_unique,
+    get_deepgemm_marlin_weight_pack_fn,
     get_moe_a2a_backend,
 )
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
@@ -323,21 +323,12 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 
         if self.use_deepep:
-            from deepgemm import marlin_i8_contiguous_weight, marlin_i8_masked_weight
-
-            shuffle_unique, mode = _get_deepgemm_shuffle_unique()
-
-            # shuffle_unique=1 (IFB): unified 6D format, same pack for prefill+decode
-            # shuffle_unique=0 (PD separation): contiguous for prefill, masked for decode
-            if shuffle_unique == 1 or mode == "prefill":
-                pack_fn = marlin_i8_contiguous_weight
-            else:
-                pack_fn = marlin_i8_masked_weight
+            pack_fn = get_deepgemm_marlin_weight_pack_fn("int8")
 
             layer._dsv4_w13_weight_shape = tuple(layer.w13_weight.shape)
             layer._dsv4_w2_weight_shape = tuple(layer.w2_weight.shape)
             w13_weight = layer.w13_weight.contiguous()
-            w13_packed = pack_fn(w13_weight, shuffle_unique=shuffle_unique)
+            w13_packed = pack_fn(w13_weight)
             layer.w13_weight = Parameter(w13_packed, requires_grad=False)
             layer.register_buffer(
                 "w13_weight_deepgemm", layer.w13_weight.data, persistent=False
@@ -346,7 +337,7 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
             torch.cuda.empty_cache()
 
             w2_weight = layer.w2_weight.contiguous()
-            w2_packed = pack_fn(w2_weight, shuffle_unique=shuffle_unique)
+            w2_packed = pack_fn(w2_weight)
             layer.w2_weight = Parameter(w2_packed, requires_grad=False)
             layer.register_buffer(
                 "w2_weight_deepgemm", layer.w2_weight.data, persistent=False

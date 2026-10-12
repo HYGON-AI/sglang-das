@@ -448,6 +448,14 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             - tic
         )
 
+        from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
+            release_hcu_flashmla_decode_h16_capture_cache,
+        )
+
+        release_hcu_flashmla_decode_h16_capture_cache(
+            self.target_worker.model_runner
+        )
+
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_run_decode_cuda_graph = prepare_for_draft(

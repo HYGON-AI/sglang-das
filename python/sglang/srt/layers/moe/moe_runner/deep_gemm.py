@@ -1646,11 +1646,12 @@ def _varlen_deep_gemm_silu_mul_quant(
     del D_2
     G = D // group_size
 
-    # oai-swiglu (gemm1_alpha) stays on the Triton kernel until
-    # per_token_group_quant grows an activation-kind axis. The output_scale dtype picks the schedule: packed
-    # int32 UE8M0 (no follow-up transform; needs G % 4 == 0 and the
-    # num_real_tokens grid bound) when eligible, row-major fp32 otherwise.
-    if gemm1_alpha is not None:
+    # OAI-SwiGLU and channel-wise FP8 (whose single group can exceed the JIT
+    # kernel's maximum group size) stay on the Triton kernel. The output-scale
+    # dtype picks the schedule: packed int32 UE8M0 (no follow-up transform;
+    # needs G % 4 == 0 and the num_real_tokens grid bound) when eligible,
+    # row-major fp32 otherwise.
+    if gemm1_alpha is not None or group_size > 256:
         assert (
             swiglu_limit is None
         ), "swiglu_limit and gemm1_alpha are mutually exclusive"

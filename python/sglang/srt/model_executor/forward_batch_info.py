@@ -761,7 +761,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # caller ultimately falls back to eager execution.
             self.global_num_tokens_gpu = None
             self.global_num_tokens_for_logprob_gpu = None
-        self.global_cp_num_tokens_cpu = batch.global_cp_num_tokens
+        from sglang.srt.layers.cp.utils import cp_v2_dp_token_counts_for_strategy
+
+        self.global_cp_num_tokens_cpu = cp_v2_dp_token_counts_for_strategy(
+            batch.global_cp_num_tokens
+        )
         self.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
 
     def materialize_deferred_device_metadata(

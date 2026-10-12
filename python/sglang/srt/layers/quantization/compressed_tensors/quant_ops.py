@@ -33,6 +33,49 @@ def triton_scaled_mm(
     bias: Optional[torch.Tensor] = None,
     best_config: Optional[list] = None,
 ) -> torch.Tensor:
+    # w8a8 decode with small M is not covered by the smooth GEMM tuning table;
+    # explicit slide values avoid excessive padding in the default heuristic.
+    if (
+        best_config is None
+        and bias is None
+        and a.dtype == torch.int8
+        and b.dtype == torch.int8
+        and b.dim() == 2
+        and not b.is_contiguous()
+        and a.shape[-1] == b.shape[0]
+        and b.shape[0] >= 128
+    ):
+        m_i = a.shape[0]
+        k_i = b.shape[0]
+        n_i = b.shape[1]
+        if n_i <= 1024 and m_i <= 256:
+            tune = 1
+        elif n_i <= 2048 and m_i <= 128:
+            tune = 1
+        elif m_i <= 64:
+            tune = 9
+        else:
+            tune = None
+        # The tuned slide values are valid for complete K=256 tiles.
+        if tune is not None and k_i % 256 == 0:
+            from lightop import op as _lop
+
+            try:
+                return _lop.gemm_w8a8_smooth_asm(
+                    a,
+                    b,
+                    scale_a,
+                    scale_b,
+                    None,
+                    out_dtype,
+                    m_i,
+                    n_i,
+                    k_i,
+                    True,
+                    tune,
+                )
+            except Exception:
+                pass
 
     return quant_ops.triton_scaled_mm(
         a, b, scale_a, scale_b, out_dtype, bias, best_config
