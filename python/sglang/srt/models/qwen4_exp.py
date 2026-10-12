@@ -527,6 +527,23 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 # but only list Linear in config_groups.targets.
                 if not ple_int8:
                     ple_fp8_channelwise = True
+        if (
+            not ple_int8
+            and quant_config is not None
+            and quant_config.get_name()
+            in ("slimquant_w4a8_marlin", "slimquant_w4a8")
+        ):
+            comp = getattr(config, "compression_config", None) or {}
+            mixed = comp.get("mixed_precision") if isinstance(comp, dict) else {}
+            ngram = (mixed or {}).get("ngram_embedding") or {}
+            weight_bits = ngram.get("weight_bits")
+            if weight_bits == 8 or weight_bits == "8":
+                ignore = getattr(quant_config, "ignore", ()) or ()
+                ple_not_ignored = not should_ignore_layer(
+                    f"{prefix}.shard_0", ignore
+                )
+                if ple_not_ignored:
+                    ple_int8 = True
         self.ple_per_row_scale = ple_int8 or ple_fp8_channelwise
         # Allocate the large PLE table on CPU from the start when offload is
         # requested. This avoids a transient GPU allocation without requiring
@@ -2497,7 +2514,23 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if num_experts is not None
             else []
         )
+        # Scale keys must come before weight keys: ckpt names like
+        # ``experts.gate_up_proj.weight_scale`` contain ``experts.gate_up_proj``,
+        # and naive replace would yield the non-existent
+        # ``experts.w13_weight.weight_scale`` instead of ``w13_weight_scale``.
         fused_expert_params_mapping = [
+            (
+                "experts.w13_weight_scale",
+                "experts.gate_up_proj.weight_scale",
+                0,
+                "w1",
+            ),
+            (
+                "experts.w2_weight_scale",
+                "experts.down_proj.weight_scale",
+                0,
+                "w2",
+            ),
             ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
         ]
@@ -2512,7 +2545,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             "_weight_scale_inv",
             ".input_scale_inv",
             "_input_scale_inv",
+            ".weight_scale",
             "_weight_scale",
+            ".input_scale",
             "_input_scale",
         )
 
@@ -2820,9 +2855,14 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     if name.endswith(ignore_suffixes) and name not in params_dict:
                         continue
                     if name.endswith("_scale") and name not in params_dict:
-                        assert (
-                            abs(loaded_weight.item() - 1.0) < 1e-6
-                        ), f"Expected 1.0, got {loaded_weight.item()} in skipped {name}"
+                        # Only scalar placeholder scales are guaranteed to be 1.0;
+                        # per-row / per-expert scales (e.g. slimquant W4A8 and
+                        # ngram-int8 checkpoints) are real tensors and are simply
+                        # skipped here.
+                        if loaded_weight.numel() == 1:
+                            assert (
+                                abs(loaded_weight.item() - 1.0) < 1e-6
+                            ), f"Expected 1.0, got {loaded_weight.item()} in skipped {name}"
                         continue
                     if name in params_dict:
                         param = params_dict[name]

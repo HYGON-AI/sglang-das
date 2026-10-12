@@ -73,6 +73,14 @@ def get_weight_perms(interleave: bool = True):
 
 def marlin_weights(q_w, weight_perm, k_tile=32, n_tile=64, pack_factor=8):
     size_k, size_n = q_w.shape
+    if size_k % k_tile != 0 or size_n % n_tile != 0:
+        raise ValueError(
+            f"Marlin W4A8 repack requires K%{k_tile}==0 and N%{n_tile}==0, "
+            f"got shape [K={size_k}, N={size_n}] (numel={q_w.numel()}). "
+            f"Use SGLANG_W4A8_TPMOE_BACKEND=triton or a TP size that keeps "
+            f"intermediate_size/TP divisible by 32 "
+            f"(e.g. moe_intermediate_size=640 needs TP in {{1,2,4}})."
+        )
     q_w = q_w.reshape((size_k // k_tile, k_tile, size_n // n_tile, n_tile))
     q_w = q_w.permute((0, 2, 1, 3))
     q_w = q_w.reshape((size_k // k_tile, size_n * k_tile))

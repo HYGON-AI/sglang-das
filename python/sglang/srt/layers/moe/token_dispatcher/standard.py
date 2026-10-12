@@ -224,7 +224,12 @@ class StandardDispatcher(BaseDispatcher):
                 )
             elif not self.use_aiter_moe_runner:
                 if TopKOutputChecker.format_is_standard(topk_output):
-                    topk_ids_local = self.local_expert_mapping[topk_output.topk_ids]
+                    # Clamp before gather so CUDA-graph dummy / stale ids cannot
+                    # VMFault through index_elementwise on local_expert_mapping.
+                    global_ids = topk_output.topk_ids.clamp(
+                        0, self.local_expert_mapping.numel() - 1
+                    )
+                    topk_ids_local = self.local_expert_mapping[global_ids]
                     # Drop dp-attention MAX_LEN pad rows from the dispatch:
                     # pad rows carry stale hidden through the router and
                     # their expert outputs are discarded downstream — pure

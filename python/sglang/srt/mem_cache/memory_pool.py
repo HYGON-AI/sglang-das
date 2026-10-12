@@ -138,7 +138,17 @@ def conv_window_dedup_enabled(
     Tree verify, NPU/CPU, and KDA keep dense windows: tree ancestors need independent
     windows, platform kernels expect contiguous steps, and KDA transposes the window
     before conv so the overlapping ``as_strided`` layout would corrupt stores.
+
+    HCU's Triton causal_conv1d_update writes the per-step window with those
+    overlapping strides and also corrupts the conv *output* (not only the saved
+    window). Target verify then disagrees with the HCU decode conv, so MTP
+    bonus tokens are garbage even when every draft is rejected. Keep a dense
+    window on HCU.
     """
+    from sglang.srt.utils import is_hcu
+
+    if is_hcu():
+        return False
     return (
         not is_npu
         and not is_cpu

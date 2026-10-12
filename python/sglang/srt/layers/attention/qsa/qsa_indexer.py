@@ -120,7 +120,13 @@ class QSAIndexer(MultiPlatformOp):
             )
 
     def _use_fused_prep(self, tensor: torch.Tensor) -> bool:
-        """Whether the fused indexer-prep kernels support this configuration."""
+        """Whether the fused indexer-prep kernels support this configuration.
+
+        The fused path is a CUDA JIT (``.cuh``); ROCm reports ``is_cuda`` but
+        cannot run those kernels. Keep HIP on the eager prep/compress path.
+        """
+        if is_hip():
+            return False
         return (
             tensor.is_cuda
             and tensor.dtype in (torch.bfloat16, torch.float16)
@@ -389,11 +395,25 @@ class QSAIndexer(MultiPlatformOp):
             raise RuntimeError("QSA CUDA graph compression metadata is incomplete")
         pool = metadata.token_to_kv_pool
         group_locs = metadata.graph_ring_group_locs
+        write_locs = metadata.graph_write_locs
+        if is_hip():
+            # Mirror the eager HIP extend clamp: dump rows keep gathering
+            # reserved ring slot 0; active rows stay inside the ring.
+            ring = pool.get_qsa_key_state_buffer(self.layer_id)
+            n_src = max(int(ring.shape[0]) - 1, 0)
+            group_locs = torch.where(
+                (write_locs != 0)[:, None],
+                group_locs.clamp(max=n_src),
+                torch.zeros_like(group_locs),
+            )
+            write_locs = write_locs.clamp(
+                max=max(int(pool.get_qsa_compressed_k_buffer(self.layer_id).shape[0]) - 1, 0)
+            )
         if self._use_fused_compress(pool):
             self._fused_compress_store(
                 pool,
                 group_locs,
-                metadata.graph_write_locs,
+                write_locs,
             )
             return
         key_groups = pool.get_qsa_key_state_buffer(self.layer_id)[group_locs]
@@ -405,7 +425,7 @@ class QSAIndexer(MultiPlatformOp):
             compressed, compressed_rope_positions
         )
         pool.set_qsa_compressed_k_buffer(
-            self.layer_id, metadata.graph_write_locs, compressed.contiguous()
+            self.layer_id, write_locs, compressed.contiguous()
         )
 
     def _rope_from_matrix(self, positions: torch.Tensor) -> torch.Tensor:
@@ -423,7 +443,17 @@ class QSAIndexer(MultiPlatformOp):
         if num_positions != tensor.shape[0]:
             raise ValueError("QSA RoPE positions must match the token dimension")
         if not get_is_capture_mode() and hasattr(self.rotary_emb, "_ensure_cos_sin_cache_length"):
-            self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
+            max_pos = int(positions.max().item())
+            if max_pos < 0:
+                raise ValueError(f"QSA RoPE positions must be non-negative, got max={max_pos}")
+            self.rotary_emb._ensure_cos_sin_cache_length(max_pos)
+            # HIP advanced indexing VMFaults on out-of-range destinations;
+            # clamp after the ensure so a stale write plan cannot walk off
+            # the cos/sin cache.
+            if is_hip():
+                positions = positions.clamp(
+                    0, max(int(self.rotary_emb.cos_sin_cache.shape[0]) - 1, 0)
+                )
 
         # Let the exact Qwen4-Exp RoPE instance compose regular or three-axis
         # multimodal positions.  Its public cache view repeats cos/sin to the

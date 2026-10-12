@@ -13,10 +13,47 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
+from sglang.srt.utils import is_hip
+
+_IS_HIP = is_hip()
 
 
 def _index_k_bytes(*, kv_heads: int, head_dim: int, dtype: torch.dtype) -> int:
     return kv_heads * head_dim * dtype.itemsize
+
+
+def _scatter_rows(buffer: torch.Tensor, loc: torch.Tensor, values: torch.Tensor) -> None:
+    """Write ``values[i]`` into ``buffer[loc[i]]``.
+
+    On HIP, advanced indexing with duplicate destinations (QSA non-boundary
+    rows all dump into reserved slot 0) can VMFault. Serialize those stores.
+    """
+    loc = loc.long().reshape(-1)
+    values = values.to(buffer.dtype)
+    if loc.numel() != values.shape[0]:
+        raise ValueError(
+            f"QSA scatter size mismatch: loc={loc.numel()}, values={values.shape[0]}"
+        )
+    if loc.numel() == 0:
+        return
+    max_idx = max(int(buffer.shape[0]) - 1, 0)
+    loc = loc.clamp(0, max_idx)
+    capturing = False
+    if _IS_HIP:
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        capturing = get_is_capture_mode()
+    # HIP advanced indexing with duplicate destinations can VMFault in eager
+    # mode, so serialize those stores. The Python loop is illegal during CUDA
+    # graph capture (hipErrorStreamCaptureUnsupported); use the vectorized
+    # write while capturing.
+    if (not _IS_HIP) or capturing:
+        buffer[loc] = values
+        return
+    for i in range(loc.shape[0]):
+        buffer[loc[i]] = values[i]
 
 
 class QSATokenToKVPool(HybridLinearKVPool):
@@ -191,7 +228,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self, layer_id: int, loc: torch.Tensor, token_k: torch.Tensor
     ) -> None:
         buffer = self.get_qsa_key_state_buffer(layer_id)
-        buffer[loc.long()] = token_k.to(buffer.dtype)
+        _scatter_rows(buffer, loc, token_k)
 
     def set_qsa_rope_position_buffer(
         self, loc: torch.Tensor, positions: torch.Tensor
@@ -203,7 +240,9 @@ class QSATokenToKVPool(HybridLinearKVPool):
             raise ValueError(
                 f"QSA RoPE positions must be [tokens] or [3, tokens], got {positions.shape}"
             )
-        self.qsa_rope_position_buffer[loc.long()] = positions.transpose(0, 1)
+        _scatter_rows(
+            self.qsa_rope_position_buffer, loc, positions.transpose(0, 1)
+        )
 
     def get_qsa_rope_position_buffer(self, loc: torch.Tensor) -> torch.Tensor:
         return self.qsa_rope_position_buffer[loc.long()]
@@ -217,7 +256,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self, layer_id: int, loc: torch.Tensor, compressed_k: torch.Tensor
     ) -> None:
         buffer = self.get_qsa_compressed_k_buffer(layer_id)
-        buffer[loc.long()] = compressed_k.to(buffer.dtype)
+        _scatter_rows(buffer, loc, compressed_k)
 
     def get_kv_size_bytes(self):
         k_size, v_size = super().get_kv_size_bytes()

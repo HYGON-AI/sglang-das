@@ -53,7 +53,8 @@ def create_msprobe_debugger(server_args: ServerArgs) -> Optional[Any]:
         return None
 
     try:
-        from msprobe.pytorch import PrecisionDebugger, seed_all
+        # from msprobe.pytorch import PrecisionDebugger, seed_all
+        from dcu_probe.pytorch import PrecisionDebugger, seed_all
     except ImportError:
         logger.warning(
             "Please install msprobe for tensor data dump: pip install mindstudio-probe --pre, "

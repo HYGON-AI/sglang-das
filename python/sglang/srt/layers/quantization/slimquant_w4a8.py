@@ -118,6 +118,14 @@ def fused_experts_impl_w4a8_triton(
         config1, config2 = w4a8_triton.get_w8a8moe_json(
             token_count, w1.shape[0], n1, n2, n1 // 2
         )
+        # fused_moe_kernel_int4_w4a8 has no K remainder mask; clamp tiles so
+        # BLOCK_SIZE_K|K and BLOCK_SIZE_N|N (e.g. K=80 with default BK=64).
+        from sglang.srt.layers.quantization.slimquant_w4a8_marlin import (
+            _adjust_w4a8_triton_block_config,
+        )
+
+        config1 = _adjust_w4a8_triton_block_config(config1, n=n1, k=n2)
+        config2 = _adjust_w4a8_triton_block_config(config2, n=n2, k=n1 // 2)
         sorted_ids, expert_ids, padded_count = w4a8_triton.moe_align_block_size(
             current_ids, config1["BLOCK_SIZE_M"], global_num_experts, expert_map
         )

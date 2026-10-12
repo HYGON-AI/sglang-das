@@ -1532,6 +1532,55 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     return overrides
 
 
+@_register_for("Qwen4ExpForConditionalGeneration")
+def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
+    """Qwen4-Exp compressed QSA needs a paged full-KV cache.
+
+    Compressed slots are ``full_slot // indexer_compress_ratio``, so the page
+    must be a multiple of that ratio (see ``QSATokenToKVPool``). The generic
+    page_size default is 1, which fails pool construction. Paged full-KV also
+    requires the mamba ``extra_buffer`` radix strategy (MambaComponent rejects
+    page_size>1 under ``no_buffer``).
+    """
+    from sglang.srt.server_args import ServerArgs
+
+    overrides: Dict[str, Any] = {}
+    text = getattr(hf_config, "text_config", hf_config)
+    compress_ratio = int(getattr(text, "indexer_compress_ratio", 1) or 1)
+    if compress_ratio <= 1:
+        return overrides
+
+    page = server_args.page_size
+    if page is None or page <= 1 or page % compress_ratio != 0:
+        # Prefer 64 (common FA/MHA page); fall back to the compress ratio.
+        new_page = 64 if 64 % compress_ratio == 0 else compress_ratio
+        overrides["page_size"] = new_page
+        logger.info(
+            "Qwen4-Exp compressed QSA (ratio=%s): setting page_size=%s "
+            "(was %s).",
+            compress_ratio,
+            new_page,
+            page,
+        )
+        page = new_page
+
+    # Paged KV + hybrid GDN radix: same requirement as Qwen3Next/Inkling.
+    if (
+        not server_args.disable_radix_cache
+        and page is not None
+        and page > 1
+        and server_args.mamba_radix_cache_strategy
+        == ServerArgs.mamba_radix_cache_strategy
+    ):
+        overrides["mamba_radix_cache_strategy"] = "extra_buffer"
+        logger.info(
+            "Qwen4-Exp compressed QSA (page_size=%s): setting "
+            "mamba_radix_cache_strategy=extra_buffer.",
+            page,
+        )
+    return overrides
+
+
 @_register_for(
     "Qwen3NextForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
@@ -1725,6 +1774,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "InternS2PreviewForConditionalGeneration",
         "InternS2MobiusForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
+        "Qwen4ExpForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
@@ -1746,6 +1796,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3NextForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",

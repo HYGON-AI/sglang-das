@@ -1196,8 +1196,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                     )
 
                 M, K = x.shape
-                E = self.moe_runner_config.num_experts
-                if w1.shape[0] != E or w2.shape[0] != E:
+                # Triton StandardDispatcher remaps topk_ids to the local EP
+                # range, so kernel E must match the sharded weight dim0
+                # (num_local_experts), not the global expert count.
+                E = int(w1.shape[0])
+                if w2.shape[0] != E:
                     raise RuntimeError(
                         "AITER W16A16 MoE expert count mismatch: "
                         f"E={E}, w1.shape={tuple(w1.shape)}, w2.shape={tuple(w2.shape)}"
@@ -1231,37 +1234,48 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                     dtype=x.dtype,
                     quant_type=MoeQuantType.W16A16,
                 )
-                if not status:
-                    raise RuntimeError(
-                        "[aiter_moe_w16a16] no suitable backend found: "
-                        f"M={M}, N1={N1}, N2={N2}, K={K}, E={E}, topk={top_k}"
-                    )
-                if moe_cfg.solution_type not in {
-                    MoeSolutionType.ASM,
-                    MoeSolutionType.TRITON,
-                    MoeSolutionType.CK,
-                }:
-                    raise RuntimeError(
-                        f"Unsupported solution_type: {moe_cfg.solution_type}"
-                    )
-                if moe_cfg.quant_type != MoeQuantType.W16A16:
-                    raise RuntimeError(f"Unexpected quant_type: {moe_cfg.quant_type}")
-                output = aiter_moe(
-                    hidden_states=x,
-                    w1=w1,
-                    w2=w2,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
-                    moe_config=moe_cfg,
-                    inplace=moe_runner_config.inplace,
-                    w1_scale=None,
-                    w2_scale=None,
-                    activation=activation,
-                    block_shape=None,
-                    global_num_experts=E,
-                    routed_scaling_factor=routed_scaling_factor,
+                use_aiter_w16 = bool(
+                    status
+                    and moe_cfg is not None
+                    and moe_cfg.solution_type
+                    in {
+                        MoeSolutionType.ASM,
+                        MoeSolutionType.TRITON,
+                        MoeSolutionType.CK,
+                    }
+                    and moe_cfg.quant_type == MoeQuantType.W16A16
                 )
-                return StandardCombineInput(hidden_states=output)
+                if use_aiter_w16:
+                    output = aiter_moe(
+                        hidden_states=x,
+                        w1=w1,
+                        w2=w2,
+                        topk_weights=topk_weights,
+                        topk_ids=topk_ids,
+                        moe_config=moe_cfg,
+                        inplace=moe_runner_config.inplace,
+                        w1_scale=None,
+                        w2_scale=None,
+                        activation=activation,
+                        block_shape=None,
+                        global_num_experts=E,
+                        routed_scaling_factor=routed_scaling_factor,
+                    )
+                    return StandardCombineInput(hidden_states=output)
+                logger.warning_once(
+                    "[unquant] aiter W16A16 unavailable for "
+                    f"M={M}, E={E}, N1={N1}, N2={N2}, K={K}, topk={top_k}, "
+                    f"status={status}, sol={getattr(moe_cfg, 'solution_type', None)}; "
+                    "falling back to triton"
+                )
+                quant_info = TritonMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    b13=getattr(layer, "w13_weight_bias", None),
+                    b2=getattr(layer, "w2_weight_bias", None),
+                    fuse_swiglu_interleaved=self.w13_swiglu_interleaved,
+                )
+                return self.runner.run(dispatch_output, quant_info)
 
             else:
                 quant_info = TritonMoeQuantInfo(

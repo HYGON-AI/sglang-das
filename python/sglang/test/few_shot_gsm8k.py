@@ -60,7 +60,17 @@ def get_few_shot_examples(lines, k):
 
 def get_answer_value(answer_str):
     answer_str = answer_str.replace(",", "")
-    numbers = re.findall(r"\d+", answer_str)
+    # Prefer GSM8K's canonical final-answer marker. With ignore_eos, chat
+    # models often keep generating after #### N; taking the last digit in
+    # the whole string then picks a mid-sentence number (e.g. "16 glasses")
+    # from a truncated continuation and falsely marks a correct answer wrong.
+    marked = re.findall(r"####\s*(-?\d+)", answer_str)
+    if marked:
+        try:
+            return ast.literal_eval(marked[-1])
+        except SyntaxError:
+            pass
+    numbers = re.findall(r"-?\d+", answer_str)
     if len(numbers) < 1:
         return INVALID
     try:
@@ -93,9 +103,19 @@ def run_eval(args):
     num_shots = args.num_shots
     few_shot_examples = get_few_shot_examples(lines, num_shots)
 
+    # Evaluate on examples AFTER the few-shot demos. Using lines[0:num_questions]
+    # re-asks the demos themselves; chat models then often emit <|im_end|>
+    # immediately (empty completion -> Invalid=1.0).
     questions = []
     labels = []
-    for i in range(len(lines[:num_questions])):
+    start = num_shots
+    end = num_shots + num_questions
+    if end > len(lines):
+        raise ValueError(
+            f"Need {end} examples for {num_shots}-shot + {num_questions} questions, "
+            f"but data only has {len(lines)}"
+        )
+    for i in range(start, end):
         questions.append(get_one_example(lines, i, False))
         labels.append(get_answer_value(lines[i]["answer"]))
     assert all(l != INVALID for l in labels)
@@ -110,12 +130,18 @@ def run_eval(args):
     @sgl.function
     def few_shot_gsm8k(s, question):
         s += few_shot_examples + question
+        # Chat-tuned Qwen checkpoints treat multi-shot #### completions as a
+        # finished turn and emit <|im_end|> as the first token under raw
+        # /generate few-shot prompts. ignore_eos keeps generation going;
+        # stop on "Question" still cuts the next demo header.
         s += sgl.gen(
             "answer",
             max_tokens=args.max_new_tokens,
+            ignore_eos=True,
             stop=[
                 "Question",
                 "Assistant:",
+                "\nassistant",
                 "<|separator|>",
                 "<｜end▁of▁file｜>",
                 "<｜begin▁of▁file｜>",
@@ -143,8 +169,18 @@ def run_eval(args):
     for i in range(len(states)):
         preds.append(get_answer_value(states[i]["answer"]))
 
-    # print(f"{preds=}")
-    # print(f"{labels=}")
+    # Show a few raw completions when everything is invalid (common failure mode).
+    if all(p == INVALID for p in preds):
+        for i in range(min(3, len(states))):
+            print(
+                f"[debug] empty/invalid answer[{i}] "
+                f"completion_tokens="
+                f"{states[i].get_meta_info('answer').get('completion_tokens')} "
+                f"text={states[i]['answer']!r}"
+            )
+    elif num_questions <= 5:
+        print(f"{preds=}")
+        print(f"{labels=}")
 
     # Compute accuracy
     acc = np.mean(np.array(preds) == np.array(labels))
