@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from sglang.srt.runtime_context import get_parallel
 from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
 
 import torch
@@ -34,7 +35,7 @@ from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
 from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
-from sglang.srt.distributed.parallel_state import get_attn_cp_group
+
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.dsv4.rlc import compute_rlc_metadata
 from sglang.srt.layers.dp_attention import (
@@ -49,6 +50,7 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.models.deepseek_v2 import _use_aiter
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     add_prefix,
@@ -68,6 +70,9 @@ _use_dpskv4_lightop_quant_k_cache = get_bool_env_var(
 if _is_hcu:
     from lightop import op
 
+
+if _use_aiter:
+    from aiter.tuned_gemm import tgemm
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -505,7 +510,7 @@ def _rlc_write_state(state_pool, kv_score_local, ape, paged, bundle, ratio, head
     write_src = bundle["write_src"]
     if write_src.numel():
         write_buf[bundle["write_mine_idx"]] = kv_score_local[write_src]
-    write_buf = get_attn_cp_group().all_reduce(write_buf)
+    write_buf = get_parallel().attn_cp_group.all_reduce(write_buf)
     write_plan_c = paged.plan._replace(
         compress_plan=bundle["empty16"], write_plan=bundle["write_remap"]
     )
@@ -686,6 +691,9 @@ class Compressor(BaseFusedOp):
     def _compute_wkv_gate(self, x: torch.Tensor) -> torch.Tensor:
         weight = getattr(self.wkv_gate, "weight", None)
         if weight is not None:
+            if _use_aiter and weight.dtype == torch.bfloat16:
+                # aiter's tuned GEMM for these shapes; kv_score is bf16-rounded
+                return tgemm.mm(x, weight, otype=x.dtype).float()
             return linear_bf16_fp32(x, weight)
 
         from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
@@ -746,7 +754,7 @@ class Compressor(BaseFusedOp):
         """
         from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
 
-        cp_group = get_attn_cp_group()
+        cp_group = get_parallel().attn_cp_group
         cp_size = cp_group.world_size
         cp_rank = cp_group.rank_in_group
         R, H = self.ratio, self.head_dim

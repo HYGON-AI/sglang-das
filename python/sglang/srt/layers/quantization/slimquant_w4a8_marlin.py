@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from sglang.srt.runtime_context import get_parallel
 import logging
 import os
 from typing import Dict, List, Optional
@@ -21,7 +22,7 @@ import torch.nn.functional as F
 import triton.language as tl
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_world_size
+
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.moe import (
@@ -652,7 +653,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
             FusedMoeWeightScaleSupported,
         )
 
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         intermediate_size = intermediate_size_per_partition
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
@@ -1062,7 +1063,7 @@ class SlimQuantW4A8Int8TritonMoEMethod:
             FusedMoeWeightScaleSupported,
         )
 
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         intermediate_size = intermediate_size_per_partition
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
@@ -1315,7 +1316,7 @@ class SlimQuantW4A8Int8AiterMoEMethod:
             FusedMoeWeightScaleSupported,
         )
 
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         intermediate_size = intermediate_size_per_partition
         w13_weight = torch.nn.Parameter(
             torch.empty(
@@ -1482,15 +1483,12 @@ class SlimQuantW4A8Int8AiterMoEMethod:
             and cached.device == device
         ):
             return cached
-        from sglang.srt.distributed import (
-            get_moe_expert_parallel_rank,
-            get_moe_expert_parallel_world_size,
-        )
+
         from sglang.srt.layers.moe.fused_moe_triton.layer import determine_expert_map
 
         _, expert_map = determine_expert_map(
-            get_moe_expert_parallel_world_size(),
-            get_moe_expert_parallel_rank(),
+            get_parallel().moe_ep_size,
+            get_parallel().moe_ep_rank,
             global_num_experts,
         )
         expert_map = expert_map.to(device=device, dtype=torch.int32)
@@ -1582,14 +1580,11 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         if global_num_experts is None or global_num_experts < 0:
             global_num_experts = e
         if global_num_experts > e:
-            from sglang.srt.distributed import (
-                get_moe_expert_parallel_rank,
-                get_moe_expert_parallel_world_size,
-            )
 
-            ep_rank = get_moe_expert_parallel_rank()
+
+            ep_rank = get_parallel().moe_ep_rank
             rank_offset = ep_rank * (
-                global_num_experts // get_moe_expert_parallel_world_size()
+                global_num_experts // get_parallel().moe_ep_size
             )
             dummy = global_num_experts - 1 if ep_rank == 0 else 0
             local_ids = topk_ids - rank_offset

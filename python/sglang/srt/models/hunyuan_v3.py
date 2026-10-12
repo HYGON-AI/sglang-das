@@ -25,23 +25,19 @@ from sglang.srt.distributed import (
     get_moe_tensor_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.distributed.parallel_state import (
-    get_attn_tensor_model_parallel_rank,
-    get_attn_tensor_model_parallel_world_size,
-    get_moe_expert_parallel_world_size,
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
-)
+
 from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerFacts,
-    enable_moe_dense_fully_dp,
+from sglang.srt.layers.layer_boundary import (
+    declare_attn, declare_ffn, append_stages,
 )
+from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
+
+from sglang.srt.layers.layer_boundary import is_dense_ffn_fully_dp
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -175,8 +171,7 @@ class HYV3FeedForward(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group="replicated" if tp_size == 1 else "tp",
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -185,8 +180,7 @@ class HYV3FeedForward(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group="replicated" if tp_size == 1 else "tp",
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -217,9 +211,6 @@ class HYV3MoEFused(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
-        self.tp_size = get_moe_tensor_parallel_world_size()
-        self.dense_tp_size = get_tensor_model_parallel_world_size()
-        self.ep_size = get_moe_expert_parallel_world_size()
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.n_routed_experts = config.num_experts
@@ -267,6 +258,7 @@ class HYV3MoEFused(nn.Module):
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
+            layer_id=layer_id,
             use_grouped_topk=True,
             num_expert_group=1,
             topk_group=1,
@@ -537,8 +529,8 @@ class HYV3Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        attn_tp_rank = get_attn_tensor_model_parallel_rank()
-        attn_tp_size = get_attn_tensor_model_parallel_world_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -568,8 +560,7 @@ class HYV3Attention(nn.Module):
                 self.total_num_kv_heads,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=0,
-                tp_size=1,
+                parallel_group="replicated",
                 prefix=f"{prefix}.qkv_proj",
             )
             self.o_proj = ReplicatedLinear(
@@ -587,8 +578,7 @@ class HYV3Attention(nn.Module):
                 self.total_num_kv_heads,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
                 prefix=f"{prefix}.qkv_proj",
             )
             self.o_proj = RowParallelLinear(
@@ -596,8 +586,7 @@ class HYV3Attention(nn.Module):
                 hidden_size,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
                 reduce_results=False,
                 prefix=f"{prefix}.o_proj",
             )
@@ -837,7 +826,7 @@ class HYV3DecoderLayer(nn.Module):
 
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
         if layer_id < first_k_dense_replace:
-            if enable_moe_dense_fully_dp():
+            if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
@@ -872,18 +861,10 @@ class HYV3DecoderLayer(nn.Module):
                 and layer_id + 1 >= first_k_dense_replace
             )
 
-        self.layer_facts = LayerFacts.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
-        self.layer_communicator = LayerCommunicator(
-            layer_facts=self.layer_facts,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (declare_attn(), self.input_layernorm),
+            (declare_ffn(sparse=is_layer_sparse, next_layer_sparse=is_next_layer_sparse),
+             self.post_attention_layernorm),
         )
 
     def forward(
@@ -898,11 +879,11 @@ class HYV3DecoderLayer(nn.Module):
                 positions, hidden_states, forward_batch, residual
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states,
-            residual,
-            forward_batch,
+        hidden_states, stream = ResidualStream.from_handoff(
+            hidden_states, residual, PLAIN_ADD
         )
+        forward_batch.residual_stream = stream
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -911,13 +892,10 @@ class HYV3DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
-        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if self.block_type == "moe":
                 hidden_states = self.mlp(
                     hidden_states,
@@ -931,8 +909,9 @@ class HYV3DecoderLayer(nn.Module):
                     should_allreduce_fusion=ffn_exit.fuse_mlp_allreduce,
                     use_reduce_scatter=ffn_exit.mlp_reduce_scatter,
                 )
-        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
-
+        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states, residual = stream.export(hidden_states)
+        forward_batch.residual_stream = None
         return hidden_states, residual
 
     def forward_sp(
@@ -972,7 +951,7 @@ class HYV3Model(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1091,7 +1070,7 @@ class HYV3ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.model = HYV3Model(config, quant_config, prefix=f"{prefix}.model")
         if self.pp_group.is_last_rank:

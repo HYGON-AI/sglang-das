@@ -25,18 +25,22 @@ from sglang.kernels.ops.memory.allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     get_bool_env_var,
     get_num_new_pages,
     is_hip,
+    is_hcu,
     next_power_of_2,
-)
-from sgl_kernel.kvcacheio import (
-    hcu_alloc_decode_kernel,
-    hcu_alloc_extend_kernel as sgl_kernel_alloc_extend_kernel,
 )
 
 _is_hip = is_hip()
+_is_hcu = is_hcu()
+if _is_hcu:
+    from sgl_kernel.kvcacheio import (
+        hcu_alloc_decode_kernel,
+        hcu_alloc_extend_kernel as sgl_kernel_alloc_extend_kernel,
+    )
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -141,6 +145,25 @@ def alloc_extend_naive(
     out_indices.copy_(out)
 
 
+def alloc_decode_naive(
+    seq_lens,
+    last_loc,
+    free_pages,
+    out_indices,
+    page_size,
+    num_new_pages,
+):
+    if num_new_pages == 0:
+        out_indices.copy_(last_loc + 1)
+        return
+    need_new_page = ((seq_lens - 1) % page_size == 0).to(torch.int64)
+    new_page_rank = (torch.cumsum(need_new_page, 0) - need_new_page).clamp_(
+        max=num_new_pages - 1
+    )
+    new_page_start = free_pages[new_page_rank] * page_size
+    out_indices.copy_(torch.where(need_new_page.bool(), new_page_start, last_loc + 1))
+
+
 class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Same interface as `TokenToKVPoolAllocator`, but the indices handed to one
     request are always page-aligned.
@@ -160,11 +183,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
-        self.sglang_kvalloc_kernel = get_bool_env_var(
+        self.sglang_kvalloc_kernel = _is_hcu and get_bool_env_var(
             "SGLANG_KVALLOC_KERNEL", default="true"
         )
         self.lightop_kvalloc_kernel = envs.SGLANG_LIGHTOP_KVALLOC_KERNEL.get()
         self.seen_max_num_extend_tokens_next_power_of_2 = 1
+        self.use_triton_kernels = current_platform.capabilities.supports_triton
 
         # Pre-warm the torch.unique used by free(): on ROCm the first call
         # JIT-compiles rocPRIM sort/unique kernels and costs ~200ms.
@@ -229,8 +253,26 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
 
         bs = len(prefix_lens)
-        if extend_num_tokens // self.page_size + bs + 1 > len(self.free_pages):
+        # Strict upper bound on num_new_pages: one request's page count grows
+        # by less than extend_len / page_size + 1, so the sum is below this.
+        max_new_pages = extend_num_tokens // self.page_size + bs + 1
+        if max_new_pages > len(self.free_pages):
             self.merge_and_sort_free()
+
+        if max_new_pages > len(self.free_pages):
+            # The bound cannot prove the pool is deep enough, and both kernels
+            # read past free_pages when it is not: the Triton one out of
+            # bounds, the native one clamping to duplicate rows. Pay for the
+            # exact count before launching. The fast path leaves it until
+            # after, which is what get_num_new_pages' CPU tensors are for.
+            if num_new_pages is None:
+                num_new_pages = get_num_new_pages(
+                    seq_lens=seq_lens_cpu,
+                    page_size=self.page_size,
+                    prefix_lens=prefix_lens_cpu,
+                )
+            if num_new_pages > len(self.free_pages):
+                return None
 
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
@@ -253,7 +295,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 bs=bs,
                 page_size=self.page_size,
             )
-        else:
+        elif self.use_triton_kernels:
             alloc_extend_kernel[(bs,)](
                 prefix_lens,
                 seq_lens,
@@ -262,6 +304,16 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 out_indices,
                 next_power_of_2(bs),
                 self.page_size,
+            )
+        else:
+            alloc_extend_naive(
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.page_size,
+                self.device,
             )
 
         if self.debug_mode:
@@ -273,8 +325,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 page_size=self.page_size,
                 prefix_lens=prefix_lens_cpu,
             )
-        if num_new_pages > len(self.free_pages):
-            return None
 
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
@@ -294,24 +344,25 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if bs > len(self.free_pages):
             self.merge_and_sort_free()
 
-        out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=self.page_size,
+            decode=True,
+        )
+        if num_new_pages > len(self.free_pages):
+            return None
 
+        out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
         if self.sglang_kvalloc_kernel:
-            # The HCU allocator ABI declares ``last_loc_ptr`` as int32_t*,
-            # while SWA translation can produce an int64 mapping tensor.
-            # Preserve the external ABI at this boundary: passing the int64
-            # storage through directly causes each request to read the high
-            # half of its predecessor's location.
-            last_loc_i32 = last_loc.to(dtype=torch.int32, copy=False)
             hcu_alloc_decode_kernel(
-                seq_lens_ptr = seq_lens,
-                last_loc_ptr = last_loc_i32,
-                free_page_ptr = self.free_pages,
-                out_indices = out_indices,
-                bs = bs,
-                page_size = self.page_size,
+                seq_lens_ptr=seq_lens,
+                last_loc_ptr=last_loc.to(dtype=torch.int32, copy=False),
+                free_page_ptr=self.free_pages,
+                out_indices=out_indices,
+                bs=bs,
+                page_size=self.page_size,
             )
-        else:
+        elif self.use_triton_kernels:
             alloc_decode_kernel[(bs,)](
                 seq_lens,
                 last_loc,
@@ -320,17 +371,18 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 next_power_of_2(bs),
                 self.page_size,
             )
+        else:
+            alloc_decode_naive(
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.page_size,
+                num_new_pages,
+            )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
-
-        num_new_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu,
-            page_size=self.page_size,
-            decode=True,
-        )
-        if num_new_pages > len(self.free_pages):
-            return None
 
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices

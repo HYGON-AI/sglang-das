@@ -3,12 +3,9 @@ from typing import Callable, Optional
 
 import torch
 
-from sglang.srt.distributed import (
-    attention_tensor_model_parallel_all_reduce,
-    get_tp_group,
-)
+from sglang.srt.distributed import attention_tensor_model_parallel_all_reduce
 from sglang.srt.environ import envs
-from sglang.srt.layers.communicator.legacy import (
+from sglang.srt.layers.layer_boundary.hcu_legacy import (
     AttentionInputs,
     LayerCommunicator,
     LayerScatterModes,
@@ -251,7 +248,7 @@ class MHCLayerCommunicator(LayerCommunicator):
 
         moe_a2a_backend = get_moe_a2a_backend()
         if get_attention_dp_size() > 1 and moe_a2a_backend.is_none():
-            global_hidden_states = get_global_dp_buffer(get_tp_group())
+            global_hidden_states = get_global_dp_buffer(get_parallel().tp_group)
             dp_gather_partial(global_hidden_states, hidden_states, forward_batch)
             self._mlp_comm_kind = "dp_gather"
             return global_hidden_states
@@ -277,7 +274,7 @@ class MHCLayerCommunicator(LayerCommunicator):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         if self._mlp_comm_kind == "dp_gather":
-            local_hidden_states = get_local_dp_buffer(get_tp_group())
+            local_hidden_states = get_local_dp_buffer(get_parallel().tp_group)
             dp_scatter(local_hidden_states, hidden_states, forward_batch)
             hidden_states = local_hidden_states
         elif self._mlp_comm_kind == "a2a_scatter":

@@ -25,7 +25,6 @@ import multiprocessing as multiprocessing
 import os
 import pickle
 import signal
-import sys
 import threading
 from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
@@ -73,6 +72,10 @@ from sglang.srt.utils import (
     configure_logger,
     kill_itself_when_parent_died,
     kill_process_tree,
+)
+from sglang.srt.utils.cudacore_pyspy_dump_utils import (
+    CHILD_CLEANUP_SECONDS,
+    run_fatal_exit,
 )
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.utils import get_exception_traceback
@@ -462,6 +465,7 @@ class MultiTokenizerRouter:
         port_args: PortArgs,
     ):
         self.server_args = server_args
+        self._fatal_exit_started = False
         self.startup_time: Optional[Dict[str, Any]] = None
         context = zmq.asyncio.Context(3)
         self.recv_from_detokenizer = get_zmq_socket(
@@ -509,6 +513,17 @@ class MultiTokenizerRouter:
 
     def set_startup_time(self, startup_time: Dict[str, Any]) -> None:
         self.startup_time = startup_time
+
+    def _fatal_shutdown(self, reason):
+        if self._fatal_exit_started:
+            return
+        self._fatal_exit_started = True
+        run_fatal_exit(
+            lambda deadline, event: logger.error(reason),
+            lambda: kill_process_tree(
+                os.getpid(), include_parent=False, wait_timeout=CHILD_CLEANUP_SECONDS
+            ),
+        )
 
     def _run_loop(self):
         self._loop.run_forever()
@@ -1003,14 +1018,20 @@ async def print_exception_wrapper(func):
     try:
         await func()
     except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"MultiTokenizerRouter hit an exception: {traceback}")
+        reason = f"MultiTokenizerRouter hit an exception: {get_exception_traceback()}"
         if hasattr(func, "__self__") and isinstance(
             func.__self__, MultiTokenizerRouter
         ):
-            func.__self__.dump_requests_before_crash()
-        kill_process_tree(os.getpid(), include_parent=True)
-        sys.exit(1)
+            func.__self__._fatal_shutdown(reason)
+        else:
+            run_fatal_exit(
+                lambda deadline, event: logger.error(reason),
+                lambda: kill_process_tree(
+                    os.getpid(),
+                    include_parent=False,
+                    wait_timeout=CHILD_CLEANUP_SECONDS,
+                ),
+            )
 
 
 def get_main_process_id() -> int:

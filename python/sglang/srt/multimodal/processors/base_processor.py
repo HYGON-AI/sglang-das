@@ -37,6 +37,7 @@ from sglang.srt.multimodal.cache import (
 )
 from sglang.srt.multimodal.embedding_chunks import EmbeddingChunks
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
+from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
 from sglang.srt.multimodal.transport.cuda_ipc import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
@@ -332,6 +333,7 @@ class BaseMultimodalProcessor(ABC):
             max_workers=self.mm_io_worker_num,
             thread_name_prefix="sglang-mm-io",
         )
+        self.hash_executor = MultimodalHashExecutor()
         if self.mm_io_worker_num > 4:
             logger.info(
                 "Multimodal data loading enabled with %d worker threads (%s).",
@@ -495,6 +497,7 @@ class BaseMultimodalProcessor(ABC):
     def shutdown(self) -> None:
         """Drop cached artifacts and stop every processor-side executor."""
         self.clear_preprocess_cache()
+        self.hash_executor.shutdown()
         self.io_executor.shutdown(wait=False, cancel_futures=True)
         self.cpu_executor.shutdown(wait=False, cancel_futures=True)
         if self.mm_processor_executor is not None:

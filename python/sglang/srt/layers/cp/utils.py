@@ -128,14 +128,14 @@ def get_layer_owner(local_layer_idx: int, shard_size: int, total_layers: int) ->
 
 def enable_cp_v2() -> bool:
     """Return whether the strategy-based generic prefill CP path is available."""
-    from sglang.srt.utils import is_hip, is_musa, is_npu
+    from sglang.srt.utils import is_hcu, is_musa, is_npu
 
-    return not (is_hip() or is_npu() or is_musa())
+    return not (is_hcu() or is_npu() or is_musa())
 
 
 def is_cp_active(forward_batch) -> bool:
     """Return whether the current forward batch is running through CP."""
-    # HIP/NPU/MUSA retain their platform CP implementations.  Treating those
+    # HCU/NPU/MUSA retain their platform CP implementations.  Treating those
     # batches as strategy-CP here shards the model inputs a second time while
     # their attention backends still use the legacy layout.
     if not enable_cp_v2():
@@ -207,7 +207,12 @@ def prepare_cp_forward(forward_batch) -> None:
         )
         pad_logical_token_to_physical(forward_batch.attn_cp_metadata)
 
-    if getattr(forward_batch, "global_num_tokens_cpu", None) is not None:
+    # Under CP-TP group sharing the model owns the CP row layout and gathers
+    # full rows for its MLPs, so their buffers keep the full-batch length.
+    if (
+        not get_parallel().enable_cp_tp_group_sharing
+        and getattr(forward_batch, "global_num_tokens_cpu", None) is not None
+    ):
         from sglang.srt.layers.dp_attention import set_local_dp_buffer_len
 
         set_local_dp_buffer_len(

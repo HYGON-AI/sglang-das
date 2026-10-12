@@ -7,6 +7,9 @@ from functools import lru_cache
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_hcu
+
+_is_hcu = is_hcu()
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +72,7 @@ def try_tilelang_ihc_pre(x, fn, scale, base, rms_eps, hc_eps, magnitude):
     Compilation/execution errors propagate. This API includes coefficient
     normalization but not the independent input/post-attention RMSNorm.
     """
-    if not envs.SGLANG_OPT_HY4_IHC_TILELANG.get():
+    if not _is_hcu or not envs.SGLANG_OPT_HY4_IHC_TILELANG.get():
         return None
     reason = _unsupported(x, fn, scale, base)
     if reason:
@@ -91,7 +94,7 @@ def try_tilelang_ihc_pre(x, fn, scale, base, rms_eps, hc_eps, magnitude):
 
 def try_tilelang_ihc_post(x, residual, post):
     """Return TileLang post result, or None for the eager caller."""
-    if not envs.SGLANG_OPT_HY4_IHC_TILELANG.get():
+    if not _is_hcu or not envs.SGLANG_OPT_HY4_IHC_TILELANG.get():
         return None
     if (x.ndim != 2 or residual.ndim != 3 or residual.shape[1] != 4
             or x.shape != (residual.shape[0], residual.shape[2])
@@ -123,7 +126,7 @@ def try_tilelang_ihc_post(x, residual, post):
 
 def try_tilelang_ihc_head(residual, head_fn, head_scale, head_base, rms_eps, hc_eps):
     """Return TileLang head result, or None for the eager caller."""
-    if not envs.SGLANG_OPT_HY4_IHC_TILELANG.get():
+    if not _is_hcu or not envs.SGLANG_OPT_HY4_IHC_TILELANG.get():
         return None
     if (residual.ndim != 3 or residual.shape[1] != 4
             or head_fn.shape != (4, 4 * residual.shape[2])

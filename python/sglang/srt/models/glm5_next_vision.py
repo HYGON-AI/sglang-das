@@ -55,8 +55,7 @@ class Glm4vVisionMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            parallel_group="replicated" if use_data_parallel else "tp",
         )
         self.down_proj = RowParallelLinear(
             hidden_features,
@@ -64,8 +63,7 @@ class Glm4vVisionMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            parallel_group="replicated" if use_data_parallel else "tp",
         )
         self.act_fn = swiglu_clamped
         self.swiglu_limit = swiglu_limit
@@ -191,8 +189,7 @@ class Glm4vPatchMerger(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group="replicated" if use_data_parallel else "tp",
         )
         self.down_proj = RowParallelLinear(
             context_dim,
@@ -200,8 +197,7 @@ class Glm4vPatchMerger(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group="replicated" if use_data_parallel else "tp",
         )
         self.extra_activation_func = nn.GELU()
         self.swiglu_limit = swiglu_limit

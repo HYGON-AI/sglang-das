@@ -24,9 +24,10 @@ import triton.language as tl
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.utils import get_bool_env_var, is_hcu, is_hip, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hcu, is_hip, is_npu
 
-if is_hcu():
+_is_hcu = is_hcu()
+if _is_hcu:
     from boltops.generic.triton import attn_res
 
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
@@ -35,7 +36,7 @@ _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
 _FAST_SUPPORTED = None
 _HIP_SHAPE_GATE = None
 
-_USE_HCU_ATTN_RES = is_hcu() and get_bool_env_var("SGLANG_K3_ATTN_RESIDUAL_HCU", default="true")
+_USE_HCU_ATTN_RES = _is_hcu and get_bool_env_var("SGLANG_K3_ATTN_RESIDUAL_HCU", default="true")
 
 def _supports_attn_res_tma(capability: tuple[int, int]) -> bool:
     """Return whether the device is eligible for the TMA fast path."""
@@ -55,7 +56,7 @@ def _use_hcu_aggregate(num_tokens: int, nvb: int) -> bool:
 def _use_fast(hidden_size: int) -> bool:
     """The TMA kernel needs SM100+ except SM12x and its H=7168 template."""
     global _FAST_SUPPORTED
-    if is_npu():
+    if not is_cuda():
         return False
     if _FAST_SUPPORTED is None:
         _FAST_SUPPORTED = _supports_attn_res_tma(torch.cuda.get_device_capability())

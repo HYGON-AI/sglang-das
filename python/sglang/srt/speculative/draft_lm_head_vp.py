@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from sglang.srt.runtime_context import get_parallel
 import logging
 import os
 from typing import List, Sequence, Tuple
@@ -87,10 +88,7 @@ class DraftLMHeadVocabParallelTop1:
         vp_size: int,
         max_rows_per_rank: int,
     ) -> None:
-        from sglang.srt.distributed.parallel_state import (
-            create_custom_parallel_group,
-            get_tp_group,
-        )
+        from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 
         if not torch.distributed.is_initialized():
             raise RuntimeError("torch.distributed must be initialized before draft VP.")
@@ -117,7 +115,7 @@ class DraftLMHeadVocabParallelTop1:
                 f"got {full_weight.dtype}."
             )
 
-        tp_group = get_tp_group()
+        tp_group = get_parallel().tp_group
         local_world_size = int(
             os.environ.get("LOCAL_WORLD_SIZE")
             or os.environ.get("LOCAL_SIZE")

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from sglang.srt.runtime_context import get_parallel
 import os
 from typing import Any, Dict, List, Optional
 
@@ -24,7 +25,7 @@ from lightop._lmslim_native.vllm_compat.fused_moe_cache import get_moe_cache
 from lightop.quant import per_token_quant_int8
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_world_size
+
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.parameter import (
@@ -437,7 +438,7 @@ class SlimQuantW4A8Int8MoEMethod:
             FusedMoeWeightScaleSupported,
         )
 
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         intermediate_size = intermediate_size_per_partition
 
         # WEIGHTS
