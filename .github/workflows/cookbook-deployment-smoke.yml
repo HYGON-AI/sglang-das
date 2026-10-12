@@ -35,9 +35,10 @@ jobs:
           ref: main
           token: ${{ secrets.MODEL_SMOKE_REPO_TOKEN }}
           persist-credentials: false
-          path: model-ci
+          # Fresh code-only directory bypasses reports left by the previous controller.
+          path: model-ci-tools
       - name: Invoke maintained test controller
-        uses: ./model-ci/.github/actions/deployment-smoke
+        uses: ./model-ci-tools/.github/actions/deployment-smoke
         with:
           cases: ${{ inputs.cases || '' }}
           mode: ${{ inputs.mode || 'execute' }}
