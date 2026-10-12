@@ -112,7 +112,11 @@ class RocmPlatform(Platform):
             logger.info("Using Torch SDPA backend.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
-        elif selected_backend in (AttentionBackendEnum.FA, None):
+        elif selected_backend in (
+            AttentionBackendEnum.FA,
+            AttentionBackendEnum.FA2,
+            None,
+        ):
             if is_hcu() and dtype in (torch.float16, torch.bfloat16):
                 try:
                     import flash_attn  # noqa: F401
@@ -124,6 +128,14 @@ class RocmPlatform(Platform):
                         "HCU FlashAttention-2 is unavailable; continuing to the "
                         "Torch SDPA fallback."
                     )
+
+        elif selected_backend == AttentionBackendEnum.SLA_ATTN:
+            if dtype not in (torch.float16, torch.bfloat16):
+                raise ValueError("ROCm SLA attention requires fp16 or bf16 inputs.")
+            if head_size not in (64, 128):
+                raise ValueError("ROCm SLA attention supports head sizes 64 and 128.")
+            logger.info("Using ROCm/HCU sparse-linear attention backend.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.rocm_sparse_linear_attn.RocmSparseLinearAttentionBackend"
 
         elif selected_backend == AttentionBackendEnum.AITER:
             if dtype not in (torch.float16, torch.bfloat16):
