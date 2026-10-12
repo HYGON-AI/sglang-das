@@ -778,8 +778,6 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 expert_map = getattr(dispatcher, "local_expert_mapping", None)
             if expert_map is None:
                 expert_map = getattr(dispatcher, "expert_mask_gpu", None)
-            if _is_hcu and getattr(layer, "_aiter_w8a8_fp8_moe_config_cache", None) is None:
-                setattr(layer, "_aiter_w8a8_fp8_moe_config_cache", {})
             quant_info = AiterMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
@@ -793,10 +791,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 expert_mask=expert_map,
                 # HCU 0.5.18 fused_moe cannot run bf16×fp8; use aiter_moe.
                 use_fp8_w8a8=_is_hcu,
-                layer=layer,
-                moe_config_cache=getattr(
-                    layer, "_aiter_w8a8_fp8_moe_config_cache", None
-                ),
+                # The scheme probe keeps checkpoint-layout weights when the
+                # ASM table matches; tell the unified runner to pick the
+                # matching no-shuffle ASM config instead of a shuffled one.
+                w8a8_no_shuffle=_is_hcu
+                and getattr(layer, "_hcu_aiter_fp8_noshuffle", False),
             )
             return self.runner.run(dispatch_output, quant_info)
         elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:
