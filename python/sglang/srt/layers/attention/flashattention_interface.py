@@ -482,7 +482,76 @@ def vllm_flash_attn_varlen_func(
     v_descale,
     layout=None,
     out=None,
+    total_k_hint: Optional[int] = None,
 ):
+    # Prefill already has an exact host KV-length sum. The vendor paged
+    # prefill wrapper recomputes seqused_k.sum() and branches on that device
+    # scalar for every layer, serializing all preceding GPU work. For the
+    # validated Qwen DFLASH layout, use the same conversion and FA kernels
+    # with the host count instead. Decode and all other layouts stay unchanged.
+    # E4M3 is intentionally excluded from this shortcut: retain its existing
+    # vendor/full-attention or Triton/SWA dispatch, including descale arguments.
+    # --kv-cache-dtype fp8_e4m3 remains supported; it is not coerced to E5M2.
+    if (
+        _is_hcu
+        and not _use_triton_vllm_fa
+        and get_bool_env_var("SGLANG_HCU_DFLASH_PREFILL_KV_HINT", default="true")
+        and get_spec().speculative_algorithm == "DFLASH"
+        and isinstance(total_k_hint, int)
+        and total_k_hint > 0
+        and layout == "legacy_bhsd"
+        and block_table is not None
+        and seqused_k is not None
+        and max_seqlen_q >= 16
+        and q.dtype == torch.bfloat16
+        and k.dtype == v.dtype
+        and k.dtype in (torch.bfloat16, torch.float8_e5m2)
+        and q.shape[1:] == (8, 256)
+        and k.shape[1:] == (1, 64, 256)
+        and v.shape[1:] == (1, 256, 64)
+        and causal
+        and window_size == (-1, -1)
+        and "gfx936" in torch.cuda.get_device_properties(q.device).gcnArchName
+    ):
+        from flash_attn.flash_attn_interface import flash_attn_cuda
+
+        # Retain the vendor's minimum workspace size (smaller buffers can
+        # fault in this installed runtime). Only the size calculation changes.
+        workspace_tokens = max(total_k_hint, 256 * 1024)
+        kt = torch.empty((workspace_tokens, 1, 256), device=q.device, dtype=q.dtype)
+        vt = torch.empty_like(kt)
+        cu_k = torch.empty_like(cu_seqlens_q)
+        flash_attn_cuda.pagedkv_to_contiguouskv(
+            kt, vt, k, v, block_table, seqused_k, cu_k, max_seqlen_k, 0
+        )
+        return flash_attn_cuda.varlen_fwd(
+            q,
+            kt,
+            vt,
+            out,
+            cu_seqlens_q,
+            cu_k,
+            None,
+            None,
+            None,
+            None,
+            max_seqlen_q,
+            max_seqlen_k,
+            0.0,
+            softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5,
+            False,
+            causal,
+            -1,
+            -1,
+            0.0,
+            False,
+            q_descale,
+            k_descale,
+            v_descale,
+            None,
+            None,
+        )[0]
+
     use_hcu_fp8_swa_fallback = (
         _is_hcu
         and k.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)

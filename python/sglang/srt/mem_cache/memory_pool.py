@@ -3587,10 +3587,17 @@ class MHATokenToKVPool(KVCache):
         if commit_lens.dtype != torch.int32:
             commit_lens = commit_lens.to(torch.int32)
 
-        # Gate prefix rows on device instead of materializing a dynamic nonzero
-        # result. Other layouts and the default-off path retain the old behavior.
+        # HCU DFLASH commits each draft layer here. nonzero below forces a
+        # host/device rendezvous per layer, preventing overlap with the next
+        # forward. Default to the existing device-masked writer on HCU only;
+        # Do not restrict the HCU default by dtype. Scaling and FP8 saturation
+        # remain in the conversion below, including E4M3 FN/FNUZ.
+        # SGLANG_ENABLE_HCU_FA_PREFIX_VALID=0 keeps the A/B fallback.
         if (
-            envs.SGLANG_ENABLE_HCU_FA_PREFIX_VALID.get()
+            (
+                envs.SGLANG_ENABLE_HCU_FA_PREFIX_VALID.get()
+                or (_is_hcu and not envs.SGLANG_ENABLE_HCU_FA_PREFIX_VALID.is_set())
+            )
             and _kv_layout_hcu_fa
             and not self.use_hnd
             and (_is_cuda or _is_hip)
@@ -3601,6 +3608,16 @@ class MHATokenToKVPool(KVCache):
                     cache_k = cache_k / k_scale
                 if v_scale is not None:
                     cache_v = cache_v / v_scale
+                if _is_hcu and self.dtype in (
+                    torch.float8_e5m2,
+                    torch.float8_e4m3fn,
+                    torch.float8_e4m3fnuz,
+                ):
+                    # Match set_kv_buffer's saturating cast, without modifying
+                    # the caller's dense KV (the fallback selects copies).
+                    fp8_max = float(torch.finfo(self.dtype).max)
+                    cache_k = cache_k.clamp(min=-fp8_max, max=fp8_max)
+                    cache_v = cache_v.clamp(min=-fp8_max, max=fp8_max)
                 cache_k = cache_k.to(self.dtype)
                 cache_v = cache_v.to(self.dtype)
             if self.store_dtype != self.dtype:

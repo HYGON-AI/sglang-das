@@ -65,9 +65,15 @@ from sgl_kernel import merge_state_v2
 #     flash_attn_varlen_func,
 #     flash_attn_with_kvcache,
 # )
-from sglang.srt.layers.attention.flashattention_interface import flash_attn_varlen_func, flash_attn_with_kvcache, vllm_flash_attn_varlen_func, vllm_flash_attn_with_kvcache
+from sglang.srt.layers.attention.flashattention_interface import (
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
+    vllm_flash_attn_varlen_func,
+    vllm_flash_attn_with_kvcache,
+)
 from flash_attn import varlen_fwd_unified
 from sglang.srt.utils import get_bool_env_var
+
 _use_fused_rmsnorm_rope = get_bool_env_var("SGLANG_USE_FUSED_RMSNORM_ROPE")
 _use_varlen_fwd_unified_fa = get_bool_env_var("SGLANG_USE_VARLEN_FWD_UNIFIED")
 _use_fused_bailing_rms_rotary = get_bool_env_var("SGLANG_USE_FUSED_RMS_ROTARY")
@@ -92,7 +98,9 @@ def is_nmz_fp8(dtype: torch.dtype) -> bool:
     if is_hcu():
         props = torch.cuda.get_device_properties(0)
         gcn_arch = getattr(props, "gcnArchName", "")
-        if "gfx938" in gcn_arch and (dtype == torch.float8_e4m3fn or dtype == torch.float8_e5m2):
+        if "gfx938" in gcn_arch and (
+            dtype == torch.float8_e4m3fn or dtype == torch.float8_e5m2
+        ):
             return True
     return False
 
@@ -254,9 +262,7 @@ class FlashAttentionBackend(AttentionBackend):
             kv_pool = kv_pool.full_kv_pool
         self.use_hnd = bool(getattr(kv_pool, "use_hnd", False))
         self._use_hcu_bhsd = is_hcu() and self.use_hnd
-        self._use_hcu_legacy_layout = (
-            _is_hcu and _kv_layout_hcu_fa and not self.use_hnd
-        )
+        self._use_hcu_legacy_layout = _is_hcu and _kv_layout_hcu_fa and not self.use_hnd
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
@@ -1489,7 +1495,11 @@ class FlashAttentionBackend(AttentionBackend):
                 descale_shape = (logical_batch_size, kv_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
                 v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype) if (not _is_hcu or is_nmz_fp8(self.kv_cache_dtype)) else q
+            q = (
+                q.to(self.kv_cache_dtype)
+                if (not _is_hcu or is_nmz_fp8(self.kv_cache_dtype))
+                else q
+            )
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         return q, q_rope, k_rope, k_descale, v_descale
@@ -1914,6 +1924,17 @@ class FlashAttentionBackend(AttentionBackend):
                     ),
                     layout="legacy_bhsd",
                     out=_fa_out,
+                    total_k_hint=(
+                        forward_batch.seq_lens_sum
+                        if _is_hcu
+                        and forward_batch.forward_mode == ForwardMode.EXTEND
+                        and self.attn_cp_size == 1
+                        and not layer.is_cross_attention
+                        and not use_local_attn
+                        and not use_cascade_attn
+                        and not is_swa_layer
+                        else None
+                    ),
                 )
             elif self._use_hcu_legacy_layout:
                 # Batch-semantic API: q.shape[0] is the batch size and row i
@@ -1958,22 +1979,16 @@ class FlashAttentionBackend(AttentionBackend):
                     softcap=layer.logit_cap,
                     window_size=window_size,
                     q_descale=(
-                        fa_k_descale
-                        if self.kv_cache_dtype_str != "auto"
-                        else None
+                        fa_k_descale if self.kv_cache_dtype_str != "auto" else None
                     ),
                     k_descale=(
-                        fa_k_descale
-                        if self.kv_cache_dtype_str != "auto"
-                        else None
+                        fa_k_descale if self.kv_cache_dtype_str != "auto" else None
                     ),
                     v_descale=(
-                        fa_v_descale
-                        if self.kv_cache_dtype_str != "auto"
-                        else None
+                        fa_v_descale if self.kv_cache_dtype_str != "auto" else None
                     ),
                     return_softmax_lse=use_cascade_attn,
-                    s_aux=kwargs.get('sinks', None)
+                    s_aux=kwargs.get("sinks", None),
                 )
             else:
                 # SP (hy3_sp / minimax_opt) shards the sequence across TP ranks and
@@ -2069,12 +2084,21 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k_cache=(k_cache_expand if _is_hcu else paged_view(
-                        key_cache.view(-1, layer.tp_k_head_num, layer.head_dim), 1
-                    )),
-                    v_cache=(v_cache_expand if _is_hcu else paged_view(
-                        value_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim), 1
-                    )),
+                    k_cache=(
+                        k_cache_expand
+                        if _is_hcu
+                        else paged_view(
+                            key_cache.view(-1, layer.tp_k_head_num, layer.head_dim), 1
+                        )
+                    ),
+                    v_cache=(
+                        v_cache_expand
+                        if _is_hcu
+                        else paged_view(
+                            value_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                            1,
+                        )
+                    ),
                     page_table=self.forward_metadata_spec_decode_expand.page_table,
                     cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
                     cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
@@ -2143,8 +2167,16 @@ class FlashAttentionBackend(AttentionBackend):
                         if not forward_batch.mha_one_shot
                         else metadata.max_seq_len_k
                     )
-                    k = k.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else k
-                    v = v.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else v
+                    k = (
+                        k.to(self.kv_cache_dtype)
+                        if is_nmz_fp8(self.kv_cache_dtype)
+                        else k
+                    )
+                    v = (
+                        v.to(self.kv_cache_dtype)
+                        if is_nmz_fp8(self.kv_cache_dtype)
+                        else v
+                    )
                     output = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
@@ -2574,22 +2606,16 @@ class FlashAttentionBackend(AttentionBackend):
                         softcap=layer.logit_cap,
                         window_size=window_size,
                         q_descale=(
-                        fa_k_descale
-                            if self.kv_cache_dtype_str != "auto"
-                            else None
+                            fa_k_descale if self.kv_cache_dtype_str != "auto" else None
                         ),
                         k_descale=(
-                            fa_k_descale
-                            if self.kv_cache_dtype_str != "auto"
-                            else None
+                            fa_k_descale if self.kv_cache_dtype_str != "auto" else None
                         ),
                         v_descale=(
-                            fa_v_descale
-                            if self.kv_cache_dtype_str != "auto"
-                            else None
+                            fa_v_descale if self.kv_cache_dtype_str != "auto" else None
                         ),
                         return_softmax_lse=use_cascade_attn or return_lse,
-                        s_aux=kwargs.get('sinks', None)
+                        s_aux=kwargs.get("sinks", None),
                     )
                 else:
                     if self._decode_uses_static_max_seqlen_k:
@@ -2664,11 +2690,7 @@ class FlashAttentionBackend(AttentionBackend):
                                 return_softmax_lse=True,
                                 num_splits=self.num_splits,
                                 ver=self.fa_impl_ver,
-                                **(
-                                    {"layout": "bhsd"}
-                                    if self._use_hcu_bhsd
-                                    else {}
-                                ),
+                                **({"layout": "bhsd"} if self._use_hcu_bhsd else {}),
                                 **kwargs,
                             )
                         )
@@ -3353,7 +3375,9 @@ class FlashAttentionBackend(AttentionBackend):
         # _bind_metadata_buffers) from the live out_cache_loc before replay.
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             n = out_cache_loc.shape[0]
-            assert_buffer_fits(n, self.swa_out_cache_loc_buf.shape[0], "SWA graph write buffer")
+            assert_buffer_fits(
+                n, self.swa_out_cache_loc_buf.shape[0], "SWA graph write buffer"
+            )
             self.swa_out_cache_loc_buf[n:].zero_()
             swa_write_loc = (
                 self.kv_index_translator.sliding_window_write_loc_for(out_cache_loc)
