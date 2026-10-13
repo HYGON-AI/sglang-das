@@ -40,7 +40,7 @@ class BaseDiT(nn.Module, ABC):
     _supported_attention_backends: set[AttentionBackendEnum] = {
         AttentionBackendEnum.SLIDING_TILE_ATTN,
         AttentionBackendEnum.SAGE_ATTN,
-        AttentionBackendEnum.FA,  # FlashAttention family; selector admits variants.
+        AttentionBackendEnum.FA,
         AttentionBackendEnum.AITER,
         AttentionBackendEnum.AITER_SAGE,
         AttentionBackendEnum.TORCH_SDPA,

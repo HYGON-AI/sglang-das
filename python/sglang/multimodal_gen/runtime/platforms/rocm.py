@@ -19,7 +19,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import sglang.multimodal_gen.envs as envs
-from sglang.srt.utils import is_hcu
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
@@ -27,6 +26,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
     PlatformEnum,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import is_hcu
 
 logger = init_logger(__name__)
 

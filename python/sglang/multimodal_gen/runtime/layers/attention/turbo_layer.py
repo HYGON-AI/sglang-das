@@ -362,10 +362,7 @@ class MinimalA2AAttnOp(DistributedAttention):
     ) -> Tensor:
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
-        # Wan can shard frames or flattened tokens; only an actually sharded
-        # input may enter the Ulysses exchange.  The explicit kwarg is used by
-        # Wan's flattened-token path; the batch flags cover frame-sharded paths
-        # and older callers.
+        # Only actually sharded token/frame inputs may enter Ulysses exchanges.
         sequence_shard_enabled = kwargs.pop("sequence_shard_enabled", None)
         if sequence_shard_enabled is None:
             forward_batch = getattr(forward_context, "forward_batch", None)

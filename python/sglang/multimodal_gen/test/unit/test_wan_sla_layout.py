@@ -3,8 +3,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+
 @pytest.mark.parametrize("token_shard,time_shard", [(True, False), (False, True)])
-def test_minimal_a2a_forward_uses_distributed_exchange(monkeypatch, token_shard, time_shard):
+def test_minimal_a2a_forward_uses_distributed_exchange(
+    monkeypatch, token_shard, time_shard
+):
     from sglang.multimodal_gen.runtime.layers.attention import turbo_layer
     from sglang.multimodal_gen.runtime.layers.attention.backends.rocm_sparse_linear_attn import (
         RocmSparseLinearAttentionBackend,
@@ -12,14 +15,18 @@ def test_minimal_a2a_forward_uses_distributed_exchange(monkeypatch, token_shard,
 
     group = object()
     monkeypatch.setattr(
-        turbo_layer, "get_attn_backend",
+        turbo_layer,
+        "get_attn_backend",
         lambda *args, **kwargs: RocmSparseLinearAttentionBackend,
     )
     monkeypatch.setattr(turbo_layer.dist, "is_available", lambda: True)
     monkeypatch.setattr(turbo_layer.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(
-        turbo_layer, "get_sp_group",
-        lambda: SimpleNamespace(ulysses_group=group, ulysses_world_size=4, ring_world_size=1),
+        turbo_layer,
+        "get_sp_group",
+        lambda: SimpleNamespace(
+            ulysses_group=group, ulysses_world_size=4, ring_world_size=1
+        ),
     )
     monkeypatch.setattr(turbo_layer.dist, "get_world_size", lambda pg: 4)
     batch = SimpleNamespace(
@@ -27,7 +34,8 @@ def test_minimal_a2a_forward_uses_distributed_exchange(monkeypatch, token_shard,
         did_sp_shard_latents=time_shard,
     )
     monkeypatch.setattr(
-        turbo_layer, "get_forward_context",
+        turbo_layer,
+        "get_forward_context",
         lambda: SimpleNamespace(
             attn_metadata=None,
             forward_batch=batch,
@@ -46,7 +54,10 @@ def test_minimal_a2a_forward_uses_distributed_exchange(monkeypatch, token_shard,
     monkeypatch.setattr(turbo_layer._SeqAllToAllQKV, "apply", qkv_exchange)
     monkeypatch.setattr(turbo_layer._SeqAllToAll, "apply", output_exchange)
     op = turbo_layer.MinimalA2AAttnOp(
-        num_heads=4, head_size=8, attention_type="sla", topk=0.25,
+        num_heads=4,
+        head_size=8,
+        attention_type="sla",
+        topk=0.25,
     )
     monkeypatch.setattr(op.local_attn, "forward", lambda q, k, v, meta: q + k + v)
     q = torch.randn(1, 3, 4, 8)
@@ -75,15 +86,22 @@ def test_minimal_a2a_forward_uses_distributed_exchange(monkeypatch, token_shard,
 
 
 @pytest.mark.parametrize("backend", ["sla_attn", "sage_sla_attn"])
-def test_wan_sparse_cross_attention_preserves_automatic_dense_fallback(monkeypatch, backend):
+def test_wan_sparse_cross_attention_preserves_automatic_dense_fallback(
+    monkeypatch, backend
+):
     from sglang.multimodal_gen.runtime.models.dits import wanvideo
 
     calls = []
     monkeypatch.setattr(wanvideo, "get_tp_world_size", lambda: 1)
-    monkeypatch.setattr(wanvideo, "ColumnParallelLinear", lambda *a, **k: torch.nn.Identity())
-    monkeypatch.setattr(wanvideo, "RowParallelLinear", lambda *a, **k: torch.nn.Identity())
     monkeypatch.setattr(
-        wanvideo, "get_global_server_args",
+        wanvideo, "ColumnParallelLinear", lambda *a, **k: torch.nn.Identity()
+    )
+    monkeypatch.setattr(
+        wanvideo, "RowParallelLinear", lambda *a, **k: torch.nn.Identity()
+    )
+    monkeypatch.setattr(
+        wanvideo,
+        "get_global_server_args",
         lambda: SimpleNamespace(attention_backend=backend),
     )
 
@@ -102,9 +120,13 @@ def test_wan_sparse_cross_attention_preserves_automatic_dense_fallback(monkeypat
     "token_shard,time_shard,expected_local_tokens,expected_exchange",
     [(True, False, 1, True), (False, True, 4, True), (False, False, 4, False)],
 )
-def test_wan_forward_passes_actual_layout_to_sla_blocks(
+def test_wan_forward_uses_request_layout_for_sla(
     monkeypatch, token_shard, time_shard, expected_local_tokens, expected_exchange
 ):
+    from sglang.multimodal_gen.runtime.layers.attention import turbo_layer
+    from sglang.multimodal_gen.runtime.layers.attention.backends.rocm_sparse_linear_attn import (
+        RocmSparseLinearAttentionBackend,
+    )
     from sglang.multimodal_gen.runtime.models.dits import wanvideo
 
     batch = SimpleNamespace(
@@ -116,16 +138,58 @@ def test_wan_forward_passes_actual_layout_to_sla_blocks(
     monkeypatch.setattr(
         wanvideo, "get_forward_context", lambda: SimpleNamespace(forward_batch=batch)
     )
-    monkeypatch.setattr(wanvideo, "get_sp_group", lambda: SimpleNamespace(rank_in_group=0))
+    monkeypatch.setattr(
+        wanvideo, "get_sp_group", lambda: SimpleNamespace(rank_in_group=0)
+    )
     monkeypatch.setattr(
         wanvideo, "sequence_model_parallel_all_gather", lambda x, dim: x.repeat(1, 4, 1)
     )
+    group = object()
+    monkeypatch.setattr(
+        turbo_layer,
+        "get_attn_backend",
+        lambda *args, **kwargs: RocmSparseLinearAttentionBackend,
+    )
+    monkeypatch.setattr(turbo_layer.dist, "is_available", lambda: True)
+    monkeypatch.setattr(turbo_layer.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(turbo_layer.dist, "get_world_size", lambda pg: 4)
+    monkeypatch.setattr(
+        turbo_layer,
+        "get_sp_group",
+        lambda: SimpleNamespace(
+            ulysses_group=group, ulysses_world_size=4, ring_world_size=1
+        ),
+    )
+    monkeypatch.setattr(
+        turbo_layer,
+        "get_forward_context",
+        lambda: SimpleNamespace(forward_batch=batch, attn_metadata=None),
+    )
+    exchanges = []
+
+    def exchange_qkv(pg, q, k, v, *args):
+        exchanges.append("qkv")
+        return q, k, v
+
+    def exchange_output(pg, output, *args):
+        exchanges.append("output")
+        return output
+
+    monkeypatch.setattr(turbo_layer._SeqAllToAllQKV, "apply", exchange_qkv)
+    monkeypatch.setattr(turbo_layer._SeqAllToAll, "apply", exchange_output)
+    attention = turbo_layer.MinimalA2AAttnOp(
+        num_heads=4, head_size=2, attention_type="sla", topk=0.25
+    )
+    monkeypatch.setattr(attention.local_attn, "forward", lambda q, k, v, meta: q)
     captured = []
 
     class Block(torch.nn.Module):
         def forward(self, x, *args, **kwargs):
-            captured.append((x.shape[1], kwargs["sequence_shard_enabled"]))
-            return x
+            assert "sequence_shard_enabled" not in kwargs
+            q = x.unflatten(-1, (4, 2))
+            output = attention(q, q, q)
+            captured.append((x.shape[1], attention.pg is group))
+            return output
 
     class Condition(torch.nn.Module):
         def forward(self, timestep, text, image, **kwargs):
@@ -166,3 +230,4 @@ def test_wan_forward_passes_actual_layout_to_sla_blocks(
     out = model(x, torch.zeros(1, 2, 8), torch.tensor([1]))
     assert out.shape == x.shape
     assert captured == [(expected_local_tokens, expected_exchange)]
+    assert exchanges == (["qkv", "output"] if expected_exchange else [])

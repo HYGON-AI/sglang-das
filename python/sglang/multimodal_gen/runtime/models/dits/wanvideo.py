@@ -668,7 +668,6 @@ class WanTransformerBlock(nn.Module):
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         rope_cos_sin_cache: torch.Tensor | None = None,
-        sequence_shard_enabled: bool = False,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -758,15 +757,7 @@ class WanTransformerBlock(nn.Module):
             query, key = _apply_rotary_emb(
                 query, cos, sin, is_neox_style=False
             ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
-        if isinstance(self.attn1, MinimalA2AAttnOp):
-            attn_output = self.attn1(
-                query,
-                key,
-                value,
-                sequence_shard_enabled=sequence_shard_enabled,
-            )
-        else:
-            attn_output = self.attn1(query, key, value)
+        attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
@@ -947,9 +938,7 @@ class WanTransformerBlock_VSA(nn.Module):
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         rope_cos_sin_cache: torch.Tensor | None = None,
-        sequence_shard_enabled: bool = False,
     ) -> torch.Tensor:
-        del sequence_shard_enabled
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         bs, seq_length, _ = hidden_states.shape
@@ -1233,15 +1222,8 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             sequence_shard_enabled = (
                 forward_batch.enable_sequence_shard and self.sp_size > 1
             )
-            # Some Wan pipelines shard the latent time axis before entering
-            # the model instead of letting Wan flatten and shard the token
-            # sequence.  SLA still needs the Ulysses exchange for that input.
-            attention_sequence_shard_enabled = sequence_shard_enabled or bool(
-                getattr(forward_batch, "did_sp_shard_latents", False)
-            )
         else:
             sequence_shard_enabled = False
-            attention_sequence_shard_enabled = False
         self.enable_teacache = (
             forward_batch is not None and forward_batch.enable_teacache
         )
@@ -1410,7 +1392,6 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     timestep_proj,
                     freqs_cis,
                     rope_cos_sin_cache=rope_cos_sin_cache,
-                    sequence_shard_enabled=attention_sequence_shard_enabled,
                 )
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:

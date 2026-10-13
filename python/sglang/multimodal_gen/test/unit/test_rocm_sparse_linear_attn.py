@@ -100,7 +100,6 @@ def test_rocm_sparse_linear_attention_calls_flash_attn_sla(monkeypatch):
     torch.testing.assert_close(output, query + key + value)
 
 
-
 def test_rocm_sparse_linear_attention_calls_sla_without_compute_flags(monkeypatch):
     calls = {}
 
@@ -280,7 +279,9 @@ def test_minimal_a2a_binds_ulysses_group_when_sequence_sharded(monkeypatch):
     )
     monkeypatch.setattr(turbo_layer.dist, "is_available", lambda: True)
     monkeypatch.setattr(turbo_layer.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(turbo_layer, "get_sp_group", lambda: fake_sp_group, raising=False)
+    monkeypatch.setattr(
+        turbo_layer, "get_sp_group", lambda: fake_sp_group, raising=False
+    )
 
     attn_op = turbo_layer.MinimalA2AAttnOp(
         num_heads=4,
@@ -366,10 +367,7 @@ def test_wan_sla_backend_switches_default_attention_type():
     from sglang.multimodal_gen.runtime.models.dits import wanvideo
 
     assert wanvideo.resolve_wan_attention_type("original", "sla_attn") == "sla"
-    assert (
-        wanvideo.resolve_wan_attention_type("original", "sage_sla_attn")
-        == "sagesla"
-    )
+    assert wanvideo.resolve_wan_attention_type("original", "sage_sla_attn") == "sagesla"
     assert wanvideo.resolve_wan_attention_type("original", "fa") == "original"
     assert wanvideo.resolve_wan_attention_type("sla", "fa") == "sla"
 
@@ -380,15 +378,11 @@ def test_fsdp_loader_treats_rocm_sla_projection_as_zero_init():
     )
 
     assert (
-        _resolve_missing_param_init(
-            "blocks.10.attn1.local_attn.proj_l.weight", None
-        )
+        _resolve_missing_param_init("blocks.10.attn1.local_attn.proj_l.weight", None)
         == "zeros"
     )
     assert (
-        _resolve_missing_param_init(
-            "blocks.10.attn1.local_attn.proj_l.bias", None
-        )
+        _resolve_missing_param_init("blocks.10.attn1.local_attn.proj_l.bias", None)
         == "zeros"
     )
 
@@ -396,24 +390,9 @@ def test_fsdp_loader_treats_rocm_sla_projection_as_zero_init():
 def test_wan_sla_topk_uses_attention_backend_config():
     from sglang.multimodal_gen.runtime.models.dits import wanvideo
 
-    assert (
-        wanvideo.resolve_wan_sla_topk(
-            0.1, "sla", {"sla_topk": 0.3}
-        )
-        == 0.3
-    )
-    assert (
-        wanvideo.resolve_wan_sla_topk(
-            0.1, "sla", {"topk": "0.5"}
-        )
-        == 0.5
-    )
-    assert (
-        wanvideo.resolve_wan_sla_topk(
-            0.1, "original", {"sla_topk": 0.3}
-        )
-        == 0.1
-    )
+    assert wanvideo.resolve_wan_sla_topk(0.1, "sla", {"sla_topk": 0.3}) == 0.3
+    assert wanvideo.resolve_wan_sla_topk(0.1, "sla", {"topk": "0.5"}) == 0.5
+    assert wanvideo.resolve_wan_sla_topk(0.1, "original", {"sla_topk": 0.3}) == 0.1
 
     with pytest.raises(ValueError, match="sla_topk"):
         wanvideo.resolve_wan_sla_topk(0.1, "sla", {"sla_topk": 0})
@@ -422,14 +401,8 @@ def test_wan_sla_topk_uses_attention_backend_config():
 def test_wan_sla_local_blocks_uses_attention_backend_config():
     from sglang.multimodal_gen.runtime.models.dits import wanvideo
 
-    assert (
-        wanvideo.resolve_wan_sla_local_blocks(0, "sla", {"sla_local_blocks": 3})
-        == 3
-    )
-    assert (
-        wanvideo.resolve_wan_sla_local_blocks(0, "sla", {"local_blocks": "2"})
-        == 2
-    )
+    assert wanvideo.resolve_wan_sla_local_blocks(0, "sla", {"sla_local_blocks": 3}) == 3
+    assert wanvideo.resolve_wan_sla_local_blocks(0, "sla", {"local_blocks": "2"}) == 2
     assert (
         wanvideo.resolve_wan_sla_local_blocks(0, "original", {"sla_local_blocks": 3})
         == 0
@@ -455,12 +428,15 @@ def test_wan_sla_skip_linear_uses_attention_backend_config():
         is True
     )
     assert (
-        wanvideo.resolve_wan_sla_skip_linear(True, "original", {"sla_skip_linear": False})
+        wanvideo.resolve_wan_sla_skip_linear(
+            True, "original", {"sla_skip_linear": False}
+        )
         is True
     )
 
     with pytest.raises(ValueError, match="sla_skip_linear"):
         wanvideo.resolve_wan_sla_skip_linear(True, "sla", {"sla_skip_linear": "maybe"})
+
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("head_size", [64, 128])
@@ -496,8 +472,12 @@ def test_minimal_a2a_preserves_sla_options(monkeypatch):
 
     monkeypatch.setattr(turbo_layer, "get_attn_backend", select_backend)
     op = turbo_layer.MinimalA2AAttnOp(
-        num_heads=2, head_size=8, attention_type="sla", topk=0.25,
-        local_blocks=2, skip_linear_branch=False,
+        num_heads=2,
+        head_size=8,
+        attention_type="sla",
+        topk=0.25,
+        local_blocks=2,
+        skip_linear_branch=False,
     )
     assert selections == [AttentionBackendEnum.SLA_ATTN]
     assert op.local_attn.topk_ratio == 0.25
@@ -513,18 +493,23 @@ def test_minimal_a2a_forward_uses_distributed_exchange(monkeypatch):
 
     group = object()
     monkeypatch.setattr(
-        turbo_layer, "get_attn_backend",
+        turbo_layer,
+        "get_attn_backend",
         lambda *args, **kwargs: RocmSparseLinearAttentionBackend,
     )
     monkeypatch.setattr(turbo_layer.dist, "is_available", lambda: True)
     monkeypatch.setattr(turbo_layer.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(
-        turbo_layer, "get_sp_group",
-        lambda: SimpleNamespace(ulysses_group=group, ulysses_world_size=4, ring_world_size=1),
+        turbo_layer,
+        "get_sp_group",
+        lambda: SimpleNamespace(
+            ulysses_group=group, ulysses_world_size=4, ring_world_size=1
+        ),
     )
     monkeypatch.setattr(turbo_layer.dist, "get_world_size", lambda pg: 4)
     monkeypatch.setattr(
-        turbo_layer, "get_forward_context",
+        turbo_layer,
+        "get_forward_context",
         lambda: SimpleNamespace(
             attn_metadata=None,
             forward_batch=SimpleNamespace(
@@ -546,7 +531,10 @@ def test_minimal_a2a_forward_uses_distributed_exchange(monkeypatch):
     monkeypatch.setattr(turbo_layer._SeqAllToAllQKV, "apply", qkv_exchange)
     monkeypatch.setattr(turbo_layer._SeqAllToAll, "apply", output_exchange)
     op = turbo_layer.MinimalA2AAttnOp(
-        num_heads=4, head_size=8, attention_type="sla", topk=0.25,
+        num_heads=4,
+        head_size=8,
+        attention_type="sla",
+        topk=0.25,
     )
     monkeypatch.setattr(op.local_attn, "forward", lambda q, k, v, meta: q + k + v)
     q = torch.randn(1, 3, 4, 8)
@@ -605,17 +593,24 @@ def test_minimal_a2a_ring_parallelism_is_explicitly_rejected(monkeypatch):
     )
 
     monkeypatch.setattr(
-        turbo_layer, "get_attn_backend",
+        turbo_layer,
+        "get_attn_backend",
         lambda *args, **kwargs: RocmSparseLinearAttentionBackend,
     )
     monkeypatch.setattr(turbo_layer.dist, "is_available", lambda: True)
     monkeypatch.setattr(turbo_layer.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(
-        turbo_layer, "get_sp_group",
-        lambda: SimpleNamespace(ulysses_group=object(), ulysses_world_size=2, ring_world_size=2),
+        turbo_layer,
+        "get_sp_group",
+        lambda: SimpleNamespace(
+            ulysses_group=object(), ulysses_world_size=2, ring_world_size=2
+        ),
     )
     op = turbo_layer.MinimalA2AAttnOp(
-        num_heads=4, head_size=8, attention_type="sla", topk=0.25,
+        num_heads=4,
+        head_size=8,
+        attention_type="sla",
+        topk=0.25,
     )
     with pytest.raises(NotImplementedError, match="ring-degree 1"):
         op._maybe_bind_sequence_parallel_group(

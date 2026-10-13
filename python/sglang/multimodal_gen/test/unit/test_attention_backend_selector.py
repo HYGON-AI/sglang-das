@@ -226,9 +226,7 @@ class TestAttentionBackendFallback(unittest.TestCase):
             "unsupported_requirements",
             return_value=("packed varlen attention",),
         ):
-            with self.assertRaisesRegex(
-                ValueError, "does not implement packed varlen"
-            ):
+            with self.assertRaisesRegex(ValueError, "does not implement packed varlen"):
                 self._resolve(
                     AttentionBackendEnum.FA2,
                     explicit=True,
