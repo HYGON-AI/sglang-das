@@ -32,6 +32,7 @@ For SWA-only layers callers pass ``topk=0``, ``compressed_base = 0`` (the
 compressed branch becomes a no-op) and any ``compress_ratio >= 1``.
 """
 
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Dict, Optional
@@ -45,6 +46,16 @@ from sglang.srt.utils import ceil_align, get_bool_env_var, is_hcu
 _use_hcu_combine_topk_swa_indices = is_hcu() and get_bool_env_var(
     "SGLANG_HCU_OPT_COMBINE_TOPK_SWA_INDICES", "true"
 )
+_hcu_combine_topk_swa_indices = None
+if _use_hcu_combine_topk_swa_indices:
+    try:
+        from lightop import (
+            combine_topk_swa_indices_hcu as _hcu_combine_topk_swa_indices,
+        )
+    except ImportError:
+        logging.getLogger(__name__).warning(
+            "LightOp combine_topk_swa_indices_hcu is unavailable; using Triton."
+        )
 
 # FlashMLA sparse prefill asserts ``params.topk % B_TOPK == 0``. B_TOPK is 64
 # for the h_q=64 kernel and 128 for h_q=128; pad to 128 to satisfy both.
@@ -150,9 +161,9 @@ def combine_topk_swa_indices(
     assert compressed_base.dtype == torch.int32
     assert swa_base.dtype == torch.int32
     assert compress_ratio >= 1, "compress_ratio must be >= 1 (use topk=0 for SWA-only)"
-    assert topk_indices.shape[-1] >= topk, (
-        f"topk_indices width {topk_indices.shape[-1]} must be >= topk {topk}"
-    )
+    assert (
+        topk_indices.shape[-1] >= topk
+    ), f"topk_indices width {topk_indices.shape[-1]} must be >= topk {topk}"
 
     num_tokens = topk_indices.shape[0]
     num_reqs = seq_lens.shape[0]
@@ -177,10 +188,8 @@ def combine_topk_swa_indices(
         assert out_lens.dtype == torch.int32
         combined_lens = out_lens
 
-    if _use_hcu_combine_topk_swa_indices:
-        from lightop import combine_topk_swa_indices_hcu
-
-        combine_topk_swa_indices_hcu(
+    if _hcu_combine_topk_swa_indices is not None:
+        _hcu_combine_topk_swa_indices(
             topk_indices,
             query_start_loc,
             query_pos,
@@ -528,9 +537,9 @@ class SparsePrefillChunkCache:
         device = self.seq_lens.device
         c_max = max(self.max_seq_len // compress_ratio, 1)
         c_capacity = page_table.shape[-1] * c_page_size
-        assert c_max <= c_capacity, (
-            f"live c{compress_ratio} extent {c_max} exceeds metadata capacity {c_capacity}"
-        )
+        assert (
+            c_max <= c_capacity
+        ), f"live c{compress_ratio} extent {c_max} exceeds metadata capacity {c_capacity}"
         first_q_per_req = (
             self.query_start_loc[:-1].clamp_max(self.num_qo_tokens - 1).long()
         )

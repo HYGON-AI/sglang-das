@@ -1922,6 +1922,9 @@ class MQALayer(MqaAttentionBase):
                     token_to_kv_pool.swa_page_size,
                     False,
                 )
+                if use_cp:
+                    # Local fused KV must be gathered before writing global slots.
+                    swa_cache, swa_loc = None, None
 
             from sglang.kernels.ops.attention.fused_qk_norm_rope_store import (
                 fused_qk_norm_rope_swa_store,
@@ -1962,17 +1965,20 @@ class MQALayer(MqaAttentionBase):
                 # which has no second return slot here. Prefill's write lands
                 # after attention, verify's before it; both read this pair.
                 kv = k_nope_out
-            elif not (unified and fuse_verify):
+            elif not ((unified and fuse_verify) or (not unified and use_cp)):
                 kv = None
 
             if not unified and use_cp:
-                # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
-                # write to the FlashMLA cache after gather.
-                kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
+                # The fused kernel already normed and rotated KV in place.
                 kv = cp_materialize_global_token_order(
                     kv.contiguous(),
                     forward_batch,
                     torch.cuda.current_stream(),
+                )
+                attn_backend.store_cache(
+                    layer_id=self.layer_id,
+                    swa_k=kv,
+                    forward_batch=forward_batch,
                 )
         elif _is_npu:
             q_lora = self.q_norm(q_lora)
@@ -2283,7 +2289,7 @@ class MQALayer(MqaAttentionBase):
                                 meta.q_pad_buffer = q_padded
                             except (AttributeError, TypeError):
                                 pass
-                elif _is_gfx942_supported:
+                elif _is_gfx942_supported or _is_hcu:
                     # Uninitialized padded TP heads inject NaN into attention on gfx942
                     # (fnuz), so zero-init there; other archs tolerate new_empty and skip
                     # the per-forward memset.
