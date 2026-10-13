@@ -698,6 +698,11 @@ def can_handle(
     # q layout must be [tokens, H_Q, D]; head dims handled by power-of-2 pad.
     if q_extend.dim() != 3 or k_extend.dim() != 3 or v_extend.dim() != 3:
         return False
+    # The prefix kernel addresses KV buffers as [tokens, H_KV, D].
+    # Paged 4-D buffers use stride(0) per page, not per token; reject them
+    # even when page_size happens to match head_dim.
+    if k_buffer.dim() != 3 or v_buffer.dim() != 3:
+        return False
     # GQA group must divide evenly.
     h_q = q_extend.shape[1]
     h_kv = k_extend.shape[1]
