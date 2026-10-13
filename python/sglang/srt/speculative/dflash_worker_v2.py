@@ -1690,10 +1690,25 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
             device = next_token_ids.device
-            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-            draft_seq_lens = torch.tensor(
-                batch.prefix_lens, dtype=torch.int32, device=device
-            )
+            if _is_hcu:
+                # Constructing tensors directly on the GPU issues blocking H2D
+                # copies after target prefill. Stage both host length lists in
+                # one pinned allocation so the host can enqueue draft KV work
+                # without waiting for target kernels to complete.
+                lengths_cpu = torch.tensor(
+                    [batch.extend_lens, batch.prefix_lens],
+                    dtype=torch.int32,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                ctx_lens, draft_seq_lens = lengths_cpu.to(
+                    device=device, non_blocking=True
+                ).unbind(0)
+            else:
+                ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
+                draft_seq_lens = torch.tensor(
+                    batch.prefix_lens, dtype=torch.int32, device=device
+                )
 
             if batch.out_cache_loc is None:
                 raise RuntimeError(
