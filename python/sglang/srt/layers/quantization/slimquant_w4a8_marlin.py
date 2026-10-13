@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib
 import logging
 import os
 import re
@@ -33,6 +32,7 @@ from sglang.srt.layers.moe import (
     MoeRunnerConfig,
     get_moe_a2a_backend,
 )
+from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
     W4A8_TPMOE_BACKEND_AITER,
     W4A8_TPMOE_BACKEND_AUTO,
@@ -52,7 +52,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
 from sglang.srt.layers.quantization.slimquant_w4a8 import SlimQuantW4A8Int8LinearMethod
 from sglang.srt.layers.quantization.w4a8_utils import w4a8_weight_repack_impl
 from sglang.srt.utils import get_bool_env_var, set_weight_attrs
-from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+
 # from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
 
 logger = logging.getLogger(__name__)
@@ -81,11 +81,11 @@ def _ensure_lightop_w4a8_marlin_available() -> None:
     if _lmslim_w4a8_marlin_available:
         return
     try:
-        from lightop.moe import (
-            fused_experts_impl_w4a8_marlin as _fused_experts_impl_w4a8_marlin,
-        )
         from lightop._lmslim_native.layers.fused_moe import (
             w4a8_marlin as _lightop_w4a8_marlin,
+        )
+        from lightop.moe import (
+            fused_experts_impl_w4a8_marlin as _fused_experts_impl_w4a8_marlin,
         )
     except Exception as e:
         raise RuntimeError(
@@ -343,9 +343,13 @@ def _resolve_w4a8_tpmoe_backend(
         _ensure_aiter_w4a8_marlin_available()
     return backend
 
+
 _use_aiter_moe = get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE", default="true")
-_use_lightop_w4a8_marlin_moe = get_bool_env_var("SGLANG_USE_LIGHTOP_W4A8_MARLIN_MOE", default="true")
+_use_lightop_w4a8_marlin_moe = get_bool_env_var(
+    "SGLANG_USE_LIGHTOP_W4A8_MARLIN_MOE", default="true"
+)
 _use_int4_w4a8 = get_bool_env_var("SGLANG_USE_INT4_W4A8")
+
 
 class MarlinMoeWorkspace:
     """
@@ -732,6 +736,7 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         experts_only_linear: bool = False,
         w8a8_include: Optional[list[str]] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+        compressed_tensors_packed: bool = False,
     ):
         super().__init__()
         self.ignore = ignore
@@ -742,6 +747,7 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         self.experts_only_linear = experts_only_linear
         self.w8a8_include = list(w8a8_include or [])
         self.packed_modules_mapping = packed_modules_mapping or {}
+        self.compressed_tensors_packed = compressed_tensors_packed
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -770,10 +776,35 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
             experts_only_linear=experts_only_linear,
             w8a8_include=list(w8a8.get("modules") or []),
             packed_modules_mapping=config.get("packed_modules_mapping") or {},
+            compressed_tensors_packed=config.get("format") == "pack-quantized",
         )
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
+        if (
+            user_quant == cls.get_name()
+            and hf_quant_cfg.get("quant_method") == "compressed-tensors"
+            and hf_quant_cfg.get("format") == "pack-quantized"
+        ):
+            groups = hf_quant_cfg.get("config_groups", {})
+            for group in groups.values():
+                weight = group.get("weights") or {}
+                activation = group.get("input_activations") or {}
+                if not (
+                    weight.get("num_bits") == 4
+                    and weight.get("type") == "int"
+                    and weight.get("strategy") == "channel"
+                    and weight.get("symmetric") is True
+                    and weight.get("dynamic") is False
+                    and activation.get("num_bits") == 8
+                    and activation.get("type") == "int"
+                    and activation.get("strategy") == "token"
+                    and activation.get("symmetric") is True
+                    and activation.get("dynamic") is True
+                ):
+                    return None
+            if groups:
+                return cls.get_name()
         if hf_quant_cfg.get("quant_method") == "slimquant_w4a8" and user_quant in (
             "slimquant_w4a8_marlin",
             "slimquant_marlin",
@@ -939,6 +970,8 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
             FusedMoeWeightScaleSupported,
         )
 
+        if self.quant_config.compressed_tensors_packed:
+            extra_weight_attrs["compressed_tensors_packed_int4"] = True
         tp_size = get_tensor_model_parallel_world_size()
         intermediate_size = intermediate_size_per_partition
         # WEIGHTS
@@ -995,6 +1028,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         if not _use_lightop_w4a8_marlin_moe:
             if self.use_deepep:
                 from deepgemm import pack_w4a8_moe_hipc_weight
+
                 layer.w13_weight = Parameter(
                     pack_w4a8_moe_hipc_weight(layer.w13_weight.data),
                     requires_grad=False,
@@ -1026,9 +1060,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
                 #   - restore the true per-channel scale (x16)
                 def _to_triton_layout(w: torch.Tensor) -> torch.Tensor:
                     u = w.data.to(torch.uint8)
-                    u = ((((u & 0x0F) << 4) | ((u >> 4) & 0x0F)) ^ 0x88).to(
-                        torch.int8
-                    )
+                    u = ((((u & 0x0F) << 4) | ((u >> 4) & 0x0F)) ^ 0x88).to(torch.int8)
                     return u.contiguous()
 
                 if _use_aiter_moe:
@@ -1069,9 +1101,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         else:
             # Legacy lightop path: repack into the Marlin W4A8 layout.
             layer.w13_weight = Parameter(
-                w4a8_weight_repack_impl(
-                    layer.w13_weight, use_deepep=self.use_deepep
-                ),
+                w4a8_weight_repack_impl(layer.w13_weight, use_deepep=self.use_deepep),
                 requires_grad=False,
             )
             layer.w2_weight = Parameter(
@@ -1352,6 +1382,8 @@ class SlimQuantW4A8Int8TritonMoEMethod:
             FusedMoeWeightScaleSupported,
         )
 
+        if self.quant_config.compressed_tensors_packed:
+            extra_weight_attrs["compressed_tensors_packed_int4"] = True
         tp_size = get_tensor_model_parallel_world_size()
         intermediate_size = intermediate_size_per_partition
         # WEIGHTS
@@ -1607,6 +1639,8 @@ class SlimQuantW4A8Int8AiterMoEMethod:
             FusedMoeWeightScaleSupported,
         )
 
+        if self.quant_config.compressed_tensors_packed:
+            extra_weight_attrs["compressed_tensors_packed_int4"] = True
         tp_size = get_tensor_model_parallel_world_size()
         intermediate_size = intermediate_size_per_partition
         w13_weight = torch.nn.Parameter(
@@ -1966,9 +2000,7 @@ class SlimQuantW4A8Int8AiterMoEMethod:
             )
             valid = ~invalid
             if not valid.any():
-                return torch.zeros(
-                    orig_m, k, device=x.device, dtype=torch.bfloat16
-                )
+                return torch.zeros(orig_m, k, device=x.device, dtype=torch.bfloat16)
             # DeepEP pads unused top-k slots with a dummy global id. aiter_moe
             # has no skip mask, so compact to valid (token, expert) pairs with
             # topk=1 and scatter-add. Dummy traffic must not run as expert 0.
@@ -2048,8 +2080,6 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         )
         if scatter_idx is None:
             return output
-        combined = torch.zeros(
-            orig_m, k, device=output.device, dtype=output.dtype
-        )
+        combined = torch.zeros(orig_m, k, device=output.device, dtype=output.dtype)
         combined.index_add_(0, scatter_idx, output)
         return combined

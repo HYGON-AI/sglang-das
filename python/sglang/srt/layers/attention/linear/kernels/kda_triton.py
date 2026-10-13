@@ -22,6 +22,7 @@ if not is_cpu():
     from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
         fused_recurrent_linear_replayssm_decode,
     )
+
     if is_hcu() and _USE_KDA_HCU:
         # The SGLang-compatible decode/verify ABI lives in BoltOPs fla.common.
         # The same-named fla.gdn facade exposes the vLLM GDN decode ABI.
@@ -32,6 +33,10 @@ if not is_cpu():
         from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
             fused_sigmoid_gating_delta_rule_update,
         )
+    # Verify uses the in-tree ABI; HCU shares preparation across V tiles.
+    from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+        fused_sigmoid_gating_delta_rule_update as _target_verify_update,
+    )
     from sglang.kernels.ops.attention.fla.kda import chunk_kda
 
 
@@ -39,9 +44,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
     """Triton-based kernel for KDA (Kimi Delta Attention) linear attention."""
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
-    verify_impl_name: str = (
-        "boltops_common" if is_hcu() and _USE_KDA_HCU else "sglang_triton"
-    )
+    verify_impl_name: str = "sglang_triton_prepared" if is_hcu() else "sglang_triton"
 
     def packed_decode(
         self,
@@ -215,7 +218,8 @@ class TritonKDAKernel(LinearAttnKernelBase):
         # the committed pool (disable_state_update=True), and handles chain + tree
         # (retrieve_parent_token). The verify kernel for the Triton / CuTe DSL KDA
         # decode backends, and the reference the KDA correctness tests assert against.
-        return fused_sigmoid_gating_delta_rule_update(
+
+        return _target_verify_update(
             A_log=A_log,
             dt_bias=dt_bias,
             q=q,

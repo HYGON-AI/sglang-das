@@ -8,6 +8,10 @@ from compressed_tensors.quantization import QuantizationArgs
 import logging
 
 from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
@@ -116,7 +120,11 @@ class SlimQuantCompressedTensorsMarlinConfig(CompressedTensorsConfig):
             # which selects the HCU AITER/Triton kernel.
             from sglang.srt.utils import is_hcu
 
-            if is_hcu():
+            use_deepgemm_marlin = (
+                get_moe_runner_backend().is_deep_gemm()
+                or get_moe_a2a_backend().is_deepep()
+            )
+            if is_hcu() and not use_deepgemm_marlin:
                 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
                     CompressedTensorsFusedMoEMethod,
                 )
@@ -125,5 +133,8 @@ class SlimQuantCompressedTensorsMarlinConfig(CompressedTensorsConfig):
                 if layer.scheme is None:
                     return UnquantizedEmbeddingMethod()
                 return CompressedTensorsFusedMoEMethod(self)
+            # DeepEP's legacy HCU W8A8 core calls DeepGEMM even when the runner
+            # backend is AUTO. Use #484's topology-aware INT8 packer for both
+            # explicit DeepGEMM and implicit DeepEP; preserve other fallbacks.
             return CompressedTensorsMarlinMoEMethod.get_moe_method(self, layer)
         return None

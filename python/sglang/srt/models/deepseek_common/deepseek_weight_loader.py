@@ -87,6 +87,14 @@ def _resolve_weight_param_name(
 ) -> Optional[str]:
     if name in params_dict:
         return name
+    if name.endswith("weight_packed"):
+        alternate_name = name.removesuffix("_packed")
+        param = params_dict.get(alternate_name)
+        if param is not None and getattr(
+            param, "compressed_tensors_packed_int4", False
+        ):
+            return alternate_name
+        return None
     if name.endswith("weight_scale"):
         alternate_name = name + "_inv"
     elif name.endswith("weight_scale_inv"):
