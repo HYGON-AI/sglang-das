@@ -69,6 +69,10 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Indexer,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStatePacker,
+)
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
@@ -4471,7 +4475,7 @@ class DeepseekV4Model(nn.Module):
         input_ids: torch.Tensor,
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
-        dspark_aux_hidden_states: List[torch.Tensor],
+        dspark_aux_hidden_states: AuxHiddenStateAccumulator,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
         assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
         hash_ids = None
@@ -4794,7 +4798,15 @@ class DeepseekV4Model(nn.Module):
             input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
 
         capture_dspark = self.dspark_layers_to_capture is not None
-        dspark_aux_hidden_states: List[torch.Tensor] = []
+        # Pack rank-local captures before CP gather, avoiding a global aux cat.
+        dspark_aux_hidden_states: AuxHiddenStateAccumulator = (
+            AuxHiddenStatePacker(len(self.dspark_layers_to_capture))
+            if _is_hcu
+            and capture_dspark
+            and is_cp_active(forward_batch)
+            and self.pp_group.world_size == 1
+            else []
+        )
 
         attn_backend = get_attn_backend()
         if _is_npu and forward_batch.attn_cp_metadata is not None:
@@ -4912,7 +4924,12 @@ class DeepseekV4Model(nn.Module):
             )
 
         if capture_dspark:
-            return (hidden_states, pre_hc_head), dspark_aux_hidden_states
+            aux_hidden_states = (
+                dspark_aux_hidden_states.finalize()
+                if isinstance(dspark_aux_hidden_states, AuxHiddenStatePacker)
+                else dspark_aux_hidden_states
+            )
+            return (hidden_states, pre_hc_head), aux_hidden_states
 
         return hidden_states, pre_hc_head
 
