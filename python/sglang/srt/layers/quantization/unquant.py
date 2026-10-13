@@ -993,7 +993,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 self._aiter_runner = MoeRunner(
                     MoeRunnerBackend.AITER, moe_runner_config
                 )
-            elif aiter_backend.is_aiter():
+            elif aiter_backend.is_aiter() and not _is_hcu:
+                # Only non-HCU forwards actually use _aiter_runner; on HCU the
+                # runner stays unused (marlin/triton handle the MoE), so a
+                # hard error here would reject serveable shape configs.
                 raise ValueError(
                     "moe_runner_backend=aiter is not supported for "
                     f"intermediate_size_per_partition={layer.intermediate_size_per_partition}; "
