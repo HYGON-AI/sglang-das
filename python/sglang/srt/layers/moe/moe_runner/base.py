@@ -69,6 +69,7 @@ class MoeRunnerConfig:
     gate_up_interleaved: bool = True
     layer: Optional[torch.nn.Module] = None
     use_tp_all_gather_activation: bool = False
+    is_minimax_m3: bool = False
 
 
 @dataclass
