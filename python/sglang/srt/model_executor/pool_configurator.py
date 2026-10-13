@@ -1062,7 +1062,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_total = len(self.compression_ratios)
         self.use_cp_cache_layer_split = bool(
             getattr(get_parallel(), "enable_cp_cache_layer_split", False)
+            and not kvc.is_draft_worker
         )
+        self.cp_draft_layers = 0
+        if self.use_cp_cache_layer_split and kvc.spec_algorithm.is_dspark():
+            # Draft KV remains replicated on every CP rank, as in the V4
+            # LayerSplit implementation; only target KV is layer-sharded.
+            self.cp_draft_layers = len(cfg.hf_text_config.dspark_target_layer_ids)
+            assert self.cp_draft_layers > 0, "DSPARK draft layer count is required"
         self.swa_priced_layers = self.num_layers_total
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
@@ -1189,7 +1196,24 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
         self.bytes_per_swa_token = self._get_bytes_per_swa_token()
         self.bytes_per_full_token = self._get_bytes_per_full_token()
-        if self.is_speculative and not self.encoder_replay:
+        if self.use_cp_cache_layer_split:
+            logger.info(
+                "CP Cache LayerSplit KV pricing: cp_size=%d, target_layers=%d, "
+                "swa_layers=%d, draft_layers=%d, kv_bytes=%d, swa_cap=%s, "
+                "bytes_per_swa_token=%.2f",
+                get_parallel().attn_cp_size,
+                self.num_layers_total,
+                self.swa_priced_layers,
+                self.cp_draft_layers,
+                self.kv_bytes,
+                self.swa_cap_tokens,
+                self.bytes_per_swa_token,
+            )
+        if (
+            self.is_speculative
+            and not self.encoder_replay
+            and not self.use_cp_cache_layer_split
+        ):
             # Reserve memory for the speculative draft worker by inflating
             # per-token bytes by (target+draft)/target. Equivalent to dflash's
             # scale_kv_cell_size_per_token_for_dflash but applied to
@@ -1300,7 +1324,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         c4_state_ratio = self.c4_ring_size / self.swa_page_size
         return (
-            self.kv_bytes * self.swa_priced_layers
+            self.kv_bytes * (self.swa_priced_layers + self.cp_draft_layers)
             + c4_state_ratio
             * (c4_state_bytes + c4_indexer_state_bytes)
             * self.num_layers_ca4
