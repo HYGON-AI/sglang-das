@@ -27,8 +27,8 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn 
     SparseLinearAttentionMetadata,
     SparseLinearAttentionMetadataBuilder,
 )
-from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
 
 class RocmSparseLinearAttentionBackend(AttentionBackend):

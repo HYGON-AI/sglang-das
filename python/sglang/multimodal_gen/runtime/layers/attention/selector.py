@@ -472,6 +472,11 @@ def _is_backend_supported(
 ) -> bool:
     if selected_backend in supported_attention_backends:
         return True
+    # FA admits the FlashAttention family; an explicit FA2-only constraint
+    # remains specific to that implementation. Keep capability checks on the
+    # resolved backend class rather than replacing its enum with FA.
+    if selected_backend == AttentionBackendEnum.FA2:
+        return AttentionBackendEnum.FA in supported_attention_backends
     if selected_backend == AttentionBackendEnum.TORCH_CUDNN_SDPA:
         return AttentionBackendEnum.TORCH_SDPA in supported_attention_backends
     if selected_backend == AttentionBackendEnum.DYNAMIC_CUDNN_SDPA:

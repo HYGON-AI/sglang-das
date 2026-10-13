@@ -23,6 +23,7 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.nn import Module
 
+from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionImpl,
 )
@@ -297,6 +298,9 @@ class MinimalA2AAttnOp(DistributedAttention):
         topk: float,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        *,
+        local_blocks: int = 0,
+        skip_linear_branch: bool = True,
     ):
         dtype = get_compute_dtype()
         try:
@@ -322,9 +326,32 @@ class MinimalA2AAttnOp(DistributedAttention):
             num_heads=num_heads,
             head_size=head_size,
             topk_ratio=topk,
+            local_blocks=local_blocks,
+            skip_linear_branch=skip_linear_branch,
             prefix=f"{prefix}.impl",
         )
         super(MinimalA2AAttnOp, self).__init__(local_attn)
+
+    def _maybe_bind_sequence_parallel_group(
+        self, query: Tensor, *, sequence_shard_enabled: bool
+    ) -> None:
+        if not sequence_shard_enabled:
+            self.pg = None
+            self.stream = None
+            return
+        if self.pg is not None or not dist.is_available() or not dist.is_initialized():
+            return
+
+        sp_group = get_sp_group()
+        if getattr(sp_group, "ring_world_size", 1) > 1:
+            raise NotImplementedError(
+                "MinimalA2AAttnOp supports Ulysses sequence parallelism only; "
+                "set --ring-degree 1 for SLA attention."
+            )
+        if sp_group.ulysses_world_size < 2:
+            return
+        stream = torch.cuda.current_stream(query.device) if query.is_cuda else None
+        self.set_context_parallel_group(sp_group.ulysses_group, None, stream)
 
     def set_context_parallel_group(self, process_group, ranks, stream):
         del ranks
@@ -335,5 +362,19 @@ class MinimalA2AAttnOp(DistributedAttention):
     ) -> Tensor:
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
+        # Only actually sharded token/frame inputs may enter Ulysses exchanges.
+        sequence_shard_enabled = kwargs.pop("sequence_shard_enabled", None)
+        if sequence_shard_enabled is None:
+            forward_batch = getattr(forward_context, "forward_batch", None)
+            if forward_batch is None:
+                sequence_shard_enabled = False
+            else:
+                sequence_shard_enabled = bool(
+                    getattr(forward_batch, "enable_sequence_shard", False)
+                    or getattr(forward_batch, "did_sp_shard_latents", False)
+                )
+        self._maybe_bind_sequence_parallel_group(
+            query, sequence_shard_enabled=sequence_shard_enabled
+        )
         results = super().forward(query, key, value, ctx_attn_metadata)
         return rearrange(results, "b ... h l -> b ... (h l)")

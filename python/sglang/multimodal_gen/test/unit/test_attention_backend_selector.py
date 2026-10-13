@@ -77,6 +77,12 @@ class _FakeAITERBackend:
         return ("packed varlen attention",) if requirements.packed_varlen else ()
 
 
+class _FakeFA2Backend(_FakeFABackend):
+    @classmethod
+    def get_enum(cls) -> AttentionBackendEnum:
+        return AttentionBackendEnum.FA2
+
+
 class _FakeSparseBackend:
     @classmethod
     def get_enum(cls) -> AttentionBackendEnum:
@@ -98,6 +104,8 @@ class _FakePlatform:
             return "fake.AITERBackend"
         if selected_backend == AttentionBackendEnum.LASER_ATTN:
             return "fake.SparseBackend"
+        if selected_backend == AttentionBackendEnum.FA2:
+            return "fake.FA2Backend"
         if selected_backend in (None, AttentionBackendEnum.FA):
             return "fake.FABackend"
         return "fake.SDPABackend"
@@ -106,6 +114,7 @@ class _FakePlatform:
 _FAKE_BACKENDS = {
     "fake.AITERBackend": _FakeAITERBackend,
     "fake.FABackend": _FakeFABackend,
+    "fake.FA2Backend": _FakeFA2Backend,
     "fake.SparseBackend": _FakeSparseBackend,
     "fake.SDPABackend": _FakeSDPABackend,
 }
@@ -177,6 +186,100 @@ class TestAttentionBackendFallback(unittest.TestCase):
                     is_cross_attention=extra_is_cross,
                 )
             return resolved
+
+    def test_platform_fa2_satisfies_fa_family_after_selection(self):
+        for selected, explicit, cross in (
+            (AttentionBackendEnum.FA, True, False),
+            (AttentionBackendEnum.FA, False, False),
+            (AttentionBackendEnum.LASER_ATTN, True, True),
+        ):
+            with self.subTest(selected=selected, explicit=explicit, cross=cross):
+                _cached_get_attn_backend.cache_clear()
+                with patch.object(
+                    _FakePlatform,
+                    "get_attn_backend_cls_str",
+                    return_value="fake.FA2Backend",
+                ):
+                    backend = self._resolve(
+                        selected,
+                        explicit=explicit,
+                        is_cross_attention=cross,
+                        supported={AttentionBackendEnum.FA},
+                    )
+                self.assertIs(backend, _FakeFA2Backend)
+                self.assertEqual(backend.get_enum(), AttentionBackendEnum.FA2)
+
+    def test_explicit_fa2_satisfies_fa_family(self):
+        backend = self._resolve(
+            AttentionBackendEnum.FA2,
+            explicit=True,
+            is_cross_attention=False,
+            supported={AttentionBackendEnum.FA},
+        )
+        self.assertIs(backend, _FakeFA2Backend)
+
+    def test_fa2_only_automatic_constraint_rejects_fa(self):
+        # Main permits explicit component overrides of automatic candidate sets.
+        # Exercise the source FA-family restriction during automatic selection.
+        with patch.object(
+            _FakePlatform, "get_attn_backend_cls_str", return_value="fake.FABackend"
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "not supported by this attention layer"
+            ):
+                self._resolve(
+                    AttentionBackendEnum.FA,
+                    explicit=False,
+                    is_cross_attention=False,
+                    supported={AttentionBackendEnum.FA2},
+                )
+
+    def test_fa2_only_constraint_rejects_platform_remap_to_fa(self):
+        with patch.object(
+            _FakePlatform,
+            "get_attn_backend_cls_str",
+            return_value="fake.FABackend",
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "not supported by this attention layer"
+            ):
+                self._resolve(
+                    AttentionBackendEnum.FA2,
+                    explicit=False,
+                    is_cross_attention=False,
+                    supported={AttentionBackendEnum.FA2},
+                )
+
+    def test_fa_family_keeps_resolved_backend_capability_checks(self):
+        with patch.object(
+            _FakeFA2Backend,
+            "unsupported_requirements",
+            return_value=("packed varlen attention",),
+        ):
+            with self.assertRaisesRegex(ValueError, "does not implement packed varlen"):
+                self._resolve(
+                    AttentionBackendEnum.FA2,
+                    explicit=True,
+                    is_cross_attention=False,
+                    supported={AttentionBackendEnum.FA},
+                    attention_requirements=AttentionRequirements(packed_varlen=True),
+                )
+
+    def test_fa_family_rejects_unrelated_platform_backend(self):
+        with patch.object(
+            _FakePlatform,
+            "get_attn_backend_cls_str",
+            return_value="fake.AITERBackend",
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "not supported by this attention layer"
+            ):
+                self._resolve(
+                    AttentionBackendEnum.FA,
+                    explicit=False,
+                    is_cross_attention=False,
+                    supported={AttentionBackendEnum.FA},
+                )
 
     def test_implicit_platform_preference_falls_back(self):
         backend = self._resolve(

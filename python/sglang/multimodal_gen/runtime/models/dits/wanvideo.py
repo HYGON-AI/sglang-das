@@ -16,7 +16,6 @@ from sglang.kernels.ops.diffusion import (
     FUSED_LINEAR_GELU,
     NVFP4_BIAS_GELU,
     BitExactFusionGate,
-    can_use_fused_temb_table_slices,
     can_use_linear_gelu,
     fused_linear_gelu_tanh,
     fused_temb_table_slices,

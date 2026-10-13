@@ -20,7 +20,6 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 import sglang.multimodal_gen.envs as envs
-from sglang.srt.utils import is_hcu
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
@@ -28,9 +27,10 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
     PlatformEnum,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.utils import is_gfx1250_supported
+from sglang.srt.utils import is_gfx1250_supported, is_hcu
 
 logger = init_logger(__name__)
+_is_hcu = is_hcu()
 
 
 # ROCm uses the same torch.cuda interface
@@ -113,8 +113,12 @@ class RocmPlatform(Platform):
             logger.info("Using Torch SDPA backend.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
-        elif selected_backend in (AttentionBackendEnum.FA, None):
-            if is_hcu() and dtype in (torch.float16, torch.bfloat16):
+        elif selected_backend in (
+            AttentionBackendEnum.FA,
+            AttentionBackendEnum.FA2,
+            None,
+        ):
+            if _is_hcu and dtype in (torch.float16, torch.bfloat16):
                 try:
                     import flash_attn  # noqa: F401
 
@@ -125,6 +129,14 @@ class RocmPlatform(Platform):
                         "HCU FlashAttention-2 is unavailable; continuing to the "
                         "Torch SDPA fallback."
                     )
+
+        elif selected_backend == AttentionBackendEnum.SLA_ATTN:
+            if dtype not in (torch.float16, torch.bfloat16):
+                raise ValueError("ROCm SLA attention requires fp16 or bf16 inputs.")
+            if head_size not in (64, 128):
+                raise ValueError("ROCm SLA attention supports head sizes 64 and 128.")
+            logger.info("Using ROCm/HCU sparse-linear attention backend.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.rocm_sparse_linear_attn.RocmSparseLinearAttentionBackend"
 
         elif selected_backend == AttentionBackendEnum.AITER:
             if dtype not in (torch.float16, torch.bfloat16):
