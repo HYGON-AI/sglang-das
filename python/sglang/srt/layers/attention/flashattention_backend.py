@@ -1588,6 +1588,17 @@ class FlashAttentionBackend(AttentionBackend):
                     ),
                     layout="legacy_bhsd",
                     out=_fa_out,
+                    total_k_hint=(
+                        forward_batch.seq_lens_sum
+                        if _is_hcu
+                        and forward_batch.forward_mode == ForwardMode.EXTEND
+                        and self.attn_cp_size == 1
+                        and not layer.is_cross_attention
+                        and not use_local_attn
+                        and not use_cascade_attn
+                        and not is_swa_layer
+                        else None
+                    ),
                 )
             elif self._use_hcu_legacy_layout:
                 # Batch-semantic API: q.shape[0] is the batch size and row i
