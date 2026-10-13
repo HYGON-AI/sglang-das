@@ -70,9 +70,10 @@ from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
 )
-from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
+from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hcu, is_hip, is_npu
 
 _is_npu = is_npu()
+_is_hcu = is_hcu()
 
 
 logger = logging.getLogger(__name__)
@@ -234,11 +235,17 @@ class _SelectorDraftSampler:
             min=1e-5,
             out=self.temperatures[:bs],
         )
-        self.greedy_mask[:bs].copy_(
-            resolve_greedy_mask(
-                bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
+        if _is_hcu:
+            # The graph consumes this stable buffer. Write the comparison into
+            # it directly, avoiding a temporary mask and a second kernel copy
+            # on every DFLASH decode step.
+            torch.le(sampling_info.top_ks.view(-1)[:bs], 1, out=self.greedy_mask[:bs])
+        else:
+            self.greedy_mask[:bs].copy_(
+                resolve_greedy_mask(
+                    bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
+                )
             )
-        )
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size
