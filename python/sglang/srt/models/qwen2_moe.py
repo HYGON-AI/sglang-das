@@ -311,8 +311,29 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             layer_id=layer_id,
         )
 
-        # Disable inplace MoE when fused gate will need hidden_states after experts
-        _needs_hidden_after_experts = (
+        _gate_uses_amx = _is_cpu and _is_cpu_amx_available
+        if _gate_uses_amx:
+            self.shared_expert_gate = ReplicatedLinear(
+                config.hidden_size,
+                1,
+                bias=False,
+                quant_config=None,
+                prefix=add_prefix("shared_expert_gate", prefix),
+            )
+        else:
+            self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+
+        # fused_gate_sigmoid_mul_add (see forward) computes the shared-expert
+        # gate outside the MoE call and reads hidden_states after self.experts
+        # has already run, so the MoE must not write its output into the
+        # hidden_states buffer. Intel-AMX CPU and NPU instead apply the gate
+        # inside _forward_shared_experts, before the experts.
+        # use_intel_amx_backend() reads a layer attr that is set only in
+        # process_weights_after_loading, too late for this decision.
+        self.use_fused_gate = (
+            self.shared_expert_gate is not None and not _gate_uses_amx and not is_npu()
+        )
+        _needs_hidden_after_experts = self.use_fused_gate and (
             config.shared_expert_intermediate_size > 0
             and not self.enable_shared_expert_fusion
         )
@@ -379,16 +400,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         else:
             self.shared_expert = None
-        if _is_cpu and _is_cpu_amx_available:
-            self.shared_expert_gate = ReplicatedLinear(
-                config.hidden_size,
-                1,
-                bias=False,
-                quant_config=None,
-                prefix=add_prefix("shared_expert_gate", prefix),
-            )
-        else:
-            self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
         if (
             get_moe_a2a_backend().is_deepep()
@@ -833,11 +844,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         ):
             return self._forward_deepep(hidden_states, forward_batch)
 
-        use_fused_gate = (
-            self.shared_expert_gate is not None
-            and not use_intel_amx_backend(self.shared_expert_gate)
-            and not is_npu()
-        )
+        # Decided once in __init__ (also drives the experts' inplace=False there)
+        use_fused_gate = self.use_fused_gate
 
         if hidden_states.shape[0] == 0:
             # M=0 guard for idle DP ranks: skip shared_experts and gate
