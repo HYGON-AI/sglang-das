@@ -65,7 +65,7 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.topk import TopK
@@ -88,7 +88,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
-from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
+from sglang.srt.runtime_context import get_exec, get_model, get_parallel, get_stream
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -1326,6 +1326,33 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
 
     _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
 
+    def __init__(self, config, quant_config=None, prefix=""):
+        super().__init__(config, quant_config=quant_config, prefix=prefix)
+        if not _is_hcu or get_model().quantization != "slimquant_w4a8_marlin":
+            return
+
+        experts = self.model.decoder.mlp.experts
+        if (
+            not isinstance(experts, DeepEPMoE)
+            or experts.deprecate_flag
+            or experts.quant_config is not None
+            or experts.w13_weight.dtype != torch.bfloat16
+        ):
+            return
+
+        # Only the BF16 GLM MTP paired with a W4A8 target needs this override.
+        # Its DeepEP kernels consume canonical BF16 weights and activations.
+        experts.use_fp8_w8a8 = False
+        experts.use_w4afp8 = False
+        experts.use_w4a8_marlin = False
+        experts.use_w8a8_marlin = False
+        experts.use_w4a16_marlin = False
+        experts.use_bf16_marlin = True
+        experts._skip_aiter_moe_shuffle = True
+        experts.dispatcher.set_quant_config(
+            {"dispatcher_output_dtype": "bf16", "preserve_input_dtype": True}
+        )
+
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
         # The PTPC cast only rewrites routed experts, so the shared expert never
@@ -1386,6 +1413,21 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
         return super().load_weights(weights)
 
     def _resolve_nextn_quant_config(self, config, quant_config):
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "slimquant_w4a8_marlin"
+        ):
+            from sglang.srt.layers.quantization.compressed_tensors.utils import (
+                should_ignore_layer,
+            )
+
+            # The bundled MTP block may remain BF16 in an INT4 checkpoint.
+            if should_ignore_layer(
+                layer_name=f"model.layers.{config.num_hidden_layers}",
+                ignore=quant_config.ignore or (),
+            ):
+                return None
+
         if quant_config is None or quant_config.get_name() != "quark":
             return quant_config
 

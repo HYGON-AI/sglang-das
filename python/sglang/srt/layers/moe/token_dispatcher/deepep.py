@@ -791,7 +791,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
-        if _deepgemm_is_selected() and self.use_fp8:
+        if self.quant_config.get("preserve_input_dtype", False):
+            # BF16 drafts must not inherit target activation quantization.
+            pass
+        elif _deepgemm_is_selected() and self.use_fp8:
             quant_group_size = (
                 hidden_states.shape[-1] if _hcu_deepgemm_is_selected() else 128
             )
@@ -920,6 +923,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 in ("slimquant_marlin", "slimquant_w4a8_marlin")
                 or _use_fp8_w8a8_moe
                 or _use_marlin_w16a16_moe
+                or self.quant_config.get("preserve_input_dtype", False)
             )
         )
         (
@@ -1098,6 +1102,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         input_global_scale = self.quant_config.get("input_global_scale", None)
+        preserve_input_dtype = self.quant_config.get("preserve_input_dtype", False)
 
         # round_scale / use_ue8m0 are FP8-DeepGEMM specific. Dropping use_ue8m0
         # makes DeepEP return fp32 column-major scales the e8m0 cast cannot view.
@@ -1108,7 +1113,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
             )
-            if self.use_fp8
+            if self.use_fp8 and not preserve_input_dtype
             else dict()
         )
 
@@ -1120,7 +1125,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             and _DEEPEP_LL_DISPATCH_USES_QUANT_TYPE
             and not _hcu_deepgemm_is_selected()
         ):
-            if _use_fp8_w8a8_moe:
+            if _use_fp8_w8a8_moe and not preserve_input_dtype:
                 packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
                     buffer.low_latency_dispatch(
                         hidden_states,
@@ -1134,7 +1139,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                         return_recv_hook=self.return_recv_hook,
                     )
                 )
-            elif _use_marlin_w16a16_moe or _use_marlin_w4a16_moe:
+            elif (
+                preserve_input_dtype or _use_marlin_w16a16_moe or _use_marlin_w4a16_moe
+            ):
                 packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
                     buffer.low_latency_dispatch(
                         hidden_states,
@@ -1171,8 +1178,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                     topk_weights,
                     self.num_max_dispatch_tokens_per_rank,
                     self.num_experts,
-                    use_fp8=self.use_fp8,
-                    use_nvfp4=self.use_nvfp4,
+                    use_fp8=self.use_fp8 and not preserve_input_dtype,
+                    use_nvfp4=self.use_nvfp4 and not preserve_input_dtype,
                     input_global_scale=input_global_scale,
                     round_scale=fp8_deepgemm_scale_opts.get("round_scale", False),
                     use_ue8m0=fp8_deepgemm_scale_opts.get("use_ue8m0", False),
