@@ -1157,7 +1157,10 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
             topk_ids=topk_ids,
             workspace=workspace,
             global_reduce_buffer=global_reduce_buffer,
-            inplace=True,
+            # Honor the caller's inplace setting: the fused shared-expert gate
+            # re-reads hidden_states after the routed experts, so the routed
+            # output must not alias the MoE input buffer.
+            inplace=self.moe_runner_config.inplace,
             use_int4_w4a8=True,
             per_channel_quant=True,
             activation=layer.moe_runner_config.activation,
@@ -1233,7 +1236,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
             topk_ids=topk_ids,
             workspace=workspace,
             global_reduce_buffer=global_reduce_buffer,
-            inplace=True,
+            inplace=self.moe_runner_config.inplace,
             use_int4_w4a8=True,
             per_channel_quant=True,
             activation=activation,
@@ -1287,7 +1290,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
             topk_weights=topk_weights,
             workspace=workspace,
             global_reduce_buffer=global_reduce_buffer,
-            inplace=True,
+            inplace=self.moe_runner_config.inplace,
             use_int4_w4a8=True,
             per_channel_quant=True,
             activation=activation,
@@ -1898,7 +1901,7 @@ class SlimQuantW4A8Int8AiterMoEMethod:
                 topk_weights=topk_weights,
                 workspace=workspace,
                 global_reduce_buffer=global_reduce_buffer,
-                inplace=True,
+                inplace=self.moe_runner_config.inplace,
                 use_int4_w4a8=True,
                 per_channel_quant=True,
                 activation=activation,

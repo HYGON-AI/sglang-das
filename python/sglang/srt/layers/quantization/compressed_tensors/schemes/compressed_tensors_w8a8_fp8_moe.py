@@ -867,7 +867,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
                     global_num_experts=self.moe_runner_config.num_experts,
-                    inplace=True,
+                    # Honor the caller's inplace setting: the fused shared-expert
+                    # gate re-reads hidden_states after the routed experts, so the
+                    # routed output must not alias the MoE input buffer.
+                    inplace=moe_runner_config.inplace,
                     origin_w1_shape=origin_w1_shape,
                     origin_w2_shape=origin_w2_shape,
                     routed_scaling_factor=moe_runner_config.routed_scaling_factor,
@@ -997,7 +1000,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 moe_config=moe_cfg,
-                inplace=True,
+                inplace=moe_runner_config.inplace,
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
                 activation=activation,
