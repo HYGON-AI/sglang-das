@@ -53,9 +53,14 @@ def validate_cp_cache_layer_split(args, hf_config):
         "does not support the separate disaggregation staging transport",
     )
     require(
-        args.speculative_algorithm is None,
-        "does not yet support speculative decoding",
+        args.speculative_algorithm in (None, "DSPARK"),
+        "supports DSPARK speculation only",
     )
+    if args.speculative_algorithm == "DSPARK":
+        require(
+            bool(getattr(text_config, "dspark_target_layer_ids", None)),
+            "requires a DSPARK model configuration",
+        )
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
         is_unified_kv_triton,
     )
