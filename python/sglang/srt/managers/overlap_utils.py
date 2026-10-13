@@ -324,11 +324,11 @@ class FutureMap:
             self.new_seq_lens_buf = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
-        # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
-        # D2H pulls (gated only on publish, off the schedule stream). CUDA-only:
-        # recovers occupancy lost to the WAR barrier (also CUDA-only); other
-        # platforms have no barrier and use the plain .cpu() bootstrap path.
-        if _is_cuda:
+        # DFLASH publishes lengths before its draft-KV commit finishes. On HCU,
+        # a pageable .cpu() pull also waits for work on the scheduling stream.
+        # Reuse the publish-gated pinned mirror to wait only for the lengths.
+        self._hcu_dflash_d2h = _is_hcu and self.spec_algo.is_dflash()
+        if _is_cuda or self._hcu_dflash_d2h:
             self.new_seq_lens_cpu_pinned = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, pin_memory=True
             )
@@ -512,12 +512,15 @@ class FutureMap:
                 # forward publish; a stale consume means a publish went missing.
                 assert self._publish_fresh, "resolve without a fresh forward publish"
                 self._publish_fresh = False
-            if _is_hip and (not _is_hcu or self.needs_cpu_seq_lens):
+            if _is_hip and (
+                not _is_hcu
+                or (self.needs_cpu_seq_lens and not self._hcu_dflash_d2h)
+            ):
                 # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
                 self.publish_ready.synchronize()
             else:
-                # HCU GPU-only backends can wait on the stream without blocking
-                # the host from preparing the next forward pass.
+                # HCU can enqueue the dependency without blocking the host;
+                # a needed CPU mirror is fenced on the private stream below.
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
