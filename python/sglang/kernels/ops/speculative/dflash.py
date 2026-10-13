@@ -2,6 +2,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_hcu
+
+_is_hcu = is_hcu()
+
 
 @triton.jit
 def _dflash_accept_bonus_contig_kernel(
@@ -295,12 +299,19 @@ def selector_walk_triton(
     uniforms,
     temperatures,
     greedy_mask,
+    tokens_out=None,
+    q_out=None,
 ):
     batch, slots, top_k = candidate_ids.shape
-    tokens = torch.empty((batch, slots), dtype=torch.int64, device=scores.device)
-    q_rows = torch.empty(
-        (batch, slots, top_k), dtype=torch.float32, device=scores.device
-    )
+    # HCU graph callers own stable, contiguous output buffers. Writing directly
+    # preserves the walk and q semantics while avoiding two post-walk copies.
+    if _is_hcu and tokens_out is not None and q_out is not None:
+        tokens, q_rows = tokens_out, q_out
+    else:
+        tokens = torch.empty((batch, slots), dtype=torch.int64, device=scores.device)
+        q_rows = torch.empty(
+            (batch, slots, top_k), dtype=torch.float32, device=scores.device
+        )
     _selector_walk_kernel[(batch,)](
         scores.contiguous(),
         candidate_ids.contiguous(),
