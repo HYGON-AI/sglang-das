@@ -351,7 +351,7 @@ class MinimalA2AAttnOp(DistributedAttention):
         if sp_group.ulysses_world_size < 2:
             return
         stream = torch.cuda.current_stream(query.device) if query.is_cuda else None
-        super().set_context_parallel_group(sp_group.ulysses_group, stream)
+        self.set_context_parallel_group(sp_group.ulysses_group, None, stream)
 
     def set_context_parallel_group(self, process_group, ranks, stream):
         del ranks
