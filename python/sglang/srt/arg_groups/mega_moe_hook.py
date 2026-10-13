@@ -36,9 +36,13 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
             "--enable-single-batch-overlap."
         )
     platform = get_platform()
-    if not (platform.is_cuda and (platform.is_sm90 or platform.is_sm100)):
+    if not (
+        platform.is_hcu
+        or (platform.is_cuda and (platform.is_sm90 or platform.is_sm100))
+    ):
         raise ValueError(
-            "--moe-a2a-backend megamoe needs a CUDA SM90 GPU (block-FP8 experts) "
+            "--moe-a2a-backend megamoe needs HCU channel-FP8 experts, "
+            "a CUDA SM90 GPU (block-FP8 experts) "
             "or an SM100-class GPU (MXFP4 / NVFP4 experts); it runs DeepGEMM "
             "kernels over CUDA symmetric memory."
         )
@@ -48,6 +52,7 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
 MEGA_MOE_NO_FALLBACK_ARCHS = frozenset(
     {
         "DeepseekV4ForCausalLM",
+        "DeepseekV41ForCausalLM",
         "InternS2PreviewForConditionalGeneration",
         "MellumForCausalLM",
         "Qwen2MoeForCausalLM",

@@ -247,6 +247,8 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         if isinstance(layer, LinearBase):
             return SlimQuantW4A8Int8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if get_moe_a2a_backend().is_megamoe():
+                return SlimQuantW4A8Int8MarlinMoEMethod(self)
             if _resolved_backend == W4A8_TPMOE_BACKEND_AITER:
                 return SlimQuantW4A8Int8AiterMoEMethod(self)
             return SlimQuantW4A8Int8MarlinMoEMethod(self)
@@ -513,6 +515,13 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import (
+                build_hcu_w4a8_mega_moe_experts_weights,
+            )
+
+            build_hcu_w4a8_mega_moe_experts_weights(layer)
+            return
         layer.w13_weight = Parameter(
             w4a8_weight_repack_impl(layer.w13_weight, use_deepep=self.use_deepep),
             requires_grad=False,
