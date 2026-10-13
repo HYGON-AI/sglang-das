@@ -155,7 +155,15 @@ def conv_window_dedup_enabled(
     Tree verify, NPU/CPU, and KDA keep dense windows: tree ancestors need independent
     windows, platform kernels expect contiguous steps, and KDA transposes the window
     before conv so the overlapping ``as_strided`` layout would corrupt stores.
+
+    HCU's Triton causal_conv1d_update writes the per-step window with those
+    overlapping strides and also corrupts the conv *output* (not only the saved
+    window). Target verify then disagrees with the HCU decode conv, so MTP
+    bonus tokens are garbage even when every draft is rejected. Keep a dense
+    window on HCU.
     """
+    if _is_hcu:
+        return False
     return (
         not is_npu
         and not is_cpu
@@ -3123,6 +3131,9 @@ class MHATokenToKVPool(KVCache):
             and v_scale is not None
             and dcp_kv_mask is None
             and not self.use_hnd
+            # Fused writer is NHD token-major; HCU FA is paged
+            # (pages, heads, page, dim) / V (pages, heads, dim, page).
+            and not _kv_layout_hcu_fa
         )
         if use_scaled_fp8_store:
             k_buffer = self.k_buffer[layer_id - self.start_layer]

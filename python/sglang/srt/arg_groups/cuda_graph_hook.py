@@ -377,6 +377,27 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
         )
 
 
+def apply_qwen4_exp_hcu_ple_decode_cuda_graph_default(server_args: Any):
+    """Keep mapped-host PLE gathers eager between captured HCU segments."""
+    cfg = resolving_view(server_args)
+    if (
+        not _is_hcu
+        or cfg.cuda_graph_backend_decode is not None
+        or cfg.disable_decode_cuda_graph
+        or cfg.disable_cuda_graph
+        or not cfg.ple_offload_embedding
+        or parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE
+    ):
+        return
+    arch = model_config_of(server_args).hf_config.architectures[0]
+    if arch in ("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLMMTP"):
+        declare_resolution(
+            server_args,
+            "apply_qwen4_exp_hcu_ple_decode_cuda_graph_default",
+            cuda_graph_backend_decode=Backend.BREAKABLE,
+        )
+
+
 def apply_muse_glimmer_prefill_cuda_graph_max_bs_default(server_args: Any):
 
     cfg = resolving_view(server_args)

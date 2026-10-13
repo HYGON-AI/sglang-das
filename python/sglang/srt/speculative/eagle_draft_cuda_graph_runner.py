@@ -300,7 +300,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self._metadata_glue = None
 
     def _replay_graph(self, shape_key, forward_batch):
-        return self.backend.replay(shape_key, forward_batch)
+        with (
+            self.backend.replay_session(),
+            forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
+        ):
+            return self.backend.replay(shape_key, forward_batch)
 
     # -----------------------------------------------------------------
     # Helpers

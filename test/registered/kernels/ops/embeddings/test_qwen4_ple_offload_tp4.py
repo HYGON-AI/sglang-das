@@ -28,9 +28,7 @@ _TP_SIZE = 4
 
 
 def _run_tp4_parity(local_rank: int, world_size: int, master_port: int) -> None:
-    enable_symm_mem = (
-        os.environ.get("SGLANG_TEST_QWEN4_PLE_SYMM_MEM", "1") != "0"
-    )
+    enable_symm_mem = os.environ.get("SGLANG_TEST_QWEN4_PLE_SYMM_MEM", "1") != "0"
     update_environment_variables(
         {
             "RANK": str(local_rank),
@@ -101,7 +99,7 @@ def _run_tp4_parity(local_rank: int, world_size: int, master_port: int) -> None:
             expected = baseline(ids)
             actual = offloaded(ids)
 
-            assert offloaded.weight.is_pinned()
+            assert not offloaded.weight.is_pinned()
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
         embedding_dim = 7
@@ -111,10 +109,7 @@ def _run_tp4_parity(local_rank: int, world_size: int, master_port: int) -> None:
             device=f"cuda:{local_rank}",
         )
         scales = (
-            torch.arange(1, 18, dtype=torch.bfloat16, device="cuda").reshape(
-                17, 1
-            )
-            / 8
+            torch.arange(1, 18, dtype=torch.bfloat16, device="cuda").reshape(17, 1) / 8
         )
         for weight_dtype in (torch.int8, torch.float8_e4m3fn):
             ple = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
@@ -144,9 +139,7 @@ def _run_tp4_parity(local_rank: int, world_size: int, master_port: int) -> None:
                 .reshape(17, embedding_dim)
                 .to(weight_dtype)
             )
-            ple.ngram_embedding.weight_loader(
-                ple.ngram_embedding.weight, full_weight
-            )
+            ple.ngram_embedding.weight_loader(ple.ngram_embedding.weight, full_weight)
 
             dequantized = full_weight.to(torch.bfloat16) * scales
             expected = dequantized.index_select(0, ids.flatten()).reshape(

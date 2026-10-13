@@ -16,6 +16,9 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
+from sglang.srt.utils import is_hcu
+
+_is_hcu = is_hcu()
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +46,27 @@ def resolve_qsa_indexer_dtype(name: str) -> torch.dtype:
         f"Unsupported --qsa-indexer-dtype {name!r}; expected one of "
         f"{QSA_INDEXER_DTYPE_CHOICES}"
     )
+
+
+def _scatter_rows(
+    buffer: torch.Tensor, loc: torch.Tensor, values: torch.Tensor
+) -> None:
+    """Write unique live slots, keeping the shared padding slot inert on HCU."""
+    loc = loc.long().reshape(-1)
+    values = values.to(buffer.dtype)
+    if loc.numel() != values.shape[0]:
+        raise ValueError("QSA scatter locations and value rows must match")
+    if loc.numel() == 0:
+        return
+    if _is_hcu:
+        # Non-boundary rows share reserved slot zero. Give every such writer
+        # identical zero bytes, avoiding races on arbitrary dummy values.
+        # Keep real locations unchanged: clamping them aliases live requests.
+        valid = (loc != 0).reshape(-1, *([1] * (values.ndim - 1)))
+        values = torch.where(valid, values, torch.zeros_like(values))
+        buffer.index_copy_(0, loc, values)
+    else:
+        buffer[loc] = values
 
 
 class QSATokenToKVPool(HybridLinearKVPool):
@@ -234,7 +258,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self, layer_id: int, loc: torch.Tensor, token_k: torch.Tensor
     ) -> None:
         buffer = self.get_qsa_key_state_buffer(layer_id)
-        buffer[loc.long()] = token_k.to(buffer.dtype)
+        _scatter_rows(buffer, loc, token_k)
 
     def set_qsa_rope_position_buffer(
         self, loc: torch.Tensor, positions: torch.Tensor
@@ -246,7 +270,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
             raise ValueError(
                 f"QSA RoPE positions must be [tokens] or [3, tokens], got {positions.shape}"
             )
-        self.qsa_rope_position_buffer[loc.long()] = positions.transpose(0, 1)
+        _scatter_rows(self.qsa_rope_position_buffer, loc, positions.transpose(0, 1))
 
     def get_qsa_rope_position_buffer(self, loc: torch.Tensor) -> torch.Tensor:
         return self.qsa_rope_position_buffer[loc.long()]
@@ -262,7 +286,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self, layer_id: int, loc: torch.Tensor, compressed_k: torch.Tensor
     ) -> None:
         buffer = self.get_qsa_compressed_k_buffer(layer_id)
-        buffer[loc.long()] = compressed_k.to(buffer.dtype)
+        _scatter_rows(buffer, loc, compressed_k)
 
     @staticmethod
     def _get_paged_state_buf_infos(tensors, page_size: int):

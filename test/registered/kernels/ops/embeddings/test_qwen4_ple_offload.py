@@ -43,9 +43,7 @@ def _make_source_embedding(
         requires_grad=False,
     )
     scale_shape = (
-        (local_rows, 1)
-        if dtype in (torch.int8, torch.float8_e4m3fn)
-        else (1,)
+        (local_rows, 1) if dtype in (torch.int8, torch.float8_e4m3fn) else (1,)
     )
     weight_scale = torch.ones(
         scale_shape,
@@ -97,7 +95,18 @@ def _load_rows(offloaded, rows, *, pinned=True):
     pointer = offloaded.weight.data_ptr()
     offloaded.weight_loader(offloaded.weight, rows)
     assert offloaded.weight.data_ptr() == pointer
-    assert offloaded.weight.is_pinned() == pinned
+    if (
+        getattr(offloaded, "_hcu_ple_gather", False)
+        and offloaded.weight.dtype == torch.bfloat16
+    ):
+        # hipHostRegister maps the original allocation without a second table.
+        if getattr(offloaded.weight, "_sglang_ple_host_registered", False):
+            assert offloaded.weight.is_pinned()
+            assert offloaded._host_registration_finalizer.alive
+        else:
+            assert not offloaded.weight.is_pinned()
+    else:
+        assert offloaded.weight.is_pinned() == pinned
     assert offloaded.weight.weight_loader.__self__ is offloaded
     assert offloaded.quant_method is None
 
@@ -179,8 +188,10 @@ def test_qwen4_ple_pinned_gather_per_row_scale(weight_dtype):
 
     ids = torch.tensor([[0, 7, 3], [4, 1, 6]], dtype=torch.int64, device="cuda")
     expected = (
-        rows.to(torch.bfloat16) * scales
-    ).index_select(0, ids.flatten()).reshape(*ids.shape, embedding_dim)
+        (rows.to(torch.bfloat16) * scales)
+        .index_select(0, ids.flatten())
+        .reshape(*ids.shape, embedding_dim)
+    )
     actual = offloaded(ids)
 
     assert offloaded.weight.dtype == weight_dtype

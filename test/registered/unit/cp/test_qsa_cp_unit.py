@@ -249,11 +249,9 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
         pool.get_value_buffer.side_effect = AssertionError(
             "zero prefix needs no cache read"
         )
-    backend = SimpleNamespace(
-        token_to_kv_pool=pool,
-        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
-        _pad_extend_output=QwenSparseAttnBackend._pad_extend_output,
-    )
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.token_to_kv_pool = pool
+    backend.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
     batch = SimpleNamespace(
         attn_cp_metadata=meta,
         seq_lens_cpu=seq_lens,

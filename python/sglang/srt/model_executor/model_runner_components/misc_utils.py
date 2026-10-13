@@ -54,12 +54,21 @@ def create_msprobe_debugger() -> Optional[Any]:
         return None
 
     try:
-        from msprobe.pytorch import PrecisionDebugger, seed_all
+        from sglang.srt.utils import is_hcu
+
+        _is_hcu = is_hcu()
+        if _is_hcu:
+            from dcu_probe.pytorch import PrecisionDebugger, seed_all
+        else:
+            from msprobe.pytorch import PrecisionDebugger, seed_all
     except ImportError:
-        logger.warning(
-            "Please install msprobe for tensor data dump: pip install mindstudio-probe --pre, "
-            "see https://gitcode.com/Ascend/msprobe for details."
-        )
+        if _is_hcu:
+            logger.warning("Please install dcu_probe for HCU tensor data dump.")
+        else:
+            logger.warning(
+                "Please install msprobe for tensor data dump: pip install mindstudio-probe --pre, "
+                "see https://gitcode.com/Ascend/msprobe for details."
+            )
         return None
 
     seed_all(mode=True)

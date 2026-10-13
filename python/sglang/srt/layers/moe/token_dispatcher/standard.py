@@ -96,9 +96,9 @@ def _map_topk_ids_to_local_experts(
 ) -> torch.Tensor:
     """Map global expert ids while preserving the ``-1`` drop sentinel."""
     return torch.where(
-        topk_ids < 0,
+        (topk_ids < 0) | (topk_ids >= local_expert_mapping.numel()),
         -1,
-        local_expert_mapping[topk_ids.clamp_min(0)],
+        local_expert_mapping[topk_ids.clamp(0, local_expert_mapping.numel() - 1)],
     )
 
 

@@ -544,6 +544,7 @@ def _step3p_overrides(server_args: Any, hf_config: Any) -> dict:
 # Keep this hybrid-model set in sync with model_hook.handle_model_specific_adjustments.
 _MAMBA_RADIX_CACHE_ARCHS = frozenset(
     {
+        "Qwen4ExpForConditionalGeneration",
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
@@ -576,6 +577,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
 # Registry specs opt in through `support_mamba_cache_extra_buffer` instead.
 _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
     {
+        "Qwen4ExpForConditionalGeneration",
         "KimiLinearForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",

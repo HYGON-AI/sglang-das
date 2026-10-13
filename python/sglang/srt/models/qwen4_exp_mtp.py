@@ -11,12 +11,16 @@ from transformers import PretrainedConfig
 
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.hyperconnection import GroupedGemmaRMSNorm
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_config
 from sglang.srt.models.qwen4_exp import Qwen4ExpModel
 from sglang.srt.runtime_context import get_model, get_parallel
@@ -76,18 +80,22 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         self.pre_fc_norm_embedding = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        hidden_norm_size = (
-            self.hc_count * config.hidden_size
-            if self.hc_count > 1
-            else config.hidden_size
-        )
-        self.pre_fc_norm_hidden = GemmaRMSNorm(
-            hidden_norm_size, eps=config.rms_norm_eps
-        )
+        # mHC residual is hc_count independent streams. Checkpoint
+        # pre_fc_norm_hidden.weight is stored flat (10240,) but the four
+        # hidden_size slices have disjoint statistics; RMS over the concatenated
+        # 10240-d vector mixes branches and collapses MTP accept rate.
+        if self.hc_count > 1:
+            self.pre_fc_norm_hidden = GroupedGemmaRMSNorm(
+                self.hc_count * config.hidden_size,
+                eps=config.rms_norm_eps,
+                group_size=config.hidden_size,
+            )
+        else:
+            self.pre_fc_norm_hidden = GemmaRMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
 
-    def _init_linear_projections(
-        self, config: PretrainedConfig, prefix: str
-    ) -> None:
+    def _init_linear_projections(self, config: PretrainedConfig, prefix: str) -> None:
         # These projections are quantized in INT8-w8a8-ngram checkpoints.
         # Building plain nn.Linear modules silently copies the raw int8 values
         # into BF16 weights and drops their weight_scale tensors in load_weights.
@@ -122,9 +130,7 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
     def _fuse_residual_linear_shared(
         self, input_embeds: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        input_embeds, _ = self.fc_embedding(
-            self.pre_fc_norm_embedding(input_embeds)
-        )
+        input_embeds, _ = self.fc_embedding(self.pre_fc_norm_embedding(input_embeds))
         orig_shape = hidden_states.shape
         hidden_states = self.pre_fc_norm_hidden(hidden_states)
         decoder_view = hidden_states.view(
@@ -136,9 +142,7 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         # would only project one hc_count-wide slice and then broadcast it over
         # tokens.  Flatten every logical row explicitly and restore the HC
         # layout after the projection.
-        encoder_inputs, _ = self.fc_hidden(
-            decoder_view.reshape(-1, self.hidden_size)
-        )
+        encoder_inputs, _ = self.fc_hidden(decoder_view.reshape(-1, self.hidden_size))
         encoder_inputs = encoder_inputs.view_as(decoder_view)
         return (input_embeds.unsqueeze(-2) + encoder_inputs).view(orig_shape)
 
@@ -253,6 +257,13 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
             logits_output, hc_hidden_states, forward_batch
         )
         return logits_output
+
+
+# Same HIP-graph issue as the target decoder: fusion GEMMs + QSA sitting in
+# one captured graph replay as token-0 / garbage drafts. Breakable capture
+# eager-runs the whole MTP forward; the graph remains the outer decode/extend
+# scaffolding.
+Qwen4ExpForCausalLMMTP.forward = eager_on_graph(True)(Qwen4ExpForCausalLMMTP.forward)
 
 
 EntryClass = [Qwen4ExpForCausalLMMTP]

@@ -571,7 +571,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Capture draft
         decode_backend = get_exec().graph.cuda_graph_config.decode.backend
         capture_bs, _ = get_batch_sizes_to_capture(self.draft_runner)
-        if self.speculative_num_steps > 1:
+        skip_hcu_qwen4_exp_draft_graphs = False
+        if _is_hcu:
+            draft_archs = (
+                getattr(self.draft_runner.model_config.hf_config, "architectures", None)
+                or []
+            )
+            skip_hcu_qwen4_exp_draft_graphs = "Qwen4ExpForCausalLMMTP" in draft_archs
+        if skip_hcu_qwen4_exp_draft_graphs:
+            log_info_on_rank0(
+                logger,
+                "Skip HCU Qwen4Exp MTP draft CUDA graphs (decode + extend). "
+                "HIP replay cannot keep the MTP Python chain or QSA extend "
+                "indices numerically correct. Target verify graphs stay on.",
+            )
+        if self.speculative_num_steps > 1 and not skip_hcu_qwen4_exp_draft_graphs:
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             log_info_on_rank0(
@@ -689,6 +703,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # TODO: support draft extend cuda graph for more attention backends
         if (
             self.draft_extend_attn_backend
+            and not skip_hcu_qwen4_exp_draft_graphs
             and not envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH.get()
             and (
                 _is_npu
@@ -1277,8 +1292,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             next_token_ids = batch_result.next_token_ids.to(torch.int64)
 
         # Batch 2: Draft extend
+        target_hidden = batch_result.logits_output.hidden_states
+        if target_hidden is not None:
+            target_hidden = target_hidden.detach().contiguous().clone()
         draft_extend_input = EagleDraftExtendInput(
-            hidden_states=batch_result.logits_output.hidden_states,
+            hidden_states=target_hidden,
             # accept_lens includes the bonus token; correct drafts exclude it.
             num_correct_drafts=num_correct_drafts,
             num_accept_tokens=batch_result.accept_lens,
@@ -1721,9 +1739,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_moe_a2a_backend_context(),
             spec_stage_span("draft_extend"),
         ):
+            target_hidden = batch_output.logits_output.hidden_states
+            if target_hidden is not None:
+                target_hidden = target_hidden.detach().contiguous().clone()
             batch_output.next_draft_input = self.draft_worker._draft_extend_for_prefill(
                 batch,
-                batch_output.logits_output.hidden_states,
+                target_hidden,
                 batch_output.next_token_ids,
                 batch_output.logits_output.mm_input_embeds,
                 kv_loc_plan=kv_loc_plan,

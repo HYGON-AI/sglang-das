@@ -377,7 +377,14 @@ def tilelang_qsa_mqa_prefill(
     # contiguous, so do not copy this large matrix again when removing padding.
     logits = logits[:rows]
     logits.div_(score_scale or math.sqrt(head_dim))
-    _tilelang_qsa_mqa_mask_kernel()(logits, starts[:rows], ends[:rows])
+    # HIP: default mask CTA (threads=512, block_k=4096) has been implicated in
+    # warmup VMFaults; use a smaller launch matching the prefill GEMM CTA.
+    if _is_hcu:
+        _tilelang_qsa_mqa_mask_kernel(threads=128, block_k=1024)(
+            logits, starts[:rows], ends[:rows]
+        )
+    else:
+        _tilelang_qsa_mqa_mask_kernel()(logits, starts[:rows], ends[:rows])
     return logits
 
 
@@ -491,7 +498,7 @@ def qsa_mqa_prefill(
         )
         if boltops_logits is not None:
             return boltops_logits
-    if q.is_cuda and HAS_TILELANG:
+    if q.is_cuda and HAS_TILELANG and not _is_hcu:
         try:
             return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
         except Exception as exc:
@@ -519,7 +526,7 @@ def qsa_mqa_decode(
         )
         if boltops_logits is not None:
             return boltops_logits
-    if q.is_cuda and HAS_TILELANG:
+    if q.is_cuda and HAS_TILELANG and not _is_hcu:
         try:
             return tilelang_qsa_mqa_decode(
                 q,

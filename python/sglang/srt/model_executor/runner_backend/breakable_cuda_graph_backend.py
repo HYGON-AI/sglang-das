@@ -135,7 +135,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 warmup_out
             )
             if capacity_rows is None:
-                capacity_rows = size
+                capacity_rows = max(size, self._output_rows(warmup_out, size))
             self._shared_output_buffer = self._alloc_full_buffer(
                 warmup_out, capacity_rows
             )
@@ -153,7 +153,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             out_rows = self._output_rows(out, size)
             self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
 
-        stored = self._slice_output(self._shared_output_buffer, out_rows)
+        stored = self._slice_output(self._shared_output_buffer, out_rows, template=out)
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = stored
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
@@ -168,6 +168,10 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         runner_rows = self._cuda_graph_runner.cuda_graph_output_rows(output)
         if runner_rows is not None:
             return runner_rows
+        logits = getattr(output, "next_token_logits", None)
+        if torch.is_tensor(logits):
+            # Verify keys count requests, whereas logits contain all draft rows.
+            return logits.shape[0]
         if torch.is_tensor(output):
             return min(cap, output.shape[0])
         if isinstance(output, PPProxyTensors):
@@ -214,28 +218,54 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return [self._alloc_full_buffer(o, size) for o in output]
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
-    def _slice_output(self, output: Any, num_tokens: int) -> Any:
+    def _slice_output(self, output: Any, num_tokens: int, template: Any = None) -> Any:
         if output is None:
             return None
         if torch.is_tensor(output):
-            return output[:num_tokens]
+            rows = (
+                min(num_tokens, template.shape[0])
+                if torch.is_tensor(template)
+                else num_tokens
+            )
+            return output[:rows]
         if isinstance(output, PPProxyTensors):
+            if isinstance(template, PPProxyTensors):
+                return PPProxyTensors(
+                    {
+                        key: self._slice_output(
+                            tensor, num_tokens, template.tensors[key]
+                        )
+                        for key, tensor in output.tensors.items()
+                    }
+                )
             return output[:num_tokens]
         if dataclasses.is_dataclass(output) and not isinstance(output, type):
             return dataclasses.replace(
                 output,
                 **{
                     field.name: self._slice_output(
-                        getattr(output, field.name), num_tokens
+                        getattr(output, field.name),
+                        num_tokens,
+                        getattr(template, field.name) if template is not None else None,
                     )
                     for field in dataclasses.fields(output)
                     if field.init
                 },
             )
         if isinstance(output, tuple):
-            return tuple(self._slice_output(item, num_tokens) for item in output)
+            return tuple(
+                self._slice_output(
+                    item, num_tokens, template[i] if template is not None else None
+                )
+                for i, item in enumerate(output)
+            )
         if isinstance(output, list):
-            return [self._slice_output(item, num_tokens) for item in output]
+            return [
+                self._slice_output(
+                    item, num_tokens, template[i] if template is not None else None
+                )
+                for i, item in enumerate(output)
+            ]
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
     def _copy_output_to_buffer(
@@ -249,7 +279,12 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 f"{type(output)} vs {type(output_buffer)}"
             )
         if torch.is_tensor(output) and torch.is_tensor(output_buffer):
-            output_buffer[:num_tokens].copy_(output[:num_tokens])
+            rows = min(num_tokens, output.shape[0])
+            if output_buffer.shape[0] < rows:
+                raise ValueError(
+                    "BCG output buffer capacity is smaller than captured output"
+                )
+            output_buffer[:rows].copy_(output[:rows])
             return
         if isinstance(output, PPProxyTensors) and isinstance(
             output_buffer, PPProxyTensors

@@ -1609,10 +1609,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         timer_ctx = device_timer_ctx(
             self.model_runner.device_timer, forward_batch.forward_mode.name.lower()
         )
+        attn_backend = self._replay_attn_backend()
         shared_read_ends = self._resolve_shared_read_ends(
-            self._replay_attn_backend(), forward_batch.forward_mode
+            attn_backend, forward_batch.forward_mode
         )
-        with timer_ctx, self.backend.replay_session():
+        with (
+            timer_ctx,
+            self.backend.replay_session(),
+            forward_context(ForwardContext(attn_backend=attn_backend)),
+        ):
             self.load_batch(forward_batch, pp_proxy_tensors)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
@@ -1657,16 +1662,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     else None
                 )
 
-            # Preserve extension fields produced by the eager output processor.
+            hidden_states = (
+                output.hidden_states[: self.raw_num_token]
+                if output.hidden_states is not None
+                else None
+            )
+            # BCG replay returns a view of the shared capture buffer. mHC
+            # EAGLE keeps that tensor as the draft recurrent state across
+            # overlap; clone so the next verify replay cannot clobber it.
+            if (
+                hidden_states is not None
+                and getattr(self.model_runner.model_config, "hc_hidden_size", None)
+                is not None
+            ):
+                hidden_states = hidden_states.contiguous().clone()
             return dataclasses.replace(
                 output,
                 next_token_logits=next_token_logits,
                 full_logits=full_logits,
-                hidden_states=(
-                    output.hidden_states[: self.raw_num_token]
-                    if output.hidden_states is not None
-                    else None
-                ),
+                hidden_states=hidden_states,
                 draft_topk_index=(
                     output.draft_topk_index[: self.raw_num_token]
                     if output.draft_topk_index is not None

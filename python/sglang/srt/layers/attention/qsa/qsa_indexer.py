@@ -29,6 +29,9 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.utils import is_hcu, is_hip
+
+_is_hcu = is_hcu()
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -124,7 +127,13 @@ class QSAIndexer(MultiPlatformOp):
             )
 
     def _use_fused_prep(self, tensor: torch.Tensor) -> bool:
-        """Whether the fused indexer-prep kernels support this configuration."""
+        """Whether the fused indexer-prep kernels support this configuration.
+
+        The fused path is a CUDA JIT (``.cuh``); ROCm reports ``is_cuda`` but
+        cannot run those kernels. Keep HIP on the eager prep/compress path.
+        """
+        if is_hip():
+            return False
         return (
             tensor.is_cuda
             and tensor.dtype in (torch.bfloat16, torch.float16)
@@ -373,11 +382,18 @@ class QSAIndexer(MultiPlatformOp):
             raise RuntimeError("QSA CUDA graph compression metadata is incomplete")
         pool = metadata.token_to_kv_pool
         group_locs = metadata.graph_ring_group_locs
+        write_locs = metadata.graph_write_locs
+        if _is_hcu:
+            # Inactive compression rows have no live group; gather only the
+            # reserved zero slot. Never clamp a live request to another slot.
+            group_locs = torch.where(
+                (write_locs != 0)[:, None], group_locs, torch.zeros_like(group_locs)
+            )
         if self._use_fused_compress(pool):
             self._fused_compress_store(
                 pool,
                 group_locs,
-                metadata.graph_write_locs,
+                write_locs,
             )
             return
         key_groups = pool.get_qsa_key_state_buffer(self.layer_id)[group_locs]
@@ -389,7 +405,7 @@ class QSAIndexer(MultiPlatformOp):
             compressed, compressed_rope_positions
         )
         pool.set_qsa_compressed_k_buffer(
-            self.layer_id, metadata.graph_write_locs, compressed.contiguous()
+            self.layer_id, write_locs, compressed.contiguous()
         )
 
     def _rope_from_matrix(self, positions: torch.Tensor) -> torch.Tensor:

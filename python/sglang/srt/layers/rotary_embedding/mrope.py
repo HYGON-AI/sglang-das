@@ -23,6 +23,7 @@ from sglang.srt.runtime_context import attention_backends
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cuda,
+    is_hcu,
     is_hip,
     is_npu,
     is_xpu,
@@ -31,6 +32,7 @@ from sglang.srt.utils import (
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_hcu = is_hcu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -152,8 +154,14 @@ class MRotaryEmbedding(RotaryEmbedding):
         cos, sin = cos_sin.chunk(2, dim=-1)
         if self.mrope_interleaved:
             # Runs in prefill and decode: both halves must support triton.
+            # HCU: prefer the pure-Torch interleaved path; the Triton variant
+            # has been observed to trip async VMFaults under QSA warmup.
             prefill_backend, decode_backend = attention_backends()
-            if support_triton(prefill_backend) and support_triton(decode_backend):
+            if (
+                not _is_hcu
+                and support_triton(prefill_backend)
+                and support_triton(decode_backend)
+            ):
                 cos = apply_interleaved_rope_triton(cos, self.mrope_section)
                 sin = apply_interleaved_rope_triton(sin, self.mrope_section)
             else:

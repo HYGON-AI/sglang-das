@@ -350,6 +350,10 @@ class EagleDraftExtendInput(SpecInput):
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = 1
+    # QSA / PLE metadata historically reads spec_info.draft_token_num, which
+    # EagleVerifyInput has. Eager draft-extend uses this class instead; expose
+    # the same window width so those backends do not AttributeError.
+    draft_token_num: int = 0
 
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
     dsa_seed_topk_select: Optional[torch.Tensor] = None
@@ -366,6 +370,11 @@ class EagleDraftExtendInput(SpecInput):
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)
+        if (
+            int(self.draft_token_num or 0) <= 0
+            and int(self.num_tokens_per_req or 0) > 0
+        ):
+            self.draft_token_num = int(self.num_tokens_per_req)
 
     def pad_batch(
         self,
