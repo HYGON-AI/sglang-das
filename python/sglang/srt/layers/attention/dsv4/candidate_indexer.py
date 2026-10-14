@@ -8,6 +8,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsv4 import lightop_indexer
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_hcu
@@ -291,6 +293,20 @@ def _topk_block_ids(
     return block_ids
 
 
+def _select_candidate_blocks_lightop(
+    logits: torch.Tensor,
+    compress_lens: torch.Tensor,
+    topk_blocks: int,
+    *,
+    return_block_ids: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Select blocks and expand the mask in one LightOp kernel, without fallback."""
+    mask, block_ids = lightop_indexer.candidate_block_mask(
+        logits, compress_lens, topk_blocks
+    )
+    return (mask, block_ids) if return_block_ids else mask
+
+
 def _select_candidate_blocks_fused(
     logits: torch.Tensor,
     compress_lens: torch.Tensor,
@@ -390,6 +406,10 @@ def select_candidate_blocks(
         and logits.ndim == 2
         and isinstance(compress_lens, torch.Tensor)
     ):
+        if _IS_HCU and envs.SGLANG_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS.get():
+            return _select_candidate_blocks_lightop(
+                logits, compress_lens, topk_blocks, return_block_ids=return_block_ids
+            )
         return _select_candidate_blocks_fused(
             logits, compress_lens, topk_blocks, return_block_ids=return_block_ids
         )

@@ -1018,6 +1018,8 @@ class Envs:
     # DSV4.1 low-ratio decode/verify indexer on HCU via the paged path on LightOp;
     # falls back to the slot-based path when LightOp lacks the paged operators.
     SGLANG_USE_LIGHTOP_DSV41_PAGED_INDEXER = EnvBool(True)
+    # HCU block selection on dense logits; 0 keeps the block-amax + top-k path.
+    SGLANG_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS = EnvBool(True)
     SGLANG_USE_FAST_HADAMARD_TRANSFORM = EnvBool(False)
     SGLANG_USE_FUSED_DPSKV4_QNORM_ROPE_KV_ROPE_QUANT = EnvBool(False)
     SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
