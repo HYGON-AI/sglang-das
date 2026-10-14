@@ -331,18 +331,34 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             if gguf_file is not None:
                 validate_minimax_h3_checkpoint_variant([gguf_file], selected_variant)
             elif component_server_args.transformer_weights_path is not None:
+                from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant import (
+                    inspect_quant_checkpoint,
+                )
+
                 validate_minimax_h3_checkpoint_variant(
                     safetensors_list, selected_variant
                 )
-                adaln_curve_shape, layer_markers = inspect_minimax_h3_safetensors(
-                    safetensors_list
+                checkpoint_info = inspect_quant_checkpoint(
+                    safetensors_list, selected_variant
                 )
-                checkpoint_quant_config = resolve_minimax_h3_checkpoint_quantization(
-                    layer_markers,
-                    safetensors_list,
-                    dit_config.arch_config.param_names_mapping,
-                    dit_config.arch_config.reverse_param_names_mapping,
-                )
+                if checkpoint_info is not None:
+                    (
+                        checkpoint_quant_config,
+                        dit_config.arch_config.checkpoint_uses_diffusers_layout,
+                        adaln_curve_shape,
+                    ) = checkpoint_info
+                else:
+                    adaln_curve_shape, layer_markers = inspect_minimax_h3_safetensors(
+                        safetensors_list
+                    )
+                    checkpoint_quant_config = (
+                        resolve_minimax_h3_checkpoint_quantization(
+                            layer_markers,
+                            safetensors_list,
+                            dit_config.arch_config.param_names_mapping,
+                            dit_config.arch_config.reverse_param_names_mapping,
+                        )
+                    )
                 if adaln_curve_shape is not None:
                     (
                         dit_config.arch_config.adaln_curve_grid,
@@ -390,6 +406,13 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             or cpu_offload_flag
         )
         use_fsdp = server_args.should_use_fsdp_for_component(component_name)
+        if (
+            use_fsdp
+            and quant_spec.quant_config is not None
+            and quant_spec.quant_config.get_name()
+            in ("minimax_h3_int8", "minimax_h3_fp8")
+        ):
+            raise ValueError("MiniMax-H3 INT8/FP8 supports TP/SP, not FSDP inference")
         if quant_spec.uses_comfy_layer_markers and use_fsdp:
             raise ValueError(
                 "Comfy quantized checkpoints do not support FSDP "

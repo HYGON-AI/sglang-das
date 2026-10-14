@@ -5,6 +5,10 @@ from typing import Tuple
 
 import torch
 
+from sglang.srt.utils import is_hcu
+
+_is_hcu = is_hcu()
+
 
 def create_token_ids(
     patch_dims, device, dtype, id_type="length_normalized", flatten=True
@@ -167,6 +171,15 @@ def apply_rotary_pos_emb_qk(
     native = native_rope_cache(query, key, rotary_pos_emb)
     if native is not None:
         from sgl_kernel import rotary_embedding
+
+        if _is_hcu:
+            rotary_embedding = getattr(
+                torch.ops.sgl_kernel, "minimax_h3_rotary_embedding", None
+            )
+            if rotary_embedding is None:
+                raise RuntimeError(
+                    "MiniMax-H3 on HCU requires its dedicated RoPE operator; rebuild sglang-kernel with setup_hip.py"
+                )
 
         cache, positions = native
         query = query.contiguous()

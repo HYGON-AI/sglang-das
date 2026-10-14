@@ -24,6 +24,10 @@ if "SGLANG_DIFFUSION_TRACE_FUNCTION" in os.environ:
     )
 
 if TYPE_CHECKING:
+    SGLANG_MINIMAX_H3_QUANT_OPTIMIZE: bool = True
+    SGLANG_MINIMAX_H3_INT8_ENABLE: bool = True
+    SGLANG_MINIMAX_H3_INT8_FUSION: bool = True
+    SGLANG_MINIMAX_H3_FP8_OPTIMIZE: bool = True
     SGLANG_DIFFUSION_NCCL_SO_PATH: str | None = None
     LOCAL_RANK: int = 0
     SGLANG_DIFFUSION_CACHE_ROOT: str = os.path.expanduser("~/.cache/sgl_diffusion")
@@ -194,6 +198,18 @@ def _lazy_path(
 # begin-env-vars-definition
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "SGLANG_MINIMAX_H3_QUANT_OPTIMIZE": _lazy_bool(
+        "SGLANG_MINIMAX_H3_QUANT_OPTIMIZE", "true"
+    ),
+    "SGLANG_MINIMAX_H3_INT8_ENABLE": _lazy_bool(
+        "SGLANG_MINIMAX_H3_INT8_ENABLE", "true"
+    ),
+    "SGLANG_MINIMAX_H3_INT8_FUSION": _lazy_bool(
+        "SGLANG_MINIMAX_H3_INT8_FUSION", "true"
+    ),
+    "SGLANG_MINIMAX_H3_FP8_OPTIMIZE": _lazy_bool(
+        "SGLANG_MINIMAX_H3_FP8_OPTIMIZE", "true"
+    ),
     # ================== Runtime Env Vars ==================
     # Root directory for SGL-diffusion cache files
     # Defaults to `~/.cache/sgl_diffusion` unless `XDG_CACHE_HOME` is set

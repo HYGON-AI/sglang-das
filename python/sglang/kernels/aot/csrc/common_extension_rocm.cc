@@ -334,6 +334,12 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "                 Tensor cos_sin_cache, bool is_neox) -> ()");
   m.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
 
+  m.def(
+      "minimax_h3_rotary_embedding(Tensor positions, Tensor! query,"
+      "                            Tensor!? key, int head_size,"
+      "                            Tensor cos_sin_cache, bool is_neox) -> ()");
+  m.impl("minimax_h3_rotary_embedding", torch::kCUDA, &minimax_h3_rotary_embedding);
+
   /*
    * From csrc/memory
    */
