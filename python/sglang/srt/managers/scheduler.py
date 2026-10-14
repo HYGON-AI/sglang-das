@@ -2677,9 +2677,12 @@ class Scheduler(
             if get_mm().mm_feature_transport == "cuda_vmm":
                 vmm_errors = self._materialize_cuda_vmm_inputs(recv_req)
 
-            # Skip health check when server is busy — ongoing requests already carry health info.
-            if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
-                for_health_check=True
+            # DP health fan-out needs each rank's generated response, not just
+            # the busy-worker heartbeat used by ordinary TP health checks.
+            if (
+                is_health_check_generate_req(recv_req)
+                and not self.server_args.enable_dp_attention
+                and not self.is_fully_idle(for_health_check=True)
             ):
                 self.return_health_check_ipcs.append(
                     getattr(recv_req, "http_worker_ipc", None)
@@ -5503,7 +5506,10 @@ class Scheduler(
                             deferred_count=len(deferred_reqs),
                             forward_iter=self.forward_ct,
                         )
-                    elif is_health_check_generate_req(recv_req):
+                    elif (
+                        is_health_check_generate_req(recv_req)
+                        and not self.server_args.enable_dp_attention
+                    ):
                         # A forward is running, so the server is busy: answer
                         # as process_input_requests does when not fully idle.
                         self.return_health_check_ipcs.append(
