@@ -1168,11 +1168,16 @@ class SchedulerDisaggregationPrefillMixin:
 
     def maybe_supplemental_poll_final_chunks(self: Scheduler) -> List[Req]:
         """Give newly submitted final chunks one bounded chance to finish."""
-        final_rooms = getattr(self, "_disagg_final_chunk_rooms", set())
-        self._disagg_final_chunk_rooms = set()
-        timeout_ms = envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get()
-        if timeout_ms <= 0 or not final_rooms:
+        timeout_ms = self._mooncake_final_poll_timeout_ms
+        if timeout_ms <= 0:
+            final_rooms = getattr(self, "_disagg_final_chunk_rooms", None)
+            if final_rooms:
+                final_rooms.clear()
             return []
+        final_rooms = getattr(self, "_disagg_final_chunk_rooms", None)
+        if not final_rooms:
+            return []
+        self._disagg_final_chunk_rooms = set()
 
         remaining_rooms = {
             req.bootstrap_room
@@ -1291,7 +1296,8 @@ class SchedulerDisaggregationPrefillMixin:
         running_batch: ScheduleBatch,
         last_batch: Optional[ScheduleBatch],
     ) -> NextBatchPlan:
-        self._begin_scheduler_iteration()
+        if self.enable_waiting_queue_dfs_prefetch:
+            self._begin_scheduler_iteration()
         self.process_pending_chunked_abort()
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
@@ -1327,14 +1333,20 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         while True:
-            self._process_deferred_reqs()
+            if self._forward_ingress_enabled:
+                self._process_deferred_reqs()
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
-            self._admit_prefill_bootstrapped_reqs()
+            if DAS_PREFETCH_TRACE_ENABLED:
+                self._admit_prefill_bootstrapped_reqs()
+            else:
+                self.waiting_queue.extend(
+                    self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+                )
 
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(
@@ -1357,7 +1369,8 @@ class SchedulerDisaggregationPrefillMixin:
                 self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
-            self.maybe_supplemental_poll_final_chunks()
+            if self._mooncake_final_poll_timeout_ms > 0:
+                self.maybe_supplemental_poll_final_chunks()
 
             # Update last_batch
             self.last_batch = batch
@@ -1372,7 +1385,12 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
-            self._admit_prefill_bootstrapped_reqs()
+            if DAS_PREFETCH_TRACE_ENABLED:
+                self._admit_prefill_bootstrapped_reqs()
+            else:
+                self.waiting_queue.extend(
+                    self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+                )
 
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(
@@ -1404,7 +1422,8 @@ class SchedulerDisaggregationPrefillMixin:
                 self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
-            self.maybe_supplemental_poll_final_chunks()
+            if self._mooncake_final_poll_timeout_ms > 0:
+                self.maybe_supplemental_poll_final_chunks()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -2486,7 +2505,7 @@ class SchedulerDisaggregationPrefillMixin:
         if (
             last_chunk
             and self.ps.pp_size == 1
-            and envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get() > 0
+            and self._mooncake_final_poll_timeout_ms > 0
         ):
             final_rooms = getattr(self, "_disagg_final_chunk_rooms", None)
             if final_rooms is None:

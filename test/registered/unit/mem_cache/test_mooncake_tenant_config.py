@@ -1,9 +1,10 @@
 import json
+import os
 import tempfile
 import types
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
@@ -206,6 +207,81 @@ class TestMooncakeTenantConfig(unittest.TestCase):
 
         fake_store = FakeMooncakeDistributedStore.instances[-1]
         self.assertEqual(fake_store.setup_calls[0][1]["tenant_id"], "tenant-embedding")
+
+
+class TestMooncakePrefetchSetup(unittest.TestCase):
+    def test_hicache_factory_disables_unused_waiting_queue_arena(self):
+        from sglang.srt.mem_cache.storage.backend_factory import StorageBackendFactory
+
+        backend_class = Mock()
+        storage_config, host_pool = object(), object()
+        result = StorageBackendFactory._create_builtin_backend(
+            "mooncake", backend_class, storage_config, host_pool
+        )
+        backend_class.assert_called_once_with(
+            storage_config, host_pool, enable_dfs_prefetch=False
+        )
+        self.assertIs(result, backend_class.return_value)
+
+    def test_disabled_prefetch_overrides_client_without_changing_environment(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        with (
+            patch.dict(
+                "sys.modules", _fake_mooncake_modules(FakeMooncakeDistributedStore)
+            ),
+            patch.dict(os.environ, {"MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES": "4096"}),
+        ):
+            MooncakeStore(_make_storage_config(), enable_dfs_prefetch=False)
+            self.assertEqual(
+                os.environ["MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES"], "4096"
+            )
+
+        fake_store = FakeMooncakeDistributedStore.instances[-1]
+        self.assertIs(fake_store.setup_calls[0][1]["enable_dfs_prefetch"], False)
+
+    def test_enabled_or_unspecified_prefetch_preserves_environment_setup(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        for enabled in (True, None):
+            with (
+                self.subTest(enabled=enabled),
+                patch.dict(
+                    "sys.modules", _fake_mooncake_modules(FakeMooncakeDistributedStore)
+                ),
+            ):
+                MooncakeStore(_make_storage_config(), enable_dfs_prefetch=enabled)
+                self.assertNotIn(
+                    "enable_dfs_prefetch",
+                    FakeMooncakeDistributedStore.instances[-1].setup_calls[0][1],
+                )
+
+    def test_disabled_prefetch_cannot_silently_drop_unsupported_gate(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        class UnsupportedPrefetchStore(FakeMooncakeDistributedStore):
+            attempts = 0
+
+            def setup(self, *args, **kwargs):
+                type(self).attempts += 1
+                if "enable_dfs_prefetch" in kwargs:
+                    raise TypeError(
+                        "enable_dfs_prefetch is an invalid keyword argument"
+                    )
+                return super().setup(*args, **kwargs)
+
+        with patch.dict(
+            "sys.modules", _fake_mooncake_modules(UnsupportedPrefetchStore)
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cannot disable DFS prefetch"):
+                MooncakeStore(_make_storage_config(), enable_dfs_prefetch=False)
+        self.assertEqual(UnsupportedPrefetchStore.attempts, 1)
 
 
 if __name__ == "__main__":

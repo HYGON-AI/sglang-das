@@ -40,6 +40,7 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
     def test_successful_read_plan_load_reports_success(self):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
         linker.read_plan_enabled = True
+        linker.host_prefetch_enabled = False
         linker.tp_rank = 0
         linker.load_with_read_plan = Mock()
 
@@ -47,6 +48,128 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
 
         self.assertIs(success, True)
         linker.load_with_read_plan.assert_called_once_with(7, [])
+
+    def _read_plan_linker(self, *, prefetch):
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.read_plan_enabled = True
+        linker.host_prefetch_enabled = prefetch
+        linker.read_plan_reuse_ranges = False
+        linker.enable_page_wise_load = False
+        linker.tp_rank = 0
+        linker.num_layers = 1
+        linker.pools = {}
+        linker.storage = types.SimpleNamespace(store=Mock())
+        linker._prepare_read_plan_layouts = Mock(return_value=[])
+        linker._prepare_expanded_load = Mock(
+            side_effect=AssertionError("unexpected Python session preparation")
+        )
+        linker.abort_prepared_load = Mock()
+        linker.layer_done_counter = ReadPlanLoadCounter(num_layers=1)
+        linker.layer_done_counter.update_producer()
+        return linker
+
+    def test_prefetch_off_read_plan_owns_sessions(self):
+        linker = self._read_plan_linker(prefetch=False)
+        transfers = [[PoolTransfer(name=PoolName.KV, keys=["page"])]]
+
+        self.assertTrue(linker.load_layer_wise(0, transfers))
+
+        linker._prepare_expanded_load.assert_not_called()
+        linker.abort_prepared_load.assert_not_called()
+        linker.storage.store.create_read_plan.assert_called_once_with(
+            [],
+            1,
+            reuse_ranges=False,
+            page_wise=False,
+            borrowed_sessions=False,
+            buffer_owners=linker.pools,
+        )
+        linker.storage.store.create_read_plan.return_value.run.assert_called_once()
+
+    def test_prefetch_on_read_plan_borrows_prepared_sessions(self):
+        linker = self._read_plan_linker(prefetch=True)
+        linker.session_lock = threading.Lock()
+        linker.prepared_load_sessions = {"rid": ["tagged-page"]}
+        transfers = [[PoolTransfer(name=PoolName.KV, keys=["page"])]]
+
+        self.assertTrue(linker.load_layer_wise(0, transfers, request_ids=["rid"]))
+
+        linker._prepare_expanded_load.assert_not_called()
+        self.assertTrue(
+            linker.storage.store.create_read_plan.call_args.kwargs["borrowed_sessions"]
+        )
+        linker.abort_prepared_load.assert_called_once_with("rid")
+
+    def test_prefetch_off_read_plan_failure_skips_python_session_cleanup(self):
+        linker = self._read_plan_linker(prefetch=False)
+        linker.storage.store.create_read_plan.return_value.run.side_effect = (
+            RuntimeError("read failed")
+        )
+        transfers = [[PoolTransfer(name=PoolName.KV, keys=["page"])]]
+
+        with self.assertLogs(
+            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker",
+            level="ERROR",
+        ):
+            self.assertFalse(linker.load_layer_wise(0, transfers))
+
+        linker._prepare_expanded_load.assert_not_called()
+        linker.abort_prepared_load.assert_not_called()
+
+    def test_prefetch_off_legacy_load_batches_sessions_by_pool(self):
+        for page_wise in (False, True):
+            with self.subTest(page_wise=page_wise):
+                linker = self._read_plan_linker(prefetch=False)
+                linker.read_plan_enabled = False
+                linker.enable_page_wise_load = page_wise
+                linker.page_wise_load_threshold = 1
+                del linker._prepare_read_plan_layouts
+                linker.storage._get_hybrid_page_component_keys = Mock(
+                    side_effect=lambda keys, _: (keys, 1)
+                )
+                linker.storage._tag_keys = lambda keys: [
+                    f"tagged:{key}" for key in keys
+                ]
+                linker.pools = {
+                    PoolName.KV: types.SimpleNamespace(
+                        prepare_locations=lambda indices: list(indices),
+                        get_prepared_layer_range_meta=lambda locations, _: (
+                            [[index] for index in locations],
+                            [[8] for _ in locations],
+                            [[0] for _ in locations],
+                        ),
+                    )
+                }
+                store = linker.storage.store
+                store.batch_get_session_start.return_value = [0, 0]
+                store.batch_get_into_multi_buffer_ranges.return_value = [8, 8]
+                linker.layer_done_counter = Mock()
+                events = []
+                store.batch_get_session_end.side_effect = lambda _: events.append("end")
+                linker.layer_done_counter.complete.side_effect = (
+                    lambda *_: events.append("complete")
+                )
+                transfers = [
+                    [PoolTransfer(name=PoolName.KV, keys=["a"], host_indices=[1])],
+                    [PoolTransfer(name=PoolName.KV, keys=["b"], host_indices=[2])],
+                ]
+
+                self.assertTrue(linker.load_layer_wise(0, transfers))
+
+                store.batch_get_session_start.assert_called_once_with(
+                    ["tagged:a", "tagged:b"]
+                )
+                store.batch_get_session_end.assert_called_once_with(
+                    ["tagged:a", "tagged:b"]
+                )
+                self.assertEqual(
+                    events, ["end", "complete"] if page_wise else ["complete", "end"]
+                )
+                self.assertEqual(
+                    linker.storage._get_hybrid_page_component_keys.call_count, 2
+                )
+                linker._prepare_expanded_load.assert_not_called()
+                linker.abort_prepared_load.assert_not_called()
 
     def test_layout_expands_packed_layer_mapping(self):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
@@ -73,7 +196,7 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
             host_indices=torch.tensor([4, 5]),
             keys=["page-0"],
         )
-        layouts = linker._prepare_read_plan_layouts([("rid", [transfer])])
+        layouts = linker._prepare_read_plan_layouts([[transfer]])
 
         self.assertEqual(len(layouts), 1)
         keys, locations, packed, layers = layouts[0]
@@ -98,7 +221,7 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
         linker.host_prefetch_enabled = True
         linker.host_prefetch_limit = 8
-        linker.host_prefetch_max_pages = 1024
+        linker.host_prefetch_generation = 0
         linker.host_prefetch_lock = threading.Lock()
         linker.host_prefetch_entries = {}
         linker.host_prefetch_queue = Queue()

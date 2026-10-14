@@ -204,7 +204,10 @@ class SchedulerRequestReceiver:
             # controller, so we broadcast within attn_tp_group + attn_cp_group
             # instead of the full tp_group.  This avoids an expensive
             # all-ranks gloo sync.
-            if self._local_control_broadcast():
+            if (
+                get_parallel().enable_dp_attention_local_control_broadcast
+                or is_ep_scale_joiner()
+            ):
                 if self.ps.attn_tp_size != 1:
                     control_reqs = broadcast_pyobj(
                         control_reqs,

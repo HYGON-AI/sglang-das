@@ -417,6 +417,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         storage_config: HiCacheStorageConfig = None,
         mem_pool: HostKVCache = None,
         enable_client_http_server: Optional[bool] = None,
+        enable_dfs_prefetch: Optional[bool] = None,
     ):
         MooncakeBaseStore.__init__(self)
         MooncakeDistributedStore = self._import_mooncake_store()
@@ -547,6 +548,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     enable_client_http_server,
                     getattr(storage_config, "dp_rank", None),
                 )
+                if enable_dfs_prefetch is False:
+                    # Override the arena environment for this client only.
+                    setup_kwargs["enable_dfs_prefetch"] = False
                 if self.config.enable_ssd_offload:
                     setup_kwargs["enable_ssd_offload"] = True
                 if self.config.ssd_offload_path is not None:
@@ -574,6 +578,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         ]
                         if not unsupported_kwargs:
                             raise
+                        if "enable_dfs_prefetch" in unsupported_kwargs:
+                            raise RuntimeError(
+                                "The installed Mooncake package cannot disable "
+                                "DFS prefetch per client. Rebuild/install the "
+                                "updated Mooncake package to honor the disabled "
+                                "SGLang prefetch flag."
+                            ) from e
                         if "tenant_id" in unsupported_kwargs:
                             raise RuntimeError(
                                 "The installed Mooncake version does not support "

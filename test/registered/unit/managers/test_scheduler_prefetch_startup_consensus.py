@@ -65,8 +65,8 @@ class TestSingleRank(CustomTestCase):
 
     def test_not_configured_skips_the_capability_query(self):
         s = _scheduler(flag=False)
+        s.tree_cache = object()
         self.assertEqual(s._resolve_prefetch_startup_switches(None), (False, False))
-        s.tree_cache.waiting_queue_prefetch_enabled.assert_not_called()
 
     def test_invalid_final_poll_reads_as_off_like_the_runtime(self):
         # The typed getter falls back to its default (0.0, off) on a bad value,
@@ -240,6 +240,9 @@ class TestRuntimeInit(CustomTestCase):
         import sglang.srt.managers.scheduler as scheduler_module
 
         s = _scheduler(**kwargs)
+        if kwargs.get("flag", True) is False:
+            # A disabled rank must not query or call the prefetch-only API.
+            s.tree_cache = object()
         s.world_group = types.SimpleNamespace(world_size=1, cpu_group=None)
         s.attn_cp_cpu_group = "cp"
         s.attn_tp_cpu_group = "tp_attn"
@@ -271,6 +274,16 @@ class TestRuntimeInit(CustomTestCase):
         self.assertFalse(s.enable_waiting_queue_dfs_prefetch)
         self.assertEqual(created, [])
         self.assertIsNone(s._forward_launch_executor)
+        self.assertIsNone(s._bg_thread)
+        for name in (
+            "_bg_prefetch_jobs",
+            "_bg_prefetch_acks",
+            "_bg_pending_prefetch_jobs",
+            "_bg_prefetch_join_age",
+            "_bg_prefetch_rooms",
+            "_bg_condition",
+        ):
+            self.assertFalse(hasattr(s, name), name)
 
     def test_on_creates_the_executor(self):
         s, created = self._init()
@@ -304,6 +317,48 @@ class TestRuntimeInit(CustomTestCase):
                 ) as getter:
                     s._resolve_prefetch_startup_switches(None)
                 getter.assert_not_called()
+
+
+class TestRunBatchOffRoute(CustomTestCase):
+    def test_disabled_ingress_calls_worker_directly(self):
+        from contextlib import nullcontext
+        from unittest.mock import patch
+
+        import sglang.srt.managers.scheduler as scheduler_module
+
+        class StopForward(Exception):
+            pass
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.forward_ct = 0
+        scheduler._sched_idled = False
+        scheduler.scripted_scheduler_hook = None
+        scheduler.profiler_manager = MagicMock()
+        scheduler.forward_sleep_time = None
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.is_generation = True
+        scheduler.enable_overlap = False
+        scheduler.enable_pdmux = False
+        scheduler._forward_ingress_enabled = False
+        scheduler.future_map = MagicMock()
+        scheduler._forward_isolation = MagicMock(return_value=nullcontext())
+        scheduler.model_worker = MagicMock()
+        scheduler.model_worker.forward_batch_generation.side_effect = StopForward
+        scheduler._forward_with_waiting_queue_ingress = MagicMock(
+            side_effect=AssertionError("disabled ingress wrapper called")
+        )
+        batch = types.SimpleNamespace(
+            forward_mode=types.SimpleNamespace(is_prebuilt=lambda: False),
+            spec_algorithm=types.SimpleNamespace(is_none=lambda: False),
+            reqs=[],
+        )
+
+        with patch.object(scheduler_module, "resolve_forward_inputs"):
+            with self.assertRaises(StopForward):
+                scheduler.run_batch(batch)
+
+        scheduler.model_worker.forward_batch_generation.assert_called_once_with(batch)
+        scheduler._forward_with_waiting_queue_ingress.assert_not_called()
 
 
 if __name__ == "__main__":

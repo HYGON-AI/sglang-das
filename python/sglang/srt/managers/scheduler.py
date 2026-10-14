@@ -461,21 +461,6 @@ class Scheduler(
         self.enable_overlap_mlx = (
             not get_schedule().disable_overlap_schedule and use_mlx()
         )
-        # The worker consumes immutable linker-prefetch snapshots. Per-iteration
-        # rounds keep every CP/TP participant in the same collective sequence,
-        # including rounds with no local jobs.
-        self._bg_prefetch_jobs: queue.Queue = queue.Queue()
-        self._bg_prefetch_acks: queue.Queue = queue.Queue()
-        self._bg_pending_prefetch_jobs = {}
-        self._bg_prefetch_join_age = {}
-        self._bg_condition = threading.Condition()
-        self._bg_requested_epoch = 0
-        self._bg_completed_epoch = 0
-        self._bg_error: Optional[BaseException] = None
-        self._bg_stop_flag = False
-        self._bg_thread = threading.Thread(target=self._bg_worker_loop, daemon=True)
-        self._bg_thread.start()
-
         self.enable_pdmux = get_disagg().enable_pdmux
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.stream_interval = get_serving().stream_interval
@@ -1941,7 +1926,8 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
-            self._process_deferred_reqs()
+            if self._forward_ingress_enabled:
+                self._process_deferred_reqs()
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -2385,12 +2371,15 @@ class Scheduler(
                 )
 
     def _begin_scheduler_iteration(self) -> None:
+        if not self.enable_waiting_queue_dfs_prefetch:
+            return
         self._drain_bg_prefetch_acks()
         self._request_bg_prefetch_epoch()
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
-        self._trace_prefill_reqs("scheduler_receive", recv_reqs)
+        if DAS_PREFETCH_TRACE_ENABLED:
+            self._trace_prefill_reqs("scheduler_receive", recv_reqs)
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
         if get_mm().mm_feature_transport == "cuda_vmm":
@@ -3288,7 +3277,7 @@ class Scheduler(
         self._ingress_tp_cpu_group = self.tp_cpu_group
         self._forward_launch_executor = None
         self._forward_deferred_reqs = []
-        self._bg_prefetch_rooms = {} if DAS_PREFETCH_TRACE_ENABLED else None
+        self._bg_thread = None
         if self.enable_waiting_queue_dfs_prefetch:
             # Every rank creates groups in the same order. The helper
             # gathers each rank's local subgroup membership on the default
@@ -3328,6 +3317,20 @@ class Scheduler(
                 self._forward_launch_executor = ThreadPoolExecutor(
                     max_workers=1, thread_name_prefix="prefetch-forward"
                 )
+            # Start only after the prefetch decision and groups are ready.
+            # Per-iteration rounds include ranks with no local jobs.
+            self._bg_prefetch_jobs: queue.Queue = queue.Queue()
+            self._bg_prefetch_acks: queue.Queue = queue.Queue()
+            self._bg_pending_prefetch_jobs = {}
+            self._bg_prefetch_join_age = {}
+            self._bg_prefetch_rooms = {} if DAS_PREFETCH_TRACE_ENABLED else None
+            self._bg_condition = threading.Condition()
+            self._bg_requested_epoch = 0
+            self._bg_completed_epoch = 0
+            self._bg_error: Optional[BaseException] = None
+            self._bg_stop_flag = False
+            self._bg_thread = threading.Thread(target=self._bg_worker_loop, daemon=True)
+            self._bg_thread.start()
 
     def _waiting_queue_prefetch_configured(self) -> bool:
         """This rank's own conditions for waiting-queue prefetch, before the
@@ -3373,12 +3376,16 @@ class Scheduler(
             == "none"
         )
         final_poll_on, final_poll_valid = False, True
+        final_poll_timeout_ms = 0.0
         if (
             self.disaggregation_mode == DisaggregationMode.PREFILL
             and self.ps.pp_size == 1
         ):
             try:
-                final_poll_on = envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get() > 0
+                final_poll_timeout_ms = (
+                    envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get()
+                )
+                final_poll_on = final_poll_timeout_ms > 0
             except Exception:
                 final_poll_on, final_poll_valid = False, False
 
@@ -3405,6 +3412,9 @@ class Scheduler(
                 "positive on every rank or <= 0 on every rank; this rank has "
                 f"on={final_poll_on}, valid={final_poll_valid}"
             )
+        self._mooncake_final_poll_timeout_ms = (
+            final_poll_timeout_ms if final_poll_on else 0.0
+        )
 
         enabled = bool(prefetch)
         if prefetch_local and not enabled:
@@ -3537,10 +3547,12 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
+        req.time_stats.track_queue_wait_reasons = self.enable_waiting_queue_dfs_prefetch
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
-            self._prefetch_kvcache(req, is_retracted=is_retracted)
+            if self.enable_waiting_queue_dfs_prefetch or self.enable_hicache_storage:
+                self._prefetch_kvcache(req, is_retracted=is_retracted)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -3568,7 +3580,11 @@ class Scheduler(
                 )
             if added:
                 req.time_stats.set_prefill_bootstrap_queue_entry_time()
-                self._prefetch_kvcache(req, is_retracted=is_retracted)
+                if (
+                    self.enable_waiting_queue_dfs_prefetch
+                    or self.enable_hicache_storage
+                ):
+                    self._prefetch_kvcache(req, is_retracted=is_retracted)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
@@ -3937,7 +3953,8 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
-        self._begin_scheduler_iteration()
+        if self.enable_waiting_queue_dfs_prefetch:
+            self._begin_scheduler_iteration()
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:
@@ -4141,7 +4158,7 @@ class Scheduler(
         ):
             self.tree_cache.check_hicache_events()
 
-        waiting_queue_prefetch_states = {}
+        waiting_queue_prefetch_states = None
         if self.enable_waiting_queue_dfs_prefetch:
             waiting_queue_prefetch_states = (
                 self.tree_cache.get_waiting_queue_prefetch_admission_states(
@@ -4870,7 +4887,14 @@ class Scheduler(
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self._forward_with_waiting_queue_ingress(batch)
+                    if self._forward_ingress_enabled:
+                        batch_result = self._forward_with_waiting_queue_ingress(
+                            batch
+                        )
+                    else:
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch
+                        )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -4894,7 +4918,14 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
-                batch_result = self._forward_with_waiting_queue_ingress(batch, **kwargs)
+                if self._forward_ingress_enabled:
+                    batch_result = self._forward_with_waiting_queue_ingress(
+                        batch, **kwargs
+                    )
+                else:
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, **kwargs
+                    )
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(batch.req_pool_indices, batch_result)

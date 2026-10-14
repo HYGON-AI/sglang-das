@@ -597,16 +597,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
-        _trace_disagg_prefill_dispatch("tokenizer_send_start", obj)
+        if _DAS_PREFETCH_TRACE_ENABLED:
+            _trace_disagg_prefill_dispatch("tokenizer_send_start", obj)
         sock_send(self.send_to_scheduler, obj)
-        _trace_disagg_prefill_dispatch("tokenizer_send_done", obj)
+        if _DAS_PREFETCH_TRACE_ENABLED:
+            _trace_disagg_prefill_dispatch("tokenizer_send_done", obj)
 
     async def _async_dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
-        _trace_disagg_prefill_dispatch("tokenizer_send_start", obj)
+        if _DAS_PREFETCH_TRACE_ENABLED:
+            _trace_disagg_prefill_dispatch("tokenizer_send_start", obj)
         await async_sock_send(self.send_to_scheduler, obj)
-        _trace_disagg_prefill_dispatch("tokenizer_send_done", obj)
+        if _DAS_PREFETCH_TRACE_ENABLED:
+            _trace_disagg_prefill_dispatch("tokenizer_send_done", obj)
 
     def init_running_status(self):
         # Request states

@@ -24,6 +24,7 @@ def make_manager(request_status, outstanding=None):
     manager = object.__new__(MooncakeKVManager)
     manager.request_status = request_status
     manager._staging_outstanding = defaultdict(int, outstanding or {})
+    manager._final_poll_enabled = True
     manager._transfer_completion_condition = threading.Condition()
     return manager
 
@@ -98,11 +99,12 @@ class TestMooncakeWaitForTransferRooms(CustomTestCase):
 
 class TestSupplementalPollFinalChunks(CustomTestCase):
     @staticmethod
-    def make_scheduler(inflight_rooms, final_rooms, wait_result=True):
+    def make_scheduler(inflight_rooms, final_rooms, wait_result=True, timeout_ms=0):
         kv_manager = SimpleNamespace(
             wait_for_transfer_rooms=Mock(return_value=wait_result)
         )
         scheduler = SimpleNamespace(
+            _mooncake_final_poll_timeout_ms=timeout_ms,
             _disagg_final_chunk_rooms=set(final_rooms),
             disagg_prefill_inflight_queue=[
                 SimpleNamespace(bootstrap_room=room) for room in inflight_rooms
@@ -130,7 +132,9 @@ class TestSupplementalPollFinalChunks(CustomTestCase):
         self.assertEqual(scheduler._disagg_final_chunk_rooms, set())
 
     def test_waits_only_for_final_rooms_still_inflight(self):
-        scheduler, kv_manager = self.make_scheduler([1, 2, 3], [2, 3, 9])
+        scheduler, kv_manager = self.make_scheduler(
+            [1, 2, 3], [2, 3, 9], timeout_ms=400
+        )
         with envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.override(400):
             self.assertEqual(self.call(scheduler), ["done"])
         kv_manager.wait_for_transfer_rooms.assert_called_once_with({2, 3}, 0.4)
@@ -145,20 +149,24 @@ class TestSupplementalPollFinalChunks(CustomTestCase):
         # ranks that timed out must both run it exactly once.
         for wait_result in (True, False):
             with self.subTest(wait_result=wait_result):
-                scheduler, _ = self.make_scheduler([1], [1], wait_result)
+                scheduler, _ = self.make_scheduler(
+                    [1], [1], wait_result, timeout_ms=400
+                )
                 with envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.override(400):
                     self.call(scheduler)
                 scheduler.process_disagg_prefill_inflight_queue.assert_called_once_with()
 
     def test_skips_when_final_rooms_already_done(self):
-        scheduler, kv_manager = self.make_scheduler([1], [2])
+        scheduler, kv_manager = self.make_scheduler([1], [2], timeout_ms=400)
         with envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.override(400):
             self.assertEqual(self.call(scheduler), [])
         kv_manager.wait_for_transfer_rooms.assert_not_called()
         scheduler.process_disagg_prefill_inflight_queue.assert_not_called()
 
     def test_timeout_is_counted_and_summary_logged(self):
-        scheduler, _ = self.make_scheduler([1], [1], wait_result=False)
+        scheduler, _ = self.make_scheduler(
+            [1], [1], wait_result=False, timeout_ms=400
+        )
         scheduler._final_poll_wait_stats = {"start": time.monotonic() - 61}
         with envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.override(400):
             with self.assertLogs("sglang.srt.disaggregation.prefill", "INFO") as logs:
@@ -183,6 +191,7 @@ class TestSupplementalPollFinalChunks(CustomTestCase):
                 # The empty allocator stops send_kv_chunk right after recording.
                 scheduler = SimpleNamespace(
                     ps=SimpleNamespace(pp_size=pp_size),
+                    _mooncake_final_poll_timeout_ms=timeout_ms,
                     token_to_kv_pool_allocator=SimpleNamespace(),
                 )
                 with envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.override(timeout_ms):

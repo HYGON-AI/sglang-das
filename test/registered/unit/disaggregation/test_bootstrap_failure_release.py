@@ -86,6 +86,7 @@ class TestBootstrapFailureRelease(CustomTestCase):
 
 def _mooncake_linker(state):
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.host_prefetch_enabled = True
     linker.host_prefetch_lock = threading.Lock()
     linker.session_lock = threading.Lock()
     linker.prepared_load_sessions = {}
@@ -95,7 +96,6 @@ def _mooncake_linker(state):
             "state": state,
             "cancelled": False,
             "session_rid": "s-r",
-            "reserved_bytes": 1 << 20,
         }
     }
     linker._abort_prepared_load_now = MagicMock()
@@ -109,6 +109,7 @@ class TestReleaseFreesThePrefetch(CustomTestCase):
         wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
         wrapper.cache = MagicMock()
         wrapper.cache_linker = cache_linker
+        wrapper._waiting_queue_prefetch_enabled = True
         hit = ExternalCacheHitMarker(
             prefix_key=None, tail_hashes=["h"], device_hit_len=0
         )
@@ -167,7 +168,6 @@ def _live_linker():
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     linker.host_prefetch_enabled = True
     linker.host_prefetch_limit = 8
-    linker.host_prefetch_max_bytes = 1 << 30
     linker.host_prefetch_lock = threading.Lock()
     linker.host_prefetch_entries = {}
     linker.host_prefetch_queue = Queue()
@@ -185,9 +185,6 @@ def _live_linker():
         _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
         _tag_keys=lambda keys: list(keys),
     )
-    linker._get_host_prefetch_object_sizes = lambda transfers: {
-        key: 4 << 10 for transfer in transfers for key in transfer.keys
-    }
     linker.cancel_queued_load = MagicMock(return_value=False)
     return linker, native
 
@@ -216,6 +213,7 @@ class TestReleaseAcrossBackgroundSubmitStages(CustomTestCase):
         wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
         wrapper.cache = MagicMock()
         wrapper.cache_linker = self.linker
+        wrapper._waiting_queue_prefetch_enabled = True
         hit = ExternalCacheHitMarker(
             prefix_key=None, tail_hashes=[self.KEY], device_hit_len=0
         )

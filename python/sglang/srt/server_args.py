@@ -2965,7 +2965,9 @@ class ServerArgs:
         "Prefetch Mooncake DFS objects into its pinned session cache while "
         "requests wait in the FCFS scheduler queue. Hold admission until "
         "the prefetch is ready on all ranks; failures use the normal external "
-        "load path.",
+        "load path. When disabled, ignore the waiting-queue prefetch limits "
+        "and disable this client's DFS prefetch arena even if its size is "
+        "configured in the environment.",
         NS("memory"),
     ] = False
     mooncake_waiting_queue_dfs_prefetch_max_requests: A[
@@ -2980,12 +2982,6 @@ class ServerArgs:
         "for waiting-queue prefetch. Capped by the request limit.",
         NS("memory"),
     ] = 2
-    mooncake_waiting_queue_dfs_prefetch_max_bytes: A[
-        int,
-        "Maximum estimated active pinned-buffer capacity for waiting-queue "
-        "DFS prefetch per scheduler rank.",
-        NS("memory"),
-    ] = 1073741824
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
     # -------------------------------------------------------------------------
