@@ -7,6 +7,8 @@ from typing import Tuple
 import torch
 from diffusers.utils import logging
 
+from sglang.srt.utils import is_hcu
+
 
 def _env_flag(name, default="0"):
     value = os.environ.get(name, default)
@@ -236,6 +238,16 @@ def apply_rotary_pos_emb_qk(
             and positions.shape == (query.shape[1],)
         ):
             from sgl_kernel import rotary_embedding
+
+            if is_hcu():
+                rotary_embedding = getattr(
+                    torch.ops.sgl_kernel, "minimax_h3_rotary_embedding", None
+                )
+                if rotary_embedding is None:
+                    raise RuntimeError(
+                        "MiniMax-H3 on HCU requires its dedicated RoPE operator; "
+                        "rebuild sglang-kernel with setup_hip.py"
+                    )
 
             query = query.contiguous()
             key = key.contiguous()
