@@ -10,6 +10,10 @@ on:
         type: choice
         options: [preflight, execute]
         default: preflight
+      image:
+        description: SGLang image to test (full reference); empty uses the newest dated jenkins/model_test_env/sglang tag
+        type: string
+        default: ''
       cases:
         description: Exact cookbook section; empty tests all single-host deployments
         type: string
@@ -40,5 +44,6 @@ jobs:
       - name: Invoke maintained test controller
         uses: ./model-ci-tools/.github/actions/deployment-smoke
         with:
+          image: ${{ inputs.image || '' }}
           cases: ${{ inputs.cases || '' }}
           mode: ${{ inputs.mode || 'execute' }}
