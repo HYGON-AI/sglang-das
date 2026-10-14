@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional, Union
 
+import msgspec
 import torch
 
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -28,6 +29,12 @@ logger = logging.getLogger(__name__)
 
 _AITER_UNIFIED_MOE_CONFIG_CACHE: dict[tuple, Any] = {}
 _AITER_UNIFIED_MOE_FALLBACK_WARNINGS: set[tuple] = set()
+
+
+class _AiterWeightLayout(msgspec.Struct, frozen=True, kw_only=True):
+    signature: tuple
+    logical_shapes: tuple
+    packed_shapes: tuple
 
 
 @functools.cache
@@ -340,13 +347,6 @@ def _aiter_fused_moe_supports_no_combine() -> bool:
     return "no_combine" in inspect.signature(fused_moe).parameters
 
 
-@dataclass(frozen=True)
-class _AiterWeightLayout:
-    signature: tuple
-    logical_shapes: tuple
-    packed_shapes: tuple
-
-
 class AiterRunnerCore(MoeRunnerCore):
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
@@ -575,7 +575,9 @@ class AiterRunnerCore(MoeRunnerCore):
         moe_config: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.config.is_minimax_m3:
-            return self._get_legacy_weights(quant_info, moe_config)
+            return self._get_legacy_weights(
+                quant_info=quant_info, moe_config=moe_config
+            )
         w1 = quant_info.w13_weight
         w2 = quant_info.w2_weight
         if not moe_config.need_shuffle:
