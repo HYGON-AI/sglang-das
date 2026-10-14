@@ -1521,6 +1521,10 @@ class MQALayer(MqaAttentionBase):
                     token_to_kv_pool.swa_kv_pool.page_size,
                     False,
                 )
+                if use_cp:
+                    # The fused kernel only sees local CP tokens. Store the
+                    # normed KV after gathering into global token order below.
+                    swa_cache, swa_loc = None, None
 
             from sglang.kernels.ops.attention.fused_qk_norm_rope_store import (
                 fused_qk_norm_rope_swa_store,
@@ -1549,17 +1553,21 @@ class MQALayer(MqaAttentionBase):
             # current chunk (attn_k = kv) and save_kv_cache = kv is not None lets
             # the backend do its normal causally-indexed store into the ring
             # before the decode kernel runs -- exactly as the unfused path did.
-            if not (unified and fuse_verify):
+            if not ((unified and fuse_verify) or (not unified and use_cp)):
                 kv = None
 
             if not unified and use_cp:
-                # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
-                # write to the FlashMLA cache after gather.
-                kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
+                # The fused kernel already applied KV norm and RoPE in place.
+                # Gather that result rather than normalizing and rotating twice.
                 kv = cp_materialize_global_token_order(
                     kv.contiguous(),
                     forward_batch,
                     torch.cuda.current_stream(),
+                )
+                attn_backend.store_cache(
+                    layer_id=self.layer_id,
+                    swa_k=kv,
+                    forward_batch=forward_batch,
                 )
         elif _is_npu:
             q_lora = self.q_norm(q_lora)
@@ -1752,11 +1760,10 @@ class MQALayer(MqaAttentionBase):
             # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
             # this rank and padded to match.
             padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
-            # Only [0:n_local_heads] is written below. Uninitialized padded TP
-            # heads inject NaN into attention on gfx942 (fnuz), so zero-init
-            # there; other archs tolerate new_empty and skip the per-forward
-            # memset.
-            if _is_gfx942_supported:
+            # Only [0:n_local_heads] is written below. Padded TP heads must
+            # be finite for gfx942 and HCU sparse attention; allocator reuse
+            # can otherwise feed NaN into the valid heads' attention output.
+            if _is_gfx942_supported or _is_hcu:
                 q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
             else:
                 q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
