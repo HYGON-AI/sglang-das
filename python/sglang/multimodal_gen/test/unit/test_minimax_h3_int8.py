@@ -142,7 +142,7 @@ class TestMiniMaxH3Int8Scope(unittest.TestCase):
         fn = next(
             n
             for n in tree.body
-            if isinstance(n, ast.FunctionDef) and n.name == "_use_int8_fp32_modulation"
+            if isinstance(n, ast.FunctionDef) and n.name == "_use_quant_fp32_modulation"
         )
         namespace = {}
         exec(

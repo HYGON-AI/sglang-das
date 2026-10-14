@@ -308,15 +308,15 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
-def _use_int8_fp32_modulation(arch, quant_config) -> bool:
+def _use_quant_fp32_modulation(arch, quant_config) -> bool:
     if quant_config is None or arch.adaln_curve_grid is None:
         return False
     from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant import (
-        MiniMaxH3Int8Config,
+        MiniMaxH3QuantConfig,
     )
 
     return (
-        isinstance(quant_config, MiniMaxH3Int8Config)
+        isinstance(quant_config, MiniMaxH3QuantConfig)
         and quant_config.compressed_adaln
         and quant_config.fused
         and arch.adaln_curve_grid is not None
@@ -1488,7 +1488,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         use_adaln_cache: bool = False,
     ) -> None:
         super().__init__()
-        self._fused_fp32_modulation = _use_int8_fp32_modulation(arch, quant_config)
+        self._fused_fp32_modulation = _use_quant_fp32_modulation(arch, quant_config)
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
         self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
         self.attn = MiniMaxH3Attention(
@@ -1602,7 +1602,7 @@ class MiniMaxH3FinalLayer(nn.Module):
         use_adaln_cache: bool = False,
     ) -> None:
         super().__init__()
-        self._fused_fp32_modulation = _use_int8_fp32_modulation(arch, quant_config)
+        self._fused_fp32_modulation = _use_quant_fp32_modulation(arch, quant_config)
         video_patch_dim = (
             arch.latents_dim
             * arch.patch_size[0]
