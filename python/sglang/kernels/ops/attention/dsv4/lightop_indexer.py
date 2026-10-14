@@ -53,6 +53,32 @@ def _lightop_modules():
 
 
 @functools.cache
+def lightop_candidate_mask_available() -> bool:
+    """Check the fused logical-ID/mask interface required by the dense selector."""
+    if not _is_hcu:
+        return False
+    modules = _lightop_modules()
+    return modules is not None and all(
+        hasattr(module, "dsv41_select_candidate_blocks") for module in modules
+    )
+
+
+def candidate_block_mask(
+    logits: torch.Tensor, seq_lens: torch.Tensor, topk_blocks: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not lightop_candidate_mask_available():
+        raise RuntimeError(
+            "SGLANG_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS=1 requires LightOp "
+            "dsv41_select_candidate_blocks (Python wrapper and native operator); "
+            "rebuild or upgrade LightOp"
+        )
+    _, attention = _lightop_modules()
+    return attention.dsv41_select_candidate_blocks(
+        logits, _int32_lens(seq_lens), topk_blocks
+    )
+
+
+@functools.cache
 def lightop_paged_indexer_available() -> bool:
     """True when the paged fp4 decode indexer can run on LightOp: HCU, the flag
     on, and a LightOp build providing the paged ABI and the candidate table."""
