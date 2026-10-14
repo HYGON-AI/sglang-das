@@ -375,7 +375,6 @@ if _use_lightop_sqrtsoftplus_v41_gate:
 
 _use_lightop_moe_gate_pad_int64_fusion = (
     _use_lightop_sqrtsoftplus_v41_gate
-    and get_bool_env_var("SGLANG_USE_LIGHTOP_MOE_GATE_PAD_INT64_FUSION", "false")
     and hasattr(op, "moe_fused_gate_sqrtsoftplus_v41_hcu_fused")
 )
 
