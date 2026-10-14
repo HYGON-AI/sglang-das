@@ -506,6 +506,16 @@ def _apply_rope_qk(
 
     from sgl_kernel import rotary_embedding as apply_sgl_kernel_rotary_embedding
 
+    if is_hcu():
+        apply_sgl_kernel_rotary_embedding = getattr(
+            torch.ops.sgl_kernel, "minimax_h3_rotary_embedding", None
+        )
+        if apply_sgl_kernel_rotary_embedding is None:
+            raise RuntimeError(
+                "MiniMax-H3 on HCU requires its dedicated RoPE operator; "
+                "rebuild sglang-kernel with setup_hip.py"
+            )
+
     apply_sgl_kernel_rotary_embedding(
         positions,
         q.view(q.shape[0], -1),
