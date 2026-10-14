@@ -70,6 +70,7 @@ class MoeRunnerConfig:
     gate_up_interleaved: bool = True
     layer: Optional[torch.nn.Module] = None
     use_tp_all_gather_activation: bool = False
+    is_minimax_m3: bool = False
     # Request FP32 SiLU/multiply intermediates until FP8 quantization.
     # False preserves backend defaults, including their existing FP32 paths.
     silu_mul_keep_fp32: bool = False

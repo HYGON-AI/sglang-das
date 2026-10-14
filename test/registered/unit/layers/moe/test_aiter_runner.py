@@ -294,6 +294,7 @@ def test_unified_aiter_moe_c_uses_oai_activation_and_interleaved_scale(
             gemm1_alpha=1.702,
             gemm1_clamp_limit=7.0,
             gate_up_interleaved=False,
+            is_minimax_m3=True,
         )
     )
     config = SimpleNamespace(
@@ -348,6 +349,7 @@ def test_unified_aiter_moe_c_interleaves_minimax_gate_up_before_shuffle(
             gemm1_alpha=1.702,
             gemm1_clamp_limit=7.0,
             gate_up_interleaved=False,
+            is_minimax_m3=True,
         )
     )
     w1 = torch.tensor([[[1.0], [2.0], [10.0], [20.0]]])

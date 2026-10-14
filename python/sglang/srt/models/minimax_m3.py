@@ -572,6 +572,7 @@ class MiniMaxM3MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
             gate_up_interleaved=False,
         )
+        self.experts.moe_runner_config.is_minimax_m3 = True
         self.topk = TopK(
             top_k=(
                 config.num_experts_per_tok
