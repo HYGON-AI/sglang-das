@@ -147,8 +147,6 @@ class MiniMaxH3QuantConfig(QuantizationConfig):
                 "use --transformer-weights-path"
             )
         self.targets = frozenset(targets)
-        if compressed_adaln and self.precision != "int8":
-            raise ValueError("Compressed AdaLN is only supported by the INT8 export")
         self.compressed_adaln = compressed_adaln
         self.fused = _quant_optimize(self.precision)
 
@@ -537,7 +535,7 @@ FP8_FORMAT = "h3_channel_fp8_main_blocks_v1"
 
 
 def inspect_fp8_checkpoint(paths):
-    """Recognize only the standalone exporter's full-AdaLN Diffusers format."""
+    """Recognize the standalone exporter's full/curve-AdaLN Diffusers format."""
     from safetensors import safe_open
 
     roots = {Path(path).resolve().parent for path in paths}
@@ -546,10 +544,28 @@ def inspect_fp8_checkpoint(paths):
     manifest_path = roots.pop() / "manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
     recognized = manifest.get("recipe") == FP8_RECIPE
+    explicit_variant = manifest.get("variant")
+    source_component = manifest.get("source_component") or Path(
+        manifest.get("source", "")
+    ).name
+    if recognized:
+        checkpoint_variant = explicit_variant or "fl2va"
+        expected_component = {
+            "fl2va": "transformer",
+            "ref2va": "transformer_ref",
+        }.get(checkpoint_variant)
+        if expected_component is None or source_component != expected_component:
+            raise ValueError("MiniMax-H3 FP8 manifest variant/source component mismatch")
+        if explicit_variant is None and source_component != "transformer":
+            raise ValueError("Only the legacy FL2VA FP8 export may omit its variant")
+        profile = manifest.get("profile", "backbone")
+        if profile not in ("backbone", "backbone-adaln"):
+            raise ValueError("Unsupported MiniMax-H3 FP8 profile")
     tensors = {}
     for path in paths:
         with safe_open(path, framework="pt", device="cpu") as checkpoint:
-            tagged = (checkpoint.metadata() or {}).get("recipe") == FP8_FORMAT
+            metadata = checkpoint.metadata() or {}
+            tagged = metadata.get("recipe") == FP8_FORMAT
             if not recognized:
                 if tagged:
                     raise ValueError(
@@ -558,6 +574,13 @@ def inspect_fp8_checkpoint(paths):
                 continue
             if not tagged:
                 raise ValueError("Mixed MiniMax-H3 FP8 checkpoint formats")
+            shard_variant = metadata.get("variant")
+            if explicit_variant is not None and shard_variant != checkpoint_variant:
+                raise ValueError("MiniMax-H3 FP8 shard variant mismatch")
+            if explicit_variant is None and shard_variant not in (None, "fl2va"):
+                raise ValueError("Invalid variant tag in legacy MiniMax-H3 FP8 shard")
+            if profile == "backbone-adaln" and metadata.get("profile") != profile:
+                raise ValueError("MiniMax-H3 FP8 shard AdaLN profile mismatch")
             for name in checkpoint.keys():
                 if name in tensors:
                     raise ValueError(f"Duplicate checkpoint tensor: {name}")
@@ -605,6 +628,24 @@ def inspect_fp8_checkpoint(paths):
                 raise ValueError(f"Invalid FP8 weight or per-channel scale: {name}")
         elif dtype not in ("BF16", "F16", "F32") or name.endswith("weight_scale_inv"):
             raise ValueError(f"Unexpected unquantized FP8 checkpoint tensor: {name}")
+    if profile == "backbone-adaln":
+        if tensors.get("adaln_t_table") != ("F32", [1025, 8]):
+            raise ValueError("Compressed AdaLN requires an FP32 [1025,8] table")
+        projections = {
+            **{f"transformer_blocks.{i}.adaln_proj.linear": 96768 for i in range(50)},
+            "norm_out.linear": 10752,
+        }
+        for prefix, rows in projections.items():
+            if tensors.get(prefix + ".weight") != ("F32", [rows, 8]) or tensors.get(
+                prefix + ".bias"
+            ) != ("F32", [rows]):
+                raise ValueError(f"Invalid compressed FP8 AdaLN projection: {prefix}")
+        if any(name.startswith("time_embedder.") for name in tensors):
+            raise ValueError("Compressed AdaLN must not contain the original time MLP")
+    elif "adaln_t_table" in tensors:
+        raise ValueError("Full AdaLN profile must not contain a compressed table")
+    manifest["_validated_variant"] = checkpoint_variant
+    manifest["_validated_source_component"] = source_component
     return manifest
 
 
@@ -641,11 +682,13 @@ def inspect_quant_checkpoint(paths, selected_variant):
         return config, False, (1025, 8) if compressed else None
     manifest = inspect_fp8_checkpoint(paths)
     if manifest is not None:
-        if selected_variant.lower() != "fl2va":
-            raise ValueError(
-                "This MiniMax-H3 FP8 export requires --model-variant fl2va"
-            )
-        return MiniMaxH3Fp8Config(targets=backbone_layers()), True, None
+        if selected_variant.lower() != manifest["_validated_variant"]:
+            raise ValueError("MiniMax-H3 FP8 checkpoint model variant mismatch")
+        compressed = manifest.get("profile", "backbone") == "backbone-adaln"
+        config = MiniMaxH3Fp8Config(
+            targets=backbone_layers(), compressed_adaln=compressed
+        )
+        return config, True, (1025, 8) if compressed else None
     return None
 
 
