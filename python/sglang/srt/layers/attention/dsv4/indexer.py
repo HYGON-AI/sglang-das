@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+import math
+import os
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -37,13 +40,14 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.mem_cache.cp_cache_layer_split.pool_base import is_cp_cache_layer_split_pool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner_utils import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel, get_schedule
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import (
     add_prefix,
@@ -70,6 +74,106 @@ _is_aiter_fp8_paged_mqa_logits_supported = is_gfx942_supported() or is_gfx95_sup
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
 logger = logging.getLogger(__name__)
+
+
+_FRACTION_ENV = "SGLANG_DSV4_PAGED_MQA_LOGITS_FREE_MEM_FRACTION"
+_budget_cache = {}
+
+
+@dataclass(frozen=True)
+class PagedMQAChunkPlan:
+    rows_per_chunk: int
+    budget_bytes: int
+    output_width: int
+    use_prefill: bool
+
+
+def explicit_mqa_fraction():
+    """Absence disables this V4 path; the DSA environment is independent."""
+    raw = os.environ.get(_FRACTION_ENV)
+    if raw is None:
+        return None
+    try:
+        fraction = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{_FRACTION_ENV} must be a finite number in (0, 1], got {raw!r}") from exc
+    if not math.isfinite(fraction) or not 0 < fraction <= 1:
+        raise ValueError(f"{_FRACTION_ENV} must be in (0, 1], got {raw!r}")
+    return fraction
+
+
+def _budget_bytes(device, fraction, mem_fraction_static):
+    device_index = torch.device(device).index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    key = (device_index, fraction, mem_fraction_static)
+    if key in _budget_cache:
+        return _budget_cache[key]
+    total = int(torch.cuda.get_device_properties(device_index).total_memory)
+    total_guard = int(total * 0.3)
+    static_guard = total_guard
+    if mem_fraction_static is not None:
+        static_guard = min(
+            total_guard, int(int(total * max(0.0, 1.0 - mem_fraction_static)) * fraction)
+        )
+    free, device_total = torch.cuda.mem_get_info(device_index)
+    try:
+        stats = torch.cuda.memory_stats(device_index)
+        reusable = max(
+            0,
+            int(stats["reserved_bytes.all.current"])
+            - int(stats["active_bytes.all.current"])
+            - int(stats["inactive_split_bytes.all.current"]),
+        )
+        free = min(int(device_total), int(free) + reusable)
+    except (KeyError, RuntimeError, TypeError, ValueError):
+        pass
+    budget = max(1, min(int(free * fraction), static_guard))
+    _budget_cache[key] = budget
+    return budget
+
+
+def make_paged_mqa_chunk_plan(q, max_seq_len, *, use_prefill, mem_fraction_static):
+    fraction = explicit_mqa_fraction()
+    if fraction is None:
+        return None
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Paged MQA row chunk planning requires eager execution")
+    if q.shape[0] < 1 or max_seq_len < 1:
+        return None
+    # The ordinary paged kernel allocates a physical width rounded to page size.
+    width = max_seq_len if use_prefill else (max_seq_len + 63) // 64 * 64
+    budget = _budget_bytes(q.device, fraction, mem_fraction_static)
+    rows = min(q.shape[0], max(1, budget // (4 * width)))
+    return PagedMQAChunkPlan(rows, budget, width, use_prefill)
+
+
+def run_int8_paged_mqa_chunks(
+    fn, q, kv_cache, weights, seq_lens, block_table, max_seq_len,
+    *, rows_per_chunk, use_prefill, consume_logits, label="",
+):
+    """Consume each FP32 logits chunk immediately; the callback must not retain it.
+
+    Prefix-prefill reads only the first page-table row: use it exclusively for a
+    proven single-request batch with no metadata row padding. Mixed or unknown
+    ownership must use the ordinary paged kernel's per-query page table.
+    """
+    if rows_per_chunk <= 0:
+        raise ValueError("rows_per_chunk must be positive")
+    rows = q.shape[0]
+    if any(t.shape[0] != rows for t in (weights, seq_lens, block_table)):
+        raise ValueError("INT8 paged MQA inputs must have the same Q row count")
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Paged MQA row chunks require eager execution")
+    for start in range(0, rows, rows_per_chunk):
+        end = min(start + rows_per_chunk, rows)
+        logits = fn(
+            q[start:end], kv_cache, weights[start:end], seq_lens[start:end],
+            block_table[start:end], None, max_seq_len, False, use_prefill,
+        )
+        consume_logits(logits, start, end)
+        # Release before the next RHS allocation, avoiding two live chunks.
+        del logits
 
 
 IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -911,6 +1015,7 @@ class C4IndexerBackendMixin:
             else None
         )
         persistent_mqa_selected = False
+        mqa_chunk_plan = None
         if nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
             logits = self._forward_nonpaged_indexer(
@@ -997,17 +1102,40 @@ class C4IndexerBackendMixin:
                         num_sms=_PERSISTENT_MQA_NUM_SMS,
                     )
                 else:
-                    logits = fn(
-                        q_int8,
-                        packed_cache,
-                        adjusted_weights,
-                        c4_seq_lens.reshape(-1).to(torch.int32).contiguous(),
-                        indexer_page_table.to(torch.int32).contiguous(),
-                        None,
-                        indexer_metadata.max_c4_seq_len,
-                        False,
-                        forward_batch.forward_mode == ForwardMode.EXTEND,
-                )
+                    if (
+                        envs.SGLANG_DSV4_PAGED_MQA_LOGITS_FREE_MEM_FRACTION.is_set()
+                        and forward_batch.forward_mode == ForwardMode.EXTEND
+                        and get_disagg().disaggregation_mode != "decode"
+                        and not graph_mqa_route
+                        and not get_is_capture_mode()
+                        and not use_fp4_indexer
+                        and not _use_tilelang
+                        and not _use_aiter
+                        and not self.debug_use_external_c4_sparse_indices
+                    ):
+                        # Only a known single request may share the first table.
+                        use_prefix_prefill = (
+                            forward_batch.batch_size == 1
+                            and indexer_metadata.c4_seq_lens.shape[0] == query_rows
+                            and indexer_metadata.page_table.shape[0] == query_rows
+                        )
+                        mqa_chunk_plan = make_paged_mqa_chunk_plan(
+                            q_int8, max_seq_len,
+                            use_prefill=use_prefix_prefill,
+                            mem_fraction_static=get_schedule().mem_fraction_static,
+                        )
+                    if mqa_chunk_plan is None:
+                        logits = fn(
+                            q_int8,
+                            packed_cache,
+                            adjusted_weights,
+                            c4_seq_lens.reshape(-1).to(torch.int32).contiguous(),
+                            indexer_page_table.to(torch.int32).contiguous(),
+                            None,
+                            indexer_metadata.max_c4_seq_len,
+                            False,
+                            forward_batch.forward_mode == ForwardMode.EXTEND,
+                    )
             else:
                 c4_indexer_kv_cache = (
                     token_to_kv_pool.get_index_k_with_scale_buffer(
@@ -1078,66 +1206,136 @@ class C4IndexerBackendMixin:
         elif getattr(core_metadata, "c4_sparse_raw_indices", None) is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
-        if raw_indices is not None:
-            assert raw_indices.shape[0] == logits.shape[0], (
-                "C4 topk raw_indices must use the same local batch as logits, "
-                f"got raw_indices.shape={raw_indices.shape}, logits.shape={logits.shape}"
-            )
+        if mqa_chunk_plan is not None:
+            if raw_indices is not None:
+                assert raw_indices.shape[0] == query_rows
 
-        if (
-            envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
-            or self.dsa_topk_backend.is_torch()
-        ):
-            topk_transform_512_pytorch_vectorized(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
-            )
-        elif self.dsa_topk_backend.is_flashinfer():
-            topk_transform_512_flashinfer_unfused(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
-            )
-        elif (
-            envs.SGLANG_OPT_USE_TOPK_V2.get()
-            and torch.version.hip is None
-            and raw_indices is None
-        ):
-            topk_transform_512_v2(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                indexer_metadata.topk_metadata,
-            )
-        elif envs.SGLANG_LIGHTOP_TOPK.get():
-            from lightop import topk_transform_512 as lightop_topk_transform_512
+            def consume_chunk_logits(chunk_logits, start, end):
+                chunk_raw_indices = None if raw_indices is None else raw_indices[start:end]
+                if (
+                    envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
+                    or self.dsa_topk_backend.is_torch()
+                ):
+                    topk_transform_512_pytorch_vectorized(
+                        chunk_logits,
+                        c4_seq_lens[start:end],
+                        page_table[start:end],
+                        c4_sparse_page_indices[start:end],
+                        indexer_metadata.c4_page_size,
+                        chunk_raw_indices,
+                    )
+                elif self.dsa_topk_backend.is_flashinfer():
+                    topk_transform_512_flashinfer_unfused(
+                        chunk_logits,
+                        c4_seq_lens[start:end],
+                        page_table[start:end],
+                        c4_sparse_page_indices[start:end],
+                        indexer_metadata.c4_page_size,
+                        chunk_raw_indices,
+                    )
+                elif (
+                    envs.SGLANG_OPT_USE_TOPK_V2.get()
+                    and torch.version.hip is None
+                    and raw_indices is None
+                ):
+                    topk_transform_512_v2(
+                        chunk_logits,
+                        c4_seq_lens[start:end],
+                        page_table[start:end],
+                        c4_sparse_page_indices[start:end],
+                        indexer_metadata.c4_page_size,
+                        indexer_metadata.topk_metadata,
+                    )
+                elif envs.SGLANG_LIGHTOP_TOPK.get():
+                    from lightop import topk_transform_512 as lightop_topk_transform_512
 
-            lightop_topk_transform_512(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
+                    lightop_topk_transform_512(
+                        chunk_logits,
+                        c4_seq_lens[start:end],
+                        page_table[start:end],
+                        c4_sparse_page_indices[start:end],
+                        indexer_metadata.c4_page_size,
+                        chunk_raw_indices,
+                    )
+                else:
+                    topk_transform_512(
+                        chunk_logits,
+                        c4_seq_lens[start:end],
+                        page_table[start:end],
+                        c4_sparse_page_indices[start:end],
+                        indexer_metadata.c4_page_size,
+                        chunk_raw_indices,
+                    )
+
+            run_int8_paged_mqa_chunks(
+                fn, q_int8, packed_cache, adjusted_weights, seq_lens_i32,
+                block_table_i32, max_seq_len,
+                rows_per_chunk=mqa_chunk_plan.rows_per_chunk,
+                use_prefill=mqa_chunk_plan.use_prefill,
+                consume_logits=consume_chunk_logits,
+                label=f"layer={c4_indexer.layer_id}",
             )
         else:
-            topk_transform_512(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
-            )
+            if raw_indices is not None:
+                assert raw_indices.shape[0] == logits.shape[0], (
+                    "C4 topk raw_indices must use the same local batch as logits, "
+                    f"got raw_indices.shape={raw_indices.shape}, logits.shape={logits.shape}"
+                )
+
+            if (
+                envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
+                or self.dsa_topk_backend.is_torch()
+            ):
+                topk_transform_512_pytorch_vectorized(
+                    logits,
+                    c4_seq_lens,
+                    page_table,
+                    c4_sparse_page_indices,
+                    indexer_metadata.c4_page_size,
+                    raw_indices,
+                )
+            elif self.dsa_topk_backend.is_flashinfer():
+                topk_transform_512_flashinfer_unfused(
+                    logits,
+                    c4_seq_lens,
+                    page_table,
+                    c4_sparse_page_indices,
+                    indexer_metadata.c4_page_size,
+                    raw_indices,
+                )
+            elif (
+                envs.SGLANG_OPT_USE_TOPK_V2.get()
+                and torch.version.hip is None
+                and raw_indices is None
+            ):
+                topk_transform_512_v2(
+                    logits,
+                    c4_seq_lens,
+                    page_table,
+                    c4_sparse_page_indices,
+                    indexer_metadata.c4_page_size,
+                    indexer_metadata.topk_metadata,
+                )
+            elif envs.SGLANG_LIGHTOP_TOPK.get():
+                from lightop import topk_transform_512 as lightop_topk_transform_512
+
+                lightop_topk_transform_512(
+                    logits,
+                    c4_seq_lens,
+                    page_table,
+                    c4_sparse_page_indices,
+                    indexer_metadata.c4_page_size,
+                    raw_indices,
+                )
+            else:
+                topk_transform_512(
+                    logits,
+                    c4_seq_lens,
+                    page_table,
+                    c4_sparse_page_indices,
+                    indexer_metadata.c4_page_size,
+                    raw_indices,
+                )
         if hisparse_coordinator is not None:
             if hisparse_decode:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
