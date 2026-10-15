@@ -446,18 +446,6 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_auto():
             moe_runner_backend = MoeRunnerBackend.TRITON
 
-        if (
-            _is_hcu
-            and moe_runner_backend.is_triton()
-            and not _use_fp8_w8a8_moe
-            and get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE", default="true")
-        ):
-            # Triton's legacy HCU fallback also dispatches to AITER, but passes
-            # canonical weights to backends that require shuffled storage. Use
-            # the unified runner, which owns the one-time in-place shuffle and
-            # keeps the chosen layout stable across warmup and graph replay.
-            moe_runner_backend = MoeRunnerBackend.AITER
-
         if moe_runner_backend.is_aiter() and _is_hcu:
             self.runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
         elif moe_runner_backend.is_triton():
