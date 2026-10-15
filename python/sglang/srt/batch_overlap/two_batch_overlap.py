@@ -1156,6 +1156,18 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
             handle_list.append(inner.register_deepep_dispatch_hook(hook))
         return handle_list
 
+    def register_deepep_combine_hook(self, hook):
+        # K3 SBO: mirror the dispatch hook without bypassing dispatcher wrappers.
+        handle_list = []
+        try:
+            for inner in self._inners:
+                handle_list.append(inner.register_deepep_combine_hook(hook))
+        except Exception:
+            for handle in handle_list:
+                handle.remove()
+            raise
+        return handle_list
+
     def set_quant_config(self, quant_config: dict):
         super().set_quant_config(quant_config)
         for inner in self._inners:
