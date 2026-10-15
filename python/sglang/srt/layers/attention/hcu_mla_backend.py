@@ -834,6 +834,23 @@ class HCUMLABackend(AttentionBackend):
             ):
                 reshape_q = _pad_last_dim(reshape_q, self.kv_cache_dim)
             if is_fp8 and not is_bmz_fp8(k_cache):
+                # K3 post fusion already supplies packed Q in the cache dtype.
+                # Keep it packed: the with_cat FP8 path assumes dense components.
+                if _is_hcu and reshape_q.dtype == k_cache_reshaped.dtype:
+                    o, _ = flash_mla_with_kvcache_fp8(
+                        q=reshape_q,
+                        k_cache=k_cache_reshaped,
+                        block_table=block_table,
+                        cache_seqlens=cache_seqlens,
+                        head_dim_v=self.kv_lora_rank,
+                        tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
+                        num_splits=self.forward_metadata.num_splits,
+                        softmax_scale=scaling,
+                        causal=True,
+                        descale_k=self.k_scale,
+                        descale_q=self.q_scale,  # 不能传torch.tensor(1.0)，只能传torch.ones((1))，而且不能和descale_k使用同一个张量
+                    )
+                    return o
                 # gfx938 e4m3 accepts bf16 q_nope/q_pe against an fp8 KV cache.
                 # Casting the absorbed query (dim 576) to fp8 with scale 1
                 # saturates it, so later tokens no longer match the prefill logit.
