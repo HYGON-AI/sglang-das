@@ -728,7 +728,9 @@ class UnifiedCacheLinkerWrapper:
                 self.hit_markers[req.rid] = hit
                 return self.load_back(req)
             prepared_from_host_prefetch = True
-        elif self._waiting_queue_prefetch_enabled:
+        else:
+            # Ordinary LOAD construction must agree across ranks even when
+            # waiting-queue prefetch is disabled.
             component_transfers, constructed, build_error = self._build_load_transfers(
                 req, tail_hashes
             )
@@ -747,23 +749,6 @@ class UnifiedCacheLinkerWrapper:
                     pending=build_error,
                 )
                 return empty_indices, req.last_node
-        else:
-            # With prefetch disabled, keep the original rank-local construction
-            # and failure path without a construction-verdict collective.
-            component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
-            for component in cache._components_tuple:
-                transfer = component.build_external_linker_transfer(
-                    LinkerTransferPhase.LOAD, None, tail_hashes
-                )
-                if transfer is None:
-                    self._update_load(
-                        ExternalLinkerLoadPhase.ABORT,
-                        req,
-                        component_transfers,
-                        prefix_len,
-                    )
-                    return empty_indices, req.last_node
-                component_transfers.append((component, transfer))
 
         # Keys can be evicted remotely (master memory-watermark eviction)
         # between the match-time lookup and this load-back; a stale hit would

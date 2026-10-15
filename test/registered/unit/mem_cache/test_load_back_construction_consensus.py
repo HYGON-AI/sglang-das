@@ -1,4 +1,4 @@
-"""With waiting-queue prefetch enabled, load_back agrees on LOAD construction.
+"""load_back agrees on LOAD construction with or without waiting-queue prefetch.
 
 Building a LOAD transfer allocates device slots and can fail on one rank
 alone. Every rank must then abort together, each freeing what it built and
@@ -204,8 +204,26 @@ SCENARIOS = {
     "mixed_claim_fails_one_rank": ("mixed", {}, False, {0: "fail"}),
     "mixed_claim_raises_one_rank": ("mixed", {}, False, {1: "raise"}),
     "mixed_build_raises_on_no_prefetch_rank": ("mixed", {3: (1, "raise")}, False, {}),
+    "disabled_layer_split_none": (
+        "disabled_layer_split",
+        {3: (1, "none")},
+        False,
+        {},
+    ),
+    "disabled_no_layer_split_none": (
+        "disabled_no_layer_split",
+        {3: (1, "none")},
+        False,
+        {},
+    ),
+    "disabled_all_built": ("disabled_layer_split", {}, False, {}),
 }
 NO_PREFETCH_NEEDED_RANKS = {2, 3}
+DISABLED_SCENARIOS = {
+    "disabled_layer_split_none",
+    "disabled_no_layer_split_none",
+    "disabled_all_built",
+}
 
 
 def _cache(cp_group, tp_group, components, reductions):
@@ -231,14 +249,11 @@ def _cache(cp_group, tp_group, components, reductions):
     return cache
 
 
-def _wrapper(cache, backend, prefetch):
+def _wrapper(cache, backend, prefetch, *, waiting_queue_prefetch_enabled=True):
     wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
     wrapper.cache = cache
     wrapper.cache_linker = backend
-    # All consensus cases keep the feature enabled; ``prefetch`` selects a
-    # prefetched hit versus its ordinary fallback. OFF semantics are tested in
-    # test_mooncake_waiting_queue_no_prefetch_needed.py.
-    wrapper._waiting_queue_prefetch_enabled = True
+    wrapper._waiting_queue_prefetch_enabled = waiting_queue_prefetch_enabled
     hit = ExternalCacheHitMarker(
         prefix_key=None, tail_hashes=["h0", "h1"], device_hit_len=0
     )
@@ -263,6 +278,9 @@ def _rank(rank, world_size, port, results):
         reval = dist.new_group([0, 1, 2, 3], backend="gloo")
         out = {}
         for name, (path, failures, other_holder, claims) in SCENARIOS.items():
+            prefetch_enabled = not path.startswith("disabled_")
+            has_layer_split_revalidation = path != "disabled_no_layer_split"
+            has_prefetched_hit = path in ("prefetch", "mixed")
             # One allocator pair for all repeats: a leak accumulates.
             components = [FakeComponent(PoolName.KV), FakeComponent(PoolName.SWA)]
             if rank in failures:
@@ -270,6 +288,7 @@ def _rank(rank, world_size, port, results):
                 components[index].failure = failure
             claim = claims.get(rank, "ok")
             reps = []
+            mask_reps = []
             for _ in range(REPEATS):
                 reductions = []
                 cache = _cache(cp[rank // 2], tp[rank % 2], components, reductions)
@@ -277,19 +296,27 @@ def _rank(rank, world_size, port, results):
 
                 def revalidate_load(transfers, _seen=revalidated):
                     _seen.append(1)
-                    verdict = torch.ones(1, dtype=torch.int)
-                    dist.all_reduce(verdict, op=dist.ReduceOp.MIN, group=reval)
-                    return False  # stop right after it: a plain miss
+                    if has_layer_split_revalidation:
+                        verdict = torch.ones(1, dtype=torch.int)
+                        dist.all_reduce(verdict, op=dist.ReduceOp.MIN, group=reval)
+                    # Disabled-prefetch success cases should reach PREPARE;
+                    # existing cases stop here to model a stale-key miss.
+                    return not prefetch_enabled
 
                 no_prefetch = path == "mixed" and rank in NO_PREFETCH_NEEDED_RANKS
                 if no_prefetch:
                     backend, ended = _no_prefetch_needed_backend()
-                elif path in ("prefetch", "mixed"):
+                elif has_prefetched_hit:
                     backend, ended = _prefetch_backend(other_holder, claim)
                 else:
                     backend, ended = MagicMock(), None
                 backend.revalidate_load = revalidate_load
-                wrapper = _wrapper(cache, backend, path != "normal")
+                wrapper = _wrapper(
+                    cache,
+                    backend,
+                    has_prefetched_hit,
+                    waiting_queue_prefetch_enabled=prefetch_enabled,
+                )
                 try:
                     indices, node = wrapper.load_back(
                         types.SimpleNamespace(rid="r", last_node="node")
@@ -305,6 +332,21 @@ def _rank(rank, world_size, port, results):
                 if result == "prepare":
                     for c in components:  # the load owns them now
                         c.allocated = 0
+                if name in DISABLED_SCENARIOS:
+                    common_pages = wrapper._sync_restorable_prefix(
+                        [1, 2],
+                        num_pages=2,
+                        device_hit_pages=0,
+                    )
+                    mask_reps.append(
+                        (
+                            common_pages,
+                            tuple(
+                                1 if isinstance(reduction, int) else len(reduction)
+                                for reduction in reductions
+                            ),
+                        )
+                    )
                 reps.append(
                     (
                         result,
@@ -312,7 +354,7 @@ def _rank(rank, world_size, port, results):
                         len(revalidated),
                         (
                             None
-                            if path == "normal" or result == "prepare"
+                            if not has_prefetched_hit or result == "prepare"
                             else (
                                 _no_prefetch_needed_released(backend, ended)
                                 if no_prefetch
@@ -332,6 +374,8 @@ def _rank(rank, world_size, port, results):
                     )
                 )
             out[name] = reps
+            if name in DISABLED_SCENARIOS:
+                out[f"{name}__mask"] = mask_reps
         dist.barrier()
         results[rank] = out
     finally:
@@ -389,6 +433,11 @@ class TestConstructionConsensus(CustomTestCase):
             "prefetch_all_built": ("prepare", [1, 1], 0, None, 3, 2),
             # Agreement passes, revalidate_load runs, then its miss frees all.
             "all_built": ("miss", [0, 0], 1, None, 1, None),
+            # Prefetch disabled still agrees on construction before either
+            # LayerSplit revalidation or the later prefix-mask reduction.
+            "disabled_layer_split_none": ("miss", [0, 0], 0, None, 2, None),
+            "disabled_no_layer_split_none": ("miss", [0, 0], 0, None, 2, None),
+            "disabled_all_built": ("prepare", [1, 1], 1, None, 2, None),
         }
         # The rank whose build or claim raised re-raises after the same
         # agreement and cleanup; nobody retries the normal path.
@@ -425,6 +474,13 @@ class TestConstructionConsensus(CustomTestCase):
                     self.assertEqual(len(out[name]), REPEATS)
                     for rep, got in enumerate(out[name]):
                         self.assertEqual(got, want, f"repeat {rep}")
+
+        for name in DISABLED_SCENARIOS:
+            rank_masks = [out[f"{name}__mask"] for out in outcomes]
+            self.assertEqual(rank_masks, [rank_masks[0]] * 4)
+            for common_pages, reduction_shapes in rank_masks[0]:
+                self.assertEqual(common_pages, 2)
+                self.assertEqual(reduction_shapes, (1, 3))
 
 
 class TestInterruptDuringConstruction(CustomTestCase):
@@ -727,6 +783,117 @@ class TestComponentRollback(CustomTestCase):
                 LinkerTransferPhase.LOAD, None, ["k0", "k1"]
             )
         allocator.free.assert_called_once_with(slots)
+
+
+def _offload_completion_rank(rank, port, outputs):
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=2,
+        timeout=datetime.timedelta(seconds=60),
+    )
+    try:
+        nodes = {
+            node_id: types.SimpleNamespace(
+                id=node_id,
+                external_cache_stored=True,
+                detached=False,
+                write_through_pending_id=node_id,
+            )
+            for node_id in (7, 8)
+        }
+        results = [rank != 0, True]
+        retries, unlocked = [], []
+        component = types.SimpleNamespace(
+            build_external_linker_transfer=lambda _phase, node, _keys: PoolTransfer(
+                name=PoolName.KV, keys=[str(node.id)]
+            )
+        )
+
+        def offload(transfers):
+            retries.extend(int(key) for transfer in transfers for key in transfer.keys)
+            return True
+
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.attn_cp_group = None
+        cache.attn_tp_group = dist.group.WORLD
+        cache.tp_world_size = 2
+        cache._components_tuple = (component,)
+        cache.resolve_node_handle = nodes.__getitem__
+        cache.inc_lock_ref = lambda node_id: types.SimpleNamespace(
+            to_dec_params=lambda: f"lock-{node_id}"
+        )
+        cache.dec_lock_ref = lambda node_id, _params: unlocked.append(node_id)
+        cache.tree_core = types.SimpleNamespace(
+            mark_write_through_pending=lambda node_id: setattr(
+                nodes[node_id], "write_through_pending_id", node_id
+            )
+        )
+        wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+        wrapper.cache = cache
+        wrapper.cache_linker = types.SimpleNamespace(
+            num_completed_loads=lambda: 0,
+            num_completed_offloads=lambda: len(results),
+            pop_completed_offload=lambda: results.pop(0),
+            offload=offload,
+        )
+        wrapper.pending_offloads = [
+            types.SimpleNamespace(
+                lock_node_id=node_id,
+                lock_params=f"lock-{node_id}",
+                publish_node_ids=[node_id],
+            )
+            for node_id in (7, 8)
+        ]
+        cache.linker = wrapper
+
+        cache.check_hicache_events()
+        after_failure = [nodes[i].external_cache_stored for i in (7, 8)]
+        rank_states = [None, None]
+        dist.all_gather_object(rank_states, after_failure)
+        assert rank_states == [[False, True], [False, True]]
+        assert [nodes[i].write_through_pending_id for i in (7, 8)] == [None, None]
+
+        # The failed shard must be the only one retried on every rank.
+        wrapper.offload_nodes([7, 8])
+        assert retries == [7]
+        results.append(True)
+        cache.check_hicache_events()
+        after_retry = [nodes[i].external_cache_stored for i in (7, 8)]
+        rank_states = [None, None]
+        dist.all_gather_object(rank_states, after_retry)
+        assert rank_states == [[True, True], [True, True]]
+        assert [nodes[i].write_through_pending_id for i in (7, 8)] == [None, None]
+        assert not wrapper.pending_offloads
+        assert unlocked == [7, 8, 7]
+        outputs[rank] = (after_failure, retries, after_retry, unlocked)
+    finally:
+        dist.destroy_process_group()
+
+
+class TestOffloadCompletionConsensus(CustomTestCase):
+    def test_failed_offload_is_retried_on_every_rank(self):
+        import torch.multiprocessing as mp
+
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        with mp.Manager() as manager:
+            outputs = manager.dict()
+            mp.spawn(
+                _offload_completion_rank,
+                args=(port, outputs),
+                nprocs=2,
+                join=True,
+            )
+            self.assertEqual(
+                dict(outputs),
+                {
+                    rank: ([False, True], [7], [True, True], [7, 8, 7])
+                    for rank in range(2)
+                },
+            )
 
 
 if __name__ == "__main__":
