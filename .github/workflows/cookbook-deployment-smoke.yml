@@ -45,5 +45,6 @@ jobs:
         uses: ./model-ci-tools/.github/actions/deployment-smoke
         with:
           image: ${{ inputs.image || '' }}
+          dashhub-token: ${{ secrets.DASHHUB_CI_TOKEN }}
           cases: ${{ inputs.cases || '' }}
           mode: ${{ inputs.mode || 'execute' }}
