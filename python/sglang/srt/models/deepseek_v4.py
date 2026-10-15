@@ -4789,7 +4789,10 @@ def _should_disable_v41_vision_for_hcu(config: DeepSeekV4Config) -> bool:
         get_disagg().disaggregation_mode in ("prefill", "decode")
         or parallel.attn_cp_size != 1
         or parallel.pp_group.world_size != 1
-        or not get_moe_a2a_backend().is_none()
+        or not (
+            get_moe_a2a_backend().is_none()
+            or get_moe_a2a_backend().is_deepep()
+        )
     )
 
 
