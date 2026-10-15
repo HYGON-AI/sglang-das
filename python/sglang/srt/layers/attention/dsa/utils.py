@@ -280,11 +280,11 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
         # Keep model-level and attention-level CP admission in sync. Uneven
         # token counts cannot use this model-level round-robin path safely;
         # fall back to the unsharded prefill for this batch.
-        if (
-            seq_len % cp_size != 0
-            or sum(forward_batch.extend_seq_lens_cpu) % cp_size != 0
-        ):
-            return False
+        # if (
+        #     seq_len % cp_size != 0
+        #     or sum(forward_batch.extend_seq_lens_cpu) % cp_size != 0
+        # ):
+        #     return False
         cur_cp_seq_len = seq_len // cp_size
     else:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
