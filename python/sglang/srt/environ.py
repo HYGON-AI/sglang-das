@@ -2044,6 +2044,8 @@ class Envs:
     # Optional legacy fixed GiB budget; unset retains the fraction policy.
     SGLANG_NSA_MQA_LOGITS_MEMORY_BUDGET_GB = EnvFloat(None)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Opt-in eager INT8 paged MQA Q-row chunks; unset preserves the V4 path.
+    SGLANG_DSV4_PAGED_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(None)
     # Paired gfx938 LightOp sparse Page-MQA and mask-aware paged TopK.
     SGLANG_DSA_HCU_LIGHTOP_MASK_TOPK = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_LIGHTOP_MASK_TOPK"

@@ -52,6 +52,7 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
 
         with (
             patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch(f"{_METADATA}._is_hcu", False),
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
             envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
             envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.override(True),
@@ -102,7 +103,10 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
             get_num_sms=MagicMock(return_value=1),
             get_paged_mqa_logits_metadata=planner,
         )
-        with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch(f"{_METADATA}._is_hcu", False),
+        ):
             metadata = [
                 PagedIndexerMetadata(
                     page_size=256,
@@ -285,7 +289,9 @@ class TestDSV4TopKDispatch(CustomTestCase):
             backend.forward_c4_indexer(
                 x=torch.empty((1, 1)),
                 q_lora=torch.empty((1, 1)),
-                c4_indexer=SimpleNamespace(use_fp4_indexer=False, layer_id=0),
+                c4_indexer=SimpleNamespace(
+                    use_fp4_indexer=False, use_direct_int8_indexer_q=False, layer_id=0
+                ),
                 forward_batch=SimpleNamespace(forward_mode=ForwardMode.EXTEND),
             )
 
@@ -567,7 +573,10 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         expected = MagicMock(name="logits")
         deep_gemm = SimpleNamespace(fp8_mqa_logits=MagicMock(return_value=expected))
 
-        with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch(f"{_METADATA}._is_hcu", False),
+        ):
             kv = C4IndexerBackendMixin._gather_nonpaged_index_k(
                 c4_indexer=c4_indexer,
                 token_to_kv_pool=token_to_kv_pool,
@@ -788,6 +797,7 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
         )
         with (
             patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch(f"{_METADATA}._is_hcu", False),
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
             envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.override(False),
             patch(f"{_METADATA}.is_hip", return_value=False),
