@@ -55,7 +55,22 @@ from sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels import (
     _build_cp_sparse_query_metadata_kernel,
     _build_swa_token_ids_kernel,
     _combine_topk_swa_indices_kernel,
+    _pack_compact_sparse_token_ids_kernel,
 )
+
+
+def plan_c4_topk_workspace(
+    num_compressed: int, num_queries: int, topk: int
+) -> tuple[int, int]:
+    """Return the full query extent and a CPU-known safe BF16 row capacity.
+
+    Capacity bounds the union; it is not the GPU's actual unique count. Keep
+    one native attention call: splitting would repeatedly dequantize shared
+    hits across blocks and can cost more than the memory it saves.
+    """
+    if num_compressed <= 0 or num_queries <= 0 or topk <= 0:
+        raise ValueError("C4 TopK workspace geometry must be positive")
+    return num_queries, min(num_compressed, num_queries * topk)
 
 
 def use_dsv4_q8kv8_sparse_prefill(dsv4_prefill_backend: str = "auto") -> bool:
@@ -93,16 +108,26 @@ class SparsePrefillWorkspace:
         self,
         num_tokens: int,
         dtype: torch.dtype = torch.bfloat16,
+        *,
+        release_before_grow: bool = False,
     ) -> torch.Tensor:
         assert num_tokens > 0
         current_capacity = self._buffer.shape[0] if self._buffer is not None else 0
         current_dtype = self._buffer.dtype if self._buffer is not None else None
         if num_tokens > current_capacity or dtype != current_dtype:
+            if release_before_grow:
+                # Previous eager calls no longer retain workspace views. Drop
+                # our owning reference before requesting the larger allocation.
+                self._buffer = None
             self._buffer = torch.empty(
                 (num_tokens, 1, WORKSPACE_DIM),
                 dtype=dtype,
                 device=self.device,
             )
+        if release_before_grow and self._buffer.is_cuda:
+            # A later growth may drop this allocation while GPU work is still
+            # pending. Record the consumer stream before returning its view.
+            self._buffer.record_stream(torch.cuda.current_stream(self.device))
         return self._buffer[:num_tokens]
 
 
@@ -384,6 +409,9 @@ class SparsePrefillChunkCache:
     # Real rank-local query rows per request. Unlike query_start_loc's physical
     # segments, these lengths exclude CP padding and may legitimately be zero.
     real_query_seq_lens: Optional[torch.Tensor] = None  # (num_reqs,) int32
+    # Compact layout. Existing CPU metadata determines allocation size;
+    # the GPU sequence lengths independently build all per-request offsets.
+    compact_seq_lens_cpu: Optional[tuple[int, ...]] = None
 
     # c0 pre-computed combine output (entire input set is chunk-invariant).
     c0_combined_indices: torch.Tensor = field(default=None)
@@ -419,9 +447,21 @@ class SparsePrefillChunkCache:
         query_seq_lens: Optional[torch.Tensor] = None,
         query_positions: Optional[torch.Tensor] = None,
         real_query_seq_lens: Optional[torch.Tensor] = None,
+        *,
+        compact_seq_lens_cpu: Optional[tuple[int, ...]] = None,
     ) -> "SparsePrefillChunkCache":
         device = seq_lens.device
         num_reqs = seq_lens.shape[0]
+        if compact_seq_lens_cpu is not None:
+            if (
+                len(compact_seq_lens_cpu) != num_reqs
+                or any(
+                    type(length) is not int or length < 0
+                    for length in compact_seq_lens_cpu
+                )
+                or max(compact_seq_lens_cpu, default=0) != max_seq_len
+            ):
+                raise ValueError("compact sequence lengths must match request geometry")
 
         if query_seq_lens is None:
             query_seq_lens = extend_seq_lens
@@ -466,6 +506,7 @@ class SparsePrefillChunkCache:
             swa_offsets=swa_offsets,
             query_positions=query_positions,
             real_query_seq_lens=real_query_seq_lens,
+            compact_seq_lens_cpu=compact_seq_lens_cpu,
         )
 
         # Pre-compute the c0 combine output: TOPK=0, compressed_base=0,
@@ -486,6 +527,51 @@ class SparsePrefillChunkCache:
             query_positions=query_positions,
         )
         return cache
+
+    def _pack_compact_token_ids(
+        self,
+        per_req_ids: torch.Tensor,
+        compress_ratio: int,
+        page_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Pack each request's live compressed extent without host transfers.
+
+        Keep one harmless slot for requests shorter than the compression
+        ratio, just as the original dense layout does. CP-inactive requests
+        also retain their extent, with their masked source rows landing at 0.
+        """
+        assert self.compact_seq_lens_cpu is not None
+        assert compress_ratio in (4, 128)
+        assert page_size > 0
+        total_compressed = sum(
+            max(length // compress_ratio, 1) for length in self.compact_seq_lens_cpu
+        )
+        if (
+            total_compressed + self.swa_token_ids.shape[0]
+            > torch.iinfo(torch.int32).max
+        ):
+            raise ValueError(
+                "compact sparse-prefill workspace exceeds int32 index range"
+            )
+        compressed_lens = (self.seq_lens // compress_ratio).clamp_min(1)
+        compressed_base = (
+            torch.cumsum(compressed_lens, dim=0, dtype=torch.int32) - compressed_lens
+        )
+        flat_token_ids = torch.empty(
+            total_compressed, dtype=torch.int32, device=self.seq_lens.device
+        )
+        _pack_compact_sparse_token_ids_kernel[(self.num_reqs, 32)](
+            flat_token_ids,
+            per_req_ids,
+            per_req_ids.stride(0),
+            per_req_ids.stride(1),
+            compressed_lens,
+            compressed_base,
+            PAGE_SIZE=page_size,
+            FROM_PAGE_TABLE=compress_ratio == 4,
+            BLOCK_TOKENS=256,
+        )
+        return flat_token_ids, compressed_base, total_compressed
 
     def ensure_c128(self, c128_page_indices: torch.Tensor) -> None:
         """Populate c128-side fields from per-query c128 page indices.
@@ -530,11 +616,18 @@ class SparsePrefillChunkCache:
         per_req_c128 = torch.where(has_real_q[:, None], per_req_c128, -1)
         # Clamp -1 -> 0 so dequant doesn't OOB; combine masks the invalid
         # tail via topk_len.
-        flat_c128_ids = per_req_c128.reshape(-1).clamp_min(0).to(torch.int32)
-        compressed_base = (
-            torch.arange(self.num_reqs, dtype=torch.int32, device=device) * c128_max
-        ).to(torch.int32)
-        total_compressed = self.num_reqs * c128_max
+        if self.compact_seq_lens_cpu is None:
+            flat_c128_ids = per_req_c128.reshape(-1).clamp_min(0).to(torch.int32)
+            compressed_base = (
+                torch.arange(self.num_reqs, dtype=torch.int32, device=device) * c128_max
+            ).to(torch.int32)
+            total_compressed = self.num_reqs * c128_max
+        else:
+            flat_c128_ids, compressed_base, total_compressed = (
+                self._pack_compact_token_ids(
+                    per_req_c128, compress_ratio=128, page_size=1
+                )
+            )
         # Pre-compute the c128 combine output. topk_indices[q, j] = j is the
         # arange-broadcast pattern; we materialize it once here so the
         # combine kernel can read it like any other topk tensor.
@@ -603,23 +696,74 @@ class SparsePrefillChunkCache:
             has_real_q[:, None], per_req_page_table, -1
         )
 
-        k_arange = torch.arange(c4_max, dtype=torch.int32, device=device)
-        block_idx = (k_arange // c4_page_size).long()
-        in_page = (k_arange % c4_page_size).to(torch.int32)
-        c4_token_ids_2d = (
-            per_req_page_table.index_select(1, block_idx) * c4_page_size + in_page
-        ).to(torch.int32)
-        flat_c4_ids = c4_token_ids_2d.reshape(-1).clamp_min(0)
-        total_compressed = self.num_reqs * c4_max
-        compressed_base = (
-            torch.arange(self.num_reqs, dtype=torch.int32, device=device) * c4_max
-        ).to(torch.int32)
+        if self.compact_seq_lens_cpu is None:
+            k_arange = torch.arange(c4_max, dtype=torch.int32, device=device)
+            block_idx = (k_arange // c4_page_size).long()
+            in_page = (k_arange % c4_page_size).to(torch.int32)
+            c4_token_ids_2d = (
+                per_req_page_table.index_select(1, block_idx) * c4_page_size + in_page
+            ).to(torch.int32)
+            flat_c4_ids = c4_token_ids_2d.reshape(-1).clamp_min(0)
+            total_compressed = self.num_reqs * c4_max
+            compressed_base = (
+                torch.arange(self.num_reqs, dtype=torch.int32, device=device) * c4_max
+            ).to(torch.int32)
+        else:
+            flat_c4_ids, compressed_base, total_compressed = (
+                self._pack_compact_token_ids(
+                    per_req_page_table, compress_ratio=4, page_size=c4_page_size
+                )
+            )
         swa_base = (total_compressed + self.swa_offsets[:-1]).to(torch.int32)
 
         self.c4_flat_token_ids = flat_c4_ids
         self.c4_page_size = c4_page_size
         self.c4_compressed_base = compressed_base
         self.c4_swa_base = swa_base
+
+    def pack_c4_topk_chunk(
+        self,
+        combined_indices: torch.Tensor,
+        combined_lens: torch.Tensor,
+        topk: int,
+        *,
+        capacity: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pack a query block's C4 union and preserve its attention index rows.
+
+        Input indices already include request ownership, causal masks and CP
+        padding. Deduplication changes storage only: each query keeps the same
+        order and multiplicity. SWA remains separate, rebased behind capacity.
+        All cardinality-dependent work stays on the GPU, including the count
+        consumed by the counted dequant kernel. Rebuild for every C4 layer.
+        """
+        assert self.c4_flat_token_ids is not None
+        assert combined_indices.dtype == combined_lens.dtype == torch.int32
+        assert combined_indices.device == combined_lens.device == self.seq_lens.device
+        assert combined_indices.ndim == 2 and combined_indices.stride(1) == 1
+        assert combined_lens.shape == (combined_indices.shape[0],)
+        assert combined_lens.stride(0) == 1
+        num_queries = combined_indices.shape[0]
+        num_compressed = self.c4_flat_token_ids.shape[0]
+        if num_queries <= 0 or num_compressed <= 0 or topk <= 0:
+            raise ValueError("C4 TopK workspace geometry must be positive")
+        required_capacity = min(num_compressed, num_queries * topk)
+        if capacity is None:
+            capacity = required_capacity
+        if not required_capacity <= capacity <= num_compressed:
+            raise ValueError("C4 TopK workspace capacity is not a safe union bound")
+        if capacity + self.swa_token_ids.shape[0] > torch.iinfo(torch.int32).max:
+            raise ValueError("C4 TopK workspace exceeds int32 index range")
+
+        from lightop.kvcache.topk_workspace import dsv4_pack_c4_topk_workspace
+
+        return dsv4_pack_c4_topk_workspace(
+            self.c4_flat_token_ids,
+            combined_indices,
+            combined_lens,
+            topk,
+            capacity=capacity,
+        )
 
     def combine_c4_layer(
         self,

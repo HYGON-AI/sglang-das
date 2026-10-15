@@ -84,6 +84,7 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
     build_cp_sparse_query_metadata,
+    plan_c4_topk_workspace,
     use_dsv4_q8kv8_sparse_prefill,
 )
 from sglang.srt.layers.attention.verify_mask import (
@@ -141,6 +142,26 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
+
+
+def _use_compact_sparse_prefill_workspace(forward_batch: ForwardBatch) -> bool:
+    if not _is_hcu or forward_batch.forward_mode != ForwardMode.EXTEND:
+        return False
+
+    from sglang.srt.layers.attention.dsa.forward_batch_utils import (
+        effective_forward_mode,
+    )
+    from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+    from sglang.srt.runtime_context import get_disagg
+
+    return (
+        effective_forward_mode(forward_batch) == ForwardMode.EXTEND
+        and get_disagg().disaggregation_mode != "decode"
+        and not get_is_capture_mode()
+        and not torch.cuda.is_current_stream_capturing()
+        and getattr(forward_batch, "tbo_parent_token_range", None) is None
+        and not getattr(forward_batch, "tbo_children", None)
+    )
 
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -2552,7 +2573,13 @@ class DeepseekV4AttnBackend(
         # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)
 
+        compact_workspace = _use_compact_sparse_prefill_workspace(forward_batch)
         cache = self.forward_metadata.sparse_prefill_cache
+        if cache is not None and (
+            (getattr(cache, "compact_seq_lens_cpu", None) is not None)
+            != compact_workspace
+        ):
+            cache = None
         if cache is None:
             seq_lens_cpu = forward_batch.seq_lens_cpu
             assert seq_lens_cpu is not None
@@ -2614,6 +2641,9 @@ class DeepseekV4AttnBackend(
                 query_seq_lens=query_seq_lens,
                 query_positions=query_positions,
                 real_query_seq_lens=real_query_seq_lens,
+                compact_seq_lens_cpu=(
+                    tuple(seq_lens_cpu.tolist()) if compact_workspace else None
+                ),
             )
             self.forward_metadata.sparse_prefill_cache = cache
 
@@ -2624,7 +2654,14 @@ class DeepseekV4AttnBackend(
         extra_page_size = None
         flat_token_ids = None
         if compress_ratio == 0:
-            workspace = self.sparse_prefill_workspace.get(cache.swa_token_ids.shape[0])
+            if compact_workspace:
+                workspace = self.sparse_prefill_workspace.get(
+                    cache.swa_token_ids.shape[0], release_before_grow=True
+                )
+            else:
+                workspace = self.sparse_prefill_workspace.get(
+                    cache.swa_token_ids.shape[0]
+                )
             combined_indices = cache.c0_combined_indices
             combined_lens = cache.c0_combined_lens
             swa_slice = workspace
@@ -2649,10 +2686,34 @@ class DeepseekV4AttnBackend(
                         : cache.num_qo_tokens
                     ],
                 )
+                if (
+                    compact_workspace
+                    and envs.SGLANG_DSV4_PREFILL_C4_TOPK_KV_WORKSPACE.get()
+                    and q_flat.shape[0] > 0
+                ):
+                    return self._forward_prefill_sparse_c4_topk(
+                        q_flat=q_flat,
+                        cache=cache,
+                        combined_indices=combined_indices,
+                        combined_lens=combined_lens,
+                        topk=core_attn_metadata.c4_sparse_raw_indices.shape[-1],
+                        extra_k_cache=extra_k_cache,
+                        extra_page_size=extra_page_size,
+                        token_to_kv_pool=token_to_kv_pool,
+                        layer_id=layer_id,
+                        attn_sink=attn_sink,
+                        sparse_attention=flash_mla_sparse_fwd,
+                    )
             n_compressed = flat_token_ids.shape[0]
-            workspace = self.sparse_prefill_workspace.get(
-                n_compressed + cache.swa_token_ids.shape[0]
-            )
+            if compact_workspace:
+                workspace = self.sparse_prefill_workspace.get(
+                    n_compressed + cache.swa_token_ids.shape[0],
+                    release_before_grow=True,
+                )
+            else:
+                workspace = self.sparse_prefill_workspace.get(
+                    n_compressed + cache.swa_token_ids.shape[0]
+                )
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
@@ -2709,6 +2770,89 @@ class DeepseekV4AttnBackend(
             topk_length=combined_lens,
         )
         return o
+
+    def _forward_prefill_sparse_c4_topk(
+        self,
+        q_flat: torch.Tensor,
+        cache: SparsePrefillChunkCache,
+        combined_indices: torch.Tensor,
+        combined_lens: torch.Tensor,
+        topk: int,
+        extra_k_cache: torch.Tensor,
+        extra_page_size: int,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        layer_id: int,
+        attn_sink: torch.Tensor,
+        sparse_attention,
+    ) -> torch.Tensor:
+        """Dequantize only this layer's selected C4 union.
+
+        The native attention operator is unchanged. Fixed CPU-known capacity
+        separates compressed scratch from SWA; the actual union count never
+        leaves the GPU. Only the caller's eager Prefill route enters.
+        """
+        _, capacity = plan_c4_topk_workspace(
+            cache.c4_flat_token_ids.shape[0], q_flat.shape[0], topk
+        )
+        workspace = self.sparse_prefill_workspace.get(
+            capacity + cache.swa_token_ids.shape[0], release_before_grow=True
+        )
+        compressed_slice = workspace[:capacity]
+        swa_slice = workspace[capacity:]
+        swa_ids = cache.swa_token_ids
+        layer_split = is_cp_cache_layer_split_deepseek_v4_pool(token_to_kv_pool)
+        if layer_split:
+            swa_ids = token_to_kv_pool.remap_flat_token_ids_for_read(
+                layer_id, swa_ids, family="swa"
+            )
+        swa_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
+        if swa_ids.shape[0] > 0:
+            if envs.SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED.get():
+                from lightop.kvcache import dsv4_dequantize_k_cache_paged_out
+
+                dsv4_dequantize_k_cache_paged_out(
+                    swa_cache.view(torch.uint8), swa_ids, swa_slice, cache.swa_page_size
+                )
+            else:
+                dequantize_k_cache_paged(
+                    swa_cache, swa_ids, page_size=cache.swa_page_size, out=swa_slice
+                )
+
+        packed_ids, indices, valid_count = cache.pack_c4_topk_chunk(
+            combined_indices, combined_lens, topk, capacity=capacity
+        )
+        if layer_split:
+            packed_ids = token_to_kv_pool.remap_flat_token_ids_for_read(
+                layer_id, packed_ids, family="extra"
+            )
+        if envs.SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED.get():
+            from lightop.kvcache import dsv4_dequantize_k_cache_paged_out
+
+            dsv4_dequantize_k_cache_paged_out(
+                extra_k_cache.view(torch.uint8),
+                packed_ids,
+                compressed_slice,
+                extra_page_size,
+                valid_count=valid_count,
+            )
+        else:
+            dequantize_k_cache_paged(
+                extra_k_cache,
+                packed_ids,
+                page_size=extra_page_size,
+                out=compressed_slice,
+                valid_count=valid_count,
+            )
+        output, _, _ = sparse_attention(
+            q=q_flat,
+            kv=workspace,
+            indices=indices.unsqueeze(1),
+            sm_scale=self.softmax_scale,
+            d_v=self.head_dim_v,
+            attn_sink=attn_sink,
+            topk_length=combined_lens,
+        )
+        return output
 
     def _prepare_q8kv8_q_and_sink(
         self,

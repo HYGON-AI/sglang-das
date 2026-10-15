@@ -40,6 +40,8 @@ def dequantize_k_cache_paged(
     page_table_1_flattened: torch.Tensor,
     page_size: int,
     out: Optional[torch.Tensor] = None,
+    *,
+    valid_count: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Dequantize the DeepSeek v4 paged KV cache for a list of token IDs.
 
@@ -54,6 +56,10 @@ def dequantize_k_cache_paged(
     Returns:
         (num_tokens, 1, DIM_NOPE + DIM_ROPE) bfloat16.
     """
+    if valid_count is not None:
+        return _dequantize_k_cache_paged_counted(
+            quant_k_cache, page_table_1_flattened, page_size, out, valid_count
+        )
     assert quant_k_cache.is_contiguous()
     assert page_table_1_flattened.dtype in (torch.int32, torch.int64)
 
@@ -95,6 +101,65 @@ def dequantize_k_cache_paged(
         NOPE_ROPE_BYTES=NOPE_ROPE_BYTES,
         PADDED_SCALE_PER_TOKEN=PADDED_SCALE_PER_TOKEN,
         S_OFFSET_BYTES=s_offset_bytes,
+    )
+    return out
+
+
+def _dequantize_k_cache_paged_counted(
+    quant_k_cache: torch.Tensor,
+    page_table_1_flattened: torch.Tensor,
+    page_size: int,
+    out: Optional[torch.Tensor],
+    valid_count: torch.Tensor,
+) -> torch.Tensor:
+    """Dequantize a GPU-counted prefix of a statically sized ID buffer.
+
+    The valid count remains on the accelerator. Rows beyond that prefix are
+    neither read nor written, so callers can keep unused ID slots at -1 and
+    pass the fixed-capacity output to sparse attention through remapped indices.
+    """
+    assert quant_k_cache.is_contiguous()
+    assert page_table_1_flattened.dtype in (torch.int32, torch.int64)
+    assert page_table_1_flattened.ndim == 1
+    assert valid_count.dtype == torch.int32
+    assert valid_count.numel() == 1
+    assert valid_count.device == quant_k_cache.device
+    assert page_table_1_flattened.device == quant_k_cache.device
+    assert page_size > 0
+
+    quant_k_cache_u8 = quant_k_cache.view(torch.uint8)
+    num_tokens = page_table_1_flattened.shape[0]
+    if out is None:
+        out = torch.empty(
+            (num_tokens, 1, DIM_NOPE + DIM_ROPE),
+            dtype=torch.bfloat16,
+            device=quant_k_cache.device,
+        )
+    else:
+        assert out.shape == (num_tokens, 1, DIM_NOPE + DIM_ROPE)
+        assert out.dtype == torch.bfloat16
+        assert out.device == quant_k_cache.device
+    if num_tokens == 0:
+        return out
+
+    _dequantize_k_cache_paged_counted_kernel[(num_tokens,)](
+        out,
+        quant_k_cache_u8.view(fp8_dtype).reshape(-1),
+        quant_k_cache_u8.view(torch.bfloat16).reshape(-1),
+        quant_k_cache_u8.reshape(-1),
+        page_table_1_flattened,
+        valid_count,
+        out.stride(0),
+        NUM_PAGES=quant_k_cache_u8.shape[0],
+        BYTES_PER_PAGE=quant_k_cache_u8.shape[-1],
+        PAGE_SIZE=page_size,
+        DIM_NOPE=DIM_NOPE,
+        DIM_ROPE=DIM_ROPE,
+        TILE_SIZE=TILE_SIZE,
+        NUM_SCALE_TILES=NUM_SCALE_TILES,
+        NOPE_ROPE_BYTES=NOPE_ROPE_BYTES,
+        PADDED_SCALE_PER_TOKEN=PADDED_SCALE_PER_TOKEN,
+        S_OFFSET_BYTES=page_size * NOPE_ROPE_BYTES,
     )
     return out
 
@@ -362,6 +427,61 @@ def cast_q_fp8_for_q8kv8_prefill(
     q_fp8[:, :num_heads].copy_(q)
     q_scale = torch.ones((), dtype=torch.float32, device=q.device)
     return q_fp8, q_scale
+
+
+@triton.jit
+def _dequantize_k_cache_paged_counted_kernel(
+    output_ptr,
+    buf_fp8_ptr,
+    buf_bf16_ptr,
+    buf_uint8_ptr,
+    page_table_ptr,
+    valid_count_ptr,
+    output_stride_0,
+    NUM_PAGES: tl.constexpr,
+    BYTES_PER_PAGE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    DIM_NOPE: tl.constexpr,
+    DIM_ROPE: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    NUM_SCALE_TILES: tl.constexpr,
+    NOPE_ROPE_BYTES: tl.constexpr,
+    PADDED_SCALE_PER_TOKEN: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+):
+    token_id = tl.program_id(0).to(tl.int64)
+    valid_count = tl.load(valid_count_ptr).to(tl.int64)
+    if token_id < valid_count:
+        loc = tl.load(page_table_ptr + token_id).to(tl.int64)
+        tl.device_assert(
+            (loc >= 0) & (loc < NUM_PAGES * PAGE_SIZE),
+            "selected KV token ID is outside the cache",
+        )
+        page_idx = loc // PAGE_SIZE
+        in_page = loc % PAGE_SIZE
+        page_byte_base = page_idx * BYTES_PER_PAGE
+        token_data_base = page_byte_base + in_page * NOPE_ROPE_BYTES
+        token_scale_base = (
+            page_byte_base + S_OFFSET_BYTES + in_page * PADDED_SCALE_PER_TOKEN
+        )
+        out_row_base = token_id * output_stride_0
+
+        nope_offs = tl.arange(0, TILE_SIZE)
+        for tile_id in tl.static_range(NUM_SCALE_TILES):
+            fp8_off = token_data_base + tile_id * TILE_SIZE + nope_offs
+            fp8_vals = tl.load(buf_fp8_ptr + fp8_off).to(tl.float32)
+            scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + tile_id).to(tl.int32)
+            scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))
+            out_off = out_row_base + tile_id * TILE_SIZE + nope_offs
+            tl.store(
+                output_ptr + out_off,
+                (fp8_vals * scale_pow2).to(output_ptr.dtype.element_ty),
+            )
+
+        rope_offs = tl.arange(0, DIM_ROPE)
+        bf16_off = (token_data_base + DIM_NOPE) // 2 + rope_offs
+        rope_data = tl.load(buf_bf16_ptr + bf16_off)
+        tl.store(output_ptr + out_row_base + DIM_NOPE + rope_offs, rope_data)
 
 
 @triton.jit

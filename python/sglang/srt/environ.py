@@ -1442,6 +1442,10 @@ class Envs:
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+    # HCU eager Prefill uses compact C4/C128 and SWA workspaces.
+    # Decode workers and graph routes retain their existing paths.
+    # Opt in to dequantizing only the selected C4 TopK union within that layout.
+    SGLANG_DSV4_PREFILL_C4_TOPK_KV_WORKSPACE = EnvBool(False)
 
     # ===================================================================
     # DeepSeek V4 - cache, GEMM, and distributed
