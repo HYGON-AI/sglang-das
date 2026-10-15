@@ -29,6 +29,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_parallel,
     get_spec,
 )
 from sglang.srt.utils import is_npu
@@ -2204,7 +2205,7 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
             "DeepSeek-V4.1 DSpark PD requires target and draft SWA state"
         )
 
-    return {
+    layout = {
         "num_draft_tokens": get_spec().speculative_num_draft_tokens,
         "compression_ratios": list(ratios),
         "kv_layer_ids": list(kv_args.kv_layer_ids),
@@ -2212,6 +2213,50 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
         "state_types": [state_type.value for state_type in kv_args.state_types],
         "state_item_lens": [list(items) for items in kv_args.state_item_lens],
     }
+    if getattr(kv_args, "cp_cache_layer_split", False):
+        # Handshake against the global logical layout, not a rank's owned
+        # buffers. Actual copies still use v4_transfer_metadata descriptors.
+        metadata = kv_args.v4_transfer_metadata
+        descriptors = [metadata["kv"], *metadata["states"]]
+        item_lens = [kv_args.kv_item_lens, *kv_args.state_item_lens]
+        if len(descriptors) != len(item_lens) or any(
+            len(keys) != len(sizes) for keys, sizes in zip(descriptors, item_lens)
+        ):
+            raise RuntimeError("Incomplete LayerSplit DSPARK transfer descriptors")
+        local = [list(zip(keys, sizes)) for keys, sizes in zip(descriptors, item_lens)]
+        ranks = get_parallel().attn_cp_group.all_gather_object(local)
+        merged = [{} for _ in local]
+        for rank in ranks:
+            if len(rank) != len(merged):
+                raise RuntimeError("Incomplete LayerSplit DSPARK transfer descriptors")
+            for entries, destination in zip(rank, merged):
+                for descriptor, size in entries:
+                    key = tuple(descriptor)
+                    if key in destination and destination[key] != size:
+                        raise RuntimeError(
+                            f"LayerSplit DSPARK page ABI differs across CP ranks: {key}"
+                        )
+                    destination[key] = size
+        # V4.1's unsharded pool registers ratio-1 then ratio-2, each with
+        # KV, indexer and optional separate scales, in source-layer order.
+        family_order = {
+            f"c{ratio}_{family}": order
+            for order, (ratio, family) in enumerate(
+                (ratio, family)
+                for ratio in (1, 2)
+                for family in ("kv", "indexer", "indexer_scale")
+            )
+        }
+        layout["kv_item_lens"] = [
+            merged[0][key]
+            for key in sorted(
+                merged[0], key=lambda key: (family_order[key[0]], key[1])
+            )
+        ]
+        layout["state_item_lens"] = [
+            [entries[key] for key in sorted(entries)] for entries in merged[1:]
+        ]
+    return layout
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):

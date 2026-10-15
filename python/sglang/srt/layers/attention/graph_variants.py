@@ -108,13 +108,30 @@ class Dsv41CandidateGraphVariants:
         return DSV41_CANDIDATE_FILTERED
 
 
+def _candidate_indexer_capturable(model_runner) -> bool:
+    """Whether this device can capture the two-level candidate decode graphs.
+
+    HCU runs the same two-level indexer as CUDA but through LightOp, so it
+    qualifies once LightOp provides the paged fp4 ABI. Other platforms keep
+    main's gfx95/SM100 eligibility checks.
+    """
+    import torch
+
+    from sglang.srt.utils import is_gfx95_supported, is_hcu, is_hip
+
+    if not is_hip():
+        return torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 10
+    if not is_hcu():
+        return is_gfx95_supported()
+    from sglang.kernels.ops.attention.dsv4 import lightop_indexer
+
+    return lightop_indexer.lightop_paged_indexer_available()
+
+
 def create_dsv41_candidate_graph_variants(
     model_runner, capture_forward_mode, captured_req_width: int = 0
 ) -> Optional[Dsv41CandidateGraphVariants]:
-    import torch
-
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
-    from sglang.srt.utils import is_gfx95_supported, is_hip
 
     text_config = model_runner.model_config.hf_text_config
     dspark_target_verify = (
@@ -126,11 +143,7 @@ def create_dsv41_candidate_graph_variants(
     if not (
         (capture_forward_mode == ForwardMode.DECODE or dspark_target_verify)
         and model_runner.device == "cuda"
-        and (
-            is_gfx95_supported()
-            if is_hip()
-            else torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 10
-        )
+        and _candidate_indexer_capturable(model_runner)
         and getattr(text_config, "model_type", None) == "deepseek_v41"
         and getattr(text_config, "candidate_source_layer_id", -1) >= 0
     ):

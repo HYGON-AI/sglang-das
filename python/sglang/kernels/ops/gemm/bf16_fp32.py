@@ -135,6 +135,9 @@ def _linear_bf16_fp32_cublas(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     global _HIP_BF16_OUT_DTYPE_SUPPORTED
 
     if x.is_cuda and x.dtype == torch.bfloat16 and y.dtype == torch.bfloat16:
+        if _is_hcu:
+            # Preserve the V4.1 HCU BF16 GEMM rounding before exposing FP32 output.
+            return torch.mm(x, y.t(), out_dtype=x.dtype).float()
         if not _is_hip:
             return torch.mm(x, y.t(), out_dtype=torch.float32)
         if _HIP_BF16_OUT_DTYPE_SUPPORTED is not False:
@@ -418,5 +421,9 @@ def linear_bf16_fp32(
         z = torch.empty(x.size(0), y.size(0), dtype=torch.float32, device=x.device)
         deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, y, z)
         return z
+    elif _linear_bf16_fp32_algo == "lightop":
+        from lightop import gemm_ops
+
+        return gemm_ops.gemm(x, y, out_dtype=torch.float32)
     else:
         return _linear_bf16_fp32_cublas(x, y)

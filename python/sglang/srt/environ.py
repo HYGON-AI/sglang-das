@@ -1108,6 +1108,13 @@ class Envs:
     SGLANG_ROCM_USE_AITER_TILELANG_MHC = EnvBool(False)
     SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM = EnvBool(False)
     SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE = EnvBool(False)
+       # LightOp FP4 indexer logits on gfx928/936/938,Set to 0 to fall back to Triton.
+    SGLANG_USE_LIGHTOP_PAGED_MQA_LOGITS_FP4 = EnvBool(True)
+    # DSV4.1 low-ratio decode/verify indexer on HCU via the paged path on LightOp;
+    # falls back to the slot-based path when LightOp lacks the paged operators.
+    SGLANG_USE_LIGHTOP_DSV41_PAGED_INDEXER = EnvBool(True)
+    # HCU block selection on dense logits; 0 keeps the block-amax + top-k path.
+    SGLANG_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS = EnvBool(True)
     SGLANG_USE_FAST_HADAMARD_TRANSFORM = EnvBool(False)
     SGLANG_USE_FUSED_DPSKV4_QNORM_ROPE_KV_ROPE_QUANT = EnvBool(False)
     SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
@@ -1689,6 +1696,10 @@ class Envs:
     # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
     # below) and gather rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
+    # HCU-only loading optimizations for DeepSeek-V4.1 W4A8 EnGram tables.
+    # Keep disabled by default so the upstream loading and page-cache behavior
+    # remains unchanged unless the deployment explicitly opts in.
+    SGLANG_HCU_ENABLE_DSV41_W4A8_ENGRAM_LOAD_OPTIMIZATION = EnvBool(False)
     # "shared" is one buffer for the whole TP group, mapped by every rank, with no
     # lookup all-reduce (the ranks must share a PID namespace); "per_rank" is one
     # anonymous mapping per rank holding only its rows, gathered with the

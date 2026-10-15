@@ -303,11 +303,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         w13 = layer.w13_weight
         w2 = layer.w2_weight
 
-        from deepgemm.m_group_gemm import pack_int8_weight_enk_to_w6_low_latency
+        from deepgemm import marlin_fp8_masked_weight
 
         with torch.no_grad():
-            w13_deepgemm = pack_int8_weight_enk_to_w6_low_latency(w13).detach()
-            w2_deepgemm = pack_int8_weight_enk_to_w6_low_latency(w2).detach()
+            w13_deepgemm = marlin_fp8_masked_weight(w13).detach()
+            w2_deepgemm = marlin_fp8_masked_weight(w2).detach()
 
         self._register_runtime_buffer(layer, "w13_weight_deepgemm", w13_deepgemm)
         self._register_runtime_buffer(layer, "w2_weight_deepgemm", w2_deepgemm)
@@ -411,9 +411,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             build_hcu_w8a8_mega_moe_experts_weights(layer)
             return
 
+        moe_runner_backend = self._resolve_moe_runner_backend()
         if (
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-            and _use_aiter
+            and moe_runner_backend.is_aiter()
             and not _is_hcu
         ):
             with torch.no_grad():
@@ -432,7 +433,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL
             and _use_deepgemm_moe
             and _is_hcu
-            and self.use_deepep
+            and moe_runner_backend.is_deep_gemm()
         ):
             # SGLANG_USE_DEEPGEMM_MOE is process-wide, but DSpark may use a
             # standalone draft MoE alongside a DeepEP target MoE.  Repacking
@@ -456,6 +457,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         elif (
             self.use_hcu_fp8_w8a8_moe
             and _is_hcu
+            and not moe_runner_backend.is_triton()
             and not getattr(layer, "_w8a8_fp8_packed", False)
         ):
             w1 = layer.w13_weight
@@ -546,20 +548,23 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 requires_grad=False,
             )
 
+    def _resolve_moe_runner_backend(self):
+        moe_runner_backend = get_moe_runner_backend()
+        if not moe_runner_backend.is_auto():
+            return moe_runner_backend
+        if (
+            _use_aiter
+            and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and get_moe_a2a_backend().supports_aiter()
+        ):
+            return MoeRunnerBackend.AITER
+        return MoeRunnerBackend.TRITON
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto():
-            if (
-                will_use_aiter_moe()
-                and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-                and get_moe_a2a_backend().supports_aiter()
-            ):
-                moe_runner_backend = MoeRunnerBackend.AITER
-            else:
-                moe_runner_backend = MoeRunnerBackend.TRITON
+        moe_runner_backend = self._resolve_moe_runner_backend()
 
         if (
             moe_runner_backend.is_aiter()
@@ -660,7 +665,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     block_shape=self.weight_block_size,
                 )
             return self.runner.run(dispatch_output, quant_info)
-        elif _is_hcu and self.use_hcu_fp8_w8a8_moe:
+        elif (
+            _is_hcu
+            and self.use_hcu_fp8_w8a8_moe
+            and not self.runner.runner_backend.is_triton()
+        ):
             if getattr(layer.w13_weight, "_w8a8_fp8_packed", False) or getattr(
                 layer.w2_weight, "_w8a8_fp8_packed", False
             ):

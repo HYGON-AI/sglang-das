@@ -319,6 +319,74 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
         self.assertEqual(loaded_weights[0].dtype, torch.bfloat16)
         self.assertGreater(loaded_weights[0].abs().sum().item(), 0)
 
+    def test_deepseek_v4_dspark_remaps_pre_normalized_per_channel_scale(self):
+        remapper = SimpleNamespace(
+            confidence_head=None, _dspark_scale_suffix="weight_scale"
+        )
+
+        for checkpoint_name in (
+            "mtp.0.attn.wq_a.scale",
+            "mtp.0.attn.wq_a.weight_scale_inv",
+        ):
+            with self.subTest(checkpoint_name=checkpoint_name):
+                self.assertEqual(
+                    DeepseekV4ForCausalLMDSpark._remap_dspark_weight_name(
+                        remapper, checkpoint_name
+                    ),
+                    "stages.0.self_attn.wq_a.weight_scale",
+                )
+
+    def test_deepseek_v4_dspark_loads_pre_normalized_per_channel_expert_scale(self):
+        loaded = []
+
+        class Param:
+            def weight_loader(
+                self,
+                _param,
+                loaded_weight,
+                candidate,
+                *,
+                shard_id,
+                expert_id,
+            ):
+                loaded.append(
+                    (loaded_weight, candidate, shard_id, expert_id)
+                )
+
+        class DraftModel:
+            num_fused_shared_experts = 0
+            confidence_head = None
+            config = SimpleNamespace(n_routed_experts=1)
+
+            def named_parameters(self):
+                return [
+                    (
+                        "stages.0.mlp.experts.w13_weight_scale",
+                        Param(),
+                    )
+                ]
+
+            def _remap_dspark_weight_name(self, name):
+                return DeepseekV4ForCausalLMDSpark._remap_dspark_weight_name(
+                    self, name
+                )
+
+            def _assert_confidence_head_loaded(self, **_kwargs):
+                return None
+
+        scale = torch.ones(1)
+        DeepseekV4ForCausalLMDSpark.load_weights(
+            DraftModel(),
+            [("mtp.0.ffn.experts.0.w1.weight_scale_inv", scale)],
+        )
+
+        self.assertEqual(len(loaded), 1)
+        self.assertIs(loaded[0][0], scale)
+        self.assertEqual(
+            loaded[0][1:],
+            ("stages.0.mlp.experts.w13_weight_scale", "w1", 0),
+        )
+
     def test_deepseek_v4_streaming_dequant_preserves_missing_scale_behavior(self):
         weight = torch.eye(128, dtype=torch.float32).to(torch.float8_e4m3fn)
         ordinary = torch.tensor([3])

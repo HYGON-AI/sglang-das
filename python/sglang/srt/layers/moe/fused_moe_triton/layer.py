@@ -92,6 +92,10 @@ from sglang.srt.utils import (
     round_up,
 )
 from sglang.srt.utils.common import is_building_neighbour_layer
+from sglang.srt.layers.moe.utils import (
+    is_sbo_enabled,
+    is_tbo_enabled,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
@@ -233,7 +237,7 @@ def create_moe_dispatcher(
             params_dtype=moe_runner_config.params_dtype,
             deepep_mode=get_deepep_mode(),
             async_finish=True,
-            return_recv_hook=not is_hcu(),
+            return_recv_hook=(not is_hcu()) or is_tbo_enabled() or is_sbo_enabled(),
         )
     elif a2a_backend.is_deepep_v2():
         output_dtype = get_deepep_v2_dispatcher_output_dtype(
@@ -799,6 +803,11 @@ class FusedMoE(torch.nn.Module):
     ):
         # for per channel weight quantization
         if shard_id == "w2":
+            if (
+                loaded_weight.ndim == 2
+                and loaded_weight.transpose(-2, -1).shape == expert_data.shape
+            ):
+                loaded_weight = loaded_weight.transpose(-2, -1)
             loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
             expert_data.copy_(loaded_weight)
         elif shard_id in ("w1", "w3"):
@@ -862,7 +871,16 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             if not self.use_presharded_weights:
-                if not is_bias and self.use_triton_kernels:
+                transpose_for_layout = (
+                    not is_bias
+                    and loaded_weight.ndim == 2
+                    and expert_data.ndim == 2
+                    and loaded_weight.shape[1 - shard_dim]
+                    != expert_data.shape[1 - shard_dim]
+                    and loaded_weight.transpose(-2, -1).shape[1 - shard_dim]
+                    == expert_data.shape[1 - shard_dim]
+                )
+                if not is_bias and (self.use_triton_kernels or transpose_for_layout):
                     # do not transpose for bias
                     loaded_weight = loaded_weight.transpose(-2, -1)
                 # When the buffer is padded (e.g., MXFP4 SM100 rounds
@@ -951,7 +969,15 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             if not is_bias and not self.use_presharded_weights:
-                if self.use_triton_kernels:
+                transpose_for_layout = (
+                    loaded_weight.ndim == 2
+                    and expert_data.ndim == 2
+                    and loaded_weight.shape[1 - shard_dim]
+                    != expert_data.shape[1 - shard_dim]
+                    and loaded_weight.transpose(-2, -1).shape[1 - shard_dim]
+                    == expert_data.shape[1 - shard_dim]
+                )
+                if self.use_triton_kernels or transpose_for_layout:
                     loaded_weight = loaded_weight.transpose(-2, -1)
                 # Derive shard size from the loaded weight so padded buffers
                 # do not cause out-of-bounds indexing into the checkpoint.

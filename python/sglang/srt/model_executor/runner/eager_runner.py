@@ -421,6 +421,10 @@ class EagerRunner(BaseRunner):
             )
 
         stream = torch.cuda.current_stream()
+        if aux_hidden_states is not None and isinstance(hidden_states, tuple):
+            # The logits path drops pre-HC states when aux capture is active;
+            # avoid gathering the unused tensor across CP ranks.
+            hidden_states = hidden_states[0]
         hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
         # DSpark aux tensors ride the same CP token split; gather them the same way.
         if aux_hidden_states is not None:

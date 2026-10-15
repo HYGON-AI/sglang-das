@@ -140,7 +140,7 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             "DeepSeekV4 zigzag CP requires the NPU backend; CUDA/HIP backends "
             "reindex with interleave order."
         )
-    if get_platform().is_hip:
+    if get_platform().is_hip and not _is_hcu:
         prefill_backend, decode_backend = attention_backends_of(
             resolved_view(server_args)
         )
@@ -209,11 +209,6 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         )
     elif model_config_of(server_args).hf_config.model_type != "deepseek_v41":
         # The generic CP-aware sparse chunk cache is validated on V4.1 only.
-        logger.warning(
-            "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
-            "context parallelism is enabled."
-        )
-        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
         logger.warning(
             "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
             "context parallelism is enabled."
@@ -315,9 +310,36 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             read_ragged_verify_mode,
         )
 
-        if (
+        common_invalid = (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
             or cfg.disaggregation_transfer_backend != "mooncake"
+            or cfg.dcp_size != 1
+        )
+        if is_hcu():
+            if cfg.disaggregation_mode == "prefill":
+                topology_invalid = not (
+                    cfg.dp_size == 1
+                    and cfg.enable_prefill_cp
+                    and cfg.attn_cp_size == cfg.tp_size
+                )
+                topology = "P requires DP=1 and interleave prefill CP=TP"
+            else:
+                topology_invalid = not (
+                    cfg.disaggregation_mode == "decode"
+                    and cfg.dp_size == cfg.tp_size
+                    and cfg.enable_dp_attention
+                    and not cfg.enable_prefill_cp
+                    and cfg.attn_cp_size == 1
+                )
+                topology = "D requires DP=TP, DP attention and CP=1"
+            if common_invalid or topology_invalid:
+                raise ValueError(
+                    "DeepSeek-V4.1 DSpark PD on HCU requires static verify, "
+                    f"Mooncake and DCP=1; {topology}. Both servers must use "
+                    "the same DSpark block size and TP size."
+                )
+        elif (
+            common_invalid
             or cfg.enable_prefill_cp
             or cfg.attn_cp_size != 1
             or cfg.dcp_size != 1

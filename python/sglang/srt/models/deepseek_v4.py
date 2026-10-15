@@ -149,6 +149,12 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE, MultimodalInputs
 from sglang.srt.mem_cache.memory_pool import RadixAttention
+from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers import (
+    is_cp_cache_layer_split_deepseek_v4_pool,
+    maybe_prefetch_cp_kv_extra,
+    maybe_prefetch_cp_kv_swa,
+    maybe_wait_cp_kv_swa_prefetch,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -207,6 +213,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
 )
 from sglang.srt.runtime_context import (
     get_device,
+    get_disagg,
     get_exec,
     get_forward,
     get_parallel,
@@ -1962,6 +1969,10 @@ class MQALayer(MqaAttentionBase):
             qkv_a = None
 
         use_cp = is_cp_active(forward_batch)
+        layer_split_cp = (
+            is_cp_cache_layer_split_deepseek_v4_pool(get_token_to_kv_pool())
+            and forward_batch.forward_mode.is_context_parallel_extend()
+        )
         kv: Optional[torch.Tensor]
 
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
@@ -2008,9 +2019,10 @@ class MQALayer(MqaAttentionBase):
             and not is_decode
             and not forward_batch.forward_mode.is_target_verify()
         )
-        do_fused_qk_norm_rope = (
-            unified and (is_decode or fuse_verify or fuse_prefill)
-        ) or (not unified and self.use_fused_qk_norm_rope)
+        do_fused_qk_norm_rope = not layer_split_cp and (
+            (unified and (is_decode or fuse_verify or fuse_prefill))
+            or (not unified and self.use_fused_qk_norm_rope)
+        )
 
         if do_fused_qk_norm_rope:
             if _is_gfx95_supported or _is_gfx1250_supported:
@@ -2085,7 +2097,7 @@ class MQALayer(MqaAttentionBase):
                     False,
                 )
                 if use_cp:
-                    # Store globally ordered KV after the CP gather.
+                    # Local fused KV must be gathered before writing global slots.
                     swa_cache, swa_loc = None, None
 
             from sglang.kernels.ops.attention.fused_qk_norm_rope_store import (
@@ -2318,7 +2330,15 @@ class MQALayer(MqaAttentionBase):
         x_quant: Optional[torch.Tensor] = None,
         defer_all_reduce: bool = False,
     ) -> Union[torch.Tensor, mhc.AttnOutput]:
-        if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
+        layer_split_prefill = (
+            is_cp_cache_layer_split_deepseek_v4_pool(get_token_to_kv_pool())
+            and forward_batch.forward_mode.is_context_parallel_extend()
+        )
+        if (
+            not get_attn_tp_context().input_scattered
+            and x.shape[0] == 0
+            and not layer_split_prefill
+        ):
             return x
 
         attn_backend = get_attn_backend()
@@ -2463,7 +2483,7 @@ class MQALayer(MqaAttentionBase):
                                 meta.q_pad_buffer = q_padded
                             except (AttributeError, TypeError):
                                 pass
-                elif _is_gfx942_supported:
+                elif _is_gfx942_supported or _is_hcu:
                     # Uninitialized padded TP heads inject NaN into attention on gfx942
                     # (fnuz), so zero-init there; other archs tolerate new_empty and skip
                     # the per-forward memset.
@@ -2533,6 +2553,14 @@ class MQALayer(MqaAttentionBase):
             kv, k_rope = _materialize_cp_unified_fp8_kv(
                 kv, k_rope, forward_batch, torch.cuda.current_stream()
             )
+        if layer_split_prefill:
+            pool = get_token_to_kv_pool()
+            maybe_prefetch_cp_kv_swa(pool, self.layer_id, forward_batch)
+            if self.compress_ratio in (1, 2):
+                maybe_prefetch_cp_kv_extra(pool, self.layer_id, forward_batch)
+            maybe_wait_cp_kv_swa_prefetch(pool, self.layer_id, forward_batch)
+            if x.shape[0] == 0 and not get_attn_tp_context().input_scattered:
+                return x
 
         # save_kv_cache = kv is not None selects who writes the ring. When kv is
         # None the store was already fused into _forward_prepare* (decode) or
@@ -4735,6 +4763,23 @@ class DeepseekV4Model(nn.Module):
         return hidden_states, pre_hc_head
 
 
+def _should_disable_v41_vision_for_hcu(config: DeepSeekV4Config) -> bool:
+    if not (
+        _is_hcu
+        and config.model_type == "deepseek_v41"
+        and config.vision_n_layers > 0
+    ):
+        return False
+
+    parallel = get_parallel()
+    return (
+        get_disagg().disaggregation_mode in ("prefill", "decode")
+        or parallel.attn_cp_size != 1
+        or parallel.pp_group.world_size != 1
+        or not get_moe_a2a_backend().is_none()
+    )
+
+
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
 
@@ -4754,6 +4799,13 @@ class DeepseekV4ForCausalLM(nn.Module):
 
             set_force_ck_w8a8(True)
             set_batched_rope(True)
+        if _should_disable_v41_vision_for_hcu(config):
+            logger.info(
+                "Disabling the DeepSeek-V4.1 vision tower for this HCU text "
+                "serving topology; the V4.1 vision path does not support PD, "
+                "CP, PP or MoE A2A."
+            )
+            config.vision_n_layers = 0
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
@@ -4764,10 +4816,13 @@ class DeepseekV4ForCausalLM(nn.Module):
             if (
                 get_parallel().attn_cp_size != 1
                 or get_parallel().pp_group.world_size != 1
-                or not get_moe_a2a_backend().is_none()
+                or not (
+                    get_moe_a2a_backend().is_none()
+                    or get_moe_a2a_backend().is_deepep()
+                )
             ):
                 raise ValueError(
-                    "V4.1 vision currently supports TP/EP/DP without CP, PP or MoE A2A"
+                    "V4.1 vision supports TP/EP/DP with none or DeepEP A2A, without CP or PP"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
@@ -5469,6 +5524,17 @@ class DeepseekV4ForCausalLM(nn.Module):
                     )
                 try:
                     use_async_loading = should_async_load(loaded_weight)
+                    # EnGram tables are much larger than ordinary model weights.
+                    # Loading them asynchronously keeps the full checkpoint tensors
+                    # alive in pending futures and can exhaust host memory before
+                    # their TP-local row shards are copied. Consume them inline so
+                    # each full tensor can be released before reading the next one.
+                    if (
+                        _is_hcu
+                        and envs.SGLANG_HCU_ENABLE_DSV41_W4A8_ENGRAM_LOAD_OPTIMIZATION.get()
+                        and ".engram." in name
+                    ):
+                        use_async_loading = False
 
                     name = self.remap_weight_name_to_dpsk_hf_format(
                         name,
