@@ -385,13 +385,9 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
     ):
         return False
     if is_dsa_prefill_cp_round_robin_split():
-        # Keep model-level and attention-level CP admission in sync. Uneven
-        # token counts cannot use this model-level round-robin path safely;
-        # fall back to the unsharded prefill for this batch.
-        if (
-            seq_len % cp_size != 0
-            or sum(forward_batch.extend_seq_lens_cpu) % cp_size != 0
-        ):
+        # Physical input tensors are padded by ForwardBatch to the CP alignment.
+        # The original per-request token count may be uneven across ranks.
+        if seq_len % cp_size != 0:
             return False
         cur_cp_seq_len = seq_len // cp_size
     else:
