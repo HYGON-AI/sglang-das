@@ -426,6 +426,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         )
         try:
             self.store = MooncakeDistributedStore()
+            if enable_dfs_prefetch is True and not callable(
+                getattr(self.store, "disable_dfs_prefetch", None)
+            ):
+                raise RuntimeError(
+                    "Waiting-queue DFS prefetch requires Mooncake with "
+                    "disable_dfs_prefetch to release its arena if startup "
+                    "agreement disables prefetch. Rebuild/install the updated "
+                    "Mooncake package."
+                )
 
             self.config = self._load_config(storage_config)
             extra_config = (

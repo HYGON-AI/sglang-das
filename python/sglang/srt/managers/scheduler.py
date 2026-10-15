@@ -3365,10 +3365,15 @@ class Scheduler(
         there), so other roles do not read the variable and report it off.
         """
 
-        prefetch_local = (
-            self._waiting_queue_prefetch_configured()
+        linker_prefetch = (
+            getattr(
+                self.server_args, "mooncake_enable_waiting_queue_dfs_prefetch", False
+            )
+            and self.server_args.enable_unified_cache_external_linker
+            and self.server_args.unified_cache_external_linker_backend == "mooncake"
             and self.tree_cache.waiting_queue_prefetch_enabled()
         )
+        prefetch_local = self._waiting_queue_prefetch_configured() and linker_prefetch
         # Forward ingress matches (and may split) radix nodes while the
         # forward runs; KV canary's sweep walks them from the forward thread.
         ingress_local = (
@@ -3417,11 +3422,11 @@ class Scheduler(
         )
 
         enabled = bool(prefetch)
-        if prefetch_local and not enabled:
+        if linker_prefetch and not enabled:
             # Before any job exists: keep the linker consistent with the world.
             self.tree_cache.disable_waiting_queue_prefetch()
             logger.warning(
-                "Waiting-queue DFS prefetch disabled: another rank is not "
+                "Waiting-queue DFS prefetch disabled: this or another rank is not "
                 "configured for it or lacks the Mooncake capability."
             )
         forward_ingress = enabled and bool(ingress)

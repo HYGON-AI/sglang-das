@@ -46,6 +46,9 @@ class FakeMooncakeDistributedStore:
     def register_buffer(self, *args, **kwargs):
         return 0
 
+    def disable_dfs_prefetch(self):
+        return True
+
     def put(self, key, value, *args):
         self.objects[key] = value
         return 0
@@ -282,6 +285,19 @@ class TestMooncakePrefetchSetup(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "cannot disable DFS prefetch"):
                 MooncakeStore(_make_storage_config(), enable_dfs_prefetch=False)
         self.assertEqual(UnsupportedPrefetchStore.attempts, 1)
+
+    def test_prefetch_requires_release_api_before_setup(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        class UnsupportedReleaseStore(FakeMooncakeDistributedStore):
+            disable_dfs_prefetch = None
+
+        with patch.dict("sys.modules", _fake_mooncake_modules(UnsupportedReleaseStore)):
+            with self.assertRaisesRegex(RuntimeError, "disable_dfs_prefetch"):
+                MooncakeStore(_make_storage_config(), enable_dfs_prefetch=True)
+        self.assertEqual(UnsupportedReleaseStore.instances[-1].setup_calls, [])
 
 
 if __name__ == "__main__":

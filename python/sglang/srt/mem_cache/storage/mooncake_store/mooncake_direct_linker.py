@@ -229,6 +229,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 False,
             )
         )
+        if self.host_prefetch_enabled and (
+            server_args.schedule_policy != "fcfs"
+            or server_args.disaggregation_mode not in ("null", "prefill")
+            or params.pp_size != 1
+        ):
+            self.host_prefetch_enabled = False
+            logger.warning(
+                "Waiting-queue DFS prefetch disabled: requires FCFS scheduling, "
+                "a prefill or non-disaggregated role, and pp_size=1."
+            )
         self.page_size = params.page_size
         self.page_wise_load_threshold = server_args.mooncake_page_wise_load_threshold
         self.enable_page_wise_load = server_args.mooncake_enable_page_wise_load
@@ -368,9 +378,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 "Mooncake ReadPlan enabled; address reuse=%s",
                 self.read_plan_reuse_ranges,
             )
-        self.host_prefetch_enabled = self._resolve_host_prefetch_enabled(
+        prefetch_enabled = self._resolve_host_prefetch_enabled(
             params, requested=self.host_prefetch_enabled
         )
+        if self.host_prefetch_enabled and not prefetch_enabled:
+            self.disable_waiting_queue_prefetch()
+        self.host_prefetch_enabled = prefetch_enabled
 
         self.storage_metrics_collector = None
         if params.enable_metrics:
@@ -549,8 +562,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return self.host_prefetch_enabled
 
     def disable_waiting_queue_prefetch(self) -> None:
-        # The scheduler found a rank without prefetch before any submission;
-        # the idle host-prefetch workers stay parked on an empty queue.
+        # Startup only, before any request or prefetch submission. Keep the
+        # native client and its pinned arena consistent with the final switch.
+        if not self.storage.store.disable_dfs_prefetch():
+            raise RuntimeError(
+                "Mooncake cannot disable DFS prefetch after requests have started."
+            )
         self.host_prefetch_enabled = False
 
     def register_buffers(self) -> None:

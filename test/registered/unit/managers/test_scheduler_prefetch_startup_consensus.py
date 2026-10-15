@@ -32,7 +32,9 @@ from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
-def _scheduler(*, flag=True, capable=True, canary="none", mode="prefill", pp=1):
+def _scheduler(
+    *, flag=True, capable=True, canary="none", mode="prefill", pp=1, policy="fcfs"
+):
     s = Scheduler.__new__(Scheduler)
     s.server_args = types.SimpleNamespace(
         mooncake_enable_waiting_queue_dfs_prefetch=flag,
@@ -45,7 +47,7 @@ def _scheduler(*, flag=True, capable=True, canary="none", mode="prefill", pp=1):
         "decode": DisaggregationMode.DECODE,
         "null": DisaggregationMode.NULL,
     }[mode]
-    s.schedule_policy = "fcfs"
+    s.schedule_policy = policy
     s.ps = types.SimpleNamespace(pp_size=pp)
     s.tree_cache = MagicMock()
     s.tree_cache.waiting_queue_prefetch_enabled.return_value = capable
@@ -67,6 +69,17 @@ class TestSingleRank(CustomTestCase):
         s = _scheduler(flag=False)
         s.tree_cache = object()
         self.assertEqual(s._resolve_prefetch_startup_switches(None), (False, False))
+
+    def test_local_ineligibility_disables_an_enabled_linker(self):
+        for settings in ({"policy": "lpm"}, {"mode": "decode"}, {"pp": 2}):
+            with self.subTest(**settings):
+                s = _scheduler(**settings)
+                with self.assertLogs(level="WARNING") as logs:
+                    self.assertEqual(
+                        s._resolve_prefetch_startup_switches(None), (False, False)
+                    )
+                s.tree_cache.disable_waiting_queue_prefetch.assert_called_once()
+                self.assertIn("Waiting-queue DFS prefetch disabled", logs.output[0])
 
     def test_invalid_final_poll_reads_as_off_like_the_runtime(self):
         # The typed getter falls back to its default (0.0, off) on a bad value,
@@ -95,6 +108,7 @@ CASES = {
     ),
     "one_rank_flag_off": ([{}, {"flag": False}, {}, {}], (False, False)),
     "all_off": ([{"flag": False}] * 4, (False, False)),
+    "one_rank_lpm": ([{}, {}, {}, {"policy": "lpm"}], (False, False)),
     "unsupported_backend_on_one_rank": (
         [{}, {}, {}, {"backend": "other"}],
         (False, False),
@@ -220,15 +234,14 @@ class TestWorldConsensus(CustomTestCase):
                 for rank, (decision, created, disabled) in enumerate(outcomes):
                     self.assertEqual(decision, expected)
                     self.assertEqual(created, int(expected[0]))
-                    # Only a rank that was locally able turns its linker off.
-                    locally_able = (
+                    # A live linker must turn off even when local scheduler
+                    # conditions already disallow prefetch.
+                    linker_enabled = (
                         settings[rank].get("flag", True)
                         and settings[rank].get("capable", True)
                         and settings[rank].get("backend", "mooncake") == "mooncake"
-                        and settings[rank].get("mode", "prefill") != "decode"
-                        and settings[rank].get("pp", 1) == 1
                     )
-                    self.assertEqual(disabled, int(locally_able and not expected[0]))
+                    self.assertEqual(disabled, int(linker_enabled and not expected[0]))
 
 
 class TestRuntimeInit(CustomTestCase):
@@ -330,6 +343,7 @@ class TestRunBatchOffRoute(CustomTestCase):
             pass
 
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.server_args = types.SimpleNamespace(pp_size=1)
         scheduler.forward_ct = 0
         scheduler._sched_idled = False
         scheduler.scripted_scheduler_hook = None
