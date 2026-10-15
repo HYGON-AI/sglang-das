@@ -152,7 +152,7 @@ class TestSessionRefreshAge(CustomTestCase):
         _prefetched(linker, clock, rid="other", keys=("k1",), session="s2")
         self.assertEqual(linker.session_refcounts["k1"], 2)
         self.assertTrue(_revalidate(linker, clock))
-        linker.storage.store.batch_get_session_refresh.assert_called_once()
+        self.assertEqual(linker.storage.store.batch_get_session_refresh.call_count, 2)
 
     def test_reused_key_loses_its_base(self):
         clock = _Clock()
@@ -169,6 +169,7 @@ class TestSessionRefreshAge(CustomTestCase):
         linker = _linker()
         _prefetched(linker, clock, rid="b", keys=("k",), session="sb")
         _prefetched(linker, clock, rid="a", keys=("k",), session="sa")
+        linker.storage.store.batch_get_session_refresh.reset_mock()
         clock.now += 1.0
         linker.storage.store.batch_get_session_refresh.side_effect = lambda keys: [
             7
@@ -195,6 +196,7 @@ class TestSessionRefreshAge(CustomTestCase):
         _prefetched(linker, clock, rid="a", keys=("k",), session="sa")
         linker._abort_prepared_load_now("sa")
         linker._abort_prepared_load_now("sb")
+        linker.storage.store.batch_get_session_refresh.reset_mock()
         clock.now += 2.0
         _prefetched(linker, clock, rid="c", keys=("k",), session="sc")
         self.assertEqual(linker.session_lease_base, {"k": 102.0})
@@ -300,6 +302,90 @@ class TestSessionRefreshAge(CustomTestCase):
         linker.storage.store.batch_get_session_refresh.side_effect = refresh
         self.assertTrue(_revalidate(linker, clock))
         self.assertEqual(linker.session_lease_base, {})
+
+
+class TestSharedSessionPreparation(CustomTestCase):
+    def test_new_session_does_not_refresh_even_with_age_skip_disabled(self):
+        linker = _linker(age_s=0.0)
+        transfer = types.SimpleNamespace(keys=["k0", "k1"])
+        self.assertTrue(linker._prepare_expanded_load("b", [transfer]))
+        linker.storage.store.batch_get_session_start_with_sources.assert_called_once_with(
+            ["k0", "k1"]
+        )
+        linker.storage.store.batch_get_session_refresh.assert_not_called()
+
+    def test_expired_shared_session_is_renewed_before_read_and_keeps_other_holder(self):
+        clock = _Clock()
+        linker = _linker()
+        _prefetched(linker, clock)
+        lease_deadline = clock.now + 8.0
+        clock.now += 10.0
+
+        def refresh(keys):
+            nonlocal lease_deadline
+            self.assertEqual(keys, ["k0", "k1"])
+            lease_deadline = clock.now + 8.0
+            return [0, 0]
+
+        linker.storage.store.batch_get_session_refresh.side_effect = refresh
+        transfers = [types.SimpleNamespace(keys=["k0", "k1"])]
+        linker.pool_group = types.SimpleNamespace(
+            resolve_transfers=lambda *a, **k: transfers
+        )
+        with mock.patch.object(mooncake_direct_linker.time, "monotonic", clock):
+            self.assertTrue(linker.prepare_load("b", transfers))
+        self.assertLess(clock.now, lease_deadline)  # native read now has a live lease
+        self.assertEqual(linker.session_refcounts, {"k0": 2, "k1": 2})
+        linker._abort_prepared_load_now("b")
+        self.assertEqual(linker.prepared_load_sessions, {"s": ["k0", "k1"]})
+        self.assertEqual(linker.session_refcounts, {"k0": 1, "k1": 1})
+        linker.storage.store.batch_get_session_end.assert_not_called()
+        self.assertTrue(_revalidate(linker, clock))
+        linker._abort_prepared_load_now("s")
+        linker.storage.store.batch_get_session_end.assert_called_once_with(
+            ["k0", "k1"]
+        )
+
+    def test_mixed_batch_refreshes_all_reused_keys_only(self):
+        linker = _linker()
+        _prefetched(linker, _Clock())
+        store = linker.storage.store
+        store.batch_get_session_start_with_sources.reset_mock()
+        transfer = types.SimpleNamespace(keys=["k0", "k1", "k2"])
+        self.assertTrue(linker._prepare_expanded_load("b", [transfer]))
+        store.batch_get_session_refresh.assert_called_once_with(["k0", "k1"])
+        store.batch_get_session_start_with_sources.assert_called_once_with(["k2"])
+
+    def test_missing_session_partial_failure_or_exception_cannot_reuse_old_refs(self):
+        for result in ([0, 7], [], RuntimeError("session missing")):
+            with self.subTest(result=result):
+                linker = _linker()
+                _prefetched(linker, _Clock())
+                store = linker.storage.store
+                if isinstance(result, BaseException):
+                    store.batch_get_session_refresh.side_effect = result
+                else:
+                    store.batch_get_session_refresh.side_effect = lambda keys: result
+                self.assertFalse(
+                    linker._prepare_expanded_load(
+                        "b", [types.SimpleNamespace(keys=["k0", "k1"])]
+                    )
+                )
+                self.assertEqual(linker.prepared_load_sessions, {"s": ["k0", "k1"]})
+                self.assertEqual(linker.session_refcounts, {"k0": 1, "k1": 1})
+                self.assertEqual(linker.session_lease_base, {})
+                store.batch_get_session_end.assert_not_called()
+                self.assertEqual(store.batch_get_session_start_with_sources.call_count, 1)
+                self.assertFalse(_revalidate(linker, _Clock()))
+
+    def test_ordinary_revalidation_exception_fails_closed(self):
+        linker = _linker()
+        transfer = types.SimpleNamespace(keys=["k"])
+        linker.pool_group = types.SimpleNamespace(
+            resolve_transfers=lambda *a, **k: [transfer]
+        )
+        linker.storage._batch_exist = MagicMock(side_effect=RuntimeError("master failed"))
+        self.assertFalse(linker.revalidate_load([transfer]))
 
 
 class TestSessionRefreshAgeConfig(CustomTestCase):

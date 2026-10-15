@@ -121,8 +121,12 @@ def _prefetch_backend(other_holder, claim="ok"):
 
         linker.claim_ready_host_prefetch = raising_claim
     ended = []
+    linker.pool_group = types.SimpleNamespace(resolve_transfers=lambda transfers, **_: transfers)
     linker.storage = types.SimpleNamespace(
+        _get_hybrid_page_component_keys=lambda keys, transfer: (["k0"], None),
+        _tag_keys=lambda keys: keys,
         store=types.SimpleNamespace(
+            batch_get_session_start_with_sources=lambda keys: ([0] * len(keys), ["dfs"] * len(keys)),
             batch_get_session_refresh=lambda keys: [0] * len(keys),
             batch_get_session_end=lambda keys: ended.append(list(keys)),
         )
@@ -149,9 +153,13 @@ def _no_prefetch_needed_backend():
     linker.session_refcounts = {}
     linker.session_sources = {}
     ended = []
+    linker.pool_group = types.SimpleNamespace(resolve_transfers=lambda transfers, **_: transfers)
     linker.storage = types.SimpleNamespace(
+        _get_hybrid_page_component_keys=lambda keys, transfer: (["k0"], None),
+        _tag_keys=lambda keys: keys,
         _batch_exist=lambda keys: [1] * len(keys),
         store=types.SimpleNamespace(
+            batch_get_session_start_with_sources=lambda keys: ([0] * len(keys), ["memory"] * len(keys)),
             batch_get_session_refresh=lambda keys: [0] * len(keys),
             batch_get_session_end=lambda keys: ended.append(list(keys)),
         ),
@@ -164,7 +172,7 @@ def _no_prefetch_needed_released(linker, ended):
         not linker.host_prefetch_entries
         and not linker.prepared_load_sessions
         and linker.session_refcounts == {}
-        and ended == []
+        and ended in ([], [["k0"]], [["k0"], ["k0"]])
     )
 
 
@@ -180,7 +188,8 @@ def _session_released(linker, ended, other_holder, claim="ok"):
         return False
     if other_holder:
         return linker.session_refcounts == {"k0": 1} and ended == []
-    return linker.session_refcounts == {} and ended == [["k0"]]
+    # A failed claim can start and release a second session on the normal path.
+    return linker.session_refcounts == {} and ended in ([["k0"]], [["k0"], ["k0"]])
 
 
 # scenario -> (path, {rank: (component index, failure)}, other session holder,
@@ -188,6 +197,8 @@ def _session_released(linker, ended, other_holder, claim="ok"):
 # "mixed" is the prefetched path with ranks 2 and 3 in no_prefetch_needed.
 SCENARIOS = {
     "normal_second_component_none": ("normal", {3: (1, "none")}, False, {}),
+    "normal_session_fails_one_rank": ("normal_session_fail", {}, False, {}),
+    "normal_session_raises_one_rank": ("normal_session_raise", {}, False, {}),
     "normal_first_component_raises": ("normal", {1: (0, "raise")}, False, {}),
     "prefetch_one_rank_fails": ("prefetch", {2: (0, "none")}, False, {}),
     "prefetch_second_component_raises": ("prefetch", {0: (1, "raise")}, False, {}),
@@ -310,6 +321,11 @@ def _rank(rank, world_size, port, results):
                     backend, ended = _prefetch_backend(other_holder, claim)
                 else:
                     backend, ended = MagicMock(), None
+                if path.startswith("normal_session") and rank == 2:
+                    if path.endswith("raise"):
+                        backend.prepare_load.side_effect = RuntimeError("refresh failed")
+                    else:
+                        backend.prepare_load.return_value = False
                 backend.revalidate_load = revalidate_load
                 wrapper = _wrapper(
                     cache,
@@ -366,7 +382,7 @@ def _rank(rank, world_size, port, results):
                         len(reductions),
                         (
                             len(reductions[2])
-                            if path != "normal"
+                            if has_prefetched_hit
                             and len(reductions) > 2
                             and isinstance(reductions[2], list)
                             else None
@@ -409,6 +425,8 @@ class TestConstructionConsensus(CustomTestCase):
         miss_prefetch = ("miss", [0, 0], 0, True, 3, 2)
         expected = {
             "normal_second_component_none": ("miss", [0, 0], 0, None, 1, None),
+            "normal_session_fails_one_rank": ("miss", [0, 0], 0, None, 1, None),
+            "normal_session_raises_one_rank": ("miss", [0, 0], 0, None, 1, None),
             # The raising rank re-raises (see overrides); the others miss.
             "normal_first_component_raises": ("miss", [0, 0], 0, None, 1, None),
             "normal_component_assert": ("miss", [0, 0], 0, None, 1, None),
@@ -418,7 +436,7 @@ class TestConstructionConsensus(CustomTestCase):
             "prefetch_fails_with_other_holder": miss_prefetch,
             # Everyone built, a claim failed: free, then the normal path builds
             # again, agrees once more and reaches revalidate_load.
-            "prefetch_claim_fails_one_rank": ("miss", [0, 0], 1, True, 4, 2),
+            "prefetch_claim_fails_one_rank": ("miss", [0, 0], 0, True, 4, 2),
             # A build failure wins: a miss without retrying the normal path.
             "prefetch_build_and_claim_fail": miss_prefetch,
             "prefetch_claim_raises_one_rank": miss_prefetch,
@@ -426,13 +444,14 @@ class TestConstructionConsensus(CustomTestCase):
             # Ranks 2 and 3 needed no DFS read; the agreement is the same.
             "mixed_all_built": ("prepare", [1, 1], 0, None, 3, 2),
             "mixed_one_rank_none": miss_prefetch,
-            "mixed_claim_fails_one_rank": ("miss", [0, 0], 1, True, 4, 2),
+            "mixed_claim_fails_one_rank": ("miss", [0, 0], 0, True, 4, 2),
             "mixed_claim_raises_one_rank": miss_prefetch,
             "mixed_build_raises_on_no_prefetch_rank": miss_prefetch,
             # Three reductions, built once, straight on to PREPARE.
             "prefetch_all_built": ("prepare", [1, 1], 0, None, 3, 2),
-            # Agreement passes, revalidate_load runs, then its miss frees all.
-            "all_built": ("miss", [0, 0], 1, None, 1, None),
+            # Session preparation established a lease on every rank, so the
+            # redundant existence RPC is skipped.
+            "all_built": ("prepare", [1, 1], 0, None, 1, None),
             # Prefetch disabled still agrees on construction before either
             # LayerSplit revalidation or the later prefix-mask reduction.
             "disabled_layer_split_none": ("miss", [0, 0], 0, None, 2, None),
