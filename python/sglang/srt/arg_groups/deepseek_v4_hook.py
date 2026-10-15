@@ -319,19 +319,23 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             if cfg.disaggregation_mode == "prefill":
                 topology_invalid = not (
                     cfg.dp_size == 1
+                    and cfg.attn_dp_size == 1
                     and cfg.enable_prefill_cp
                     and cfg.attn_cp_size == cfg.tp_size
                 )
-                topology = "P requires DP=1 and interleave prefill CP=TP"
+                topology = "P requires replica DP=1, attention DP=1 and interleave prefill CP=TP"
             else:
                 topology_invalid = not (
                     cfg.disaggregation_mode == "decode"
-                    and cfg.dp_size == cfg.tp_size
-                    and cfg.enable_dp_attention
+                    # The pipeline normalizes the legacy DP-attention flags
+                    # before this hook; dp_size now counts model replicas.
+                    and cfg.dp_size == 1
+                    and cfg.attn_dp_size == cfg.tp_size
+                    and attn_dp_enabled_of(cfg)
                     and not cfg.enable_prefill_cp
                     and cfg.attn_cp_size == 1
                 )
-                topology = "D requires DP=TP, DP attention and CP=1"
+                topology = "D requires replica DP=1, attention DP=TP and CP=1"
             if common_invalid or topology_invalid:
                 raise ValueError(
                     "DeepSeek-V4.1 DSpark PD on HCU requires static verify, "
