@@ -309,6 +309,13 @@ class DeepseekV2WeightLoaderMixin:
                     )
                 ):
                     continue
+                if (
+                    getattr(self.quant_config, "compressed_tensors_packed", False)
+                    and ".mlp.experts." in name
+                    and name.endswith(".weight_shape")
+                ):
+                    # SlimQuant derives expert shapes from the model config.
+                    continue
                 if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
                     name = name.replace(
                         "mlp.shared_experts",
