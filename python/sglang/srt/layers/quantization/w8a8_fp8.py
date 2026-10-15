@@ -96,8 +96,15 @@ class W8A8Fp8Config(QuantizationConfig):
     - If CUTLASS is not supported: Falls back to per-tensor weight quantization
     """
 
-    def __init__(self, is_checkpoint_fp8_serialized: bool = False):
+    def __init__(
+        self,
+        is_checkpoint_fp8_serialized: bool = False,
+        ignored_layers: Optional[List[str]] = None,
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+    ):
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
+        self.ignored_layers = list(ignored_layers or [])
+        self.packed_modules_mapping = packed_modules_mapping or {}
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -121,7 +128,11 @@ class W8A8Fp8Config(QuantizationConfig):
         is_checkpoint_fp8_serialized = (
             "compressed-tensors" in quant_method or "w8a8_fp8" in quant_method
         )
-        return cls(is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized)
+        return cls(
+            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
+            ignored_layers=config.get("ignore", config.get("ignored_layers", [])),
+            packed_modules_mapping=config.get("packed_modules_mapping", {}),
+        )
 
     def get_quant_method(
         self,
@@ -132,6 +143,18 @@ class W8A8Fp8Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
+            from sglang.srt.layers.quantization.compressed_tensors.utils import (
+                should_ignore_layer,
+            )
+            from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+            # Serialized channel-FP8 checkpoints can keep GDN gates and other
+            # projections in BF16. Honor their original shard names before
+            # allocating FP8 weights and scales for a fused linear.
+            if should_ignore_layer(
+                prefix, self.ignored_layers, self.packed_modules_mapping
+            ):
+                return UnquantizedLinearMethod()
             return W8A8Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             return W8A8FP8MoEMethod(self)
@@ -422,6 +445,18 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto():
             moe_runner_backend = MoeRunnerBackend.TRITON
+
+        if (
+            _is_hcu
+            and moe_runner_backend.is_triton()
+            and not _use_fp8_w8a8_moe
+            and get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE", default="true")
+        ):
+            # Triton's legacy HCU fallback also dispatches to AITER, but passes
+            # canonical weights to backends that require shuffled storage. Use
+            # the unified runner, which owns the one-time in-place shuffle and
+            # keeps the chosen layout stable across warmup and graph replay.
+            moe_runner_backend = MoeRunnerBackend.AITER
 
         if moe_runner_backend.is_aiter() and _is_hcu:
             self.runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
