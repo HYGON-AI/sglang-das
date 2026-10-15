@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 import time
@@ -55,6 +56,31 @@ def _storage_suffix(
         parts.append(f"tp{tp_rank}")
     parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
     return "_".join(parts)
+
+
+def _session_refresh_age_config() -> float:
+    """Refresh-skip age in seconds from the environment.
+
+    The master's TTL is not visible to the client, so the deployment declares
+    it; an age that would not leave any of that TTL disables skipping.
+    """
+    age_s = float(os.environ.get("SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S", "0") or 0)
+    lease_ttl_s = float(os.environ.get("SGLANG_MOONCAKE_LEASE_TTL_S", "10") or 10)
+    if not math.isfinite(age_s) or age_s < 0:
+        raise ValueError(
+            "SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S must be a finite value >= 0"
+        )
+    if not math.isfinite(lease_ttl_s) or lease_ttl_s <= 0:
+        raise ValueError("SGLANG_MOONCAKE_LEASE_TTL_S must be a finite value > 0")
+    if age_s >= lease_ttl_s:
+        logger.warning(
+            "SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S=%.3f is not below the lease "
+            "TTL %.3f s; disabling refresh skipping",
+            age_s,
+            lease_ttl_s,
+        )
+        age_s = 0.0
+    return age_s
 
 
 class LayerWiseLoadCounter:
@@ -293,7 +319,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.read_plan_reuse_ranges = (
             os.environ.get("SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES", "0") == "1"
         )
+        # Skip the admission-time lease refresh of a prefetched request whose
+        # oldest session key was leased less than this many seconds ago. The
+        # master never evicts a leased object, so the refresh only buys lease
+        # time; 0 keeps the refresh unconditional. Must leave enough of the
+        # deployment's lease TTL to cover admission through load completion.
         if self.host_prefetch_enabled:
+            self.session_refresh_age_s = _session_refresh_age_config()
+            self._disable_refresh_skip_for_groups()
             self.host_prefetch_limit = int(
                 getattr(
                     server_args, "mooncake_waiting_queue_dfs_prefetch_max_requests", 8
@@ -391,6 +424,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.prepared_load_sessions: dict[str, list[str]] = {}
             self.session_refcounts: dict[str, int] = {}
             self.session_sources: dict[str, str] = {}
+            # Conservative base of the RPC that last granted a read lease.
+            self.session_lease_base: dict[str, float] = {}
             self.session_lock = threading.Lock()
             self.host_prefetch_lock = threading.Lock()
             self.host_prefetch_entries: dict[str, dict[str, object]] = {}
@@ -413,6 +448,31 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.offload_thread.start()
 
+    # Defaults for instances built without __init__ (unit-test fixtures).
+    session_refresh_age_s = 0.0
+
+    def _disable_refresh_skip_for_groups(self) -> None:
+        group_semantics = getattr(self.storage, "_can_use_group_semantics", None)
+        if (
+            self.session_refresh_age_s > 0
+            and callable(group_semantics)
+            and group_semantics()
+        ):
+            # A grouped object's lease is only extended once half of it is
+            # left, yet every reply reports the full TTL: the client-side
+            # deadline can run up to TTL/2 past the master's.
+            logger.warning(
+                "SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S is ignored with Mooncake "
+                "group semantics"
+            )
+            self.session_refresh_age_s = 0.0
+
+    def _lease_bases(self) -> dict[str, float]:
+        bases = getattr(self, "session_lease_base", None)
+        if bases is None:
+            bases = self.session_lease_base = {}
+        return bases
+
     def _local_host_prefetch_capability(self, requested: bool) -> tuple[bool, str]:
         """Return whether this rank can run waiting-queue DFS prefetch."""
         if not requested:
@@ -423,6 +483,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             for name in (
                 "batch_get_session_start_with_sources",
                 "batch_get_session_prefetch",
+                "batch_get_session_refresh",
                 "dfs_prefetch_arena_available",
             )
             if not callable(getattr(store, name, None))
@@ -653,10 +714,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.session_refcounts[key] += 1
                     if self.host_prefetch_enabled:
                         self.session_sources.setdefault(key, "unknown")
+                        # A shared session needs refresh before admission.
+                        self._lease_bases().pop(key, None)
                     acquired.append(key)
                 else:
                     new_keys.append(key)
 
+            lease_base = time.monotonic() if self.host_prefetch_enabled else 0.0
             try:
                 if new_keys and self.host_prefetch_enabled:
                     results, sources = (
@@ -688,6 +752,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     if self.host_prefetch_enabled:
                         source = sources[index] if index < len(sources) else "unknown"
                         self.session_sources[key] = str(source).lower()
+                        self._lease_bases()[key] = lease_base
                     acquired.append(key)
             if failed:
                 self._rollback_session_refs_locked(acquired)
@@ -746,7 +811,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return str(entry.get("state"))
 
     def revalidate_host_prefetch(self, rid: str) -> bool:
-        """Check request ownership; Mooncake prepares leases when reading."""
         if not self.host_prefetch_enabled:
             return False
         with self.host_prefetch_lock:
@@ -758,11 +822,49 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             ):
                 return False
             session_rid = str(entry["session_rid"])
-            with self.session_lock:
-                keys = self.prepared_load_sessions.get(session_rid, ())
-                return bool(keys) and all(
-                    self.session_refcounts.get(key, 0) > 0 for key in keys
-                )
+        with self.session_lock:
+            keys = list(self.prepared_load_sessions.get(session_rid, ()))
+            # A key without a base (ever shared in this generation, or whose
+            # refresh failed) counts as infinitely old.
+            bases = [self._lease_bases().get(key) for key in keys]
+            private = all(self.session_refcounts.get(key, 0) == 1 for key in keys)
+        if not keys:
+            return False
+        oldest = None if None in bases else min(bases)
+        # Measure the age after acquiring session_lock: it may have been held
+        # across another request's session-start RPC, and that wait has used
+        # up lease too.
+        age = float("inf") if oldest is None else time.monotonic() - oldest
+        if (
+            self.session_refresh_age_s > 0
+            and private
+            and age < self.session_refresh_age_s
+        ):
+            # Every key still holds at least TTL - age of master read lease,
+            # during which the master neither evicts nor replaces it.
+            return True
+        lease_base = time.monotonic()
+        try:
+            results = list(self.storage.store.batch_get_session_refresh(keys))
+        except BaseException:
+            logger.warning(
+                "Mooncake waiting-queue prefetch refresh failed for rid=%s",
+                rid,
+                exc_info=True,
+            )
+            results = []
+        ok = len(results) == len(keys) and all(result == 0 for result in results)
+        with self.session_lock:
+            bases = self._lease_bases()
+            for key in keys:
+                if not ok:
+                    # A failed refresh may have retired the Mooncake session.
+                    bases.pop(key, None)
+                elif key in bases:
+                    # Only keys private for their whole generation keep a
+                    # base; an ended or shared key has none to renew.
+                    bases[key] = lease_base
+        return ok
 
     def revalidate_no_prefetch_needed(self, rid: str) -> bool:
         """Re-check the keys of a request that needed no DFS prefetch.
@@ -974,6 +1076,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.session_refcounts.pop(key, None)
                 if self.host_prefetch_enabled:
                     self.session_sources.pop(key, None)
+                    self._lease_bases().pop(key, None)
                 to_end.append(key)
             else:
                 self.session_refcounts[key] = count - 1

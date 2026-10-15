@@ -102,7 +102,7 @@ class UnifiedCacheLinker(ABC):
         return None
 
     def revalidate_host_prefetch(self, rid: str) -> bool:
-        """Check the prepared request still owns its shared sessions."""
+        """Refresh the prepared session without copying into device memory."""
         return False
 
     def revalidate_no_prefetch_needed(self, rid: str) -> bool:
@@ -663,8 +663,6 @@ class UnifiedCacheLinkerWrapper:
                         req.rid
                     )
                 else:
-                    # Keep every rank in this ownership/existence consensus;
-                    # Mooncake repairs leases at the actual read entry point.
                     locally_valid = (
                         status == "dfs_prefetched"
                         and self.cache_linker.revalidate_host_prefetch(req.rid)
