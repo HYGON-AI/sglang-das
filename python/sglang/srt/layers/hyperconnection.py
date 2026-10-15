@@ -295,6 +295,24 @@ class GatedResidual(HyperConnectionBase):
         if block_output.shape[0] == 0:
             return hyper_input.to(self.params_dtype)
 
+        import os
+
+        if os.environ.get("SGLANG_HC_DEBUG"):
+            import torch.distributed as dist
+
+            from sglang.srt.layers.dp_attention import (
+                get_global_dp_buffer_len,
+                get_local_dp_buffer_len,
+            )
+
+            _rank = dist.get_rank() if dist.is_initialized() else -1
+            print(
+                f"[HC_DEBUG rank={_rank}] combine block_output={tuple(block_output.shape)} "
+                f"hyper_input={tuple(hyper_input.shape)} normed={tuple(hyper_input_normed.shape)} "
+                f"contig=({block_output.is_contiguous()},{hyper_input.is_contiguous()}) "
+                f"dp_buf=(g={get_global_dp_buffer_len()},l={get_local_dp_buffer_len()})",
+                flush=True,
+            )
         if (
             self._jit_combine_ok
             and block_output.is_cuda
