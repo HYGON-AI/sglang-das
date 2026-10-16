@@ -4095,6 +4095,19 @@ class DeepseekV4AttnBackend(
         topk_transform_ragged_v2(
             logits, compress_lens, out_offsets=ks, out_indices=selected
         )
+        if _is_hcu:
+            from lightop.attention import dsv41_ragged_topk_postprocess
+
+            dsv41_ragged_topk_postprocess(
+                logits,
+                selected,
+                ks,
+                k_slots,
+                page_indices[:num_tokens, :topk],
+                raw_indices[:num_tokens, :topk] if raw_indices is not None else None,
+                indexer.uses_candidates and not indexer.is_candidate_source,
+            )
+            return
         if indexer.uses_candidates and not indexer.is_candidate_source:
             selected = mask_topk_scores(logits, selected, ks)
         # ascending positions, padding last: the layout the consumers expect
