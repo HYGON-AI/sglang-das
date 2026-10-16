@@ -1038,7 +1038,8 @@ class _CircularBuffer(_Buffer):
 class _InfiniteBuffer(_Buffer):
     def __init__(self, item_shape: Tuple, dtype, device):
         self._item_shape = item_shape
-        self._buffer = torch.zeros((128, *item_shape), dtype=dtype, device=device)
+        with torch.inference_mode(False):
+            self._buffer = torch.zeros((128, *item_shape), dtype=dtype, device=device)
         self._size = 0
 
     def append(self, value: torch.Tensor):
@@ -1047,9 +1048,10 @@ class _InfiniteBuffer(_Buffer):
         device = self._buffer.device
 
         if self._size == curr_buffer_size:
-            new_buffer = torch.zeros(
-                (2 * curr_buffer_size, *self._item_shape), dtype=dtype, device=device
-            )
+            with torch.inference_mode(False):
+                new_buffer = torch.zeros(
+                    (2 * curr_buffer_size, *self._item_shape), dtype=dtype, device=device
+                )
             new_buffer[:curr_buffer_size] = self._buffer
             self._buffer = new_buffer
 
