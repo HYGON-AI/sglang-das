@@ -1420,7 +1420,7 @@ def fused_experts_impl(
             routed_scaling_factor,
             quant_type,
             gemm1_alpha,
-            gemm1_limit,
+            gemm1_limit=swiglu_limit
         )
 
     if isinstance(activation, int):
