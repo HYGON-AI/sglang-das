@@ -97,8 +97,15 @@ class W8A8Fp8Config(QuantizationConfig):
     - If CUTLASS is not supported: Falls back to per-tensor weight quantization
     """
 
-    def __init__(self, is_checkpoint_fp8_serialized: bool = False):
+    def __init__(
+        self,
+        is_checkpoint_fp8_serialized: bool = False,
+        ignored_layers: Optional[List[str]] = None,
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+    ):
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
+        self.ignored_layers = list(ignored_layers or [])
+        self.packed_modules_mapping = packed_modules_mapping or {}
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -122,7 +129,11 @@ class W8A8Fp8Config(QuantizationConfig):
         is_checkpoint_fp8_serialized = (
             "compressed-tensors" in quant_method or "w8a8_fp8" in quant_method
         )
-        return cls(is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized)
+        return cls(
+            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
+            ignored_layers=config.get("ignore", config.get("ignored_layers", [])),
+            packed_modules_mapping=config.get("packed_modules_mapping", {}),
+        )
 
     def get_quant_method(
         self,
@@ -133,6 +144,18 @@ class W8A8Fp8Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
+            from sglang.srt.layers.quantization.compressed_tensors.utils import (
+                should_ignore_layer,
+            )
+            from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+            # Serialized channel-FP8 checkpoints can keep GDN gates and other
+            # projections in BF16. Honor their original shard names before
+            # allocating FP8 weights and scales for a fused linear.
+            if should_ignore_layer(
+                prefix, self.ignored_layers, self.packed_modules_mapping
+            ):
+                return UnquantizedLinearMethod()
             return W8A8Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             return W8A8FP8MoEMethod(self)
@@ -531,13 +554,13 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
                 topk_weights, topk_ids, _ = topk_output
                 use_prequant_input = i_q is not None and i_s is not None
                 if moe_runner_config.apply_router_weight_on_input:
-                    assert (
-                        topk_weights.dim() == 2
-                    ), "`topk_weights` should be (num_tokens, topk)"
+                    assert topk_weights.dim() == 2, (
+                        "`topk_weights` should be (num_tokens, topk)"
+                    )
                     _, tk = topk_weights.shape
-                    assert (
-                        tk == 1
-                    ), "HCU marlin path: apply_router_weight_on_input requires topk=1"
+                    assert tk == 1, (
+                        "HCU marlin path: apply_router_weight_on_input requires topk=1"
+                    )
                     x = x * topk_weights.to(x.dtype)
                     topk_weights = torch.ones_like(topk_weights, dtype=torch.float32)
                     # Router-weighted input no longer matches precomputed rms-quant activations.
