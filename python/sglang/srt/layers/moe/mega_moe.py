@@ -374,6 +374,14 @@ def _get_mega_moe_symm_buffer(
         # budget below neither applies to it nor belongs in its key.
         num_sms_ctx = nullcontext()
         get_num_sms = None
+    elif _is_hcu:
+        import deepgemm.mega
+
+        package_key = _HCU_MEGA_MOE_RUNTIME_DEEP_GEMM
+        factory = deepgemm.mega.get_symm_buffer_for_mega_moe
+        cuda_graph_max_tokens_per_rank = None
+        num_sms_ctx = nullcontext()
+        get_num_sms = None
     else:
         import deep_gemm
 
@@ -461,7 +469,10 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     if get_is_capture_mode():
         if getattr(moe.experts, "_mega_moe_hcu_int4_weights", False):
             raise RuntimeError("HCU INT4 MegaMoE requires --disable-cuda-graph")
-        return not _is_hcu or _is_standalone_megamoe_runtime()
+        # deepgemm.mega supports capture with the graph's static padded rows;
+        # topk masks the non-token rows. Keep the same prepared weights/runtime
+        # during capture rather than falling back to the generic MoE runner.
+        return True
 
     global_num_tokens = get_dp_global_num_tokens()
     if global_num_tokens and not is_dsa_enable_prefill_cp():
@@ -469,6 +480,13 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    if _is_hcu and max_tokens_per_rank > cap:
+        # Prepared Mega weights cannot be consumed by the generic fallback.
+        raise ValueError(
+            f"HCU MegaMoE needs {max_tokens_per_rank} tokens per rank, exceeds cap {cap}; "
+            "raise SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK "
+            "or shrink the prefill batch"
+        )
     return max_tokens_per_rank <= cap
 
 
@@ -632,7 +650,13 @@ def _run_mega_routed(
         activation_clamp=activation_clamp,
         routed_scaling_factor=(
             1.0
-            if moe.experts.should_fuse_routed_scaling_factor_in_topk
+            if (
+                getattr(
+                    moe.topk, "topk_config", moe.topk
+                ).apply_routed_scaling_factor_on_output
+                if _is_hcu
+                else moe.experts.should_fuse_routed_scaling_factor_in_topk
+            )
             else float(moe.routed_scaling_factor)
         ),
         num_shared_experts=(
@@ -882,30 +906,34 @@ def _run_deep_gemm_hcu_w8a8_mega_moe(
     dispatch_num_tokens: int,
     activation_clamp: Optional[float] = None,
 ) -> torch.Tensor:
-    import deep_gemm
+    import deepgemm.mega
 
     if num_tokens > 0:
-        x_fp8, x_scale = deep_gemm.cast_to_fp8_channelwise(hidden_states)
-        buf.x[:num_tokens].copy_(x_fp8)
-        buf.x_sf[:num_tokens].copy_(x_scale)
-        buf.topk_idx[:num_tokens].copy_(topk_ids.to(buf.topk_idx.dtype))
-        buf.topk_weights[:num_tokens].copy_(topk_weights.to(buf.topk_weights.dtype))
+        deepgemm.mega.mega_moe_preprocess(
+            hidden_states.to(torch.bfloat16).contiguous(),
+            topk_ids.contiguous(),
+            topk_weights.contiguous(),
+            buf,
+            num_tokens,
+        )
 
     y = torch.empty(
         (num_tokens, hidden_size),
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    deep_gemm.fp8_w8a8_mega_moe(
+    # Empty ranks must still participate in the peer-memory barriers. The
+    # operator reads this rank's actual token count from y, with buf providing
+    # the shared capacity; it does not accept dispatch_num_tokens or recipe.
+    deepgemm.mega.fp8_mega_moe(
         y,
         experts.mega_l1_weights,
         experts.mega_l2_weights,
         buf,
-        recipe=(1, 1, 32),
-        activation="swiglu",
-        activation_clamp=activation_clamp,
+        activation_clamp=activation_clamp
+        if activation_clamp is not None
+        else float("inf"),
         fast_math=True,
-        dispatch_num_tokens=dispatch_num_tokens,
     )
     return y
 
@@ -1239,21 +1267,21 @@ def build_hcu_w8a8_mega_moe_experts_weights(experts) -> None:
     )
 
     if runtime == _HCU_MEGA_MOE_RUNTIME_DEEP_GEMM:
-        if l1_rows % 16 != 0 or hidden % 16 != 0 or intermediate % 16 != 0:
+        if l1_rows % 16 != 0 or hidden % 64 != 0 or intermediate % 64 != 0:
             raise ValueError(
-                "deep_gemm HCU W8A8 MegaMoE requires rows and K divisible by 16"
+                "deep_gemm HCU W8A8 MegaMoE requires rows divisible by 16 "
+                "and K divisible by 64"
             )
-        import deep_gemm
+        import deepgemm.mega
 
-        experts.mega_l1_weights = (
-            deep_gemm.weight8bit_nt_kpack2_marlin(w13.contiguous()),
-            w13_scale,
+        # Interleave both L1 gate/up weights and their channel scales before
+        # Marlin w6 packing, exactly as in the operator team's FP8 demo.
+        experts.mega_l1_weights, experts.mega_l2_weights = (
+            deepgemm.mega.transform_weights_for_mega_moe(
+                (w13, w13_scale), (w2, w2_scale)
+            )
         )
-        experts.mega_l2_weights = (
-            deep_gemm.weight8bit_nt_kpack2_marlin(w2.contiguous()),
-            w2_scale,
-        )
-        experts._mega_moe_hcu_weight_layout = "marlin_kpack2"
+        experts._mega_moe_hcu_weight_layout = "marlin_w6_interleaved"
     else:
         if (num_experts, hidden, intermediate) != (32, 4096, 2048):
             raise ValueError(

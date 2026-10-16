@@ -27,6 +27,10 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 class TestDeepGemmMegaMoeApi(CustomTestCase):
     def setUp(self):
         super().setUp()
+        # This suite mocks the CUDA DeepGEMM ABI, independent of host hardware.
+        hcu = patch.object(mega_moe, "_is_hcu", False)
+        hcu.start()
+        self.addCleanup(hcu.stop)
         mega_moe._MEGA_MOE_SYMM_BUFFER.clear()
         self.deep_gemm = ModuleType("deep_gemm")
         self.deep_gemm.num_sms = 132

@@ -2700,10 +2700,9 @@ class MQALayer(MqaAttentionBase):
                                 meta.q_pad_buffer = q_padded
                             except (AttributeError, TypeError):
                                 pass
-                elif _is_gfx942_supported:
-                    # Uninitialized padded TP heads inject NaN into attention on gfx942
-                    # (fnuz), so zero-init there; other archs tolerate new_empty and skip
-                    # the per-forward memset.
+                elif _is_gfx942_supported or _is_hcu:
+                    # Sparse attention may read padded heads; keep them finite
+                    # on gfx942 and HCU even after allocator reuse.
                     q_padded = x.new_zeros(x.shape[0], kernel_num_heads, self.head_dim)
                 else:
                     q_padded = x.new_empty(x.shape[0], kernel_num_heads, self.head_dim)
