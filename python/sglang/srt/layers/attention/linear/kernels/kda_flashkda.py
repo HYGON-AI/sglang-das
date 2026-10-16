@@ -2,6 +2,8 @@ import logging
 from typing import Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
@@ -15,6 +17,73 @@ _FLASHKDA_CHUNK_SIZE = 64
 # FlashKDA's max sequence length, Batches whose longest sequence exceeds this
 # fall back to Triton for the whole batch.
 _FLASHKDA_MAX_SEQ_LEN = 2048
+
+
+@triton.jit
+def _copy_indexed_kda_state(
+    pool,
+    packed,
+    indices,
+    STATE_SIZE: tl.constexpr,
+    POOL_STRIDE: tl.constexpr,
+    NUM_SLOTS: tl.constexpr,
+    GATHER: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    slot = tl.load(indices + row)
+    valid = (slot >= 0) & (slot < NUM_SLOTS)
+    if GATHER:
+        value = tl.load(
+            pool + slot * POOL_STRIDE + offsets,
+            mask=valid & (offsets < STATE_SIZE),
+            other=0,
+        )
+        tl.store(packed + row * STATE_SIZE + offsets, value, mask=offsets < STATE_SIZE)
+    else:
+        value = tl.load(
+            packed + row * STATE_SIZE + offsets, mask=offsets < STATE_SIZE, other=0
+        )
+        tl.store(
+            pool + slot * POOL_STRIDE + offsets,
+            value,
+            mask=valid & (offsets < STATE_SIZE),
+        )
+
+
+def _copy_kda_state(pool, packed, indices, *, gather):
+    # DP padding uses -1: it has no committed state and must never alias
+    # the final real slot through Python negative indexing.
+    if (
+        pool.ndim < 2
+        or packed.shape != (indices.numel(), *pool.shape[1:])
+        or indices.ndim != 1
+        or indices.dtype not in (torch.int32, torch.int64)
+        or not indices.is_contiguous()
+        or not packed.is_contiguous()
+        or pool.dtype != packed.dtype
+        or pool.device != packed.device
+        or pool.device != indices.device
+    ):
+        raise ValueError(
+            "KDA state copy requires matching dense rows and contiguous indices"
+        )
+    if indices.numel() == 0 or packed.numel() == 0:
+        return
+    if not pool[0].is_contiguous():
+        raise ValueError("KDA state pool rows must be contiguous")
+    state_size = packed[0].numel()
+    _copy_indexed_kda_state[(indices.numel(), triton.cdiv(state_size, 1024))](
+        pool,
+        packed,
+        indices,
+        state_size,
+        pool.stride(0),
+        pool.shape[0],
+        gather,
+        1024,
+    )
 
 
 def _load_flash_kda():
@@ -261,7 +330,12 @@ class FlashKDAKernel(LinearAttnKernelBase):
         # flash_kda varlen state is [N, H, V, K] -- the SAME layout as sglang's
         # KDA pool, so no transpose is needed. Advanced indexing copies, so the
         # final state is written back in-place below (matching chunk_kda).
-        initial_state = ssm_states[cache_indices].contiguous()
+        initial_state = torch.empty(
+            (cache_indices.numel(), *ssm_states.shape[1:]),
+            device=ssm_states.device,
+            dtype=ssm_states.dtype,
+        )
+        _copy_kda_state(ssm_states, initial_state, cache_indices, gather=True)
 
         out_buf = torch.empty_like(v)
         final_state = torch.empty_like(initial_state)
@@ -282,7 +356,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
             cu_seqlens=cu_seqlens,
         )
 
-        ssm_states[cache_indices] = final_state
+        _copy_kda_state(ssm_states, final_state, cache_indices, gather=False)
 
         # out_buf is already [1, packed_seq, HV, V].
         return out_buf

@@ -1255,7 +1255,9 @@ class LogitsProcessor(nn.Module):
                 device=logits.device,
                 dtype=logits.dtype,
             )
-            attn_tp_all_gather_into_tensor(global_logits, logits)
+            # AITER AG requires dim-0 concatenation. Keep the stacked owner for
+            # the token-major vocabulary permutation below; flatten is a view.
+            attn_tp_all_gather_into_tensor(global_logits.flatten(0, 1), logits)
             global_logits = global_logits.permute(1, 0, 2).reshape(
                 logits.shape[0], self.vocab_size
             )
