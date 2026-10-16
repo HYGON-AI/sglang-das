@@ -8,7 +8,7 @@ re-checks them and, if any is gone, sends every rank back to the normal path.
 import threading
 import types
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -317,10 +317,18 @@ class TestDisabledPrefetchMapFastPath(CustomTestCase):
             tree_core=types.SimpleNamespace(),
             write_through_threshold=0,
             _all_reduce_attn_groups=MagicMock(),
+            components=(),
         )
         cache_linker = MagicMock()
         cache_linker.waiting_queue_prefetch_enabled.return_value = False
-        wrapper = UnifiedCacheLinkerWrapper(cache, cache_linker)
+        with patch(
+            "sglang.srt.mem_cache.storage.mooncake_store."
+            "mooncake_direct_linker.MooncakeDirectLinker",
+            return_value=cache_linker,
+        ):
+            wrapper = UnifiedCacheLinkerWrapper(
+                cache, types.SimpleNamespace(), types.SimpleNamespace()
+            )
 
         self.assertIsNone(wrapper.host_prefetch_hits)
         self.assertIsNone(wrapper.pending_host_prefetch_submissions)

@@ -354,6 +354,11 @@ class TestRunBatchOffRoute(CustomTestCase):
         scheduler.enable_overlap = False
         scheduler.enable_pdmux = False
         scheduler._forward_ingress_enabled = False
+        scheduler.server_args = types.SimpleNamespace(
+            pp_size=1,
+            disaggregation_mode="null",
+            speculative_algorithm=None,
+        )
         scheduler.future_map = MagicMock()
         scheduler._forward_isolation = MagicMock(return_value=nullcontext())
         scheduler.model_worker = MagicMock()

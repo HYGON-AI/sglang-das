@@ -44,7 +44,9 @@ def _req(rid="r"):
 def _scheduler(*, hicache, external_linker, tree_cache):
     s = types.SimpleNamespace(
         enable_hicache_storage=hicache,
-        enable_unified_cache_external_linker=external_linker,
+        server_args=types.SimpleNamespace(
+            enable_unified_cache_external_linker=external_linker
+        ),
         tree_cache=tree_cache,
         ps=types.SimpleNamespace(tp_rank=0),
         clear_pending_chunk_send=MagicMock(),
