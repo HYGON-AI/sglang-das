@@ -7,6 +7,7 @@
 #   - Full-rank KDA gate (use_full_rank_gate)
 
 import logging
+import os
 from collections.abc import Iterable
 from functools import cached_property
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -517,6 +518,31 @@ class KimiK3MLP(nn.Module):
             hidden_states = hidden_states + prefix_sum
         return hidden_states
 
+    def _serial_sbo_gate_up(self, hidden_states, input_quant_args=None):
+        from sglang.srt.layers.k3_sbo_gemm import project
+
+        return project(self.gate_up_proj, hidden_states, input_quant_args)
+
+    def _serial_sbo_down(self, gate_up):
+        """The same activation/quantization boundary as the ordinary forward."""
+        from sglang.srt.layers.k3_sbo_gemm import project
+
+        situ_int8_op = self._fused_situ_int8_op
+        if situ_int8_op is not None and _lightop_int8_input_supported(gate_up):
+            x_q, x_scale = situ_int8_op(
+                gate_up, self.act_fn.beta, self.act_fn.linear_beta
+            )
+            hidden_size = gate_up.shape[1] // 2
+            hidden_states, _ = project(
+                self.down_proj,
+                gate_up[:, :hidden_size],
+                input_quant_args=(x_q, x_scale),
+            )
+        else:
+            hidden_states = self.act_fn(gate_up)
+            hidden_states, _ = project(self.down_proj, hidden_states)
+        return hidden_states
+
 
 def _add3(
     a: torch.Tensor,
@@ -771,6 +797,9 @@ class KimiK3MoE(nn.Module):
             and self.alt_stream is not None
         )
 
+        # Default off: do not change the existing shared-expert paths.
+        self._serial_sbo_enabled = self._init_serial_sbo()
+
         # Latent MoE projections. Pass quant_config through so ModelSlim
         # W8A8_DYNAMIC checkpoints (Huawei W4A8) load weight_scale/offset and
         # run quant matmul. quant_config=None previously treated int8 weights
@@ -880,6 +909,89 @@ class KimiK3MoE(nn.Module):
             and self.routed_expert_up_proj.weight.dtype == torch.bfloat16
             and self.routed_expert_up_proj.weight.is_contiguous()
         )
+
+    def _init_serial_sbo(self):
+        method = os.environ.get("SGLANG_K3_SBO_METHOD", "off")
+        if method == "off":
+            return False
+        if method != "serial":
+            raise ValueError("SGLANG_K3_SBO_METHOD must be off or serial")
+
+        from sglang.srt.layers.moe.utils import (
+            get_deepep_mode,
+            is_sbo_enabled,
+            is_tbo_enabled,
+        )
+
+        if not (
+            is_hcu()
+            and get_moe_a2a_backend().is_deepep()
+            and get_deepep_mode().value == "low_latency"
+            and self.use_latent_moe
+            and self._shared_experts_tp1
+            and not self._shared_experts_attn_tp_comm
+            and self.shared_experts is not None
+            and self.alt_stream is None
+            and not is_tbo_enabled()
+            and not is_sbo_enabled()
+        ):
+            raise ValueError(
+                "K3 serial SBO requires HCU latent MoE, DeepEP low_latency, "
+                "TP1 shared experts and no other SBO/TBO/alternate stream"
+            )
+        return True
+
+    def _serial_sbo_experts(
+        self, routed_input, topk_output, hidden_states, input_quant_args
+    ):
+        """Run shared gate/up after dispatch send, shared down after combine send.
+
+        All work stays on the current stream. The shared branch consumes the
+        original token rows, not the dispatched/quantized routed-expert buffer.
+        Latent reduction/norm/up and the shared/prefix adds remain in the caller.
+        """
+        shared_gate_up = None
+        shared_output = None
+        prepared = False
+        completed = False
+        handles = []
+
+        def gate_up_hook(dispatcher):
+            nonlocal shared_gate_up, prepared
+            if prepared:
+                raise RuntimeError("K3 serial SBO gate/up hook ran more than once")
+            if hidden_states.shape[0] > 0:
+                shared_gate_up, _ = self.shared_experts._serial_sbo_gate_up(
+                    hidden_states, input_quant_args
+                )
+            prepared = True
+
+        def down_hook(dispatcher):
+            nonlocal shared_output, completed
+            if not prepared or completed:
+                raise RuntimeError("K3 serial SBO hook order is invalid")
+            if shared_gate_up is not None:
+                shared_output = self.shared_experts._serial_sbo_down(shared_gate_up)
+            completed = True
+
+        def remember(registered):
+            if isinstance(registered, (list, tuple)):
+                handles.extend(registered)
+            else:
+                handles.append(registered)
+
+        try:
+            dispatcher = self.experts.dispatcher
+            # Validate the low-latency receive window before adding dispatch work.
+            remember(dispatcher.register_deepep_combine_hook(down_hook))
+            remember(dispatcher.register_deepep_dispatch_hook(gate_up_hook))
+            expert_output = self.experts(routed_input, topk_output)
+            if not completed:
+                raise RuntimeError("K3 serial SBO shared hooks did not run")
+        finally:
+            for handle in handles:
+                handle.remove()
+        return expert_output, shared_output
 
     def _merge_front_weights(self) -> None:
         """Merge shared gate_up + router gate + latent down_proj weights.
@@ -1336,7 +1448,8 @@ class KimiK3MoE(nn.Module):
             quantize_input = self._reuse_input_int8_op
             if quantize_input is not None:
                 input_quant_args = quantize_input(hidden_states)
-        issue_shared()
+        if not self._serial_sbo_enabled:
+            issue_shared()
 
         if not self.use_latent_moe:
             expert_output = self.experts(hidden_states, topk_output)
@@ -1364,11 +1477,16 @@ class KimiK3MoE(nn.Module):
                 routed_input, _ = self.routed_expert_down_proj(
                     hidden_states, quant_args=input_quant_args
                 )
-        expert_output = (
-            self._forward_mega_experts(routed_input, topk_output)
-            if self._use_mega_moe
-            else self.experts(routed_input, topk_output)
-        )
+        if self._serial_sbo_enabled:
+            expert_output, shared_output = self._serial_sbo_experts(
+                routed_input, topk_output, hidden_states, input_quant_args
+            )
+        else:
+            expert_output = (
+                self._forward_mega_experts(routed_input, topk_output)
+                if self._use_mega_moe
+                else self.experts(routed_input, topk_output)
+            )
 
         latent = self._reduce_latent(expert_output, apply_norm=False)
         # up_proj is replicated; the helper now owns the single normalization.
