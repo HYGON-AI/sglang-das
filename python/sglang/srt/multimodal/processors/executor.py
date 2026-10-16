@@ -4,6 +4,8 @@ import copy
 import threading
 from typing import Any, Callable, TypeVar
 
+from sglang.srt.utils.tokenizer_threads import cap_torch_intraop_threads
+
 T = TypeVar("T")
 
 
@@ -25,6 +27,7 @@ class MultimodalProcessorExecutor:
         copy.deepcopy(resolve_processor())
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=max_workers,
+            initializer=cap_torch_intraop_threads,
             thread_name_prefix="sglang-mm-processor",
         )
         self._worker_state = _WorkerState()

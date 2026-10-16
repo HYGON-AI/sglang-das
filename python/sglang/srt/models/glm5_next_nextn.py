@@ -15,7 +15,7 @@
 import logging
 
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
-from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
+from sglang.srt.models.glm5_next import Glm5NextForCausalLM
 from sglang.srt.models.utils import WeightsMapper
 
 logger = logging.getLogger(__name__)
@@ -68,13 +68,15 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
             f"model.language_model.layers.{layer_id}.",
         )
         nextn_weights = (
-            (name, weight)
+            (name.replace("language_model.", ""), weight)
             for name, weight in weights
             if name.startswith(layer_prefixes)
         )
-        return Glm5NextForConditionalGeneration.load_weights(
-            self, nextn_weights, is_nextn=True
-        )
+        return Glm5NextForCausalLM.load_weights(self, nextn_weights, is_nextn=True)
 
 
-EntryClass = [Glm5NextForConditionalGenerationNextN]
+class Glm5NextForCausalLMNextN(Glm5NextForConditionalGenerationNextN):
+    pass
+
+
+EntryClass = [Glm5NextForCausalLMNextN, Glm5NextForConditionalGenerationNextN]

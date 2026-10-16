@@ -8,12 +8,13 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache_
 from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
     filter_dcp_local_kv_indices,
 )
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -25,6 +26,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_musa,
     _is_npu,
     _use_aiter_gfx95,
+    _is_hcu,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.utils import BumpAllocator, next_power_of_2
@@ -34,6 +36,8 @@ if TYPE_CHECKING:
 
 if _is_cuda:
     from sglang.kernels.ops.attention.concat_mla import concat_mla_k
+elif _is_hcu:
+    from sgl_kernel import merge_state_v2
 elif _is_musa:
     from sgl_kernel import concat_mla_k
 
@@ -590,12 +594,18 @@ class DeepseekMHAForwardMixin:
         if _is_cuda:
             # Save latent cache
             get_token_to_kv_pool().set_mla_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+                self.attn_mha,
+                KVWriteLoc.for_batch(forward_batch),
+                kv_a.unsqueeze(1),
+                k_pe,
             )
         elif _is_npu:
             # To reduce a time-costing split operation
             get_token_to_kv_pool().set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+                self.attn_mha,
+                KVWriteLoc.for_batch(forward_batch),
+                kv_a.unsqueeze(1),
+                k_pe,
             )
         else:
             latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
@@ -603,7 +613,7 @@ class DeepseekMHAForwardMixin:
 
             # Save latent cache
             get_token_to_kv_pool().set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
+                self.attn_mha, KVWriteLoc.for_batch(forward_batch), latent_cache, None
             )
 
     def _get_mla_kv_buffer(
@@ -613,6 +623,7 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ):
         if _is_cuda or _use_aiter_gfx95:
+            kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
             )
@@ -622,6 +633,10 @@ class DeepseekMHAForwardMixin:
                 self.attn_mha.layer_id
             )
             latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
+            # HCU's dense FlashMLA cache may pad no-rope rows from 512 to 576.
+            latent_cache = latent_cache[
+                ..., : self.kv_lora_rank + self.qk_rope_head_dim
+            ]
 
             kv_a, k_pe = latent_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
@@ -638,9 +653,7 @@ class DeepseekMHAForwardMixin:
 
         Returns: (kv_a, k_pe) both in BF16
         """
-        backend = get_attn_backend()
-        if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
-            backend = backend.primary
+        backend = resolve_attn_backend(forward_batch)
         kv_indices = backend.forward_metadata.page_table_1_flattened
         assert kv_indices is not None, (
             "page_table_1_flattened should have been generated for FP8 MHA path"

@@ -19,16 +19,12 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import is_cuda, kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
-
-# HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
-register_hcu_ci(
-    est_time=1400,
-    suite="stage-b-test-1-hcu-small",
-    disabled="HCU PR baseline deferred: MoE path needs local model/backend validation before required CI.",
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_hcu_ci,
 )
-
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -40,6 +36,13 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=124, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=1400, suite="stage-b-test-1-gpu-small-amd")
+
+# HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
+register_hcu_ci(
+    est_time=1400,
+    suite="stage-b-test-1-hcu-small",
+    disabled="HCU PR baseline deferred: MoE path needs local model/backend validation before required CI.",
+)
 
 
 class TestTorchCompileMoe(CustomTestCase):
@@ -67,7 +70,7 @@ class TestTorchCompileMoe(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         # 0.48 measured, minus the 0.05 margin the other eval thresholds use.
         self.assertGreaterEqual(metrics["score"], 0.43)
 

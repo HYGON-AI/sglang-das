@@ -9,6 +9,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation import utils as disagg_utils
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.mem_cache.cp_cache_layer_split.validation import (
     validate_cp_cache_layer_split,
@@ -112,7 +113,8 @@ class TestCpCacheLayerSplitDspark(CustomTestCase):
                 hf_text_config=SimpleNamespace(dspark_target_layer_ids=[37, 38, 39]),
             ),
             layer_info=SimpleNamespace(start_layer=0, end_layer=40),
-            ps=SimpleNamespace(pp_size=1, attn_dp_size=1),
+            pp_size=1,
+            attn_dp_size=1,
             page_size=256,
             sliding_window_size=128,
             is_draft_worker=draft,
@@ -150,7 +152,10 @@ class TestCpCacheLayerSplitDspark(CustomTestCase):
                 (
                     "get_exec",
                     SimpleNamespace(
-                        kernel=SimpleNamespace(enable_deepseek_v4_fp4_indexer=True),
+                        kernel=SimpleNamespace(
+                            enable_deepseek_v4_fp4_indexer=True,
+                            dsv4_attn_backend="flashmla",
+                        ),
                         features=SimpleNamespace(enable_encoder_swa_bounded_replay=False),
                     ),
                 ),
@@ -176,8 +181,24 @@ class TestCpCacheLayerSplitDspark(CustomTestCase):
             )
             stack.enter_context(
                 mock.patch(
+                    "sglang.srt.mem_cache.deepseek_v4_memory_pool.select_dsv4_kv_layout",
+                    return_value=(KVLayout.V4, None),
+                )
+            )
+            stack.enter_context(
+                mock.patch(
+                    "sglang.srt.mem_cache.deepseek_v4_memory_pool.get_exec",
+                    side_effect=lambda: pools.get_exec(),
+                )
+            )
+            stack.enter_context(
+                mock.patch(
                     "sglang.srt.mem_cache.deepseek_v4_memory_pool.get_spec",
-                    return_value=SimpleNamespace(speculative_num_draft_tokens=6),
+                    # Hold target compressor ring pricing fixed in both cases;
+                    # this test isolates the extra replicated draft KV budget.
+                    return_value=SimpleNamespace(
+                        speculative_algorithm="DSPARK", speculative_num_draft_tokens=6
+                    ),
                 )
             )
             return pools.DSV4PoolConfigurator(kvc)
@@ -189,9 +210,11 @@ class TestCpCacheLayerSplitDspark(CustomTestCase):
                 spec = self._configurator(speculative=True, ratio=ratio)
                 self.assertEqual(spec.cp_draft_layers, 3)
                 self.assertEqual(spec._spec_infl, 1.0)
+                # Main now prices the physical page stride, including its pad.
+                paged_kv_bytes = KVLayout.V4.page_bytes(spec.page_size) / spec.page_size
                 self.assertEqual(
                     spec.bytes_per_swa_token - base.bytes_per_swa_token,
-                    3 * spec.kv_bytes,
+                    3 * paged_kv_bytes,
                 )
                 if ratio is None:
                     self.assertEqual(
@@ -199,12 +222,12 @@ class TestCpCacheLayerSplitDspark(CustomTestCase):
                     )
                     self.assertEqual(
                         spec._get_swa_fixed_bytes() - base._get_swa_fixed_bytes(),
-                        spec.swa_cap_tokens * 3 * spec.kv_bytes,
+                        spec.swa_cap_tokens * 3 * paged_kv_bytes,
                     )
                 else:
                     self.assertAlmostEqual(
                         spec.bytes_per_full_token - base.bytes_per_full_token,
-                        ratio * 3 * spec.kv_bytes,
+                        ratio * 3 * paged_kv_bytes,
                     )
 
     def test_draft_configurator_does_not_layer_shard(self):
@@ -232,7 +255,9 @@ class TestCpCacheLayerSplitDspark(CustomTestCase):
         ]
         args = SimpleNamespace(
             mla_compression_ratios=[0, 0] + [2] * 18 + [1] * 20 + [0] * 3,
-            kv_layer_ids=[],
+            # The unsharded V4.1 pool has no legacy C4/C128 layer IDs,
+            # whereas LayerSplit reports rank-local descriptor layer IDs.
+            kv_layer_ids=[] if rank is None else [key[1] for key, _ in kv],
             kv_item_lens=[size for _, size in kv],
             state_types=[StateType.SWA, StateType.DSV4_REQUEST_STATE, StateType.SWA],
             state_item_lens=[[size for _, size in entries] for entries in states],
@@ -266,6 +291,10 @@ class TestCpCacheLayerSplitDspark(CustomTestCase):
         ):
             decode, _ = self._transfer_args()
             expected = disagg_utils.get_dsv41_spec_layout(decode)
+            self.assertEqual(
+                expected["kv_layer_ids"],
+                [key[1] for key, _ in self._transfer_args()[1][0]],
+            )
             gather.assert_not_called()
             for args, _ in peers:
                 self.assertEqual(disagg_utils.get_dsv41_spec_layout(args), expected)

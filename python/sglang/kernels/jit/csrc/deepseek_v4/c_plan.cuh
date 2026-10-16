@@ -711,9 +711,12 @@ inline PlanLens plan_compress_prefill_out(
   const auto f2s_ptr = static_cast<const F2S_T*>(full_to_swa.data_ptr());
 
   const auto batch_size = static_cast<uint32_t>(B.unwrap());
-  constexpr auto kMaxTokens = static_cast<uint32_t>(std::numeric_limits<uint16_t>::max());
+  constexpr auto kMaxTokens = static_cast<uint32_t>(std::numeric_limits<uint16_t>::max()) + 1;
+  // Match plan_compress_prefill: token indices 0..65535 are representable,
+  // but batch_id=65535 with ragged_id=65535 would collide with the invalid
+  // packed write-plan sentinel, so the request count must stay below 65536.
   RuntimeCheck(compress_ratio == 4 || compress_ratio == 128);
-  RuntimeCheck(batch_size <= num_q_tokens && num_q_tokens <= kMaxTokens);
+  RuntimeCheck(batch_size < kMaxTokens && batch_size <= num_q_tokens && num_q_tokens <= kMaxTokens);
   RuntimeCheck(static_cast<uint32_t>(N.unwrap()) == num_q_tokens);
   RuntimeCheck(swa_page_size % ring_size == 0 && ring_size % compress_ratio == 0);
 

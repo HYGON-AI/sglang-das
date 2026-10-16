@@ -21,10 +21,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -42,6 +43,10 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
 )
+from sglang.srt.disaggregation.hidden_state import (
+    get_pd_hidden_capture_layer_ids,
+    get_pd_hidden_req_state as pd_hidden_state,
+)
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -53,6 +58,7 @@ from sglang.srt.disaggregation.utils import (
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
     get_kv_class,
+    get_kv_transfer_buf_infos,
     get_qsa_pending_state_indices,
     is_aborted,
     is_mla_backend,
@@ -72,13 +78,14 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
+    checkpoint_kv_cache,
     kv_to_page_indices,
     kv_to_page_num,
-    maybe_cache_unfinished_req,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_GET_NEXT_BATCH,
@@ -87,19 +94,27 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     scheduler_stage_method,
 )
 from sglang.srt.runtime_context import (
+    get_device,
     get_disagg,
     get_parallel,
     get_schedule,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.speculative.dspark_components.dspark_disaggregation import (
+    resolve_hidden_bootstrap_plan,
+)
+from sglang.srt.utils import is_hcu, is_npu
 
 if TYPE_CHECKING:
-    from torch.distributed import ProcessGroup
-
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
+
+# TP=1 yield between polls of a pending result. An initial heuristic rather
+# than a tuned value: long enough that the bootstrap, transfer and cache
+# threads reliably win the GIL even when the input socket is empty, and far
+# below the duration of any prefill forward, so it adds no visible latency.
+PREFILL_INPUT_POLL_INTERVAL_S = 0.0001
 
 _is_npu = is_npu()
 
@@ -115,6 +130,14 @@ def should_force_retry(req: Req) -> bool:
     return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
 
 
+def _uses_write_through_cache(cache: object) -> bool:
+    return (
+        isinstance(cache, UnifiedRadixCache)
+        and cache.cache_controller is not None
+        and cache.cache_controller.write_policy == "write_through"
+    )
+
+
 def _transfer_start_layer(*, pool, hf_text_config) -> int:
     # Hybrid pools count all layers in start_layer, but peer KV lists contain only
     # full-attention layers, so translate to a full-attention-relative offset.
@@ -124,9 +147,23 @@ def _transfer_start_layer(*, pool, hf_text_config) -> int:
         1 for lid in hf_text_config.full_attention_layer_ids if lid < pool.start_layer
     )
 
+def clear_pd_hidden_request_state(req: Req) -> None:
+    pd_hidden_state(req).meta = None
+    pd_hidden_state(req).src_indices = None
+    pd_hidden_state(req).dst_indices = None
+    pd_hidden_state(req).written = None
+    pd_hidden_state(req).capture_layer_ids = None
+    pd_hidden_state(req).current_src_indices = None
+    pd_hidden_state(req).current_start = None
+    pd_hidden_state(req).current_row_len = 0
+    pd_hidden_state(req).current_is_last = False
+    pd_hidden_state(req).owner_direct_sent = False
+
 
 def maybe_release_metadata_buffer(
-    req: Req, allocator: ReqToMetadataIdxAllocator
+    req: Req,
+    allocator: ReqToMetadataIdxAllocator,
+    pd_hidden_pool=None,
 ) -> None:
     """
     Release the metadata buffer index allocated for a request in prefill disaggregation mode.
@@ -140,6 +177,114 @@ def maybe_release_metadata_buffer(
     if req.metadata_buffer_index >= 0:
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
+    indices = pd_hidden_state(req).src_indices
+    if indices:
+        sender = req.disagg_kv_sender
+        if pd_hidden_pool is None and sender is not None:
+            pd_hidden_pool = sender.kv_mgr.pd_hidden_pool
+        worker_released = (
+            sender is not None
+            and sender.kv_mgr.pop_pd_hidden_request_done(sender.bootstrap_room)
+        )
+        if not worker_released and pd_hidden_pool is not None:
+            pd_hidden_pool.free(indices)
+        clear_pd_hidden_request_state(req)
+    elif not indices:
+        clear_pd_hidden_request_state(req)
+
+
+def maybe_release_pd_hidden_rows(req: Req, pd_hidden_pool) -> None:
+    """Release source hidden rows once the local RDMA transfer is complete."""
+    if pd_hidden_pool is None:
+        return
+    indices = pd_hidden_state(req).src_indices
+    if indices:
+        pd_hidden_pool.free(indices)
+        clear_pd_hidden_request_state(req)
+
+
+def maybe_release_pd_hidden_rows_on_hidden_done(
+    req: Req, pd_hidden_pool
+) -> bool:
+    """Release source hidden rows after PD_HIDDEN finishes, before KV success."""
+    indices = pd_hidden_state(req).src_indices
+    if not indices or pd_hidden_pool is None:
+        return False
+    sender = req.disagg_kv_sender
+    if sender is None or not sender.kv_mgr.pop_pd_hidden_request_done(
+        sender.bootstrap_room
+    ):
+        return False
+
+    clear_pd_hidden_request_state(req)
+    return True
+
+
+def fail_pd_hidden_transfer(req: Req, message: str) -> None:
+    """Route a PD hidden transfer failure through the standard KV failed path."""
+    logger.warning(message)
+    sender = req.disagg_kv_sender
+    if sender is None:
+        return
+    kv_mgr = sender.kv_mgr
+    room = sender.bootstrap_room
+    kv_mgr.record_failure(room, message)
+    kv_mgr.update_status(room, KVPoll.Failed)
+    kv_mgr._wake_pd_hidden_ack_waiters(room)
+    sender.conclude_state = KVPoll.Failed
+
+
+def is_pd_hidden_transfer_failed(req: Req) -> bool:
+    sender = req.disagg_kv_sender
+    return sender is not None and sender.conclude_state == KVPoll.Failed
+
+
+def _select_pd_hidden_payload_indices(
+    *,
+    rid: str,
+    owner_direct_sent: bool,
+    src_indices: Optional[List[int]],
+    capture_layer_ids: Optional[List[int]],
+    current_src_indices: Optional[List[int]],
+    has_current_pd_hidden: bool,
+    streaming_hidden: bool,
+    written: Optional[List[bool]],
+):
+    if owner_direct_sent:
+        return []
+    if src_indices is None and capture_layer_ids:
+        raise RuntimeError(
+            f"PD hidden row pool was not materialized before transfer: rid={rid}"
+        )
+    if streaming_hidden and has_current_pd_hidden:
+        return np.asarray(current_src_indices, dtype=np.int32)
+    if not src_indices:
+        return []
+    if written is not None and not all(written):
+        missing = [i for i, ok in enumerate(written) if not ok][:8]
+        raise RuntimeError(
+            "PD hidden rows are incomplete before transfer: "
+            f"rid={rid}, missing_offsets={missing}"
+        )
+    return np.asarray(src_indices, dtype=np.int32)
+
+
+def _pd_hidden_chunk_ends(batch: ScheduleBatch) -> List[int]:
+    """Return logical sequence ends for mapping captured hidden rows.
+
+    Under CP with a radix hit, ``seq_lens_cpu`` can describe only the fresh
+    local segment. ``prefix_lens + extend_lens`` remains the global token
+    coordinate used by decode's ``hidden_start`` metadata.
+    """
+    if batch.prefix_lens is not None:
+        return [
+            int(prefix_len) + int(extend_len)
+            for prefix_len, extend_len in zip(
+                batch.prefix_lens, batch.extend_lens, strict=True
+            )
+        ]
+    assert batch.seq_lens_cpu is not None
+    return [int(x) for x in batch.seq_lens_cpu.tolist()]
 
 
 class PrefillBootstrapQueue:
@@ -153,36 +298,31 @@ class PrefillBootstrapQueue:
         draft_token_to_kv_pool: Optional[KVCache],
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: MetadataBuffers,
-        tp_rank: int,
-        tp_size: int,
         gpu_id: int,
         bootstrap_port: int,
-        gloo_group: ProcessGroup,
         max_total_num_tokens: int,
         scheduler: Scheduler,
         scheduler_stage_metrics: SchedulerStageMetricsRecorder,
-        pp_rank: int,
-        pp_size: int,
         transfer_backend: TransferBackend,
     ):
+        parallel = get_parallel()
         self.token_to_kv_pool = token_to_kv_pool
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.is_mla_backend = is_mla_backend(token_to_kv_pool)
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
-        self.tp_rank = tp_rank
-        self.tp_size = tp_size
-        self.pp_rank = pp_rank
-        self.pp_size = pp_size
+        self.tp_rank = parallel.tp_rank
+        self.pp_rank = parallel.pp_rank
+        self.pp_size = parallel.pp_size
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
         self.queue: List[Req] = []
-        self.gloo_group = gloo_group
         self.scheduler = scheduler
         self.scheduler_stage_metrics = scheduler_stage_metrics
         self.max_total_num_tokens = (
-            self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
+            self.scheduler.tp_worker.model_runner.effective_logical_max_total_num_tokens
         )
+        self._last_pd_hidden_credit_warning_time = 0.0
         self.transfer_backend = transfer_backend
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
@@ -212,7 +352,7 @@ class PrefillBootstrapQueue:
         if get_disagg().disaggregation_enable_kv_checksum:
             kv_args = self.kv_manager.kv_args
             self.scheduler.kv_checksum_computer = KvChecksumComputer(
-                device=torch.device(f"cuda:{self.scheduler.ps.gpu_id}"),
+                device=torch.device(f"cuda:{get_device().gpu_id}"),
                 kv_data_ptrs=kv_args.kv_data_ptrs,
                 kv_item_lens=kv_args.kv_item_lens,
                 state_data_ptrs=kv_args.state_data_ptrs,
@@ -228,7 +368,7 @@ class PrefillBootstrapQueue:
         )
         if use_dsv4_full_token_pool:
             self.max_total_num_tokens = (
-                self.scheduler.tp_worker.model_runner.max_token_pool_size
+                self.scheduler.tp_worker.model_runner.full_max_total_num_tokens
             )
             logger.info(
                 "DeepSeek-V4 PD prefill admission uses full token pool capacity: %d",
@@ -246,7 +386,7 @@ class PrefillBootstrapQueue:
         kv_args = kv_args_class()
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
-        kv_args.system_dp_rank = self.scheduler.ps.dp_rank
+        kv_args.system_dp_rank = get_parallel().dp_rank
         kv_args.rust_http_port = (
             self.scheduler.rust_server.http_port
             if self.scheduler.rust_server is not None
@@ -255,13 +395,18 @@ class PrefillBootstrapQueue:
         kv_args.kv_cache_dtype_str = (
             self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
         )
+        kv_args.kv_cache_layout = getattr(self.token_to_kv_pool, "kv_cache_layout", None)
         layer_shard_enabled = getattr(
             self.token_to_kv_pool, "layer_shard_enabled", False
         )
         layer_shard_rank = getattr(self.token_to_kv_pool, "layer_shard_rank", None)
         layer_shard_size = getattr(self.token_to_kv_pool, "layer_shard_size", 1)
         transfer_draft_cache = (
-            not layer_shard_enabled or layer_shard_rank == layer_shard_size - 1
+            (self.pp_size <= 1 or self.pp_rank == self.pp_size - 1)
+            and (
+                not layer_shard_enabled
+                or layer_shard_rank == layer_shard_size - 1
+            )
         )
         kv_args.prefill_start_layer = (
             getattr(
@@ -275,8 +420,8 @@ class PrefillBootstrapQueue:
                 hf_text_config=self.scheduler.model_config.hf_text_config,
             )
         )
-        kv_data_ptrs, kv_data_lens, kv_item_lens = (
-            self.token_to_kv_pool.get_contiguous_buf_infos()
+        kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(
+            self.token_to_kv_pool
         )
         kv_args.prefill_end_layer = (
             kv_args.prefill_start_layer + len(kv_data_ptrs)
@@ -297,10 +442,18 @@ class PrefillBootstrapQueue:
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 draft_kv_pool.get_contiguous_buf_infos()
             )
+            num_draft_entries = len(draft_kv_data_ptrs)
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
             num_draft_entries = len(draft_kv_data_ptrs)
+
+        dcp_remote_decode_layout = []
+        if self.transfer_backend == TransferBackend.ASCEND:
+            for pool in (self.token_to_kv_pool, draft_kv_pool):
+                get_layout = getattr(pool, "get_dcp_remote_decode_layout", None)
+                if get_layout is not None:
+                    dcp_remote_decode_layout.extend(get_layout())
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
@@ -323,7 +476,7 @@ class PrefillBootstrapQueue:
             self.metadata_buffers.get_buf_infos()
         )
         kv_args.ib_device = get_disagg().disaggregation_ib_device
-        kv_args.gpu_id = self.scheduler.ps.gpu_id
+        kv_args.gpu_id = get_device().gpu_id
 
         req_to_token_pool = getattr(self.scheduler, "req_to_token_pool", None)
         setup_state_kv_args(
@@ -332,6 +485,7 @@ class PrefillBootstrapQueue:
             self.draft_token_to_kv_pool if transfer_draft_cache else None,
             self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
+            pd_hidden_pool=getattr(self.metadata_buffers, "pd_hidden_pool", None),
         )
         if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
             from sglang.srt.mem_cache.cp_cache_layer_split.transfer import (
@@ -341,12 +495,19 @@ class PrefillBootstrapQueue:
             configure_v4_transfer(kv_args, self.token_to_kv_pool, draft_kv_pool)
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
+        kv_manager_kwargs = (
+            {"dcp_remote_decode_layout": dcp_remote_decode_layout}
+            if self.transfer_backend == TransferBackend.ASCEND
+            else {}
+        )
         kv_manager = kv_manager_class(
             kv_args,
             DisaggregationMode.PREFILL,
             self.scheduler.server_args,
             self.is_mla_backend,
+            **kv_manager_kwargs,
         )
+        kv_manager.pd_hidden_pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -385,14 +546,10 @@ class PrefillBootstrapQueue:
         )
         kv_sender_class = get_kv_class(backend, KVClassType.SENDER)
 
-        dest_tp_ranks = [self.tp_rank]
-
         req.disagg_kv_sender = kv_sender_class(
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
-            dest_tp_ranks=dest_tp_ranks,
-            pp_rank=self.pp_rank,
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
         )
         self._process_req(req)
@@ -409,26 +566,344 @@ class PrefillBootstrapQueue:
         assert req.metadata_buffer_index is not None
         return True
 
+    def _requires_pd_hidden_transfer(self, req: Req) -> bool:
+        if self.kv_manager.req_to_pd_hidden_meta.get(req.bootstrap_room):
+            return True
+        return StateType.PD_HIDDEN in self.kv_manager.kv_args.state_types
+
     def finalize_bootstrap(self, req: Req) -> bool:
         """Initialize the sender after bootstrap completes.
         Returns False if no metadata buffer is available (non-terminal)."""
         assert req.pending_bootstrap, "finalize_bootstrap is not idempotent"
+        metadata_buffer_was_unallocated = req.metadata_buffer_index < 0
         if not self.ensure_metadata_buffer(req):
             return False
 
+        decode_prefix_len = getattr(req, "disagg_decode_prefix_len", None)
+        if decode_prefix_len is None:
+            decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
+            req.disagg_decode_prefix_len = decode_prefix_len
+        dspark_meta = self.kv_manager.req_to_pd_hidden_meta.get(req.bootstrap_room)
+        if dspark_meta and not self._finalize_pd_hidden_bootstrap(
+            req, dspark_meta, decode_prefix_len
+        ):
+            if metadata_buffer_was_unallocated and req.metadata_buffer_index >= 0:
+                self.req_to_metadata_buffer_idx_allocator.free(
+                    req.metadata_buffer_index
+                )
+                req.metadata_buffer_index = -1
+            return False
+
         req.time_stats.set_bootstrap_done_time()
-        decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
-        num_kv_indices = len(req.origin_input_ids)
         req.start_send_idx = decode_prefix_len
         # Base of the staging chunk grid (suffix-relative send coordinates).
         req.disagg_decode_prefix_len = decode_prefix_len
-        num_kv_indices_to_send = num_kv_indices - decode_prefix_len
-        num_pages = kv_to_page_num(
-            num_kv_indices_to_send,
-            self.scheduler.token_to_kv_pool_allocator.page_size,
-        )
+        # The optional raw-hidden fallback cannot reconstruct hidden rows for a
+        # radix hit, so it must not let prefill reuse past the prefix decode
+        # already owns. The default DSpark PD path transfers the prefill-side
+        # draft KV instead: those cached target/draft rows stay addressable
+        # through req_to_token and are shipped by _send_cached_prefix_early, so
+        # decode missing the prefix costs transfer, not a prefill recompute.
+        #
+        # Gate on the server-level state ABI, never on per-request bootstrap
+        # metadata: req_to_pd_hidden_meta is filled only on the rank hosting the
+        # bootstrap server (same block as req_to_decode_prefix_len, which needs
+        # an all_reduce backfill for exactly that reason), so a per-request gate
+        # makes ranks derive different caps and deadlocks the MoE dispatch.
+        if (
+            self.scheduler.server_args.speculative_algorithm is not None
+            and str(self.scheduler.server_args.speculative_algorithm)
+            .upper()
+            .endswith("DSPARK")
+            and StateType.PD_HIDDEN in self.kv_manager.kv_args.state_types
+        ):
+            req.pd_hidden_max_prefix_len = int(decode_prefix_len)
+        num_pages = self._num_pages_to_send(req, decode_prefix_len)
         req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
         req.pending_bootstrap = False
+        return True
+
+    def _num_pages_to_send(self, req: Req, decode_prefix_len: int) -> int:
+        return kv_to_page_num(
+            len(req.origin_input_ids) - decode_prefix_len,
+            self.scheduler.token_to_kv_pool_allocator.page_size,
+        )
+
+    def _probe_bootstrap_ready(
+        self,
+        req: Req,
+        metadata_credits: int,
+        hidden_row_credits: int,
+    ) -> Tuple[Optional[Tuple[int, int]], Optional[str]]:
+        """Validate metadata readiness without reserving transfer resources."""
+        metadata_cost = 1 if req.metadata_buffer_index < 0 else 0
+        if metadata_cost > metadata_credits:
+            return None, None
+
+        dspark_meta = self.kv_manager.req_to_pd_hidden_meta.get(req.bootstrap_room)
+        if not dspark_meta:
+            return (metadata_cost, 0), None
+
+        decode_prefix_len = getattr(req, "disagg_decode_prefix_len", None)
+        if decode_prefix_len is None:
+            decode_prefix_len = self.kv_manager.req_to_decode_prefix_len.get(
+                req.bootstrap_room
+            )
+        if decode_prefix_len is None:
+            return None, None
+
+        plan, error = resolve_hidden_bootstrap_plan(
+            req=req,
+            metadata=dspark_meta,
+            decode_prefix_len=decode_prefix_len,
+            pp_rank=self.pp_rank,
+            model_config=self.scheduler.model_config,
+            model_runner=self.scheduler.tp_worker.model_runner,
+            metadata_buffers=self.metadata_buffers,
+            prefill_radix_enabled=not bool(
+                self.scheduler.server_args.disable_radix_cache
+            ),
+        )
+        if error is not None:
+            return None, error
+        assert plan is not None
+        if not plan.local_layer_ids:
+            return (metadata_cost, 0), None
+
+        hidden_cost = 0 if plan.streaming_hidden else plan.source_window_rows
+        if pd_hidden_state(req).src_indices is not None:
+            hidden_cost = 0
+        if hidden_cost > hidden_row_credits:
+            now = time.monotonic()
+            if now - self._last_pd_hidden_credit_warning_time > 30:
+                logger.warning(
+                    "PD hidden pool blocked prefill bootstrap: "
+                    "rid=%s hidden_len=%d required_rows=%d free_rows=%d "
+                    "pool_rows=%d bootstrap_queue=%d",
+                    req.rid,
+                    plan.hidden_len,
+                    hidden_cost,
+                    hidden_row_credits,
+                    plan.pool.size,
+                    len(self.queue),
+                )
+                self._last_pd_hidden_credit_warning_time = now
+            return None, None
+
+        return (metadata_cost, hidden_cost), None
+
+    def _is_pd_hidden_credit_blocked(
+        self, req: Req, metadata_credits: int, hidden_row_credits: int
+    ) -> bool:
+        metadata_cost = 1 if req.metadata_buffer_index < 0 else 0
+        if metadata_cost > metadata_credits:
+            return False
+        dspark_meta = self.kv_manager.req_to_pd_hidden_meta.get(req.bootstrap_room)
+        if not dspark_meta:
+            return False
+
+        pp_slices = dspark_meta.get("pp_slices") or {}
+        local_pp_slice = pp_slices.get(str(self.pp_rank)) if pp_slices else None
+        local_layer_ids = (
+            [int(x) for x in local_pp_slice.get("layer_ids", [])]
+            if local_pp_slice
+            else (
+                []
+                if pp_slices
+                else [int(x) for x in dspark_meta.get("target_layer_ids", [])]
+            )
+        )
+        if not local_layer_ids or pd_hidden_state(req).src_indices:
+            return False
+
+        pool = getattr(getattr(self, "metadata_buffers", None), "pd_hidden_pool", None)
+        if pool is None:
+            return False
+        hidden_len = int(dspark_meta.get("hidden_len", len(req.origin_input_ids)))
+        streaming_hidden = bool(dspark_meta.get("streaming_hidden", False))
+        window_rows = int(dspark_meta.get("streaming_window_rows", hidden_len))
+        required_rows = 0 if streaming_hidden else min(hidden_len, window_rows)
+        return required_rows <= pool.size and required_rows > hidden_row_credits
+
+    def _get_consensus_bootstrap_resource_ready(
+        self, polls: List[KVPoll]
+    ) -> List[bool]:
+        """Agree on bootstrap resource admission across attention TP/CP ranks.
+
+        PD hidden rows are released asynchronously after the local hidden-state
+        transfer completes.  Consequently, attention CP ranks can momentarily
+        observe different free-row counts.  Reserving directly from those local
+        counts lets one rank move a request to the waiting queue while another
+        leaves it in the bootstrap queue, and the next variable-length Gloo
+        collective then fails.  Probe resources without side effects and admit
+        only the common FIFO prefix before performing any allocation.
+        """
+        ready = [True] * len(self.queue)
+        metadata_credits = (
+            self.req_to_metadata_buffer_idx_allocator.available_size()
+        )
+        pool = getattr(
+            getattr(self, "metadata_buffers", None), "pd_hidden_pool", None
+        )
+        hidden_row_credits = pool.available_size() if pool is not None else 0
+
+        resource_blocked = False
+        for i, (req, poll) in enumerate(zip(self.queue, polls)):
+            if (
+                resource_blocked
+                or poll != KVPoll.WaitingForInput
+                or not req.pending_bootstrap
+                or should_force_retry(req)
+            ):
+                if resource_blocked and poll == KVPoll.WaitingForInput:
+                    ready[i] = False
+                continue
+
+            costs, error = self._probe_bootstrap_ready(
+                req, metadata_credits, hidden_row_credits
+            )
+            # Invalid request metadata is deterministic and must reach
+            # finalize_bootstrap on every rank so the request is failed cleanly.
+            if error is not None:
+                continue
+            if costs is None:
+                ready[i] = False
+                resource_blocked = True
+                continue
+
+            metadata_cost, hidden_cost = costs
+            metadata_credits -= metadata_cost
+            hidden_row_credits -= hidden_cost
+
+        ready_tensor = torch.tensor(ready, dtype=torch.uint8, device="cpu")
+        torch.distributed.all_reduce(
+            ready_tensor,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.scheduler.attn_tp_cpu_group,
+        )
+        torch.distributed.all_reduce(
+            ready_tensor,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.scheduler.attn_cp_cpu_group,
+        )
+
+        # Only the rank hosting the bootstrap server hears decode's
+        # decode_prefix_len; the other ranks would resolve 0 and derive a
+        # diverging radix cap for the same request. Agree on the value with the
+        # same collectives as the readiness vote above, and backfill the manager
+        # dict so every rank's finalize_bootstrap resolves -- and pops -- the
+        # same value. A genuine 0 stays absent and keeps the default path.
+        prefix_tensor = torch.tensor(
+            [
+                int(
+                    self.kv_manager.req_to_decode_prefix_len.get(
+                        req.bootstrap_room, 0
+                    )
+                    or 0
+                )
+                for req in self.queue
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        torch.distributed.all_reduce(
+            prefix_tensor,
+            op=torch.distributed.ReduceOp.MAX,
+            group=self.scheduler.attn_tp_cpu_group,
+        )
+        torch.distributed.all_reduce(
+            prefix_tensor,
+            op=torch.distributed.ReduceOp.MAX,
+            group=self.scheduler.attn_cp_cpu_group,
+        )
+        for req, value in zip(self.queue, prefix_tensor.tolist()):
+            if value > 0:
+                self.kv_manager.req_to_decode_prefix_len[req.bootstrap_room] = int(
+                    value
+                )
+
+        return [bool(value) for value in ready_tensor.tolist()]
+
+    def stage_pp_bootstrap_consensus(self, rids: List[str]) -> List[str]:
+        """Enter the resource-commit phase after metadata consensus."""
+        rid_set = set(rids)
+        committed = []
+        for req in self.queue:
+            if req.rid not in rid_set:
+                continue
+            req.dspark_pp_bootstrap_consensus = True
+            if req.pending_bootstrap and not should_force_retry(req):
+                if self.finalize_bootstrap(req):
+                    committed.append(req.rid)
+        return committed
+
+    def _abort_pd_hidden_bootstrap(self, req: Req, message: str) -> None:
+        logger.error(message)
+        prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        sender = req.disagg_kv_sender
+        if sender is not None:
+            sender.kv_mgr.record_failure(sender.bootstrap_room, message)
+            sender.kv_mgr.update_status(sender.bootstrap_room, KVPoll.Failed)
+            sender.conclude_state = KVPoll.Failed
+
+    def _finalize_pd_hidden_bootstrap(
+        self, req: Req, dspark_meta: dict, decode_prefix_len: int
+    ) -> bool:
+        plan, error = resolve_hidden_bootstrap_plan(
+            req=req,
+            metadata=dspark_meta,
+            decode_prefix_len=decode_prefix_len,
+            pp_rank=self.pp_rank,
+            model_config=self.scheduler.model_config,
+            model_runner=self.scheduler.tp_worker.model_runner,
+            metadata_buffers=self.metadata_buffers,
+            prefill_radix_enabled=not bool(
+                self.scheduler.server_args.disable_radix_cache
+            ),
+        )
+        if error is not None:
+            self._abort_pd_hidden_bootstrap(req, error)
+            return False
+
+        assert plan is not None
+        if not plan.local_layer_ids:
+            pd_hidden_state(req).meta = dict(dspark_meta)
+            pd_hidden_state(req).src_indices = []
+            pd_hidden_state(req).dst_indices = []
+            pd_hidden_state(req).written = []
+            pd_hidden_state(req).owner_direct_sent = False
+            return True
+
+        src_indices = (
+            None
+            if plan.streaming_hidden
+            else plan.pool.alloc(plan.source_window_rows)
+        )
+        if src_indices is None and not plan.streaming_hidden:
+            # A request that fits in the pool can still lose a local allocation
+            # race to in-flight transfers.  This is temporary backpressure, not
+            # a malformed request; leave it pending for the next scheduler tick.
+            if plan.source_window_rows <= plan.pool.size:
+                return False
+            message = (
+                "PD hidden rows exceed prefill hidden pool capacity: "
+                f"rid={req.rid}, hidden_len={plan.hidden_len}, "
+                f"required_rows={plan.source_window_rows}, "
+                f"pool_size={plan.pool.size}. "
+                "Increase SGLANG_PD_HIDDEN_POOL_TOKENS or reduce the "
+                "maximum prompt/hidden transfer length."
+            )
+            self._abort_pd_hidden_bootstrap(req, message)
+            return False
+
+        pd_hidden_state(req).capture_layer_ids = [int(x) for x in plan.local_layer_ids]
+        pd_hidden_state(req).meta = dict(dspark_meta)
+        pd_hidden_state(req).src_indices = src_indices
+        pd_hidden_state(req).dst_indices = plan.dst_indices
+        pd_hidden_state(req).written = (
+            None if plan.streaming_hidden else [False] * plan.hidden_len
+        )
+        pd_hidden_state(req).owner_direct_sent = False
         return True
 
     def add(self, req: Req, num_kv_heads: int) -> None:
@@ -512,6 +987,8 @@ class PrefillBootstrapQueue:
                 self.scheduler.attn_tp_cpu_group,
             )
 
+        resource_ready = self._get_consensus_bootstrap_resource_ready(polls)
+
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
             if poll is None:
                 continue
@@ -521,9 +998,24 @@ class PrefillBootstrapQueue:
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
+                if self._requires_pd_hidden_transfer(req):
+                    # PD hidden must be captured for every prefill chunk.
+                    # Do not run optimistic forward before hidden rows and
+                    # capture metadata are materialized.
+                    continue
                 if (
-                    req.prefill_attempt_count < get_disagg().optimistic_prefill_attempts
+                    (
+                        req.prefill_attempt_count
+                        < get_disagg().optimistic_prefill_attempts
+                        or get_disagg().disaggregation_decode_allocation_policy
+                        == "prefill_complete"
+                    )
                     and not req.is_retracted  # engine paused
+                    and not (
+                        _uses_write_through_cache(self.scheduler.tree_cache)
+                        and req.swa_branching_seqlen is not None
+                        and req.swa_branching_seqlen > req.kv.cache_protected_len
+                    )
                 ):
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
@@ -535,11 +1027,13 @@ class PrefillBootstrapQueue:
                         self.scheduler.processed_tokens_counter
                     )
             elif poll == KVPoll.WaitingForInput:
+                if not resource_ready[i]:
+                    continue
                 if should_force_retry(req):  # skip checking for testing
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
                     req.prefill_attempt_count += 1
-                elif not self.finalize_bootstrap(req):
+                elif req.pending_bootstrap and not self.finalize_bootstrap(req):
                     continue
                 bootstrapped_reqs.append(req)
                 indices_to_remove.add(i)
@@ -559,6 +1053,70 @@ class PrefillBootstrapQueue:
         else:
             return bootstrapped_reqs, failed_reqs
 
+    def get_ready_bootstrapped_rids_for_pp(self) -> Tuple[List[str], List[str]]:
+        """Return ordered PP candidates using a side-effect-free credit probe."""
+        good_rids: List[str] = []
+        failed_rids: List[str] = []
+        if len(self.queue) == 0:
+            return good_rids, failed_rids
+
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in self.queue],
+            self.scheduler.attn_cp_cpu_group,
+            self.scheduler.attn_tp_cpu_group,
+        )
+
+        metadata_credits = (
+            self.req_to_metadata_buffer_idx_allocator.available_size()
+        )
+        pool = getattr(
+            getattr(self, "metadata_buffers", None), "pd_hidden_pool", None
+        )
+        hidden_row_credits = pool.available_size() if pool is not None else 0
+        admission_blocked = False
+
+        for req, poll in zip(self.queue, polls):
+            if poll == KVPoll.Failed:
+                failed_rids.append(req.rid)
+            elif poll == KVPoll.WaitingForInput:
+                if admission_blocked:
+                    continue
+                if should_force_retry(req):
+                    metadata_cost = 1 if req.metadata_buffer_index < 0 else 0
+                    if metadata_cost > metadata_credits:
+                        admission_blocked = True
+                        continue
+                    metadata_credits -= metadata_cost
+                elif getattr(req, "pending_bootstrap", False):
+                    costs, error = self._probe_bootstrap_ready(
+                        req, metadata_credits, hidden_row_credits
+                    )
+                    if error is not None:
+                        self._abort_pd_hidden_bootstrap(req, error)
+                        failed_rids.append(req.rid)
+                        continue
+                    if costs is None:
+                        admission_blocked = True
+                        continue
+                    metadata_cost, hidden_cost = costs
+                    metadata_credits -= metadata_cost
+                    hidden_row_credits -= hidden_cost
+                else:
+                    metadata_cost = 1 if req.metadata_buffer_index < 0 else 0
+                    if metadata_cost > metadata_credits:
+                        admission_blocked = True
+                        continue
+                    metadata_credits -= metadata_cost
+                good_rids.append(req.rid)
+            elif poll == KVPoll.Bootstrapping:
+                continue
+            else:
+                raise RuntimeError(
+                    f"Unexpected poll state {poll} for req {req.rid} "
+                    "in get_ready_bootstrapped_rids_for_pp"
+                )
+        return good_rids, failed_rids
+
     def release_memory_occupation(self):
         self.queue.clear()
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
@@ -574,6 +1132,19 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
+    def _observe_grammar_first_mask_fill(self: Scheduler, req: Req) -> None:
+        # GLM NOTE: the prefill engine samples exactly one token per request,
+        # so this is the per-request cost of one (possibly JIT) mask fill.
+        stats = req.grammar.grammar_stats
+        if (
+            self.metrics_reporter.enable_metrics
+            and stats is not None
+            and stats.first_mask_fill_time is not None
+        ):
+            self.metrics_reporter.metrics_collector.observe_grammar_first_mask_fill(
+                stats.first_mask_fill_time
+            )
+
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
         kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
@@ -584,6 +1155,25 @@ class SchedulerDisaggregationPrefillMixin:
             room = getattr(req, "bootstrap_room", None)
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
+
+    def checkpoint_disagg_prefill(self: Scheduler, req: Req) -> None:
+        cache = self.tree_cache
+        if req.pending_bootstrap and _uses_write_through_cache(cache):
+            cache.advance_unpublished_req(req)
+            req.prefix_len = req.extend_end
+            return
+
+        checkpoint_kv_cache(req, cache)
+
+    def release_aborted_prefill_waiting_req(self: Scheduler, req: Req) -> None:
+        self.clear_pending_chunk_send(req)
+        sender = getattr(req, "disagg_kv_sender", None)
+        if sender is not None and hasattr(sender, "abort"):
+            sender.abort()
+        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+        if req.kv.holds_kv or req.kv.holds_mamba:
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
+        req.pending_bootstrap = False
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def resolve_waiting_queue_bootstrap(self: Scheduler) -> None:
@@ -632,9 +1222,12 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         running_batch: ScheduleBatch,
         last_batch: Optional[ScheduleBatch],
+        should_retry_storage_prefetch: bool = True,
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
-        self._process_hicache_events()
+        self._process_hicache_events(
+            should_retry_storage_prefetch=should_retry_storage_prefetch
+        )
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
@@ -642,7 +1235,13 @@ class SchedulerDisaggregationPrefillMixin:
 
         self.resolve_waiting_queue_bootstrap()
 
-        self.process_prefill_chunk(last_batch=last_batch, running_batch=running_batch)
+        # Skip repeated chunk processing while polling a pending batch.
+        if last_batch is None or not last_batch.prefill_chunk_processed:
+            self.process_prefill_chunk(
+                last_batch=last_batch, running_batch=running_batch
+            )
+            if last_batch is not None:
+                last_batch.prefill_chunk_processed = True
 
         prefill_plan = self.get_new_batch_prefill(running_batch)
         batch = prefill_plan.batch_to_run
@@ -658,6 +1257,9 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         while True:
+            if self.gracefully_exit:
+                break
+
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
@@ -693,46 +1295,120 @@ class SchedulerDisaggregationPrefillMixin:
             # Update last_batch
             self.last_batch = batch
 
+    def _is_continuous_input_polling_enabled(self: Scheduler) -> bool:
+        """Check support once on entry to the prefill overlap loop."""
+        if not envs.SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING.get():
+            return False
+        parallel = get_parallel()
+        enabled = (
+            parallel.attn_dp_size == 1
+            and parallel.attn_cp_size == 1
+            and self.spec_algorithm.is_none()
+            and self.is_generation
+            and self.dllm_config is None
+        )
+        if not enabled:
+            logger.warning(
+                "Continuous prefill input polling requires attention DP=CP=1 and "
+                "non-speculative autoregressive generation; using the regular overlap loop."
+            )
+        return enabled
+
+    def _yield_gil_if_needed(self: Scheduler) -> None:
+        if self.tp_size == 1:
+            # No collective parks this thread at TP=1. A bounded sleep lets
+            # bootstrap, transfer and cache workers reacquire the GIL.
+            time.sleep(PREFILL_INPUT_POLL_INTERVAL_S)
+
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
+        """Run intake while pending copies finish, keeping at most two forwards.
+
+        A deferred pause stops preparation until the current result wait finishes.
+        Shutdown stops new launches; a wait finishes through the blocking handler.
+        After a failed preparation, only new input or bootstrap arrivals retry
+        during the wait; other readiness is checked after a result finishes.
+        """
+        self.enable_continuous_input_polling = (
+            self._is_continuous_input_polling_enabled()
+        )
         self.result_queue = deque()
+        batch_result_completion_status = torch.empty(1, dtype=torch.int32, device="cpu")
+        # True when intake repeats while the oldest batch result is unfinished.
+        waiting_for_batch_result = False
+        # Avoid retrying failed batch preparation after every copy poll.
+        skip_batch_creation = False
+        # Keep the newer forward's sampling context across unfinished-result passes.
+        batch = None
+        batch_result = None
 
         while True:
-            # Receive requests
-            self.ingest_requests()
+            if self.gracefully_exit:
+                break
+
+            # Stop dispatching at pause requests while waiting for a batch result.
+            received_inputs = self.ingest_requests(
+                stop_at_pause=waiting_for_batch_result
+            )
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
+                self._yield_gil_if_needed()
                 continue
-            self.waiting_queue.extend(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-            )
+            bootstrapped_reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+            self.waiting_queue.extend(bootstrapped_reqs)
+            # Resume batch creation on completion, new/ready requests, or an idle step.
+            if not waiting_for_batch_result or received_inputs or bootstrapped_reqs:
+                skip_batch_creation = False
 
-            # Get the next batch to run
-            plan = self.get_next_disagg_prefill_batch_to_run(
-                running_batch=self.running_batch, last_batch=self.last_batch
-            )
-            self.running_batch = plan.running_batch
-            batch = plan.batch_to_run
-            batch = self.ngram_embedding_manager.prepare_for_forward(
-                batch, chunked_req=self.chunked_req
-            )
-            self.cur_batch_for_debug = batch
+            # Keep at most two batches in flight.
+            if (
+                len(self.result_queue) < 2
+                and not self.gracefully_exit
+                and not self._deferred_input_requests
+                and not skip_batch_creation
+            ):
+                # Get the next batch to run
+                plan = self.get_next_disagg_prefill_batch_to_run(
+                    running_batch=self.running_batch,
+                    last_batch=self.last_batch,
+                    # Storage retry deadlines count scheduling steps, not copy polls.
+                    should_retry_storage_prefetch=not waiting_for_batch_result,
+                )
+                self.running_batch = plan.running_batch
+                batch = plan.batch_to_run
+                batch = self.ngram_embedding_manager.prepare_for_forward(
+                    batch, chunked_req=self.chunked_req
+                )
+                self.cur_batch_for_debug = batch
+                # Skip batch creation next round to avoid repeated preparation failures.
+                skip_batch_creation = batch is None
 
-            # Launch the current batch
-            if batch:
-                if self.enable_staging:
-                    self.maybe_prefetch_staging_for_batch(batch)
-                batch_result = self.run_batch(batch)
-                self._apply_war_barrier()
-                self.result_queue.append((batch.copy(), batch_result))
-            else:
-                batch_result = None
-                self._sched_idled = True
+                # Launch the current batch
+                if batch:
+                    if self.enable_staging:
+                        self.maybe_prefetch_staging_for_batch(batch)
+                    batch_result = self.run_batch(batch)
+                    self._apply_war_barrier()
+                    self.result_queue.append((batch.copy(), batch_result))
+                else:
+                    batch_result = None
 
-            # Process the last batch
             if self.last_batch:
-                tmp_batch, tmp_result = self.result_queue.popleft()
-                self.process_batch_result(tmp_batch, tmp_result)
+                if self.enable_continuous_input_polling:
+                    # Resume intake until the oldest result is ready on all TP ranks.
+                    oldest_batch_result = self.result_queue[0][1]
+                    if (
+                        not self.gracefully_exit
+                        and not self.is_disagg_prefill_batch_result_ready(
+                            oldest_batch_result, batch_result_completion_status
+                        )
+                    ):
+                        waiting_for_batch_result = True
+                        self._yield_gil_if_needed()
+                        continue
+                # Process the oldest batch result.
+                oldest_batch, oldest_batch_result = self.result_queue.popleft()
+                self.process_batch_result(oldest_batch, oldest_batch_result)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
@@ -743,8 +1419,288 @@ class SchedulerDisaggregationPrefillMixin:
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result, batch)
 
-            # Update last_batch
+            # Update last_batch and scheduler status
+            self._sched_idled = batch is None
             self.last_batch = batch
+            waiting_for_batch_result = False
+
+    def is_disagg_prefill_batch_result_ready(
+        self: Scheduler,
+        batch_result: GenerationBatchResult,
+        batch_result_completion_status: torch.Tensor,
+    ) -> bool:
+        # 0: sampling/copy has not been submitted, so polling cannot make progress.
+        state = 0
+        if (
+            batch_result.copy_done is not None
+            and batch_result.delay_sample_func is None
+        ):
+            # 1: copy unfinished; 2: copy finished locally.
+            state = 2 if batch_result.copy_done.query() else 1
+        if self.tp_size > 1:
+            batch_result_completion_status.fill_(state)
+            torch.distributed.all_reduce(
+                batch_result_completion_status,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_cpu_group,
+            )
+            state = batch_result_completion_status.item()
+        if state == 0:
+            # Every rank must submit delayed sampling before entering this wait.
+            raise RuntimeError("Prefill result copy must be submitted before polling")
+        return state == 2
+
+    def _extract_pd_hidden_states_from_result(
+        self: Scheduler,
+        result: GenerationBatchResult,
+    ) -> Optional[torch.Tensor]:
+        logits_output = result.logits_output
+        hidden_states = getattr(logits_output, "hidden_states", None)
+        if hidden_states is None and result.pp_hidden_states_proxy_tensors is not None:
+            proxy_tensors = result.pp_hidden_states_proxy_tensors.tensors
+            aux_keys = sorted(
+                key
+                for key in proxy_tensors
+                if key.startswith("pd_aux_hidden_states_")
+            )
+            if aux_keys:
+                hidden_states = (
+                    proxy_tensors[aux_keys[0]]
+                    if len(aux_keys) == 1
+                    else torch.cat([proxy_tensors[key] for key in aux_keys], dim=-1)
+                )
+        return hidden_states
+
+    def _build_pd_hidden_only_state_indices(
+        self: Scheduler, req: Req
+    ) -> Optional[List]:
+        current_indices = pd_hidden_state(req).current_src_indices
+        if current_indices is None:
+            return None
+
+        state_types = (
+            self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+        )
+        state_indices = []
+        for st in state_types:
+            if st == StateType.PD_HIDDEN:
+                state_indices.append(np.asarray(current_indices, dtype=np.int32))
+            else:
+                state_indices.append(None)
+        return state_indices
+
+    def _send_pd_hidden_only_chunk(self: Scheduler, req: Req) -> bool:
+        current_indices = pd_hidden_state(req).current_src_indices
+        current_start = pd_hidden_state(req).current_start
+        current_rows = int(pd_hidden_state(req).current_row_len or 0)
+        if current_indices is None or current_start is None or current_rows <= 0:
+            return False
+
+        state_indices = self._build_pd_hidden_only_state_indices(req)
+        if state_indices is None:
+            return False
+
+        streaming_hidden = bool(
+            (pd_hidden_state(req).meta or {}).get("streaming_hidden", False)
+        )
+        if req.disagg_kv_sender is not None:
+            source_event = self.device_module.Event()
+            source_event.record()
+            req.disagg_kv_sender.set_source_event(source_event)
+            req.disagg_kv_sender.set_pd_hidden_chunk_meta(
+                int(current_start),
+                int(current_rows),
+                bool(pd_hidden_state(req).current_is_last),
+                current_indices if streaming_hidden else pd_hidden_state(req).src_indices,
+            )
+
+        req.disagg_kv_sender.send(np.asarray([], dtype=np.int32), state_indices)
+        if streaming_hidden:
+            pd_hidden_state(req).src_indices = None
+        pd_hidden_state(req).current_src_indices = None
+        pd_hidden_state(req).current_start = None
+        pd_hidden_state(req).current_row_len = 0
+        pd_hidden_state(req).current_is_last = False
+        pd_hidden_state(req).owner_direct_sent = True
+        return True
+
+    def _write_pd_hidden_rows_for_batch(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        *,
+        send_owner_direct: bool = False,
+    ) -> None:
+        pool = getattr(self.disagg_metadata_buffers, "pd_hidden_pool", None)
+        hidden_states = self._extract_pd_hidden_states_from_result(result)
+        needs_pd_hidden_reqs = [
+            req
+            for req in batch.reqs
+            if (
+                (
+                    pd_hidden_state(req).src_indices
+                    or pd_hidden_state(req).capture_layer_ids
+                )
+                and (
+                    send_owner_direct
+                    or not pd_hidden_state(req).owner_direct_sent
+                )
+            )
+        ]
+        if pool is not None and needs_pd_hidden_reqs and hidden_states is None:
+            reqs = [
+                (
+                    req.rid,
+                    pd_hidden_state(req).capture_layer_ids,
+                    bool(pd_hidden_state(req).src_indices),
+                )
+                for req in needs_pd_hidden_reqs
+            ]
+            message = (
+                "PD hidden capture was required but forward output has no "
+                "hidden states: batch_capture_layers="
+                f"{get_pd_hidden_capture_layer_ids(batch.reqs)}, "
+                f"reqs={reqs}"
+            )
+            for req in needs_pd_hidden_reqs:
+                fail_pd_hidden_transfer(req, message)
+            return
+        if pool is None or hidden_states is None or batch.extend_lens is None:
+            return
+
+        chunk_ends = _pd_hidden_chunk_ends(batch)
+
+        hidden_offset = 0
+        for req, extend_len, chunk_end in zip(
+            batch.reqs, batch.extend_lens, chunk_ends, strict=True
+        ):
+            extend_len = int(extend_len)
+            req_hidden = hidden_states[hidden_offset : hidden_offset + extend_len]
+            hidden_offset += extend_len
+
+            meta = pd_hidden_state(req).meta or {}
+            streaming_hidden = bool(meta.get("streaming_hidden", False))
+            if not send_owner_direct and pd_hidden_state(req).owner_direct_sent:
+                continue
+            src_indices = pd_hidden_state(req).src_indices
+            if not src_indices and not streaming_hidden:
+                continue
+
+            hidden_start = int(meta.get("hidden_start", 0))
+            hidden_len = int(meta.get("hidden_len", len(src_indices or [])))
+            chunk_start = chunk_end - extend_len
+            write_start = max(chunk_start, hidden_start)
+            write_end = min(chunk_end, hidden_start + hidden_len)
+            if write_end <= write_start:
+                continue
+
+            local_start = write_start - hidden_start
+            local_end = write_end - hidden_start
+            chunk_local_start = write_start - chunk_start
+            chunk_local_end = write_end - chunk_start
+            req_hidden_to_write = req_hidden
+            pp_slices = meta.get("pp_slices") or {}
+            pp_rank = int(get_parallel().pp_rank)
+            local_pp_slice = pp_slices.get(str(pp_rank)) if pp_slices else None
+            local_slice_len = (
+                int(local_pp_slice.get("slice_len", 0))
+                if local_pp_slice
+                else pool.hidden_size
+            )
+            if local_slice_len > 0 and req_hidden_to_write.shape[-1] != local_slice_len:
+                local_slice_start = (
+                    int(local_pp_slice.get("slice_start", 0))
+                    if local_pp_slice
+                    else 0
+                )
+                local_slice_end = local_slice_start + local_slice_len
+                if req_hidden_to_write.shape[-1] < local_slice_end:
+                    raise RuntimeError(
+                        "PD hidden width does not match prefill PP slice: "
+                        f"rid={req.rid}, pp_rank={pp_rank}, "
+                        f"hidden_width={req_hidden_to_write.shape[-1]}, "
+                        f"slice_start={local_slice_start}, "
+                        f"slice_len={local_slice_len}"
+                    )
+                req_hidden_to_write = req_hidden_to_write[
+                    :, local_slice_start:local_slice_end
+                ]
+            if streaming_hidden:
+                rows = local_end - local_start
+            else:
+                rows = local_end - local_start
+                write_indices = src_indices[local_start:local_end]
+            prev_current_start = pd_hidden_state(req).current_start
+            prev_current_row_len = int(pd_hidden_state(req).current_row_len or 0)
+            if (
+                prev_current_start is not None
+                and prev_current_row_len > 0
+                and int(prev_current_start) != int(write_start)
+            ):
+                if req.pending_bootstrap:
+                    raise RuntimeError(
+                        "PD streaming hidden current chunk would be overwritten "
+                        "before bootstrap is finalized: "
+                        f"rid={req.rid}, old_start={prev_current_start}, "
+                        f"old_rows={prev_current_row_len}, new_start={write_start}, "
+                        f"new_rows={rows}"
+                    )
+                self.send_kv_chunk(
+                    req,
+                    last_chunk=False,
+                    end_idx=int(prev_current_start) + prev_current_row_len,
+                )
+            if streaming_hidden:
+                write_indices = pool.alloc(rows)
+                if write_indices is None:
+                    fail_pd_hidden_transfer(
+                        req,
+                        "PD streaming hidden source chunk allocation failed: "
+                        f"rid={req.rid}, rows={rows}, free_rows={pool.available_size()}, "
+                        f"pool_rows={pool.size}. Streaming source rows are released "
+                        "only after the matching hidden chunk ACK.",
+                    )
+                    continue
+                pd_hidden_state(req).src_indices = write_indices
+            pool.write(
+                write_indices,
+                req_hidden_to_write[chunk_local_start:chunk_local_end],
+            )
+            pd_hidden_state(req).current_start = write_start
+            pd_hidden_state(req).current_row_len = rows
+            pd_hidden_state(req).current_src_indices = write_indices
+            pd_hidden_state(req).current_is_last = write_end >= hidden_start + hidden_len
+            written = pd_hidden_state(req).written
+            if written is not None:
+                written[local_start:local_end] = [True] * rows
+            if send_owner_direct:
+                self._send_pd_hidden_only_chunk(req)
+
+    def send_dspark_owner_direct_hidden_for_batch(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> bool:
+        capture_reqs = [
+            req
+            for req in batch.reqs
+            if pd_hidden_state(req).capture_layer_ids
+        ]
+        if not capture_reqs:
+            return False
+        if any(req.pending_bootstrap for req in capture_reqs):
+            return False
+        if not all(
+            bool(
+                (pd_hidden_state(req).meta or {}).get("streaming_hidden", False)
+            )
+            for req in capture_reqs
+        ):
+            return False
+        self._write_pd_hidden_rows_for_batch(
+            batch, result, send_owner_direct=True
+        )
+        return True
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
@@ -806,6 +1762,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.batch_result_processor.materialize_sampling_mask_output(
                 batch.reqs, logits_output
             )
+        self._write_pd_hidden_rows_for_batch(batch, result)
 
         def advance_logprob_pt(i: int, req: Req) -> None:
             nonlocal logprob_pt
@@ -856,6 +1813,12 @@ class SchedulerDisaggregationPrefillMixin:
                     advance_logprob_pt(i, req)
                     continue
 
+                if is_aborted(req) or is_pd_hidden_transfer_failed(req):
+                    self.disagg_prefill_inflight_queue.append(req)
+                    req.time_stats.set_prefill_transfer_queue_entry_time()
+                    advance_logprob_pt(i, req)
+                    continue
+
                 req.output_ids.append(next_token_id)
                 if req.grammar is not None:
                     try:
@@ -868,6 +1831,7 @@ class SchedulerDisaggregationPrefillMixin:
                             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                         )
                     req.grammar.finished = req.finished()
+                    self._observe_grammar_first_mask_fill(req)
                     if is_aborted(req):
                         if self._retire_aborted_prefill_result(req):
                             req.time_stats.set_completion_time()
@@ -875,7 +1839,7 @@ class SchedulerDisaggregationPrefillMixin:
                         advance_logprob_pt(i, req)
                         continue
 
-                maybe_cache_unfinished_req(req, self.tree_cache)
+                self.checkpoint_disagg_prefill(req)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
@@ -909,6 +1873,11 @@ class SchedulerDisaggregationPrefillMixin:
                     self.batch_result_processor.add_sampling_mask_return_values(
                         i, req, logits_output
                     )
+                if (
+                    get_disagg().disaggregation_decode_allocation_policy
+                    == "prefill_complete"
+                ):
+                    req.disagg_kv_sender.mark_prefill_complete()
                 if not req.pending_bootstrap:
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
@@ -918,12 +1887,12 @@ class SchedulerDisaggregationPrefillMixin:
                 req.inflight_middle_chunks -= 1
 
                 # Still chunking iff its next chunk was launched: either it is
-                # still self.chunked_req, or its final chunk (extend_range
+                # still self.chunked_req, or its final chunk (extend_end
                 # reaching the end of the input) is in flight. A yielded req
                 # is neither, so do its deferred release here.
                 still_chunking = self.chunked_req is req or (
-                    req.extend_range is not None
-                    and req.extend_range.end >= len(req.origin_input_ids)
+                    req.extend_end is not None
+                    and req.extend_end >= len(req.origin_input_ids)
                 )
                 # Abort is terminal. Do not requeue an aborted optimistic
                 # request merely because bootstrap is still pending.
@@ -962,6 +1931,12 @@ class SchedulerDisaggregationPrefillMixin:
                     assert req.metadata_buffer_index >= 0, (
                         f"Req {req.rid} does not have metadata buffer allocated"
                     )
+                    if is_hcu():
+                        # HCU overlap transfer reads this chunk outside the forward
+                        # stream; wait for the chunk's writes before starting RDMA.
+                        ev = torch.cuda.Event()
+                        ev.record(self.forward_stream)
+                        req.disagg_kv_sender.set_source_event(ev)
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
@@ -989,16 +1964,19 @@ class SchedulerDisaggregationPrefillMixin:
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_disagg_prefill_inflight_queue(
-        self: Scheduler, rids_to_check: Optional[List[str]] = None
+        self: Scheduler,
+        transfer_status: Optional[Tuple[List[str], List[str]]] = None,
     ) -> List[Req]:
         """
         Poll the requests in the middle of transfer. If done, return the request.
-        rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
+        transfer_status: For PP, the globally agreed successful and failed rids.
         """
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
         done_reqs = []
+        success_rids = set(transfer_status[0]) if transfer_status is not None else set()
+        failed_rids = set(transfer_status[1]) if transfer_status is not None else set()
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
@@ -1009,9 +1987,28 @@ class SchedulerDisaggregationPrefillMixin:
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-            if rids_to_check is not None:
-                if req.rid not in rids_to_check:
-                    undone_reqs.append(req)
+            if transfer_status is not None:
+                consensus_failed = req.rid in failed_rids
+                failure_pending = isinstance(req.finished_reason, FINISH_ABORT)
+                if consensus_failed or failure_pending:
+                    if consensus_failed and not failure_pending:
+                        prepare_abort(
+                            req,
+                            (
+                                "Prefill transfer failed on another PP rank; "
+                                "waiting for the local transfer to stop"
+                            ),
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
+                    local_transfer_stopped = req.pending_bootstrap or poll in (
+                        KVPoll.Success,
+                        KVPoll.Failed,
+                    )
+                    if not local_transfer_stopped:
+                        undone_reqs.append(req)
+                        continue
+                    self.handle_inflight_transfer_failure(req)
+                    done_reqs.append(req)
                     continue
 
                 # In PP mode, the previous rank may have reached a terminal
@@ -1029,6 +2026,15 @@ class SchedulerDisaggregationPrefillMixin:
                     undone_reqs.append(req)
                     continue
 
+            maybe_release_pd_hidden_rows_on_hidden_done(
+                req,
+                getattr(
+                    getattr(self, "disagg_metadata_buffers", None),
+                    "pd_hidden_pool",
+                    None,
+                ),
+            )
+
             if req.pending_bootstrap:
                 # Parked: prefill finished before bootstrap completed.
                 if self.handle_pending_bootstrap(req, poll):
@@ -1044,7 +2050,8 @@ class SchedulerDisaggregationPrefillMixin:
             elif poll == KVPoll.Success:  # transfer done
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
+                # unlock the tree
+                release_kv_cache(req, self.tree_cache, checkpoint=True)
                 self.tree_cache.finish(
                     req.cache_request_handle, CacheRequestOutcome.SUCCESS
                 )
@@ -1091,7 +2098,13 @@ class SchedulerDisaggregationPrefillMixin:
             req: Req
 
             maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
+                req,
+                self.req_to_metadata_buffer_idx_allocator,
+                getattr(
+                    getattr(self, "disagg_metadata_buffers", None),
+                    "pd_hidden_pool",
+                    None,
+                ),
             )
 
         self.disagg_prefill_inflight_queue = undone_reqs
@@ -1118,7 +2131,10 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        release_kv_cache(req, self.tree_cache)  # unlock the tree
+        if req.finished_reason is None:
+            req.finished_reason = FINISH_LENGTH(length=0)
+        # unlock the tree
+        release_kv_cache(req, self.tree_cache, checkpoint=True)
         self._release_aborted_request(req)
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
@@ -1127,6 +2143,33 @@ class SchedulerDisaggregationPrefillMixin:
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
+
+    def get_transferred_rids(
+        self: Scheduler,
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Used by PP to inspect local terminal transfers without popping requests.
+        """
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+
+        success_rids: List[str] = []
+        failed_rids: List[str] = []
+        pd_hidden_pool = getattr(
+            self.disagg_metadata_buffers, "pd_hidden_pool", None
+        )
+
+        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+            maybe_release_pd_hidden_rows_on_hidden_done(req, pd_hidden_pool)
+            if poll == KVPoll.Success:
+                success_rids.append(req.rid)
+            elif poll == KVPoll.Failed:
+                failed_rids.append(req.rid)
+
+        return success_rids, failed_rids
 
     def clear_pending_chunk_send(self: Scheduler, req: Req) -> None:
         """Drop `req` from the sent-but-unconcluded chunk set.
@@ -1162,7 +2205,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.pending_bootstrap = False
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, is_insert=False)
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
         return True
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
@@ -1184,8 +2227,12 @@ class SchedulerDisaggregationPrefillMixin:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache)
-        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
+        maybe_release_metadata_buffer(
+            req,
+            self.req_to_metadata_buffer_idx_allocator,
+            getattr(self.disagg_metadata_buffers, "pd_hidden_pool", None),
+        )
         req.pending_bootstrap = False
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
         self.output_streamer.stream_output([req], req.return_logprob)
@@ -1203,10 +2250,12 @@ class SchedulerDisaggregationPrefillMixin:
         elif poll == KVPoll.WaitingForInput:
             if should_force_retry(req):  # test hook
                 return False
-            # Metadata buffer was allocated in pop_bootstrapped before
-            # the request entered the waiting queue, so finalize should not fail.
-            assert self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
-            return True
+            if self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req):
+                self.checkpoint_disagg_prefill(req)
+                return True
+            if is_aborted(req):
+                self.handle_bootstrap_failure(req)
+            return False
         else:
             raise RuntimeError(
                 f"Unexpected poll state {poll} for req {req.rid} in handle_pending_bootstrap"
@@ -1232,22 +2281,33 @@ class SchedulerDisaggregationPrefillMixin:
         chunked_req_to_exclude = set()
         if (req := self.chunked_req) is not None:
             chunked_req_to_exclude.add(req)
-            maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+            self.checkpoint_disagg_prefill(req)
 
             if not self.check_bootstrap(req):
                 if is_aborted(req):
                     # bootstrap failed
                     self.chunked_req = None
-                elif self.has_bootstrapped_waiting_req():
-                    # optimistic request yields to waiting requests
+                elif self.disagg_prefill_bootstrap_queue._requires_pd_hidden_transfer(
+                    req
+                ):
                     self.chunked_req = None
                     if not self.enable_overlap:
+                        self.optimistic_release_and_requeue(req)
+                elif (
+                    get_disagg().disaggregation_decode_allocation_policy
+                    != "prefill_complete"
+                    and self.has_bootstrapped_waiting_req()
+                ):
+                    # optimistic request yields to waiting requests
+                    self.chunked_req = None
+                    # Retract may drain every result, leaving no handler to requeue.
+                    if not self.enable_overlap or req.inflight_middle_chunks == 0:
                         self.optimistic_release_and_requeue(req)
                 # else: still bootstrapping, keep computing without sending
             elif self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 req.tmp_end_idx = min(
-                    req.extend_range.end,
+                    req.extend_end,
                     len(req.origin_input_ids),
                 )
             else:
@@ -1275,9 +2335,7 @@ class SchedulerDisaggregationPrefillMixin:
         # must stay stable across the request's batches: snapshot the at-rest
         # prefix on the first batch. Non-staging reads the live prefix.
         if self.enable_staging and req.early_send_prefix_end is None:
-            req.early_send_prefix_end = max(
-                0, len(req.prefix_indices) - req.host_hit_length
-            )
+            req.early_send_prefix_end = max(0, req.prefix_len - req.host_hit_length)
 
         if req.pending_bootstrap:
             return
@@ -1286,7 +2344,7 @@ class SchedulerDisaggregationPrefillMixin:
         cached_end = (
             req.early_send_prefix_end
             if self.enable_staging
-            else len(req.prefix_indices) - req.host_hit_length
+            else req.prefix_len - req.host_hit_length
         )
         if cached_end <= req.start_send_idx:
             return
@@ -1303,7 +2361,7 @@ class SchedulerDisaggregationPrefillMixin:
         if self.enable_overlap:
             ev = torch.cuda.Event()
             ev.record(self.forward_stream)
-            req.disagg_kv_sender._early_send_wait_event = ev
+            req.disagg_kv_sender.set_source_event(ev)
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
     def send_kv_chunk(
@@ -1318,7 +2376,7 @@ class SchedulerDisaggregationPrefillMixin:
                 value = 0
             else:
                 if end_idx is None:
-                    end_idx = min(req.extend_range.end, len(req.origin_input_ids))
+                    end_idx = min(req.extend_end, len(req.origin_input_ids))
                 page_indices_gpu = page_indices_for_request(self, req, end_idx)
                 state_indices = state_indices_for_request(self, req, end_idx)
                 value = computer.compute(page_indices_gpu, state_indices)
@@ -1330,7 +2388,7 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
-    ) -> None:
+    ) -> bool:
         """
         Send a prefilled chunk to the decode server
         """
@@ -1338,9 +2396,7 @@ class SchedulerDisaggregationPrefillMixin:
         start_idx = req.start_send_idx
         transfer_input_len = len(req.origin_input_ids)
         end_idx = (
-            end_idx
-            if end_idx is not None
-            else min(req.extend_range.end, transfer_input_len)
+            end_idx if end_idx is not None else min(req.extend_end, transfer_input_len)
         )
 
         if not last_chunk:
@@ -1363,17 +2419,32 @@ class SchedulerDisaggregationPrefillMixin:
                 start_idx,
                 end_idx,
             )
-            return
+            return True
 
+        current_pd_hidden_src_indices = pd_hidden_state(req).current_src_indices
+        current_pd_hidden_start = pd_hidden_state(req).current_start
+        current_pd_hidden_row_len = int(pd_hidden_state(req).current_row_len or 0)
+        has_current_pd_hidden = (
+            current_pd_hidden_src_indices is not None
+            and current_pd_hidden_row_len > 0
+        )
+        streaming_pd_hidden = bool(
+            (pd_hidden_state(req).meta or {}).get("streaming_hidden", False)
+        )
+
+        state_types = (
+            self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+        )
         state_indices: Optional[List] = None
-        if last_chunk:
-            self.disagg_metadata_buffers.set_buf(req)
+        if last_chunk or (streaming_pd_hidden and has_current_pd_hidden):
+            if last_chunk:
+                self.disagg_metadata_buffers.set_buf(req)
 
             # Most state payloads read token-pool rows and should match the KV
             # range actually materialized on prefill. C128 state is request
             # scoped, so its transfer index must use the logical input length
             # that decode used to register the destination row.
-            seq_len = min(req.extend_range.end, transfer_input_len)
+            seq_len = min(req.extend_end, transfer_input_len)
             c128_seq_len = transfer_input_len
 
             def _mamba_payload():
@@ -1395,7 +2466,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req.kv.req_pool_idx, window_start:seq_len
                 ]
                 window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
                         window_kv_indices_full
                     )
                 )
@@ -1438,23 +2509,39 @@ class SchedulerDisaggregationPrefillMixin:
                     int(req.kv.req_pool_idx), c128_seq_len
                 )
 
+            def _pd_hidden_payload():
+                return _select_pd_hidden_payload_indices(
+                    rid=req.rid,
+                    owner_direct_sent=pd_hidden_state(req).owner_direct_sent,
+                    src_indices=pd_hidden_state(req).src_indices,
+                    capture_layer_ids=pd_hidden_state(req).capture_layer_ids,
+                    current_src_indices=current_pd_hidden_src_indices,
+                    has_current_pd_hidden=has_current_pd_hidden,
+                    streaming_hidden=streaming_pd_hidden,
+                    written=pd_hidden_state(req).written,
+                )
+
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
-            payloads = {
-                StateType.MAMBA: _mamba_payload,
-                StateType.QSA_PENDING: _qsa_pending_payload,
-                StateType.QSA_COMPRESSED: _full_kv_pages_payload,
-                StateType.SWA: _swa_payload,
-                StateType.DSA: _full_kv_pages_payload,
-                StateType.DSA_TAIL: _dsa_tail_payload,
-                StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
-                StateType.SWA_RING: _swa_ring_payload,
-                StateType.DSV4_REQUEST_STATE: _request_state_payload,
-                StateType.BLOCK_SCALE: _full_kv_pages_payload,
-                StateType.BLOCK_SCALE_SWA: _swa_payload,
-            }
-            if _is_npu and isinstance(
+            payloads = {StateType.PD_HIDDEN: _pd_hidden_payload}
+            if last_chunk:
+                payloads = {
+                    StateType.MAMBA: _mamba_payload,
+                    StateType.QSA_PENDING: _qsa_pending_payload,
+                    StateType.QSA_COMPRESSED: _full_kv_pages_payload,
+                    StateType.SWA: _swa_payload,
+                    StateType.DSA: _full_kv_pages_payload,
+                    StateType.DSA_TAIL: _dsa_tail_payload,
+                    StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
+                    StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
+                    StateType.SWA_RING: _swa_ring_payload,
+                    StateType.DSV4_REQUEST_STATE: _request_state_payload,
+                    StateType.BLOCK_SCALE: _full_kv_pages_payload,
+                    StateType.BLOCK_SCALE_SWA: _swa_payload,
+                }
+                payloads[StateType.PD_HIDDEN] = _pd_hidden_payload
+            if last_chunk and _is_npu and isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(),
                 DeepSeekV4TokenToKVPool,
             ):
@@ -1475,15 +2562,21 @@ class SchedulerDisaggregationPrefillMixin:
                 payloads[st]() if st in payloads else None for st in state_types
             ]
 
+        transfer_chunk_tokens = req.disagg_kv_sender.get_max_transfer_tokens()
         if self.enable_staging:
             # One sender.send per grid slot; the sender's cumulative page
             # counter marks only the final sub-send of the final chunk as
             # is_last, routing aux/state correctly.
+            transfer_chunk_tokens = staging_grid_tokens(
+                get_schedule().chunked_prefill_size, page_size
+            )
+        if transfer_chunk_tokens is not None:
+            # Prefill cache hits can leave more KV to transfer than the DCP pack buffer holds.
             segments = compute_grid_segments(
                 start_idx,
                 end_idx,
                 req.disagg_decode_prefix_len,
-                staging_grid_tokens(get_schedule().chunked_prefill_size, page_size),
+                transfer_chunk_tokens,
             )
         else:
             segments = [(start_idx, end_idx)]
@@ -1502,16 +2595,49 @@ class SchedulerDisaggregationPrefillMixin:
             )
             page_indices = kv_to_page_indices(kv_indices, page_size)
             segment_is_last = last_chunk and is_final_segment
-            if not req.disagg_kv_sender.should_send_kv_chunk(
+            send_hidden_chunk = (
+                streaming_pd_hidden and has_current_pd_hidden and is_final_segment
+            )
+            should_send_kv_chunk = req.disagg_kv_sender.should_send_kv_chunk(
                 len(page_indices), segment_is_last
-            ):
+            )
+            if not should_send_kv_chunk and not send_hidden_chunk:
                 continue
-            send_state_indices = state_indices if segment_is_last else None
+            if send_hidden_chunk:
+                source_event = self.device_module.Event()
+                source_event.record()
+                req.disagg_kv_sender.set_source_event(source_event)
+                req.disagg_kv_sender.set_pd_hidden_chunk_meta(
+                    int(current_pd_hidden_start),
+                    int(current_pd_hidden_row_len),
+                    bool(pd_hidden_state(req).current_is_last),
+                    current_pd_hidden_src_indices
+                    if streaming_pd_hidden
+                    else pd_hidden_state(req).src_indices,
+                )
+            elif getattr(req.disagg_kv_sender, "_source_event", None) is None:
+                # PP + chunked prefill (overlap off) sends intermediate chunks
+                # from process_prefill_chunk while the writer is still on
+                # forward_stream. Record the barrier here so source_event is
+                # never None on that path.
+                stream = getattr(self, "forward_stream", None)
+                if stream is None:
+                    stream = torch.cuda.current_stream()
+                source_event = self.device_module.Event()
+                source_event.record(stream)
+                req.disagg_kv_sender.set_source_event(source_event)
             req.disagg_kv_sender.send(
                 page_indices,
-                send_state_indices,
+                state_indices if segment_is_last or send_hidden_chunk else None,
                 num_kv_tokens=seg_end - seg_start,
             )
+
+        if has_current_pd_hidden and streaming_pd_hidden:
+            pd_hidden_state(req).src_indices = None
+        pd_hidden_state(req).current_src_indices = None
+        pd_hidden_state(req).current_start = None
+        pd_hidden_state(req).current_row_len = 0
+        pd_hidden_state(req).current_is_last = False
         req.start_send_idx = end_idx
         # A last chunk needs no entry: every `last_chunk=True` call site has
         # already put the request on `disagg_prefill_inflight_queue`.
@@ -1519,11 +2645,14 @@ class SchedulerDisaggregationPrefillMixin:
             self.disagg_prefill_pending_chunk_rids.discard(req.rid)
         else:
             self.disagg_prefill_pending_chunk_rids.add(req.rid)
+        return True
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
         max_attempts = get_disagg().optimistic_prefill_attempts
-        maybe_cache_unfinished_req(req, self.tree_cache)
+        uses_write_through_cache = _uses_write_through_cache(self.tree_cache)
+        if not uses_write_through_cache:
+            checkpoint_kv_cache(req, self.tree_cache)
         # The cached prefix is evictable once the KV is released. Its length
         # (capped at what a retry can match) seeds the retry's storage baseline,
         # so an evicted prefix is looked up in L3 once before it is recomputed.
@@ -1536,16 +2665,15 @@ class SchedulerDisaggregationPrefillMixin:
             )
         )
         self._release_aborted_request(req)
-        # Mamba insertion donates the checkpoint and clears its sequence marker.
-        release_kv_cache(
-            req, self.tree_cache, is_insert=not self.tree_cache.supports_mamba()
-        )
+        # The checkpoint above already handed the prefill KV to the tree; the
+        # request is not finished, so the release only frees the rest.
+        release_kv_cache(req, self.tree_cache, checkpoint=False)
         req.reset_for_retract()
         req.output_ids = array("q")
         req.start_send_idx = 0
         self.clear_pending_chunk_send(req)  # re-sends from scratch
         req.tmp_end_idx = -1
-        req.disagg_decode_prefix_len = 0
+        req.disagg_decode_prefix_len = None
         req.early_send_prefix_end = None
         req.hidden_states_tensor = None
         req.output_dsa_topk_indices = None
@@ -1555,7 +2683,11 @@ class SchedulerDisaggregationPrefillMixin:
         # A fresh lookup budget for the new attempt, as after a retraction.
         req.storage_prefetch_retry_attempts = 0
         req.storage_prefetch_last_match_len = yielded_prefix_len or None
-        if req.prefill_attempt_count >= max_attempts:
+        if (
+            req.prefill_attempt_count >= max_attempts
+            and get_disagg().disaggregation_decode_allocation_policy
+            != "prefill_complete"
+        ):
             logger.info(
                 f"Req {req.rid} exhausted optimistic prefill attempts "
                 "falling back to bootstrap queue"
