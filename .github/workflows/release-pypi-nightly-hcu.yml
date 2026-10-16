@@ -24,9 +24,10 @@ on:
 
 jobs:
   compile:
-    # ---- 并发控制: 同一分支 + 同一 Python 版本的 job 只保留最新一个 ----
+    name: compile (dtk${{ matrix.dtk_tag }}-py${{ matrix.python-version }})
+    # ---- 并发控制: 同一分支 + 同一 DTK/Python 组合的 job 只保留最新一个 ----
     concurrency:
-      group: release-nightly-hcu-${{ github.ref }}-py${{ matrix.python-version }}
+      group: release-nightly-hcu-${{ github.ref }}-dtk${{ matrix.dtk_tag }}-py${{ matrix.python-version }}
       cancel-in-progress: true
     # ---- 自托管 HCU runner，在 Docker 容器内执行 ----
     runs-on: [ci, bw1100]
@@ -36,7 +37,11 @@ jobs:
         shell: bash
 
     container:
-      image: ${{ matrix.container_image }}
+      # 直接使用预装 DTK 的基础镜像, CI 内不再安装 DTK; 换/加编译目标 = 改下面矩阵
+      # image 按镜像总表固定格式拼接 (container.image 不允许 env 上下文, vars.HARBOR_SITE 内联):
+      #   ${{ vars.HARBOR_SITE }}/hcu/base/dtk:<dtk_tag>-rockylinux8.6-py<python_version>
+      # dtk26.10 的 rockylinux8.6 编译底座目前只有 py3.12, 矩阵三目标同 vllm-plugin-das 口径
+      image: ${{ vars.HARBOR_SITE }}/hcu/base/dtk:${{ matrix.dtk_tag }}-rockylinux8.6-py${{ matrix.python-version }}
       options: >
         --device=/dev/kfd --device=/dev/dri/ --group-add video
         -v /opt/hyhal/:/opt/hyhal/:ro
@@ -45,22 +50,22 @@ jobs:
         --security-opt seccomp=unconfined
         --privileged=true
 
-    # ---- Matrix: Python 3.10/3.12 并行编译, 各自使用对应的编译环境镜像 ----
+    # ---- Matrix: dtk26.04 (py3.10/3.12) + dtk26.10 (py3.12) 并行编译 ----
     strategy:
       fail-fast: false
       matrix:
         include:
-          - python-version: '3.10'
-            container_image: ${{ vars.BASE_COMPILE_IMAGE_ROCKY_PY310 }}
-          - python-version: '3.12'
-            container_image: ${{ vars.BASE_COMPILE_IMAGE_ROCKY_PY312 }}
+          - dtk_tag: "26.04"
+            python-version: '3.10'
+          - dtk_tag: "26.04"
+            python-version: '3.12'
+          - dtk_tag: "26.10"
+            python-version: '3.12'
 
     env:
       TORCH_VERSION: '2.11.0'
       PYPI_URL: ${{ vars.PYPI_URL }}
-      PIP_INDEX_URL: ${{ vars.PYPI_URL }}/nightly/dtk2604/+simple/
       RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
-      DTK_PKG_URL: ${{ vars.RESOURCE_SERVER_URL }}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
       WHEEL_COMMIT_SHA: ${{ inputs.ref || github.sha }}
 
     steps:
@@ -83,6 +88,17 @@ jobs:
         run: |
           PIP_TRUSTED_HOST="$(echo "${PYPI_URL}" | sed -E 's#^https?://([^/:]+).*#\1#')"
           echo "PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}" >> "${GITHUB_ENV}"
+
+      # 内网 pip 源按矩阵 dtk_tag 拼接并去掉点 (26.04 -> dtk2604, 26.10 -> dtk2610),
+      # 与基础镜像预装的 DTK 版本一致; 基础镜像自带 /opt/dtk, CI 内不再安装 DTK
+      - name: Resolve pip index from matrix dtk_tag
+        env:
+          DTK_VER: ${{ matrix.dtk_tag }}
+        run: |
+          DTK_VER="${DTK_VER//./}"
+          PIP_INDEX="${PYPI_URL}/nightly/dtk${DTK_VER}/+simple/"
+          echo "PIP_INDEX_URL=${PIP_INDEX}" >> "${GITHUB_ENV}"
+          echo "Building against pip nightly archive ${PIP_INDEX}"
 
       # 镜像内已预装 Python 3.10/3.12 + DTK/ROCm + gcc + cmake
       - name: Install build deps
@@ -117,12 +133,8 @@ jobs:
           low-speed-limit = 1
           EOF
 
-      - name: Install DTK
-        run: |
-          cd /opt
-          wget -q $DTK_PKG_URL
-          tar -xzf $(basename $DTK_PKG_URL)
-          mv dtk-* dtk
+      # 基础镜像已预装对应版本的 DTK (/opt/dtk), CI 内不再安装 DTK;
+      # 换 DTK 版本 = 改矩阵的 dtk_tag 换基础镜像, 同 vllm-plugin-das 口径
 
       # =======================================================================
       # 路径检测: 决定哪些组件需要编译
@@ -186,9 +198,11 @@ jobs:
         env:
           CIUPLOAD_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
           GITHUB_TOKEN: ${{ github.token }}
+          # DTK 大版本号取自矩阵 dtk_tag (26.04 -> 2604, 26.10 -> 2610)
+          RAW_DTK_VER: ${{ matrix.dtk_tag }}
         run: |
           source /opt/dtk/env.sh
-          DTK_VER=$(echo $DTK_PKG_URL | grep -oP 'dtk\K[0-9]+(\.[0-9]+)+' | tr -d '.')
+          DTK_VER="$(echo "${RAW_DTK_VER}" | tr -d '.')"
           mkdir -p output
           shopt -s nullglob
           wheels=(python/sglang/kernels/aot/dist/*.whl python/dist/*.whl sgl-model-gateway/target/wheels/*.whl)
@@ -205,19 +219,20 @@ jobs:
           echo "=== Repaired wheels ==="
           ls -lh output/
           if [[ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]]; then
+            # 新版大版本流程: 按 --dtk_version 归档到 das_nightly/dtk${DTK_VER}, 不再传 --dtk_pkg_name
             CIUpload NIGHTLY \
               --devpi_url "${PYPI_URL}" \
               --password "${CIUPLOAD_PASSWORD}" \
-              --dtk_pkg_name "$(basename "${DTK_PKG_URL}")" \
+              --dtk_version "${DTK_VER}" \
               --record \
               -f output/*.whl
           fi
-          rm -rf /home/github/sgl_whl_temp/HYGON-AI_hcu-sglang/* || true
+          # Matrix jobs share the runner; cleanup only this job workspace below.
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: hcu-wheels-py${{ matrix.python-version }}
+          name: hcu-wheels-dtk${{ matrix.dtk_tag }}-py${{ matrix.python-version }}
           path: output/*.whl
           if-no-files-found: warn
 
