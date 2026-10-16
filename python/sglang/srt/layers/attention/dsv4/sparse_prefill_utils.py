@@ -334,6 +334,14 @@ def build_swa_token_ids(
         swa_gather_lens: (num_reqs,) int32, gather length per request.
         swa_offsets: (num_reqs+1,) int32, exclusive cumsum of swa_gather_lens.
     """
+    if is_hcu():
+        from lightop.attention import dsv41_build_swa_token_ids
+
+        return dsv41_build_swa_token_ids(
+            seq_lens, extend_seq_lens, req_pool_indices, req_to_token,
+            full_to_swa, swa_window, total_swa,
+        )
+
     assert seq_lens.dtype == torch.int32
     assert extend_seq_lens.dtype == torch.int32
     assert req_pool_indices.dtype == torch.int32
