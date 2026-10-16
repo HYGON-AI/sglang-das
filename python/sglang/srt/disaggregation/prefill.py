@@ -1770,6 +1770,13 @@ class SchedulerDisaggregationPrefillMixin:
             ):
                 return False
 
+            # A decode request can only be failed safely after every local
+            # source transfer has drained. The Mooncake sender fans this
+            # terminal marker out to its saved/current decode targets.
+            notify_drained_abort = getattr(sender, "notify_drained_abort", None)
+            if notify_drained_abort is not None:
+                notify_drained_abort()
+
             if not req.external_kv_finish_state_applied:
                 if req.to_finish is not None:
                     req.update_finish_state()

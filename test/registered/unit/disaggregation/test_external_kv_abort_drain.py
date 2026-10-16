@@ -175,6 +175,19 @@ class TestAbortDrain(unittest.TestCase):
         self.env["release_kv_cache"].assert_called_once()
         self.assertTrue(self.req.external_kv_response_sent)
 
+    def test_drained_abort_notification_waits_for_forward_and_source_drain(self):
+        self.req.disagg_kv_sender.notify_drained_abort = Mock()
+        self.req.disagg_kv_sender.is_transfer_drained.return_value = False
+        self.assertFalse(self.finalize(forward_drained=False))
+        self.req.disagg_kv_sender.notify_drained_abort.assert_not_called()
+
+        self.assertFalse(self.finalize())
+        self.req.disagg_kv_sender.notify_drained_abort.assert_not_called()
+
+        self.req.disagg_kv_sender.is_transfer_drained.return_value = True
+        self.assertTrue(self.finalize())
+        self.req.disagg_kv_sender.notify_drained_abort.assert_called_once_with()
+
     def test_chunked_send_failure_retains_retry_owner(self):
         send = self.s.ipc_channels.send_to_tokenizer.send_output
         send.side_effect = [RuntimeError("before delivery"), None]
@@ -374,6 +387,7 @@ class TestSourceDrain(unittest.TestCase):
         )
         mgr = cls()
         mgr.enable_trace = False
+        mgr._final_poll_enabled = False
         mgr.enable_deferred_decode_kv_release = False
         mgr._source_drain = self.tracker
         mgr._staging_outstanding = defaultdict(int)
