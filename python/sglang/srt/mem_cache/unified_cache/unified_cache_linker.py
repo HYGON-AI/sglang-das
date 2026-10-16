@@ -403,14 +403,18 @@ class UnifiedCacheLinkerWrapper:
 
         known_hit_len = req.external_cache_hit_length if cache.pp_size > 1 else None
         if known_hit_len is not None:
-            # PP0's absolute boundary also survives later local L1 rematches.
+            # The absolute boundary also survives later local L1 rematches.
             key = key[:known_hit_len]
         elif cache.pp_size > 1:
-            if cache.pp_rank != 0:
-                req.external_cache_hit_length = 0
-                return result
-            # The local device hit is part of PP0's canonical restorable
-            # boundary even when the external tail lookup misses.
+            # Every PP stage must derive the same absolute boundary before it
+            # builds its extend batch.  In particular, a downstream stage
+            # cannot stop at its local L1 hit while PP0 extends that hit from
+            # L3: the hidden states sent by PP0 would then have a different
+            # token count from the downstream batch.  Direct-linker lookups
+            # are metadata-only, and PP-aware backends (for example Mooncake)
+            # validate every PP shard, so probing from each stage's local L1
+            # frontier produces the common restorable boundary without an
+            # additional scheduler-side PP control message.
             req.external_cache_hit_length = device_hit_len
 
         if device_hit_len >= len(key):
