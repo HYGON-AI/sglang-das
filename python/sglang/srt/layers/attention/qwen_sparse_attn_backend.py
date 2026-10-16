@@ -300,12 +300,13 @@ class QwenSparseAttnBackend(AttentionBackend):
     def _maybe_calibrate_fp8_e4m3_kv_scales(
         layer, k: torch.Tensor, v: torch.Tensor, cache_dtype: torch.dtype
     ) -> None:
-        """Replace implicit e4m3 scale=1.0 with a per-layer amax scale.
+        """Freeze matching FP8 store/read scales before graph capture.
 
-        BF16 checkpoints have no k_scale/v_scale.  e4m3fn/fnuz then clamp at
-        448/224, which saturates Qwen K/V and collapses 1-layer MTP accept
-        while e5m2 (max ~57k) still looks fine.  Skip CUDA-graph capture so a
-        dummy fill cannot freeze the scale; the first real store wins.
+        Decode graphs bake Python float descales into kernel arguments, so
+        runtime calibration must not change them afterwards. Dummy capture
+        tensors do not provide a useful amax: freeze the implicit unit scale.
+        Eager calibration may expand, but never shrink, the default range.
+        The representable source range is fp8_max * scale, not fp8_max / scale.
         """
         e4m3_dtypes = tuple(
             dt
@@ -332,22 +333,26 @@ class QwenSparseAttnBackend(AttentionBackend):
         try:
             from sglang.srt.model_executor.runner import get_is_capture_mode
 
-            if get_is_capture_mode():
-                return
+            capture = get_is_capture_mode()
         except Exception:
-            pass
-        k_amax = float(k.detach().float().abs().amax().item())
-        v_amax = float(v.detach().float().abs().amax().item())
-        if not math.isfinite(k_amax) or not math.isfinite(v_amax):
+            capture = False
+        if capture:
+            # Keep checkpoint-independent unit scales stable for every graph.
+            # Do not reduce device tensors or narrow the default FP8 range.
+            layer._qsa_fp8_e4m3_kv_calibrated = True
             return
-        if k_amax <= 1e-4 and v_amax <= 1e-4:
-            return
+        else:
+            k_amax = float(k.detach().float().abs().amax().item())
+            v_amax = float(v.detach().float().abs().amax().item())
+            if not math.isfinite(k_amax) or not math.isfinite(v_amax):
+                return
+            if k_amax <= 1e-4 and v_amax <= 1e-4:
+                return
         fp8_max = float(torch.finfo(cache_dtype).max)
-        # Floor keeps a 1-token warmup from locking a too-small scale; 1.5x
-        # leaves headroom for later tokens without changing the dequant
+        # 1.5x leaves headroom for later tokens without changing the dequant
         # contract used by compact HCU FA.
         margin = 1.5
-        floor_amax = 16.0
+        floor_amax = fp8_max / margin
         k_scale = max(k_amax, floor_amax) * margin / fp8_max
         v_scale = max(v_amax, floor_amax) * margin / fp8_max
         k_scale = max(k_scale, 1e-6)
@@ -361,13 +366,14 @@ class QwenSparseAttnBackend(AttentionBackend):
         layer._qsa_fp8_e4m3_kv_calibrated = True
         logger.info(
             "QSA e4m3 KV calibrated layer %s: k_scale=%.6g v_scale=%.6g "
-            "(amax k=%.5g v=%.5g fp8_max=%.5g)",
+            "(amax k=%.5g v=%.5g fp8_max=%.5g, phase=%s)",
             getattr(layer, "layer_id", "?"),
             k_scale,
             v_scale,
             k_amax,
             v_amax,
             fp8_max,
+            "capture" if capture else "runtime",
         )
 
     @staticmethod
