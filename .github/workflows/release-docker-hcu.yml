@@ -80,8 +80,15 @@ jobs:
         if: always()
         run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true
 
-  # Model deployment checks are scheduled independently by cookbook-deployment-smoke.yml.
-  # Keep the image build and operator tests here.
+  # Test the exact image only after the build and both pushes succeed.
+  test-models:
+    needs: build
+    uses: ./.github/workflows/cookbook-deployment-smoke.yml
+    with:
+      image: ${{ needs.build.outputs.docker_image }}
+      mode: execute
+    secrets: inherit
+
   test-operator:
     needs: build
     uses: ./.github/workflows/nightly-test-operator-hcu.yml

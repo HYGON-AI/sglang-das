@@ -1,8 +1,25 @@
 name: Cookbook deployment smoke
 
 on:
-  schedule:
-    - cron: "30 18 * * *" # 02:30 Asia/Shanghai daily
+  workflow_call:
+    inputs:
+      image:
+        description: Exact dated image built and pushed by the caller
+        type: string
+        required: true
+      mode:
+        description: preflight or execute
+        type: string
+        default: execute
+      cases:
+        description: Exact cookbook section; empty tests all single-host deployments
+        type: string
+        default: ''
+    secrets:
+      MODEL_SMOKE_REPO_TOKEN:
+        required: true
+      DASHHUB_CI_TOKEN:
+        required: false
   workflow_dispatch:
     inputs:
       mode:
