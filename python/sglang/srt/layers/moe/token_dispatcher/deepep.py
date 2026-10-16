@@ -233,6 +233,14 @@ class DeepEPPDispatchHooks(DispatcherBaseHooks):
             hook_fun(dispatcher)
 
 
+class _DeepEPCombineHooks(DispatcherBaseHooks):
+    """Optional current-stream work between combine send and receive."""
+
+    def __call__(self, dispatcher: BaseDispatcher):
+        for hook in tuple(self.hook_dict.values()):
+            hook(dispatcher)
+
+
 class DeepEPNormalDispatchOutput(NamedTuple):
     """DeepEP normal dispatch output."""
 
@@ -1360,6 +1368,7 @@ class DeepEPDispatcher(BaseDispatcher):
 
         self._stage = _Stage.INITIAL
         self._deepep_dispatch_hooks = DeepEPPDispatchHooks()
+        self._deepep_combine_hooks = None
 
         # DeepEP/Mooncake/Nixl mark invalid topk slots with -1; the AITER
         # pre_permute reroutes them to a sink slot at index num_local_experts,
@@ -1413,6 +1422,8 @@ class DeepEPDispatcher(BaseDispatcher):
         combine_input: CombineInput,
     ) -> torch.Tensor:
         self.combine_a(combine_input)
+        if self._deepep_combine_hooks is not None:
+            self._deepep_combine_hooks(self)
         ret = self.combine_b()
         return ret
 
@@ -1481,3 +1492,15 @@ class DeepEPDispatcher(BaseDispatcher):
 
     def register_deepep_dispatch_hook(self, hook):
         return self._deepep_dispatch_hooks.register_hook(hook)
+
+    def register_deepep_combine_hook(self, hook):
+        if (
+            self.deepep_mode != DeepEPMode.LOW_LATENCY
+            or not self._low_latency_dispatcher.return_recv_hook
+        ):
+            raise ValueError(
+                "Combine compute hook requires DeepEP low_latency recv hooks"
+            )
+        if self._deepep_combine_hooks is None:
+            self._deepep_combine_hooks = _DeepEPCombineHooks()
+        return self._deepep_combine_hooks.register_hook(hook)
