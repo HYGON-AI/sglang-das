@@ -7,6 +7,10 @@ from typing import Callable, Optional
 
 import torch
 
+from sglang.srt.utils import is_hcu
+
+_is_hcu = is_hcu()
+
 
 @torch.compile(dynamic=True)
 def build_active_pages_mask(
@@ -50,7 +54,7 @@ def contiguous_request_page_capacity(
     )
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=_is_hcu)
 def remap_indices_to_staging(
     indices: torch.Tensor,
     selected_pages: torch.Tensor,
@@ -58,6 +62,13 @@ def remap_indices_to_staging(
     max_pages: int,
     static_selected_pages: bool = False,
 ) -> torch.Tensor:
+    if _is_hcu:
+        from lightop.attention import dsv41_remap_indices_to_staging
+
+        return dsv41_remap_indices_to_staging(
+            indices, selected_pages, page_size, max_pages, static_selected_pages
+        )
+
     if static_selected_pages:
         selected_valid = selected_pages >= 0
         selected_slots = torch.where(
