@@ -100,6 +100,39 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         )
         linker.abort_prepared_load.assert_called_once_with("rid")
 
+    def test_prefetch_load_without_prepared_session_fails_closed(self):
+        for read_plan_enabled in (True, False):
+            with self.subTest(read_plan_enabled=read_plan_enabled):
+                linker = self._read_plan_linker(prefetch=True)
+                linker.read_plan_enabled = read_plan_enabled
+                linker.session_lock = threading.Lock()
+                linker.prepared_load_sessions = {}
+                transfers = [[PoolTransfer(name=PoolName.KV, keys=["page"])]]
+
+                with self.assertLogs(
+                    "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker",
+                    level="ERROR",
+                ) as logs:
+                    self.assertFalse(
+                        linker.load_layer_wise(
+                            0, transfers, request_ids=["missing-rid"]
+                        )
+                    )
+
+                self.assertIn(
+                    "Load admitted without prepared session: rid=missing-rid",
+                    logs.output[0],
+                )
+                linker._prepare_expanded_load.assert_not_called()
+                store = linker.storage.store
+                store.create_read_plan.assert_not_called()
+                store.batch_get_session_start.assert_not_called()
+                store.batch_get_session_start_with_sources.assert_not_called()
+                store.batch_get_session_refresh.assert_not_called()
+                store.batch_get_session_prefetch.assert_not_called()
+                store.batch_get_into_multi_buffer_ranges.assert_not_called()
+                linker.abort_prepared_load.assert_called_once_with("missing-rid")
+
     def test_prefetch_off_read_plan_failure_skips_python_session_cleanup(self):
         linker = self._read_plan_linker(prefetch=False)
         linker.storage.store.create_read_plan.return_value.run.side_effect = (

@@ -1194,12 +1194,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             if self.host_prefetch_enabled:
                 if request_ids is None:
                     raise ValueError("Prefetched loads require request IDs")
-                for rid, transfers in zip(request_ids, request_transfers):
+                for rid in request_ids:
                     with self.session_lock:
                         prepared = rid in self.prepared_load_sessions
-                    if not prepared and not self._prepare_expanded_load(rid, transfers):
+                    if not prepared:
                         raise RuntimeError(
-                            f"Mooncake get session preparation failed for rid={rid}."
+                            f"Load admitted without prepared session: rid={rid}"
                         )
             if read_plan_enabled:
                 self.load_with_read_plan(counter_index, request_transfers)
