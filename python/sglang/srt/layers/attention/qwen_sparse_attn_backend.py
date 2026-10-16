@@ -285,8 +285,21 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         BF16 checkpoints have no k_scale/v_scale.  e4m3fn/fnuz then clamp at
         448/224, which saturates Qwen K/V and collapses 1-layer MTP accept
-        while e5m2 (max ~57k) still looks fine.  Skip CUDA-graph capture so a
-        dummy fill cannot freeze the scale; the first real store wins.
+        while e5m2 (max ~57k) still looks fine.
+
+        The scales are read by decode attention as plain Python floats, so
+        whatever value is in effect during CUDA-graph capture is baked into
+        the replayed graphs.  Calibrating lazily on the first real store
+        (after capture) therefore left the graphs dequantizing with the
+        stale 1.0 while the cache held values scaled by the calibrated
+        factor -- decode read K/V ~19x too small and produced garbage.
+
+        Fix: calibrate unconditionally during capture too, using the floor
+        amax (16.0) so the baked scale is the conservative final value and
+        runtime never recalibrates (store and read stay consistent both
+        inside and outside the graphs).  The floor scale still leaves
+        ~8.3k of representable range (448 / (16 * 1.5 / 448)), far above
+        observed Qwen4Exp K/V amax (<100), so saturation is not a concern.
         """
         e4m3_dtypes = tuple(
             dt
@@ -308,19 +321,24 @@ class QwenSparseAttnBackend(AttentionBackend):
         try:
             from sglang.srt.model_executor.runner import get_is_capture_mode
 
-            if get_is_capture_mode():
-                return
+            capture = get_is_capture_mode()
         except Exception:
-            pass
-        k_amax = float(k.detach().float().abs().amax().item())
-        v_amax = float(v.detach().float().abs().amax().item())
-        if not math.isfinite(k_amax) or not math.isfinite(v_amax):
-            return
-        if k_amax <= 1e-4 and v_amax <= 1e-4:
-            return
+            capture = False
+        if capture:
+            # During graph capture the dummy K/V carry no meaningful amax
+            # (possibly NaN), and the scale fixed here is final: runtime
+            # never recalibrates, so eager stores/reads and every replayed
+            # graph agree.  Skip the amax measurement entirely.
+            k_amax = v_amax = 16.0
+        else:
+            k_amax = float(k.detach().float().abs().amax().item())
+            v_amax = float(v.detach().float().abs().amax().item())
+            if not math.isfinite(k_amax) or not math.isfinite(v_amax):
+                return
+            if k_amax <= 1e-4 and v_amax <= 1e-4:
+                return
         fp8_max = float(torch.finfo(cache_dtype).max)
-        # Floor keeps a 1-token warmup from locking a too-small scale; 1.5x
-        # leaves headroom for later tokens without changing the dequant
+        # 1.5x leaves headroom for later tokens without changing the dequant
         # contract used by compact HCU FA.
         margin = 1.5
         floor_amax = 16.0
@@ -337,13 +355,14 @@ class QwenSparseAttnBackend(AttentionBackend):
         layer._qsa_fp8_e4m3_kv_calibrated = True
         logger.info(
             "QSA e4m3 KV calibrated layer %s: k_scale=%.6g v_scale=%.6g "
-            "(amax k=%.5g v=%.5g fp8_max=%.5g)",
+            "(amax k=%.5g v=%.5g fp8_max=%.5g, phase=%s)",
             getattr(layer, "layer_id", "?"),
             k_scale,
             v_scale,
             k_amax,
             v_amax,
             fp8_max,
+            "capture" if capture else "runtime",
         )
 
     def _store_kv(self, layer, loc, k: torch.Tensor, v: torch.Tensor) -> None:
