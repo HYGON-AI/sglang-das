@@ -1364,6 +1364,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def moe_num_token_non_padded(self) -> Optional[torch.Tensor]:
         """Bound for masking a sparse MoE's padded rows, or None when the MoE
         input is a gathered buffer whose real rows are not a prefix of it."""
+        from sglang.srt.layers.cp.utils import enable_cp_v2
         from sglang.srt.layers.layer_boundary import batch_gathers_over_moe_cp
         from sglang.srt.layers.moe.utils import is_moe_input_scattered_across_dp_ranks
 
@@ -1374,9 +1375,34 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ):
             from sglang.srt.layers.cp.base import get_cp_strategy
 
-            strategy = get_cp_strategy()
-            if strategy is not None:
-                return strategy.moe_num_token_non_padded(self)
+            if enable_cp_v2():
+                strategy = get_cp_strategy()
+                if strategy is not None:
+                    return strategy.moe_num_token_non_padded(self)
+            elif _is_hcu:
+                from sglang.srt.layers.attention.dsa.utils import (
+                    dsa_use_prefill_cp,
+                    is_dsa_prefill_cp_round_robin_split,
+                )
+
+                if dsa_use_prefill_cp(self) and is_dsa_prefill_cp_round_robin_split():
+                    # Legacy HCU metadata is not InterleaveCPStrategy metadata.
+                    # Its real rows still form a prefix of each strided shard.
+                    metadata = self.attn_cp_metadata
+                    if metadata.moe_local_token_count is None:
+                        total = self.global_num_token_non_padded_cpu
+                        if total is None:
+                            total = sum(self.extend_seq_lens_cpu)
+                        parallel = get_parallel()
+                        local = max(
+                            0,
+                            (total + parallel.attn_cp_size - 1 - parallel.attn_cp_rank)
+                            // parallel.attn_cp_size,
+                        )
+                        metadata.moe_local_token_count = torch.tensor(
+                            local, dtype=torch.int32, device=self.input_ids.device
+                        )
+                    return metadata.moe_local_token_count
 
         if self.num_token_non_padded is None:
             return None

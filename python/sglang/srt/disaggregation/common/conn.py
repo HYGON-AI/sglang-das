@@ -1338,9 +1338,21 @@ class CommonKVManager(BaseKVManager):
                     "enable DSpark with the same block size and target/draft KV "
                     "layout. Upgrade both servers together."
                 )
-            if info.attn_cp_size != 1 or self.attn_cp_size != 1:
+            layer_split_mla_layout = (
+                info.cp_cache_layer_split
+                and info.attn_cp_size > 1
+                and self.attn_cp_size == 1
+                and info.attn_tp_size == self.attn_tp_size == 1
+                and self.dcp_size == 1
+                and (self.is_mla_backend or self.is_hybrid_mla_backend)
+            )
+            if (
+                info.attn_cp_size != 1 or self.attn_cp_size != 1
+            ) and not layer_split_mla_layout:
                 raise RuntimeError(
-                    "DeepSeek-V4.1 DP-only DSpark PD requires CP=1 on both servers"
+                    "DeepSeek-V4.1 DSpark PD requires CP=1 on both servers "
+                    "or descriptor-matched LayerSplit prefill with attention TP=1 "
+                    "and decode CP=1, DCP=1"
                 )
             non_cp_mla_layout = info.attn_cp_size == self.attn_cp_size == 1 and (
                 self.is_mla_backend or self.is_hybrid_mla_backend

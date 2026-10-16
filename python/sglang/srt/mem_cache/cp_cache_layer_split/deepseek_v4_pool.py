@@ -1059,6 +1059,17 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         )
         return self._get_staging_buffer(self._extra_family_name(item.compress_ratio))
 
+    def get_extra_key_buffer_for_write(self, layer_id: int) -> torch.Tensor | None:
+        # Read staging is compact and cannot be addressed with global write
+        # slots. Non-owners still compute latents and replicated index-K/state.
+        if not self._owns_extra_key_layer_id(layer_id):
+            return None
+        self.wait_layer_transfer(layer_id)
+        if self.compression_ratios[layer_id] in (1, 2):
+            item = self._owner_compress_layer_item(layer_id)
+            return item.compress_kv_pool.get_key_buffer(item.compress_layer_id)
+        return super().get_extra_key_buffer(layer_id)
+
     def get_extra_key_page_size(self, layer_id: int) -> int:
         # HCU sparse prefill asks for geometry on every rank, including ranks
         # with no persistent buffer for this layer. Staging uses the same ABI.

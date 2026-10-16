@@ -1968,7 +1968,10 @@ class MQALayer(MqaAttentionBase):
             q_lora, _ = self.wq_a(x_linear)
             qkv_a = None
 
-        use_cp = is_cp_active(forward_batch)
+        # HCU shards inputs through legacy DSA CP, not the generic CP strategy.
+        use_cp = (
+            dsa_use_prefill_cp(forward_batch) if _is_hcu else is_cp_active(forward_batch)
+        )
         layer_split_cp = (
             is_cp_cache_layer_split_deepseek_v4_pool(get_token_to_kv_pool())
             and forward_batch.forward_mode.is_context_parallel_extend()
@@ -3583,7 +3586,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids_global: Optional[torch.Tensor],
         return_moe_output: bool = False,
     ) -> Union[torch.Tensor, deepseek_v2.MoEOutput]:
-        _use_cp = is_cp_active(forward_batch)
+        _use_cp = (
+            dsa_use_prefill_cp(forward_batch) if _is_hcu else is_cp_active(forward_batch)
+        )
         _use_tp_moe_gather = (
             not _use_cp
             and get_parallel().attn_dp_size > 1
@@ -4232,12 +4237,20 @@ class DeepseekV4Model(nn.Module):
         assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
         hash_ids = None
         cp_extend = (
-            is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
+            (dsa_use_prefill_cp(forward_batch) if _is_hcu else is_cp_active(forward_batch))
+            and forward_batch.forward_mode.is_extend()
         )
         if self.engram_hasher is not None:
             if cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
-                total = int(forward_batch.attn_cp_metadata.total_seq_lens)
+                # Legacy HCU round-robin metadata has total_seq_lens=0. Keep its
+                # global execution padding, matching forward_batch.positions;
+                # EngramHasher masks padding and commits only real requests.
+                total = (
+                    forward_batch.input_ids.shape[0]
+                    if _is_hcu
+                    else int(forward_batch.attn_cp_metadata.total_seq_lens)
+                )
                 hash_ids = self.engram_hasher(
                     forward_batch.input_ids[:total], forward_batch
                 )

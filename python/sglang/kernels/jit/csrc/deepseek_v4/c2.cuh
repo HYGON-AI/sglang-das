@@ -209,6 +209,9 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
   // before the trigger because that GEMM is the successor that reads it.
   out.store(params.kv_output, static_cast<int64_t>(row) * kCTASize + tx);
   PDLTriggerSecondary<kUsePDL>();
+  // Pair-state writes and the replicated index latent are needed on every CP
+  // rank; only the owner has a persistent main-KV destination.
+  if (params.kvcache == nullptr) return;
 
   // ---- main-KV branch: RoPE tail, fp4 fake-quant, cache store ----
   // Match finish()'s bf16 rounding before RoPE.
@@ -506,7 +509,7 @@ struct FlashCompress2Kernel {
         .positions = positions.data_ptr(),
         .req = static_cast<const int64_t*>(req.data_ptr()),
         .raw_out_loc = raw_out_loc.data_ptr(),
-        .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
+        .kvcache = kvcache.size(0) == 0 ? nullptr : static_cast<uint8_t*>(kvcache.data_ptr()),
         .ring_size = static_cast<fast_mod_div_u32_t>(ring_size),
         .eps = eps,
     };

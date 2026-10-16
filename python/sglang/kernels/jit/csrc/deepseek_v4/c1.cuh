@@ -138,6 +138,8 @@ __global__ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(
 
   latent.store(params.kv_output + row * kHeadDim, tx);
   PDLTriggerSecondary<kUsePDL>();
+  // LayerSplit non-owners need the replicated index latent, not a KV store.
+  if (params.kvcache == nullptr) return;
 
   // Match finish()'s bf16 rounding before the main-KV RoPE.
 #pragma unroll
@@ -306,7 +308,7 @@ struct FlashCompress1Kernel {
         .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
         .positions = positions.data_ptr(),
         .out_loc = out_loc.data_ptr(),
-        .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
+        .kvcache = kvcache.size(0) == 0 ? nullptr : static_cast<uint8_t*>(kvcache.data_ptr()),
         .eps = eps,
     };
     const auto k = select(pos_dtype.is_type<int32_t>(), loc_dtype.is_type<int32_t>());

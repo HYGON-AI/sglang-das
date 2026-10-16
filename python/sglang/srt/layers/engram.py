@@ -349,6 +349,10 @@ class EngramHasher(nn.Module):
                 output_size=sum(lens_cpu) if lens_cpu is not None else None,
             )
             num_real = row.shape[0]
+            assert num_real <= num_tokens, (
+                "engram extend needs global token ids before CP sharding: "
+                f"{num_real} real tokens but only {num_tokens} input ids"
+            )
             kmode = MODE_EXTEND
             if forward_batch.engram_history is not None:
                 history, hist_via_slots = forward_batch.engram_history, False

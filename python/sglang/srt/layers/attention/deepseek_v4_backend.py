@@ -2780,13 +2780,16 @@ class DeepseekV4AttnBackend(
         # HCU CP needs physical/real lengths split so dummy rows cannot alias a
         # request's C4/C128 workspace. Keep the device-side metadata path HCU-only.
         query_pos = core_attn_metadata.seq_lens_casual[:num_qo_tokens] - 1
+        cp_active = (
+            dsa_use_prefill_cp(forward_batch) if _is_hcu else is_cp_active(forward_batch)
+        )
         if request_layout is not None:
-            assert not is_cp_active(forward_batch)
+            assert not cp_active
             query_pos = request_layout.pos.to(torch.int32)
         if query_pos.shape[0] < num_qo_tokens:
             query_pos = _pad_tensor_to_size(query_pos, num_qo_tokens, value=0)
         real_query_lens = None
-        if is_cp_active(forward_batch):
+        if cp_active:
             if _is_hcu:
                 assert forward_batch.extend_start_loc is not None
                 query_lens, real_query_lens, query_pos = build_cp_sparse_query_metadata(
@@ -3177,7 +3180,13 @@ class DeepseekV4AttnBackend(
     ) -> None:
         # Every rank writes the whole prompt's compressed state, scoring its own rows.
         cp_meta = forward_batch.attn_cp_metadata
-        total = int(cp_meta.total_seq_lens)
+        # Legacy HCU round-robin metadata does not populate total_seq_lens.
+        # Exclude execution padding from the compressor's request-indexed state.
+        total = (
+            sum(_as_int_list(forward_batch.extend_seq_lens_cpu))
+            if _is_hcu
+            else int(cp_meta.total_seq_lens)
+        )
         tail = self.forward_metadata.late_layer_tail
         if tail is not None:
             q_lens_cpu = tail.local_lens_cpu
@@ -3472,7 +3481,7 @@ class DeepseekV4AttnBackend(
         layer_id = layer.layer_id
         # Contiguous complex64 freqs_cis gives a real/imag-interleaved view without copying.
         freqs_cis = torch.view_as_real(layer.freqs_cis).flatten(-2)
-        kv_cache = pool.get_extra_key_buffer(layer_id)
+        kv_cache = pool.get_extra_key_buffer_for_write(layer_id)
         page_size = pool.get_extra_key_page_size(layer_id)
         # The pool's page format: V4, or the V4.1 fp8 / fp4 layouts.
         kv_layout = (
@@ -3480,8 +3489,6 @@ class DeepseekV4AttnBackend(
             if pool.uniform_fp8
             else pool.get_extra_key_layout(layer_id)
         )
-        assert kv_cache is not None
-
         if layer.compress_ratio == 1:
             # At ratio 1, c1_out_loc equals the int64 raw_out_loc supplied by the scheduler.
             latent = c1_decode_norm_rope_store(
@@ -3940,6 +3947,15 @@ class DeepseekV4AttnBackend(
         from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
             quantize_fp4_indexer_tensor,
         )
+
+        # EP/TP pads execution rows without adding requests. repeat_interleave
+        # with output_size larger than sum(q_lens) leaves invalid K offsets;
+        # native dense indexers assume every offset addresses their K buffer.
+        # Keep padded sparse-page rows at -1 and score only real queries (rank
+        # local lengths under CP, including a late-layer tail when present).
+        num_queries = sum(q_lens_cpu)
+        assert num_queries <= pos.shape[0]
+        x, q_lora, pos = x[:num_queries], q_lora[:num_queries], pos[:num_queries]
 
         pool = self.token_to_kv_pool
         core = self.forward_metadata.core_metadata

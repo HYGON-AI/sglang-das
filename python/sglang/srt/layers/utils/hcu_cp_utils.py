@@ -38,6 +38,8 @@ class ContextParallelMetadata:
     # kept as a list for torch.split() bucket sizes.
     per_rank_actual_token: List[int] = None
     max_rank_len: List[int] = None
+    # Cached real-row bound for legacy interleave MoE dispatch (not CP-v2).
+    moe_local_token_count: torch.Tensor = None
 
     # Per-sequence FlashAttention tensors (shape [bs] or [bs+1]).
     kv_len_prev_tensor: torch.Tensor = None  # [bs] int32 CUDA

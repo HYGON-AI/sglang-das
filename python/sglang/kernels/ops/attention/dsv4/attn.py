@@ -108,7 +108,13 @@ def fused_store_cache(
 
         triton_fused_store_cache(input, cache, indices, page_size=page_size, type=type)
     else:
-        assert not is_hip_runtime() or is_gfx95_supported(), (
+        # HCU retains the V4 HIP JIT writer. The gfx950 requirement applies
+        # only to the newer V4.1 physical cache formats, not the model name.
+        assert (
+            not is_hip_runtime()
+            or layout is KVLayout.V4
+            or is_gfx95_supported()
+        ), (
             "V4.1 KV stores on HIP require gfx950"
         )
         module = _jit_fused_store_module(

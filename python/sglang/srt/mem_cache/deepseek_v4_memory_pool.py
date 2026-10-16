@@ -2167,6 +2167,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert compress_kv_pool is not None
         return compress_kv_pool.get_key_buffer(compress_layer_id)
 
+    def get_extra_key_buffer_for_write(self, layer_id: int) -> torch.Tensor | None:
+        """Persistent write destination; None means this rank must not store KV."""
+        return self.get_extra_key_buffer(layer_id)
+
     def set_extra_key_buffer(
         self,
         layer_id: int,

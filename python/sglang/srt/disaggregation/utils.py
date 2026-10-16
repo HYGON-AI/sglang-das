@@ -2247,15 +2247,21 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
                 for family in ("kv", "indexer", "indexer_scale")
             )
         }
-        layout["kv_item_lens"] = [
-            merged[0][key]
-            for key in sorted(
-                merged[0], key=lambda key: (family_order[key[0]], key[1])
-            )
-        ]
+        kv_keys = sorted(merged[0], key=lambda key: (family_order[key[0]], key[1]))
+        # Layer IDs must describe the same global positional ABI as sizes,
+        # not this CP rank's subset of owned KV and replicated indexer pages.
+        layout["kv_layer_ids"] = [key[1] for key in kv_keys]
+        layout["kv_item_lens"] = [merged[0][key] for key in kv_keys]
         layout["state_item_lens"] = [
             [entries[key] for key in sorted(entries)] for entries in merged[1:]
         ]
+    elif metadata := getattr(kv_args, "v4_transfer_metadata", None):
+        # The unsharded V4.1 pool's legacy layer IDs only cover C4/C128
+        # (and are empty for C1/C2). Use its complete transfer descriptors
+        # so decode and LayerSplit prefill compare the same logical layout.
+        if len(metadata["kv"]) != len(kv_args.kv_item_lens):
+            raise RuntimeError("Incomplete DSPARK transfer descriptors")
+        layout["kv_layer_ids"] = [key[1] for key in metadata["kv"]]
     return layout
 
 
