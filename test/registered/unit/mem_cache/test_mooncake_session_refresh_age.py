@@ -288,6 +288,58 @@ class TestSessionRefreshAge(CustomTestCase):
             linker.session_lease_base, {"k0": 111.0, "k1": 111.0, "unrelated": 101.0}
         )
 
+    def test_claim_wait_does_not_hold_host_prefetch_lock(self):
+        linker = _linker()
+        session_lock = _ContendedLock()
+        linker.session_lock = session_lock
+        linker.prepared_load_sessions = {"session": ["k0"]}
+        linker.host_prefetch_entries["rid"] = {
+            "state": "dfs_prefetched",
+            "session_rid": "session",
+        }
+        linker.host_prefetch_entries["worker"] = {"state": "reading"}
+
+        claim = {}
+        claim_done = threading.Event()
+        update_done = threading.Event()
+
+        def claim_ready():
+            try:
+                claim["result"] = linker.claim_ready_host_prefetch("rid")
+            except BaseException as exc:
+                claim["error"] = exc
+            finally:
+                claim_done.set()
+
+        def publish_ready():
+            with linker.host_prefetch_lock:
+                linker.host_prefetch_entries["worker"]["state"] = "dfs_prefetched"
+            update_done.set()
+
+        with session_lock:
+            claimant = threading.Thread(target=claim_ready)
+            claimant.start()
+            claim_waiting_for_session = session_lock.contended.wait(5)
+            worker = threading.Thread(target=publish_ready)
+            worker.start()
+            updated_while_session_locked = update_done.wait(5)
+
+        claimant.join(5)
+        worker.join(5)
+        self.assertFalse(claimant.is_alive())
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(claim_done.is_set())
+        self.assertTrue(update_done.is_set())
+        self.assertTrue(claim_waiting_for_session)
+        self.assertTrue(
+            updated_while_session_locked,
+            "claim blocked host-prefetch state updates while waiting for session_lock",
+        )
+        self.assertNotIn("error", claim)
+        self.assertTrue(claim["result"])
+        self.assertEqual(linker.host_prefetch_entries["rid"]["state"], "claimed")
+        self.assertEqual(linker.prepared_load_sessions, {"rid": ["k0"]})
+
     def test_refresh_skips_base_of_key_ended_meanwhile(self):
         clock = _Clock()
         linker = _linker()
