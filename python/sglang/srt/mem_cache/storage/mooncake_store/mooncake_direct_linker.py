@@ -1249,6 +1249,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 # with no request-indexed session maps or duplicate key build.
                 for keys, _ in batches.values():
                     result = self.storage.store.batch_get_session_start(keys)
+                    # A partial result can still leave some sessions active.
+                    started.append(keys)
                     failed = [key for key, code in zip(keys, result) if code != 0]
                     if failed:
                         logger.warning(
@@ -1270,7 +1272,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                             f"Mooncake get session start failed: keys={len(keys)}, "
                             f"failed={len(failed)}, results={result}"
                         )
-                    started.append(keys)
             if self.enable_page_wise_load and any(
                 len(keys) >= self.page_wise_load_threshold
                 for keys, _ in batches.values()
