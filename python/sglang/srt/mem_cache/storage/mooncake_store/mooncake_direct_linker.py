@@ -301,6 +301,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 mem_pool=None,
                 enable_client_http_server=params.enable_metrics,
                 enable_dfs_prefetch=self.host_prefetch_enabled,
+                dfs_health_config={
+                    "probe_interval_s": getattr(
+                        server_args, "mooncake_dfs_health_probe_interval_s", 10
+                    ),
+                    "failure_threshold": getattr(
+                        server_args, "mooncake_dfs_health_failure_threshold", 3
+                    ),
+                    "success_threshold": getattr(
+                        server_args, "mooncake_dfs_health_success_threshold", 3
+                    ),
+                    "probe_timeout_s": getattr(
+                        server_args, "mooncake_dfs_health_probe_timeout_s", 2
+                    ),
+                },
             )
         else:
             self.storage = storage
