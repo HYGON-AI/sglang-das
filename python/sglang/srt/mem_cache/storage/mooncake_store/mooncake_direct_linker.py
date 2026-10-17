@@ -949,20 +949,21 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def claim_ready_host_prefetch(self, rid: str) -> bool:
         if not self.host_prefetch_enabled:
             return False
-        with self.host_prefetch_lock:
+        # Session RPCs may hold session_lock; wait before locking worker state.
+        # Keep session ownership and the claimed state atomic under both locks.
+        with self.session_lock, self.host_prefetch_lock:
             entry = self.host_prefetch_entries.get(rid)
             if entry is None or entry.get("state") != "dfs_prefetched":
                 return False
             session_rid = str(entry["session_rid"])
-            with self.session_lock:
-                if (
-                    rid in self.prepared_load_sessions
-                    or session_rid not in self.prepared_load_sessions
-                ):
-                    return False
-                self.prepared_load_sessions[rid] = self.prepared_load_sessions.pop(
-                    session_rid
-                )
+            if (
+                rid in self.prepared_load_sessions
+                or session_rid not in self.prepared_load_sessions
+            ):
+                return False
+            self.prepared_load_sessions[rid] = self.prepared_load_sessions.pop(
+                session_rid
+            )
             entry["state"] = "claimed"
         return True
 
