@@ -22,6 +22,7 @@ TODO: move dsv4 MHC into the same abstraction
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, NamedTuple, Optional, Tuple, TypeAlias, Union
 
 import msgspec
@@ -37,10 +38,34 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import compile_in_capture_mode
 from sglang.srt.models.deepseek_v2 import MoEOutput, _is_hip, _is_npu, _is_xpu
 from sglang.srt.runtime_context import get_parallel, get_platform
-from sglang.srt.utils import is_gfx95_supported, is_hcu, get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hcu
 
 _is_hcu = is_hcu()
-_use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC", default="false")
+_use_lightop = get_bool_env_var("SGLANG_USE_LIGHTOP")
+_hc_mix_stats_opt = envs.SGLANG_HCU_HC_MIX_STATS_OPT.get()
+_use_hcu_hc_mix_stats = _is_hcu and _use_lightop and _hc_mix_stats_opt
+if _use_hcu_hc_mix_stats:
+    import lightop
+
+logger = logging.getLogger(__name__)
+if _is_hcu:
+    logger.info(
+        "HCU hc_mix_stats: enabled=%s, implementation=%s",
+        _hc_mix_stats_opt,
+        "lightop" if _use_hcu_hc_mix_stats else "torch",
+    )
+
+if _use_hcu_hc_mix_stats:
+    logger.info(
+        "HCU compensated mHC: BF16x3 M=4096..65536; TF32 for other supported M; "
+        "Torch fallback, lightop=%s, extension=%s",
+        getattr(lightop, "__version__", "unknown"),
+        lightop.op.__file__,
+    )
+
+_use_aiter_tilelang_mhc = get_bool_env_var(
+    "SGLANG_ROCM_USE_AITER_TILELANG_MHC", default="false"
+)
 
 _is_gfx95_supported = is_gfx95_supported()
 
@@ -324,6 +349,39 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
                 cfg.eps,
             )
         return pre, post, comb
+    if (
+        _use_hcu_hc_mix_stats
+        and x_flat.dtype == torch.bfloat16
+        and x_flat.is_contiguous()
+        and not is_batch_invariant_mode_enabled()
+    ):
+        parts, bf16_parts = hc.tf32_parts, hc.bf16_parts
+        use_bf16x3 = 4096 <= x_flat.shape[0] <= 65536
+        if parts is not None and (not use_bf16x3 or bf16_parts is not None):
+            from lightop import (
+                hc_mix_stats_sinkhorn_bf16x3,
+                hc_mix_stats_sinkhorn_deepgemm,
+            )
+
+            if use_bf16x3:
+                return hc_mix_stats_sinkhorn_bf16x3(
+                    x_flat,
+                    bf16_parts,
+                    hc.scale,
+                    hc.base,
+                    cfg.sinkhorn_iters,
+                    cfg.rms_eps,
+                    cfg.eps,
+                )
+            return hc_mix_stats_sinkhorn_deepgemm(
+                x_flat,
+                parts,
+                hc.scale,
+                hc.base,
+                cfg.sinkhorn_iters,
+                cfg.rms_eps,
+                cfg.eps,
+            )
     if x.is_cuda and torch.version.cuda is not None:
         # cuBLAS/torch reductions can change order with num_tokens; this kernel
         # keeps the mixing and RMS reductions batch-invariant.
@@ -476,7 +534,8 @@ def post(
         return mhc_post_split_h(x, residual, post_mix, comb)
 
     if (
-        _is_hcu and _use_aiter_tilelang_mhc
+        _is_hcu
+        and _use_aiter_tilelang_mhc
         and envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
     ):
         from aiter.ops.tilelang import mhc_post_fwd
