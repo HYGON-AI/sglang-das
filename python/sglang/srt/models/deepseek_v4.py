@@ -3064,7 +3064,22 @@ class DeepseekV4DecoderLayer(nn.Module):
         # The original FP32 parameters stay intact for small rows and invariant mode.
         self._hc_attn_tf32_parts = self._hc_ffn_tf32_parts = None
         self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
+        # Prepare HCU parts after each weight load/update, before graph capture.
+        # Original FP32 parameters remain the source of truth and fallback.
         if (
+            mhc._use_hcu_hc_mix_stats
+            and self.hc_pre_from_prev_sublayer
+            and self.hc_attn_fn.shape == (24, 20480)
+            and getattr(self.config, "model_type", None) == "deepseek_v41"
+            and not is_batch_invariant_mode_enabled()
+        ):
+            from lightop import split_bf16_hc_weight, split_tf32_hc_weight
+
+            self._hc_attn_tf32_parts = split_tf32_hc_weight(self.hc_attn_fn.data)
+            self._hc_ffn_tf32_parts = split_tf32_hc_weight(self.hc_ffn_fn.data)
+            self._hc_attn_bf16_parts = split_bf16_hc_weight(self.hc_attn_fn.data)
+            self._hc_ffn_bf16_parts = split_bf16_hc_weight(self.hc_ffn_fn.data)
+        elif (
             self.hc_pre_from_prev_sublayer
             and (get_platform().is_sm100 or get_platform().is_sm90)
             and self.hc_attn_fn.shape == (24, 20480)
