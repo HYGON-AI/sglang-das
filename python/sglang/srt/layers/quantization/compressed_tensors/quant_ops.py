@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 from typing import Optional
 
 import torch
@@ -26,6 +27,34 @@ except Exception:
     print(
         "INFO: Please install lightop if you want to infer gptq or awq or w8a8 model.\n"
     )
+
+
+# lightop's `gemm_w8a8_smooth_asm` loads an arch-specific .co through
+# hipModuleLoad inside its C++ `HIP_CALL` macro, which calls `exit(0)` on
+# failure; the Python `try/except` below can never rescue that. gfx928 (K100)
+# images do not ship the w8a8 smooth asm kernels at all (lightop resolves
+# LIGHTOP_ASM_DIR to .../third_party/hsa/gfx928, which is absent), so any call
+# there kills the scheduler process during graph capture instead of raising.
+# Keep the fast path permanently disabled on those archs and always use the
+# tuned Triton path.
+_W8A8_SMOOTH_ASM_UNSUPPORTED_ARCHS = ("gfx928",)
+
+
+@functools.lru_cache(maxsize=8)
+def _w8a8_smooth_asm_supported(device: torch.device) -> bool:
+    """Whether `lightop.gemm_w8a8_smooth_asm` can run on `device`.
+
+    The asm kernels are precompiled per arch and lightop exits the process
+    instead of raising when the matching .co is missing, so a wrong answer here
+    is fatal rather than just slow. Disable the fast path on known-unsupported
+    archs and stay conservative when the arch cannot be determined.
+    """
+    try:
+        props = torch.cuda.get_device_properties(device)
+        arch = getattr(props, "gcnArchName", "").split(":")[0]
+    except Exception:
+        return False
+    return bool(arch) and arch not in _W8A8_SMOOTH_ASM_UNSUPPORTED_ARCHS
 
 
 def triton_scaled_mm(
@@ -64,7 +93,7 @@ def triton_scaled_mm(
         else:
             tune = None
         # The tuned slide values are valid for complete K=256 tiles.
-        if tune is not None and k_i % 256 == 0:
+        if tune is not None and k_i % 256 == 0 and _w8a8_smooth_asm_supported(a.device):
             try:
                 from lightop import op as _lop
 
