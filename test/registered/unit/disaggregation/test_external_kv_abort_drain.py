@@ -30,6 +30,9 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 PREFILL = ROOT / "python/sglang/srt/disaggregation/prefill.py"
 SCHED = ROOT / "python/sglang/srt/managers/scheduler.py"
+BATCH_RESULT = (
+    ROOT / "python/sglang/srt/managers/scheduler_components/batch_result_processor.py"
+)
 CONN = ROOT / "python/sglang/srt/disaggregation/mooncake/conn.py"
 TRACKER = ROOT / "python/sglang/srt/disaggregation/mooncake/source_drain.py"
 spec = importlib.util.spec_from_file_location("source_drain_under_test", TRACKER)
@@ -93,6 +96,9 @@ class TestAbortDrain(unittest.TestCase):
             release_kv_cache=Mock(),
             prepare_abort=Mock(),
             AbortReq=SimpleNamespace,
+            DisaggregationMode=SimpleNamespace(
+                NULL="null", PREFILL="prefill", DECODE="decode"
+            ),
         )
         prefill_cls = load_methods(
             PREFILL,
@@ -100,12 +106,18 @@ class TestAbortDrain(unittest.TestCase):
                 "prefill_abort_sender_terminal",
                 "prefill_abort_forward_drained",
                 "abort_external_kv_request",
+                "clear_pending_chunk_send",
             ],
             self.env,
         )
         sched_cls = load_methods(
             SCHED,
-            ["process_pending_chunked_abort", "_process_external_kv_chunked_abort"],
+            [
+                "process_pending_chunked_abort",
+                "_process_external_kv_chunked_abort",
+                "_iter_external_linker_candidates",
+                "_mark_failed_linker_loads",
+            ],
             self.env,
         )
         cls = type("Combined", (prefill_cls, sched_cls), {})
@@ -148,8 +160,12 @@ class TestAbortDrain(unittest.TestCase):
         s = self.s
         s._external_kv_abort_rids = {"r"}
         s._external_kv_cleanup_rids = {"r"}
+        s._external_kv_chunked_abort_reqs = {}
+        s._deferred_linker_rids = set()
         s._pending_chunked_abort_req = self.req
         s.chunked_req = self.req
+        s.disaggregation_mode = self.env["DisaggregationMode"].PREFILL
+        s.running_batch = SimpleNamespace(is_empty=lambda: True, reqs=[])
         s.result_queue = []
         s.clear_pending_chunk_send = Mock()
         s._release_aborted_request = Mock()
@@ -206,6 +222,139 @@ class TestAbortDrain(unittest.TestCase):
         self.env["maybe_release_metadata_buffer"].assert_called_once()
         self.assertTrue(self.req.external_kv_response_sent)
         self.assertIsNone(self.s._pending_chunked_abort_req)
+
+    def test_null_nonchunked_failure_uses_standard_result_owner(self):
+        mode = self.env["DisaggregationMode"]
+        self.s.disaggregation_mode = mode.NULL
+        self.s._external_kv_abort_rids = set()
+        self.s._external_kv_cleanup_rids = set()
+        self.s._pending_chunked_abort_req = None
+        self.s.chunked_req = None
+        self.s._release_aborted_request = Mock()
+        self.s.tree_cache = Mock(
+            drain_linker_loads=Mock(return_value=[self.req.rid]),
+            has_outstanding_failed_linker_chains=Mock(return_value=False),
+        )
+        # NULL mode has neither PD-only scheduler field.
+        del self.s.clear_pending_chunk_send
+        del self.s.req_to_metadata_buffer_idx_allocator
+        del self.s.disagg_metadata_buffers
+        self.req.to_finish = None
+        self.req.finished_reason = None
+        self.req.disagg_kv_sender = None
+        self.req.inflight_middle_chunks = 0
+        self.req.is_retracted = False
+        self.req.output_ids = []
+        self.req.return_sampling_mask = False
+        self.req.grammar = None
+        self.req.finished = lambda: self.req.finished_reason is not None
+
+        batch = SimpleNamespace(
+            reqs=[self.req],
+            return_hidden_states=False,
+            return_logprob=False,
+            decoding_reqs=[],
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+        self.s._mark_failed_linker_loads(batch)
+
+        class TokenIds:
+            def tolist(self):
+                return [17]
+
+        result = SimpleNamespace(
+            copy_done=None,
+            auxiliary_host_output=None,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+            logits_output=SimpleNamespace(hidden_states=None),
+            next_token_ids=TokenIds(),
+            extend_input_len_per_req=None,
+            extend_logprob_start_len_per_req=None,
+            can_run_cuda_graph=False,
+        )
+        processor_cls = load_methods(
+            BATCH_RESULT, ["process_batch_result_prefill"], self.env
+        )
+        processor = processor_cls()
+        processor.is_generation = True
+        processor.server_args = object()
+        processor.token_to_kv_pool_allocator = Mock()
+        processor._get_prefill_hidden_capture_mode = Mock(return_value=None)
+        processor.snapshot_auxiliary_output_starts = Mock(return_value=[])
+        processor.move_logprobs_to_cpu = Mock()
+        processor._validate_pp_skip_output_comm = Mock()
+        processor._maybe_update_reasoning_tokens = Mock()
+        processor._maybe_collect_routed_experts = Mock()
+        processor._maybe_collect_indexer_topk = Mock()
+        processor._maybe_collect_customized_info = Mock()
+        processor.output_streamer = Mock()
+        processor.metrics_reporter = Mock()
+        processor.tree_cache = self.s.tree_cache
+
+        processor.process_batch_result_prefill(batch, result)
+
+        self.assertIsInstance(self.req.finished_reason, Reason)
+        self.assertEqual(self.req.finished_reason.err_type, "external")
+        self.s._release_aborted_request.assert_called_once_with(self.req.rid)
+        self.env["release_kv_cache"].assert_called_once_with(
+            self.req, processor.tree_cache
+        )
+        processor.output_streamer.stream_output.assert_called_once_with(
+            batch.reqs, False, None
+        )
+        self.env["logger"].exception.assert_not_called()
+
+    def test_null_chunked_failure_retries_until_forward_drains(self):
+        mode = self.env["DisaggregationMode"]
+        self.s.disaggregation_mode = mode.NULL
+        self.s._external_kv_abort_rids = set()
+        self.s._external_kv_cleanup_rids = set()
+        self.s._external_kv_chunked_abort_reqs = {}
+        self.s._pending_chunked_abort_req = None
+        self.s.chunked_req = self.req
+        self.s.tree_cache = Mock(
+            drain_linker_loads=Mock(return_value=[self.req.rid]),
+            has_outstanding_failed_linker_chains=Mock(return_value=False),
+        )
+        self.s._release_aborted_request = Mock()
+        # NULL mode has neither PD-only scheduler field.
+        del self.s.clear_pending_chunk_send
+        del self.s.req_to_metadata_buffer_idx_allocator
+        del self.s.disagg_metadata_buffers
+        self.req.to_finish = None
+        self.req.finished_reason = None
+        self.req.disagg_kv_sender = None
+        self.req.inflight_middle_chunks = 1
+        batch = SimpleNamespace(reqs=[self.req])
+
+        self.s._mark_failed_linker_loads(batch)
+        self.s.process_pending_chunked_abort()
+
+        self.env["release_kv_cache"].assert_not_called()
+        self.s.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+        self.assertIs(self.s._pending_chunked_abort_req, self.req)
+
+        self.req.inflight_middle_chunks = 0
+        self.s.process_pending_chunked_abort()
+        self.s.process_pending_chunked_abort()
+
+        self.assertIsInstance(self.req.finished_reason, Reason)
+        self.assertEqual(self.req.finished_reason.err_type, "external")
+        self.s._release_aborted_request.assert_called_once_with(self.req.rid)
+        self.env["maybe_release_metadata_buffer"].assert_not_called()
+        self.env["release_kv_cache"].assert_called_once_with(
+            self.req, self.s.tree_cache, is_insert=False
+        )
+        send = self.s.ipc_channels.send_to_tokenizer.send_output
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[0].rid, self.req.rid)
+        self.assertTrue(self.req.external_kv_response_sent)
+        self.assertEqual(self.s._external_kv_abort_rids, set())
+        self.assertEqual(self.s._external_kv_chunked_abort_reqs, {})
+        self.assertIsNone(self.s._pending_chunked_abort_req)
+        self.env["logger"].exception.assert_not_called()
 
     def test_later_chunked_abort_does_not_overwrite_earlier_response_retry(self):
         send = self.s.ipc_channels.send_to_tokenizer.send_output

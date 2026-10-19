@@ -21,6 +21,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 class TestPrefillAbortCleanup(unittest.TestCase):
     def setUp(self):
         self.scheduler = prefill.SchedulerDisaggregationPrefillMixin()
+        self.scheduler.disaggregation_mode = prefill.DisaggregationMode.PREFILL
         self.req = SimpleNamespace(
             rid="failed-request",
             to_finish=None,

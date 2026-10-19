@@ -1748,7 +1748,8 @@ class SchedulerDisaggregationPrefillMixin:
                 self._external_kv_abort_rids.add(req.rid)
 
             if not req.external_kv_pending_chunk_cleared:
-                self.clear_pending_chunk_send(req)
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    self.clear_pending_chunk_send(req)
                 req.external_kv_pending_chunk_cleared = True
 
             if not req.external_kv_linker_released:
@@ -1797,15 +1798,19 @@ class SchedulerDisaggregationPrefillMixin:
                 req.external_kv_finish_state_applied = True
 
             if not req.external_kv_metadata_released:
-                maybe_release_metadata_buffer(
-                    req,
-                    self.req_to_metadata_buffer_idx_allocator,
-                    getattr(
-                        getattr(self, "disagg_metadata_buffers", None),
-                        "pd_hidden_pool",
-                        None,
-                    ),
-                )
+                if self.disaggregation_mode in (
+                    DisaggregationMode.PREFILL,
+                    DisaggregationMode.DECODE,
+                ):
+                    maybe_release_metadata_buffer(
+                        req,
+                        self.req_to_metadata_buffer_idx_allocator,
+                        getattr(
+                            getattr(self, "disagg_metadata_buffers", None),
+                            "pd_hidden_pool",
+                            None,
+                        ),
+                    )
                 req.external_kv_metadata_released = True
 
             if not req.external_kv_cache_released:
