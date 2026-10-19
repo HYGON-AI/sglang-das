@@ -75,9 +75,11 @@ def encode_v4_transfer_metadata(kv_args):
 
 
 def decode_v4_transfer_metadata(msg):
-    if len(msg) <= 20 or not msg[20]:
+    # Main owns fields 19..21 (KV item lengths, state formats and state types).
+    # LayerSplit is appended so a non-LayerSplit peer keeps the existing ABI.
+    if len(msg) <= 22 or not msg[22]:
         return {}
-    data = json.loads(msg[20])
+    data = json.loads(msg[22])
     if data.get("version") != 1:
         raise RuntimeError("Unsupported V4 LayerSplit PD descriptor version")
     return data

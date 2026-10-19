@@ -53,7 +53,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoiceFuncName,
 )
 from sglang.srt.observability.req_time_stats import monotonic_time
-from sglang.srt.parser.template_detection import detect_inline_system_support
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -190,18 +189,7 @@ class AnthropicServing:
 
     def __init__(self, openai_serving_chat: OpenAIServingChat):
         self.openai_serving_chat = openai_serving_chat
-        self._merge_inline_system = not detect_inline_system_support(
-            self._chat_template()
-        )
-
-    def _chat_template(self) -> Optional[str]:
-        tokenizer_manager = getattr(self.openai_serving_chat, "tokenizer_manager", None)
-        if tokenizer_manager is None:
-            return None
-        tokenizer = getattr(tokenizer_manager, "tokenizer", None)
-        if tokenizer is None:
-            return None
-        return getattr(tokenizer, "chat_template", None)
+        self._merge_inline_system = not openai_serving_chat.supports_inline_system
 
     async def handle_messages(
         self,
@@ -567,6 +555,7 @@ class AnthropicServing:
             "model": anthropic_request.model,
             "max_tokens": anthropic_request.max_tokens,
             "stream": anthropic_request.stream or False,
+            **anthropic_request.pd_routing_kwargs(),
         }
 
         if anthropic_request.temperature is not None:
@@ -755,10 +744,11 @@ class AnthropicServing:
 
         try:
             # Convert to internal request
-            adapted_request, processed_request = (
-                self.openai_serving_chat._convert_to_internal_request(
-                    chat_request, raw_request
-                )
+            (
+                adapted_request,
+                processed_request,
+            ) = await self.openai_serving_chat._convert_to_internal_request_async(
+                chat_request, raw_request
             )
             adapted_request.received_time = received_time
 
@@ -805,10 +795,11 @@ class AnthropicServing:
             )
 
         try:
-            adapted_request, processed_request = (
-                self.openai_serving_chat._convert_to_internal_request(
-                    chat_request, raw_request
-                )
+            (
+                adapted_request,
+                processed_request,
+            ) = await self.openai_serving_chat._convert_to_internal_request_async(
+                chat_request, raw_request
             )
             adapted_request.received_time = received_time
         except asyncio.CancelledError:
@@ -1445,19 +1436,21 @@ class AnthropicServing:
             )
 
         try:
-            is_multimodal = (
-                self.openai_serving_chat.tokenizer_manager.model_config.is_multimodal
-            )
-            processed = self.openai_serving_chat._process_messages(
-                chat_request, is_multimodal
-            )
+            tokenizer_manager = self.openai_serving_chat.tokenizer_manager
+            is_multimodal = tokenizer_manager.model_config.is_multimodal
 
-            if isinstance(processed.prompt_ids, list):
-                input_tokens = len(processed.prompt_ids)
-            else:
-                # prompt_ids is a string (multimodal case) — tokenize it
-                tokenizer = self.openai_serving_chat.tokenizer_manager.tokenizer
-                input_tokens = len(tokenizer.encode(processed.prompt_ids))
+            def _count_input_tokens() -> int:
+                processed = self.openai_serving_chat._process_messages(
+                    chat_request, is_multimodal
+                )
+                if isinstance(processed.prompt_ids, list):
+                    return len(processed.prompt_ids)
+                # prompt_ids is a string (multimodal case) — tokenize it.
+                return len(tokenizer_manager.tokenizer.encode(processed.prompt_ids))
+
+            input_tokens = await tokenizer_manager.run_tokenizer_offload(
+                _count_input_tokens
+            )
 
             return JSONResponse(
                 content=AnthropicCountTokensResponse(

@@ -19,14 +19,12 @@ from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
-from sglang.srt.function_call.deepseekv41_detector import DeepSeekV41Detector
 from sglang.srt.function_call.dots_detector import DotsToolDetector
 from sglang.srt.function_call.gemma4_detector import Gemma4Detector
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
+from sglang.srt.function_call.gigachat35_detector import GigaChat35Detector
 from sglang.srt.function_call.glm4_moe_detector import (
-    Glm4MoeDetector,
-    GlmSpecialTokenConfig,
-    generate_glm_grammar,
+    Glm4MoeDetector, GlmSpecialTokenConfig, generate_glm_grammar,
 )
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
@@ -34,6 +32,7 @@ from sglang.srt.function_call.hermes_detector import HermesDetector
 from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
 from sglang.srt.function_call.inkling_detector import InklingDetector
 from sglang.srt.function_call.internlm_detector import InternlmDetector
+from sglang.srt.function_call.iquest_q1_detector import IQuestQ1Detector
 from sglang.srt.function_call.k2_v3_detector import K2V3Detector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
@@ -77,7 +76,6 @@ class FunctionCallParser:
         "deepseekv31": DeepSeekV31Detector,
         "deepseekv32": DeepSeekV32Detector,
         "deepseekv4": DeepSeekV4Detector,
-        "deepseekv41": DeepSeekV41Detector,
         "dots": DotsToolDetector,
         "glm": Glm4MoeDetector,
         "glm45": Glm4MoeDetector,
@@ -109,11 +107,15 @@ class FunctionCallParser:
         "hermes": HermesDetector,
         "hunyuan": HunyuanDetector,
         "gigachat3": GigaChat3Detector,
+        "gigachat35": GigaChat35Detector,
         "gemma4": Gemma4Detector,
         "inkling": InklingDetector,
+        "iquest_q1": IQuestQ1Detector,
     }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str, tokenizer=None):
+    def __init__(
+        self, tools: List[Tool], tool_call_parser: str, tokenizer=None, tool_choice=None
+    ):
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             kwargs = {}
@@ -129,9 +131,19 @@ class FunctionCallParser:
             detector.use_full_assistant_constraint = not any(
                 tool.function.strict for tool in tools
             )
-        self.detector = detector
+        if isinstance(tool_choice, dict):
+            tool_choice = ToolChoice(function={"name": tool_choice["name"]})
+        self._required_tool_parser = detector.get_required_tool_parser(tool_choice)
+        self.detector = self._required_tool_parser or detector
         self.tools = tools
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
+
+    def owns_tool_format(self) -> bool:
+        return (
+            self._required_tool_parser is not None
+            or self.detector.supports_structural_tag()
+            or self.detector.parses_required_natively()
+        )
 
     def has_tool_call(self, text: str) -> bool:
         """
@@ -208,7 +220,9 @@ class FunctionCallParser:
         return sp_result.normal_text, sp_result.calls
 
     def get_legacy_structural_tag(
-        self, at_least_one: bool = False
+        self,
+        at_least_one: bool = False,
+        named_function_name: Optional[str] = None,
     ) -> StructuralTagResponseFormat:
         """
         Generate a structural tag response format for all available tools.
@@ -218,6 +232,11 @@ class FunctionCallParser:
         Args:
             at_least_one: If True, the grammar forces at least one tool call
                 (no free text allowed). Used for required/named tool_choice.
+            named_function_name: When tool_choice names a specific function,
+                restrict the grammar to that function and enforce its
+                parameters schema even in non-strict mode, so the call is
+                guaranteed to carry valid arguments. Mirrors the json_schema
+                fallback in get_json_schema_constraint.
 
         Raises:
             ValueError: If tools have conflicting $defs schemas.
@@ -233,13 +252,21 @@ class FunctionCallParser:
             function = tool.function
             name = function.name
             assert name is not None
+            if named_function_name is not None and name != named_function_name:
+                continue
             info = get_structure_info(name)
 
             # accept all if not strict, otherwise only accept the schema
             is_strict = (
                 function.strict or self.tool_strict_level >= ToolStrictLevel.PARAMETER
             )
-            schema = function.parameters if is_strict else {}
+            if named_function_name is not None:
+                # An explicitly named tool_choice must produce a call to this
+                # exact function with schema-valid arguments; an empty schema
+                # would let greedy decoding emit minimal JSON like `{}`.
+                schema = function.parameters or {}
+            else:
+                schema = function.parameters if is_strict else {}
 
             tool_structures.append(
                 StructuresResponseFormat(
@@ -282,10 +309,11 @@ class FunctionCallParser:
             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
         )
 
+        # Highest priority: model-native structural_tag when available.
         try:
             if (
                 isinstance(self.detector, Glm47MoeDetector)
-                and self.detector.use_full_assistant_constraint
+                and self.detector.parses_required_natively()
             ):
                 functions = (
                     [
@@ -346,14 +374,31 @@ class FunctionCallParser:
                 if self.detector.supports_structural_tag():
                     # For "required"/named: always use structural_tag to preserve the
                     # model's native tool call format. Schema is only included when
-                    # strict=True, per OpenAI protocol semantics.
+                    # strict=True, per OpenAI protocol semantics — except for a named
+                    # tool_choice, which pins the function and always enforces its
+                    # schema (see get_legacy_structural_tag).
                     # For "auto": only constrain when strict is enabled.
-                    tag = self.get_legacy_structural_tag(at_least_one=is_required)
+                    tag = self.get_legacy_structural_tag(
+                        at_least_one=is_required,
+                        named_function_name=(
+                            tool_choice.function.name
+                            if isinstance(tool_choice, ToolChoice)
+                            else None
+                        ),
+                    )
                     return ("structural_tag", tag)
 
             if (
                 tool_choice == "required" or isinstance(tool_choice, ToolChoice)
             ) and not self.detector.parses_required_natively():
+                required_parser = self.detector.get_required_tool_parser(tool_choice)
+                if required_parser is not None:
+                    return (
+                        "json_schema",
+                        required_parser.get_json_schema_constraint(
+                            self.tools, tool_choice, parallel_tool_calls
+                        ),
+                    )
                 json_schema = get_json_schema_constraint(
                     self.tools, tool_choice, parallel_tool_calls=parallel_tool_calls
                 )

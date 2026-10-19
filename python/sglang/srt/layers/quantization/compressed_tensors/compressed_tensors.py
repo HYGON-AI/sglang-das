@@ -64,6 +64,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW4A16Int4DynamicMoE,
     NPUCompressedTensorsW8A8Int8,
     NPUCompressedTensorsW8A8Int8DynamicMoE,
+    XPUCompressedTensorsWNA16,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     check_equal_or_regex_match,
@@ -83,6 +84,7 @@ _is_cuda = is_cuda()
 _is_hcu = is_hcu()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_hcu = is_hcu()
 _is_xpu = is_xpu()
 
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -752,7 +754,10 @@ class CompressedTensorsConfig(QuantizationConfig):
                 quant_format == CompressionFormat.pack_quantized.value
                 and weight_quant.num_bits in WNA16_SUPPORTED_BITS
             ):
-                return CompressedTensorsWNA16(
+                scheme_cls = (
+                    XPUCompressedTensorsWNA16 if _is_xpu else CompressedTensorsWNA16
+                )
+                return scheme_cls(
                     num_bits=weight_quant.num_bits,
                     strategy=weight_quant.strategy,
                     group_size=weight_quant.group_size,
@@ -1090,7 +1095,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         # (e.g. fp8 needs ada lovelace)
         # Note: NPU devices do not support min_capability function
         if _is_xpu:
-            if not isinstance(scheme, CompressedTensorsW8A8Fp8):
+            if not isinstance(
+                scheme, (CompressedTensorsW8A8Fp8, XPUCompressedTensorsWNA16)
+            ):
                 raise RuntimeError(
                     f"{scheme.__class__.__name__} is not supported on XPU "
                     "(no XPU kernel implementation)."
@@ -1178,12 +1185,18 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Will be empty for models with only sparsity
         if self.target_scheme_map:
             if matched_target is None:
-                matched_target = find_matched_target(
-                    layer_name=layer_name,
-                    module=layer,
-                    targets=self.target_scheme_map.keys(),
-                    fused_mapping=self.packed_modules_mapping,
-                )
+                try:
+                    matched_target = find_matched_target(
+                        layer_name=layer_name,
+                        module=layer,
+                        targets=self.target_scheme_map.keys(),
+                        fused_mapping=self.packed_modules_mapping,
+                    )
+                except ValueError:
+                    # Mixed checkpoints (e.g. Qwen3.8-Flash-Next Channelwise
+                    # FP8) only list MoE experts in config_groups.targets;
+                    # unmatched linears stay BF16 via UnquantizedLinearMethod.
+                    return None
 
             return self.target_scheme_map[matched_target]
 
@@ -1373,6 +1386,9 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        layer.scheme.restore_weights_before_loading(layer)
 
     def create_weights(
         self,

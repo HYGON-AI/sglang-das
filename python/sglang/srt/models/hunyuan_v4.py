@@ -6,8 +6,20 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
-from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
+from sglang.srt.layers.layer_boundary import (
+    IHCState,
+    append_stages,
+    declare_attn,
+    declare_ffn,
+    get_attn_tp_context,
+    layer_stack,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.hy4_ihc_tilelang import (
+    try_tilelang_ihc_head, try_tilelang_ihc_post, try_tilelang_ihc_pre,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -99,6 +111,20 @@ class HYV4HCPreLayer(nn.Module):
         rms_weight: torch.Tensor | None = None,
         rms_eps: float = 0.0,
     ):
+        if rms_weight is None and envs.SGLANG_OPT_HY4_IHC_TILELANG.get():
+            # Opt-in HCU TileLang iHC (SGLANG_OPT_HY4_IHC_TILELANG); it does not
+            # fuse the RMSNorm, so it only serves the unfused-norm call.
+            fused = try_tilelang_ihc_pre(
+                hidden_states,
+                self.hc_fn.weight,
+                self.hc_scale,
+                self.hc_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.magnitude,
+            )
+            if fused is not None:
+                return fused
         if hidden_states.is_cuda and not self._fused_ihc_pre_disabled:
             try:
                 from sglang.kernels.ops.layernorm.hy4_ihc import fused_hy4_ihc_pre
@@ -196,6 +222,9 @@ class HYV4HCLayer(nn.Module):
         return reduced, post, hidden_states
 
     def post(self, output, residual, post):
+        fused = try_tilelang_ihc_post(output, residual, post)
+        if fused is not None:
+            return fused
         if output.is_cuda and not self._fused_ihc_post_disabled:
             try:
                 from sglang.kernels.ops.layernorm.hy4_ihc import fused_hy4_ihc_post
@@ -270,6 +299,16 @@ class HYV4HCHeadLayer(nn.Module):
         self._fused_ihc_head_disabled = False
 
     def forward(self, hidden_states: torch.Tensor, norm: RMSNorm | None = None):
+        fused = try_tilelang_ihc_head(
+            hidden_states,
+            self.hc_head_fn.weight,
+            self.hc_head_scale,
+            self.hc_head_base,
+            self.config.rms_norm_eps,
+            self.config.hc_eps,
+        )
+        if fused is not None:
+            return fused if norm is None else norm(fused)
         if (
             hidden_states.is_cuda
             and not self._fused_ihc_head_disabled
@@ -342,20 +381,19 @@ class HYV4Attention(DeepseekV2AttentionMLA):
             ),
             max_position_embeddings=config.max_position_embeddings,
             quant_config=quant_config,
-            reduce_results=True,
+            # The FFN input boundary completes this stage's sum.
+            reduce_results=False,
             layer_id=layer_id,
             prefix=prefix,
             alt_stream=alt_stream,
             is_nextn=is_nextn,
         )
-        parallel = get_parallel()
         self.linear_gate = ColumnParallelLinear(
             config.hidden_size,
             config.num_attention_heads * config.v_head_dim,
             bias=False,
             quant_config=quant_config,
-            tp_rank=parallel.attn_tp_rank,
-            tp_size=parallel.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=f"{prefix}.linear_gate",
         )
         self.local_gate_width = self.num_local_heads * config.v_head_dim
@@ -530,9 +568,71 @@ class HYV4Attention(DeepseekV2AttentionMLA):
         if hasattr(backend, "use_mha") and backend.use_mha is not False:
             backend.use_mha = False
         method = super().dispatch_attn_forward_method(forward_batch)
-        if method != AttnForwardMethod.MLA:
+        # HIP (HCU) maps MLA onto its ROCm implementation of the same path.
+        if method not in (AttnForwardMethod.MLA, AttnForwardMethod.MLA_ROCM):
             raise RuntimeError("HYV4 requires the sparse MLA attention path")
         return method
+
+
+class _HeadNorm:
+    """The layer stack's terminal read: the learned head mixes the streams down
+    and fuses the final norm into the same kernel."""
+
+    def __init__(self, hc_head, norm):
+        self.hc_head = hc_head
+        self.norm = norm
+
+    def __call__(self, hidden_states):
+        return self.hc_head(hidden_states, self.norm)
+
+
+def _build_stages(
+    hc_attn_layer,
+    hc_mlp_layer,
+    input_layernorm,
+    post_attention_layernorm,
+    *,
+    qkv_latent_func,
+    layer_id,
+    config,
+):
+    """The attention and FFN stage boundaries of one iHC decoder layer."""
+
+    def post_pre(hidden_states, residual, post_gate, out_norm):
+        return hc_attn_layer.post_pre(
+            hidden_states, residual, post_gate, hc_mlp_layer, out_norm
+        )
+
+    residual = IHCState(
+        expand=hc_attn_layer.prepare_input,
+        attn_pre=hc_attn_layer.pre,
+        ffn_pre=hc_mlp_layer.pre,
+        attn_post=hc_attn_layer.post,
+        ffn_post=hc_mlp_layer.post,
+        post_pre=post_pre,
+    ).residual_ops()
+
+    layer_types = config.mlp_layer_types
+    is_sparse = layer_types[layer_id] != "dense"
+    next_id = layer_id + 1
+    return append_stages(
+        (
+            declare_attn(read=residual.attn_readout, update=residual.attn_update),
+            input_layernorm,
+            {"qkv_latent_func": qkv_latent_func},
+        ),
+        (
+            declare_ffn(
+                sparse=is_sparse,
+                next_layer_sparse=(
+                    next_id < len(layer_types) and layer_types[next_id] != "dense"
+                ),
+                read=residual.ffn_readout,
+                update=residual.ffn_update,
+            ),
+            post_attention_layernorm,
+        ),
+    )
 
 
 class HYV4DecoderLayer(nn.Module):
@@ -550,6 +650,8 @@ class HYV4DecoderLayer(nn.Module):
                 config.hidden_act,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                reduce_results=False,
+                allow_fused_down=False,
             )
         else:
             self.mlp = DeepseekV2MoE(
@@ -558,11 +660,21 @@ class HYV4DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
                 alt_stream=alt_stream,
+                reduce_results=False,
             )
             if hasattr(self.mlp, "shared_experts"):
                 self.mlp.shared_experts.swiglu_limit = None
         self.hc_attn_layer = HYV4HCLayer(config, f"{prefix}.hc_attn_layer")
         self.hc_mlp_layer = HYV4HCLayer(config, f"{prefix}.hc_mlp_layer")
+        self.attn_boundary, self.ffn_boundary = _build_stages(
+            self.hc_attn_layer,
+            self.hc_mlp_layer,
+            self.input_layernorm,
+            self.post_attention_layernorm,
+            qkv_latent_func=self.self_attn.prepare_qkv_latent,
+            layer_id=layer_id,
+            config=config,
+        )
 
     def forward(
         self,
@@ -572,15 +684,7 @@ class HYV4DecoderLayer(nn.Module):
         zero_allocator,
         prev_topk_indices=None,
     ):
-        hidden_states = self.hc_attn_layer.prepare_input(hidden_states)
-        hidden_states, post, residual = self.hc_attn_layer.pre(
-            hidden_states, self.input_layernorm
-        )
-        get_attn_tp_context().set_attn_inputs(
-            AttentionInputs(
-                hidden_states, forward_batch, self.self_attn.prepare_qkv_latent
-            )
-        )
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         try:
             hidden_states = self.self_attn(
                 positions,
@@ -595,18 +699,13 @@ class HYV4DecoderLayer(nn.Module):
             hidden_states, topk_indices = hidden_states
         else:
             topk_indices = None
-        hidden_states, post, residual = self.hc_attn_layer.post_pre(
-            hidden_states,
-            residual,
-            post,
-            self.hc_mlp_layer,
-            self.post_attention_layernorm,
-        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         if isinstance(self.mlp, DeepseekV2MoE):
             hidden_states = self.mlp(hidden_states, forward_batch)
         else:
             hidden_states = self.mlp(hidden_states)
-        hidden_states = self.hc_mlp_layer.post(hidden_states, residual, post)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
         return hidden_states, topk_indices
 
 
@@ -625,25 +724,29 @@ class HYV4Model(nn.Module):
             **get_embedding_tp_kwargs(),
         )
         self.alt_stream = get_stream("alt") if is_cuda() else None
-        self.layers = nn.ModuleList(
-            [
-                HYV4DecoderLayer(
-                    config,
-                    i,
-                    quant_config,
-                    f"{prefix}.layers.{i}",
-                    self.alt_stream,
-                )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
+        with layer_stack():
+            self.layers = nn.ModuleList(
+                [
+                    HYV4DecoderLayer(
+                        config,
+                        i,
+                        quant_config,
+                        f"{prefix}.layers.{i}",
+                        self.alt_stream,
+                    )
+                    for i in range(config.num_hidden_layers)
+                ]
+            )
         self.hc_head = HYV4HCHeadLayer(config, f"{prefix}.hc_head")
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        # The head mixes the streams down and fuses the final norm into one kernel.
+        self._head_norm = _HeadNorm(self.hc_head, self.norm)
 
     def forward(self, input_ids, positions, forward_batch, input_embeds=None):
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
+        residual_batch.start(forward_batch)
         zero_allocator = BumpAllocator(
             buffer_size=2 * len(self.layers),
             dtype=torch.float32,
@@ -660,7 +763,7 @@ class HYV4Model(nn.Module):
             )
             topk_share.update(topk_indices)
         topk_share.publish()
-        return self.hc_head(hidden_states, self.norm)
+        return residual_batch.final_norm(hidden_states, forward_batch, self._head_norm)
 
 
 class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):

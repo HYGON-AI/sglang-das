@@ -113,6 +113,12 @@ class BaseLinearStateParams(ABC):
     layers: list[int]
 
     @property
+    def use_hcu_kda(self) -> bool:
+        from sglang.srt.utils import is_hcu
+
+        return self.is_kda and is_hcu()
+
+    @property
     def mamba_cache_per_req(self) -> int:
         conv_numel = int(
             np.sum([np.prod(conv_shape) for conv_shape in self.shape.conv])
@@ -140,9 +146,11 @@ class BaseLinearStateParams(ABC):
                 + h_k * record_len * k_dim * conv_b  # rawk
                 + hv * record_len * fp32_b  # beta
                 + hv * record_len * k_dim * fp32_b  # vector g
-                + hv * record_len * v_dim * conv_b  # d
-                + h_k * record_len * k_dim * conv_b  # k
             )
+            if not self.use_hcu_kda:
+                per_layer += (
+                    hv * record_len * v_dim * conv_b + h_k * record_len * k_dim * conv_b
+                )
         else:
             per_layer = (
                 hv * record_len * v_dim * conv_b  # d

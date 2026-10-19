@@ -341,7 +341,9 @@ def commit_kda_replayssm_after_verify(
     last_correct_step_indices: torch.Tensor,  # [B] conv rollback target step
     mamba_track_indices: torch.Tensor | None = None,
     mamba_steps_to_track: torch.Tensor | None = None,
+    src_indices_raw: torch.Tensor | None = None,
     null_block_id: int = -1,
+    use_hcu_kda: bool = False,
 ) -> None:
     """Fold each layer's accepted window into `temporal` and roll back conv.
 
@@ -357,20 +359,38 @@ def commit_kda_replayssm_after_verify(
 
     L = spec_state.replayssm_rawv.shape[-2]
     num_k_heads = spec_state.replayssm_rawk.shape[2]
-    commit_kda_replayssm_spec_all_layers(
-        checkpoint_state=spec_state.temporal,
-        rawv_cache=spec_state.replayssm_rawv,
-        rawk_cache=spec_state.replayssm_rawk,
-        gk_cache=spec_state.replayssm_g,
-        beta_cache=spec_state.replayssm_beta,
-        ssm_state_indices=state_batch_indices,
-        accept_lens=accept_lens,
-        max_cache_len=L,
-        num_k_heads=num_k_heads,
-        mamba_track_indices=mamba_track_indices,
-        mamba_steps_to_track=mamba_steps_to_track,
-        null_block_id=null_block_id,
-    )
+    if use_hcu_kda:
+        from sglang.kernels.ops.attention.fla.hcu.kda_replayssm_spec_decode import (
+            commit_kda_replayssm_spec_all_layers as commit_hcu_kda,
+        )
+
+        commit_hcu_kda(
+            checkpoint_state=spec_state.temporal,
+            rawv_cache=spec_state.replayssm_rawv,
+            rawk_cache=spec_state.replayssm_rawk,
+            g_cache=spec_state.replayssm_g,
+            beta_cache=spec_state.replayssm_beta,
+            ssm_state_indices=state_batch_indices,
+            accept_lens=accept_lens,
+            mamba_track_indices=mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            null_block_id=null_block_id,
+        )
+    else:
+        commit_kda_replayssm_spec_all_layers(
+            checkpoint_state=spec_state.temporal,
+            rawv_cache=spec_state.replayssm_rawv,
+            rawk_cache=spec_state.replayssm_rawk,
+            gk_cache=spec_state.replayssm_g,
+            beta_cache=spec_state.replayssm_beta,
+            ssm_state_indices=state_batch_indices,
+            accept_lens=accept_lens,
+            max_cache_len=L,
+            num_k_heads=num_k_heads,
+            mamba_track_indices=mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            null_block_id=null_block_id,
+        )
     # Conv rollback + track-slot conv snapshot, per conv group (fold already did
     # the ssm side via HAS_TRACK). Loop mirrors the recurrent commit's zip; track
     # scatter is mask-gated (step -1 => skip).
@@ -378,9 +398,17 @@ def commit_kda_replayssm_after_verify(
         spec_state.conv, spec_state.intermediate_conv_window
     ):
         fused_conv_window_scatter_with_mask(
-            conv_states, interm_conv, state_batch_indices, last_correct_step_indices
+            conv_states,
+            interm_conv,
+            state_batch_indices,
+            last_correct_step_indices,
+            src_indices_raw,
         )
         if mamba_track_indices is not None and mamba_steps_to_track is not None:
             fused_conv_window_scatter_with_mask(
-                conv_states, interm_conv, mamba_track_indices, mamba_steps_to_track
+                conv_states,
+                interm_conv,
+                mamba_track_indices,
+                mamba_steps_to_track,
+                src_indices_raw,
             )

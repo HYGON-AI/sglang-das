@@ -1,14 +1,16 @@
 import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from sglang.kernels.ops.attention import qwen38_qsa_sm121_varlen
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
 from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsa_backend_module
+from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
+from sglang.srt.layers.attention.qsa import dsa_indexer as dsa_indexer_module
 from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
 from sglang.srt.layers.attention.qsa.kernel import (
+    average_pool_qsa_keys,
     expand_qsa_block_indices,
     qsa_fast_topk,
     qsa_sparse_attention,
@@ -24,11 +26,6 @@ from sglang.srt.layers.attention.qsa.mqa import (
     qsa_mqa_prefill,
 )
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
-from sglang.srt.layers.attention.qsa.sparse_attn import (
-    qwen_sparse_fa2_cu_seqlens_triton,
-    qwen_sparse_kv_extraction_compact_triton,
-    sparse_gqa_fwd_interface_triton_ck,
-)
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend,
     QwenSparseMultiStepDraftBackend,
@@ -36,6 +33,7 @@ from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 COMPRESS_RATIO = 4
@@ -44,207 +42,23 @@ BLOCK_TOPK = TOKEN_TOPK // COMPRESS_RATIO
 FINAL_TOPK = TOKEN_TOPK + COMPRESS_RATIO - 1
 
 
-def test_qsa_chunk_prefill_accepts_fp8_cached_prefix():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
-        pytest.skip("FP8-capable CUDA GPU required")
-
-    torch.manual_seed(42)
-    device = torch.device("cuda")
-    num_requests, num_q_heads, num_kv_heads, head_dim, topk = 2, 4, 1, 128, 16
-    q = torch.randn(
-        num_requests, num_q_heads, head_dim, dtype=torch.bfloat16, device=device
+def test_qwen4_exp_indexer_config_is_read_from_text_config():
+    config = Qwen4ExpConfig(
+        text_config={
+            "hc_count": 4,
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "indexer_n_heads": 4,
+            "indexer_kv_heads": 1,
+            "indexer_head_dim": 128,
+            "indexer_budget": TOKEN_TOPK,
+            "indexer_compress_ratio": COMPRESS_RATIO,
+        },
     )
-    k = torch.randn(
-        num_requests * topk,
-        num_kv_heads,
-        head_dim,
-        dtype=torch.bfloat16,
-        device=device,
-    ).to(torch.float8_e4m3fn)
-    v = torch.randn(
-        num_requests * topk,
-        num_kv_heads,
-        head_dim,
-        dtype=torch.bfloat16,
-        device=device,
-    ).to(torch.float8_e4m3fn)
-    indices = torch.arange(topk, dtype=torch.int32, device=device).repeat(
-        num_requests, 1
-    )
-    cu_q = torch.arange(num_requests + 1, dtype=torch.int32, device=device)
-    cu_k = torch.arange(
-        0,
-        (num_requests + 1) * topk,
-        topk,
-        dtype=torch.int32,
-        device=device,
-    )
-    kv_lens = torch.full((num_requests,), topk, dtype=torch.int32, device=device)
-    scale = head_dim**-0.5
-
-    actual = sparse_gqa_fwd_interface_triton_ck(
-        q, k, v, indices, cu_q, cu_k, kv_lens, scale
-    )
-    expected = sparse_gqa_fwd_interface_triton_ck(
-        q,
-        k.to(torch.bfloat16),
-        v.to(torch.bfloat16),
-        indices,
-        cu_q,
-        cu_k,
-        kv_lens,
-        scale,
-    )
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-
-
-@pytest.mark.parametrize(
-    ("capability", "expected"),
-    [((12, 0), True), ((12, 1), False), ((10, 0), False)],
-)
-def test_is_sm120_matches_exact_capability(monkeypatch, capability, expected):
-    from sglang.srt.utils import common
-
-    common.is_sm120.cache_clear()
-    monkeypatch.setattr(common, "is_cuda", lambda: True)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
-
-    try:
-        assert common.is_sm120() is expected
-    finally:
-        common.is_sm120.cache_clear()
-
-
-@pytest.mark.parametrize(
-    ("capability", "expected"),
-    [((12, 1), True), ((12, 0), False), ((10, 0), False)],
-)
-def test_is_sm121_matches_exact_capability(monkeypatch, capability, expected):
-    from sglang.srt.utils import common
-
-    common.is_sm121.cache_clear()
-    monkeypatch.setattr(common, "is_cuda", lambda: True)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
-
-    try:
-        assert common.is_sm121() is expected
-    finally:
-        common.is_sm121.cache_clear()
-
-
-@pytest.mark.parametrize(
-    ("sm100", "sm120", "expected_enabled"),
-    [(False, True, True), (True, False, True), (False, False, False)],
-    ids=["sm120", "sm100", "other-sm12x"],
-)
-def test_qsa_trtllm_sparse_decode_arch_gate(
-    monkeypatch, sm100, sm120, expected_enabled
-):
-    resolver = qsa_backend_module._resolve_trtllm_sparse_decode
-    resolver.cache_clear()
-
-    trtllm_decode_func = object()
-    flashinfer_decode = ModuleType("flashinfer.decode")
-    flashinfer_decode.trtllm_batch_decode_with_kv_cache = trtllm_decode_func
-
-    monkeypatch.setattr("sglang.srt.utils.is_sm100_supported", lambda: sm100)
-    monkeypatch.setattr("sglang.srt.utils.is_sm120", lambda: sm120)
-    monkeypatch.setitem(sys.modules, flashinfer_decode.__name__, flashinfer_decode)
-
-    try:
-        expected = trtllm_decode_func if expected_enabled else None
-        assert resolver() is expected
-    finally:
-        resolver.cache_clear()
-
-
-def test_qsa_sm121_resolves_kda_varlen_kernel(monkeypatch):
-    resolver = qsa_backend_module._resolve_flash_attn_varlen_func
-    resolver.cache_clear()
-    monkeypatch.setattr("sglang.srt.utils.is_sm121", lambda: True)
-
-    try:
-        assert resolver() is qwen38_qsa_sm121_varlen
-    finally:
-        resolver.cache_clear()
-
-
-def test_qsa_sm121_compaction_and_attention_match_sparse_reference():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 1):
-        pytest.skip("SM121-only kernel")
-    torch.manual_seed(2028)
-    device = torch.device("cuda")
-    batch, topk = 3, FINAL_TOPK
-    num_q_heads, num_kv_heads, head_dim = 24, 2, 256
-    sequence_lengths = torch.tensor([17, 1050, 4096], dtype=torch.int32)
-    valid_counts_cpu = [17, 911, topk]
-    max_sequence_length = int(sequence_lengths.max())
-
-    req_to_token = torch.arange(
-        batch * max_sequence_length, dtype=torch.int32, device=device
-    ).reshape(batch, max_sequence_length)
-    indices = torch.full((batch, topk), -1, dtype=torch.int32, device=device)
-    for row, valid_count in enumerate(valid_counts_cpu):
-        indices[row, :valid_count] = torch.randperm(
-            int(sequence_lengths[row]), device=device, dtype=torch.int64
-        )[:valid_count].to(torch.int32)
-
-    slots = torch.full_like(indices, -1)
-    for row, valid_count in enumerate(valid_counts_cpu):
-        slots[row, :valid_count] = req_to_token[row, indices[row, :valid_count].long()]
-
-    pool_size = batch * max_sequence_length
-    q = torch.randn(batch, num_q_heads, head_dim, dtype=torch.bfloat16, device=device)
-    k_cache = torch.randn(
-        pool_size, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
-    )
-    v_cache = torch.randn_like(k_cache)
-    valid_counts = torch.empty(batch, dtype=torch.int32, device=device)
-    cu_k = torch.empty(batch + 1, dtype=torch.int32, device=device)
-    cu_q = torch.arange(batch + 1, dtype=torch.int32, device=device)
-    qwen_sparse_fa2_cu_seqlens_triton(
-        sequence_lengths.to(device),
-        indices,
-        valid_counts,
-        cu_k,
-        batch,
-        topk,
-    )
-    packed_k = torch.empty(
-        batch * topk,
-        num_kv_heads,
-        head_dim,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    packed_v = torch.empty_like(packed_k)
-    qwen_sparse_kv_extraction_compact_triton(
-        k_cache,
-        v_cache,
-        req_to_token,
-        torch.arange(batch, dtype=torch.int32, device=device),
-        indices,
-        sequence_lengths.to(device),
-        cu_k,
-        packed_k,
-        packed_v,
-        batch,
-        topk,
-    )
-
-    scale = head_dim**-0.5
-    actual = qwen38_qsa_sm121_varlen(
-        q,
-        packed_k,
-        packed_v,
-        cu_q,
-        cu_k,
-        max_seqlen_k=topk,
-        softmax_scale=scale,
-    )
-    expected = qsa_sparse_attention(q, k_cache, v_cache, slots, scale)
-    assert valid_counts.tolist() == valid_counts_cpu
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    assert config.text_config.indexer_budget == TOKEN_TOPK
+    assert config.text_config.indexer_compress_ratio == COMPRESS_RATIO
 
 
 def _compressed_config_namespace(**overrides):
@@ -260,8 +74,22 @@ def _compressed_config_namespace(**overrides):
     return SimpleNamespace(**fields)
 
 
+def _tokenwise_config_namespace(**overrides):
+    fields = dict(
+        model_type="qwen3_5",
+        index_topk=2048,
+        index_n_heads=64,
+        index_kv_heads=1,
+        index_head_dim=128,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
 def test_qsa_profile_parses_compressed_qwen4_exp_schema():
     from sglang.srt.layers.attention.qsa.config import (
+        QSA_ROPE_MROPE,
+        QSA_VARIANT_COMPRESSED,
         is_qwen_qsa,
         parse_qsa_profile,
     )
@@ -282,12 +110,15 @@ def test_qsa_profile_parses_compressed_qwen4_exp_schema():
     )
     for config in (wrapped, _compressed_config_namespace()):
         profile = parse_qsa_profile(config)
+        assert profile.variant == QSA_VARIANT_COMPRESSED
         assert profile.n_heads == 8
         assert profile.kv_heads == 1
         assert profile.head_dim == 128
         assert profile.budget == TOKEN_TOPK
         assert profile.compress_ratio == COMPRESS_RATIO
         assert profile.block_topk == BLOCK_TOPK
+        assert profile.rope_mode == QSA_ROPE_MROPE
+        assert profile.draft_extend_cuda_graph is False
         assert is_qwen_qsa(config)
     # The legacy backend module keeps re-exporting the shared detector.
     assert qsa_backend_module.is_qwen_qsa is is_qwen_qsa
@@ -315,7 +146,63 @@ def test_qsa_profile_rejects_malformed_compressed_schema():
         raise AssertionError(f"{name} compressed config must be rejected")
 
 
-def test_qsa_glue_builds_compressed_indexer(monkeypatch):
+def test_qsa_profile_parses_tokenwise_qwen_schema():
+    from sglang.srt.layers.attention.qsa.config import (
+        QSA_ROPE_PLAIN,
+        QSA_VARIANT_TOKENWISE,
+        is_qwen_qsa,
+        parse_qsa_profile,
+    )
+
+    profile = parse_qsa_profile(_tokenwise_config_namespace())
+    assert profile.variant == QSA_VARIANT_TOKENWISE
+    assert profile.n_heads == 64
+    assert profile.kv_heads == 1
+    assert profile.head_dim == 128
+    assert profile.budget == 2048
+    assert profile.compress_ratio == 1
+    assert profile.block_topk == 2048
+    assert profile.rope_mode == QSA_ROPE_PLAIN
+    assert profile.draft_extend_cuda_graph is False
+    assert is_qwen_qsa(_tokenwise_config_namespace())
+
+    for name, config in {
+        "budget": _tokenwise_config_namespace(index_topk=1024),
+        "kv_heads": _tokenwise_config_namespace(index_kv_heads=2),
+        "missing": _tokenwise_config_namespace(index_head_dim=None),
+    }.items():
+        try:
+            parse_qsa_profile(config)
+        except ValueError:
+            continue
+        raise AssertionError(f"{name} tokenwise config must be rejected")
+
+
+def test_qsa_profile_does_not_swallow_deepseek_nsa_schema():
+    from sglang.srt.layers.attention.qsa.config import is_qwen_qsa, parse_qsa_profile
+
+    # DeepSeek NSA configs also expose index_topk; they must keep their own
+    # backend/draft paths instead of being parsed as Qwen tokenwise QSA.
+    deepseek_like = SimpleNamespace(
+        model_type="deepseek_v32",
+        index_topk=2048,
+        index_n_heads=64,
+        index_kv_heads=1,
+        index_head_dim=128,
+    )
+    assert parse_qsa_profile(deepseek_like) is None
+    assert not is_qwen_qsa(deepseek_like)
+
+    ambiguous = _compressed_config_namespace(**_tokenwise_config_namespace().__dict__)
+    try:
+        parse_qsa_profile(ambiguous)
+    except ValueError as exc:
+        assert "Ambiguous" in str(exc)
+    else:
+        raise AssertionError("QSA must reject configs with both schemas set")
+
+
+def test_qsa_glue_builds_indexer_per_variant(monkeypatch):
     from sglang.srt.layers.attention.qsa.glue import build_qsa_indexer
 
     recorded = {}
@@ -343,6 +230,24 @@ def test_qsa_glue_builds_compressed_indexer(monkeypatch):
         config=config, layer_id=7, quant_config="qc", prefix="p", rotary_emb=rotary
     )
 
+    # Tokenwise configs build the Lightning Indexer through the same glue.
+    class _FakeDSAIndexer:
+        def __init__(self, config, layer_id, quant_config=None, prefix="", **kw):
+            recorded.update(
+                dsa_config=config,
+                dsa_layer_id=layer_id,
+                dsa_quant_config=quant_config,
+                dsa_prefix=prefix,
+            )
+
+    monkeypatch.setattr(dsa_indexer_module, "QwenDSAIndexer", _FakeDSAIndexer)
+    dsa_indexer = build_qsa_indexer(
+        _tokenwise_config_namespace(), layer_id=2, prefix="q"
+    )
+    assert isinstance(dsa_indexer, _FakeDSAIndexer)
+    assert recorded["dsa_layer_id"] == 2
+    assert recorded["dsa_prefix"] == "q"
+
     try:
         build_qsa_indexer(SimpleNamespace(), layer_id=0, rotary_emb=rotary)
     except ValueError as exc:
@@ -361,7 +266,6 @@ def test_qsa_glue_fetches_indexer_metadata_without_model_unwrap():
         get_indexer_metadata=lambda layer_id, forward_batch: f"meta-{layer_id}",
         token_to_kv_pool=None,
         req_to_token_pool=None,
-        kv_index_translator=None,
         needs_cpu_seq_lens=True,
     )
     hybrid = HybridLinearAttnBackend(
@@ -382,27 +286,376 @@ def test_qsa_glue_fetches_indexer_metadata_without_model_unwrap():
         raise AssertionError("QSA must fail when no indexer metadata exists")
 
 
+def test_qsa_cuda_graph_padding_reaches_hybrid_children():
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
+    )
+
+    class Recorder:
+        def __init__(self):
+            self.num_padding = None
+            self.token_to_kv_pool = None
+            self.req_to_token_pool = None
+            self.needs_cpu_seq_lens = True
+
+        def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
+            self.num_padding = getattr(forward_batch, "num_padding", None)
+
+    qsa = Recorder()
+    linear = Recorder()
+    hybrid_linear = HybridLinearAttnBackend(qsa, linear, full_attn_layers=[0])
+    replay_fb = SimpleNamespace(
+        batch_size=2,
+        req_pool_indices=torch.zeros(2, dtype=torch.int32),
+        seq_lens=torch.ones(2, dtype=torch.int32),
+        seq_lens_cpu=torch.ones(2, dtype=torch.int32),
+        forward_mode=ForwardMode.DECODE,
+        spec_info=None,
+        num_padding=1,
+    )
+    hybrid_linear.init_forward_metadata_out_graph(replay_fb)
+    assert qsa.num_padding == 1
+    assert linear.num_padding == 1
+
+
 def test_qsa_draft_extend_backend_decision_follows_profile():
-    from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
     from sglang.srt.speculative.draft_utils import DraftBackendFactory
 
     def factory(config):
-        runner = SimpleNamespace(
-            model_config=SimpleNamespace(hf_config=config),
-            draft_attention_backend=None,
-        )
         return DraftBackendFactory(
-            draft_model_runner=runner,
+            draft_model_runner=SimpleNamespace(
+                model_config=SimpleNamespace(hf_config=config),
+                draft_attention_backend=None,
+                attn_backend="draft-runner-backend",
+            ),
             topk=1,
             speculative_num_steps=3,
-            qsa_profile=parse_qsa_profile(config),
         )
 
-    compressed = factory(_compressed_config_namespace())
-    backend = compressed.create_draft_extend_backend()
-    assert isinstance(backend, QwenSparseAttnBackend)
-    assert backend.runner is compressed.draft_model_runner
-    assert backend.decode_attention_backend_str == "qsa"
+    # Compressed profiles run draft-extend through the draft model runner's
+    # own (QSA-wrapped hybrid) backend; the draft-extend CUDA graph replays
+    # it with variable accepted rows padded to the captured width.
+    assert (
+        factory(_compressed_config_namespace()).create_draft_extend_backend()
+        == "draft-runner-backend"
+    )
+    # Tokenwise profiles stay eager (no graph-stable indexer metadata); they
+    # must never silently fall back to a dense backend either.
+    assert factory(_tokenwise_config_namespace()).create_draft_extend_backend() is None
+
+
+def test_qsa_backend_stores_parsed_profile():
+    from sglang.srt.layers.attention.qsa.config import QSA_VARIANT_COMPRESSED
+
+    runner, _, _ = _make_qsa_runner_and_pool()
+    runner.model_config = SimpleNamespace(
+        context_len=64,
+        hf_text_config=None,
+        hf_config=_compressed_config_namespace(),
+    )
+    backend = QwenSparseAttnBackend(runner)
+    assert backend.qsa_profile is not None
+    assert backend.qsa_profile.variant == QSA_VARIANT_COMPRESSED
+    assert backend.qsa_profile.compress_ratio == COMPRESS_RATIO
+    # The legacy field reads keep their current values.
+    assert backend.compress_ratio == COMPRESS_RATIO
+
+    tokenwise_fields = dict(runner.__dict__)
+    tokenwise_fields["model_config"] = SimpleNamespace(
+        context_len=64, hf_text_config=None, hf_config=_tokenwise_config_namespace()
+    )
+    tokenwise_runner = SimpleNamespace(**tokenwise_fields)
+    tokenwise_backend = QwenSparseAttnBackend(tokenwise_runner)
+    # Tokenwise shares the backend; the ratio comes from the profile.
+    assert tokenwise_backend.compress_ratio == 1
+    try:
+        tokenwise_backend._capture_cuda_graph_metadata(
+            bs=1,
+            num_tokens=1,
+            req_pool_indices=torch.zeros(1, dtype=torch.int32),
+            seq_lens=torch.ones(1, dtype=torch.int32),
+            forward_mode=None,
+            spec_info=None,
+        )
+    except NotImplementedError as exc:
+        assert "tokenwise" in str(exc)
+    else:
+        raise AssertionError("tokenwise CUDA graph capture must fail loudly")
+
+
+def _make_dsa_pool():
+    from sglang.srt.mem_cache.qsa_kv_pool import QwenDSATokenToKVPool
+
+    return QwenDSATokenToKVPool(
+        size=128,
+        dtype=torch.bfloat16,
+        page_size=64,
+        head_num=1,
+        head_dim=8,
+        full_attention_layer_ids=[0],
+        device="cpu",
+        mamba_pool=SimpleNamespace(),
+        qsa_index_kv_heads=1,
+        qsa_index_head_dim=8,
+        qsa_token_budget=2048,
+        enable_memory_saver=False,
+        start_layer=0,
+    )
+
+
+def test_qwen_dsa_pool_roundtrip_and_layer_mapping():
+    from sglang.srt.mem_cache.qsa_kv_pool import QwenDSATokenToKVPool
+
+    pool = _make_dsa_pool()
+    assert pool.qsa_compress_ratio == 1
+    assert pool.qsa_block_topk == 2048
+    assert pool.qsa_token_topk == 2048
+
+    rows = torch.arange(32, dtype=torch.bfloat16).reshape(4, 1, 8)
+    loc = torch.tensor([5, 6, 9, 10], dtype=torch.int32)
+    pool.set_dsa_index_k_buffer(0, loc, rows)
+    buffer = pool.get_dsa_index_k_buffer(0)
+    torch.testing.assert_close(buffer[5].float(), rows[0].float(), rtol=0, atol=0)
+    torch.testing.assert_close(buffer[10].float(), rows[3].float(), rtol=0, atol=0)
+    written_rows = buffer.abs().sum(dim=(1, 2)) > 0
+    assert int(written_rows.sum()) == 4
+    assert written_rows[loc.long()].all()
+    assert not written_rows[:5].any()
+
+    try:
+        pool.get_dsa_index_k_buffer(7)
+    except ValueError as exc:
+        assert "full attention layers" in str(exc)
+    else:
+        raise AssertionError("QwenDSA pool must reject non-full-attention layers")
+
+    try:
+        QwenDSATokenToKVPool(
+            size=128,
+            dtype=torch.bfloat16,
+            page_size=32,
+            head_num=1,
+            head_dim=8,
+            full_attention_layer_ids=[0],
+            device="cpu",
+            mamba_pool=SimpleNamespace(),
+            qsa_index_kv_heads=1,
+            qsa_index_head_dim=8,
+            qsa_token_budget=2048,
+        )
+    except ValueError as exc:
+        assert "page_size 64" in str(exc)
+    else:
+        raise AssertionError("QwenDSA pool must require page_size 64")
+
+
+def test_mambaish_pool_profile_variants_parse():
+    from sglang.srt.layers.attention.qsa.config import (
+        QSA_VARIANT_COMPRESSED,
+        QSA_VARIANT_TOKENWISE,
+        parse_qsa_profile,
+    )
+
+    assert parse_qsa_profile(None) is None
+    assert (
+        parse_qsa_profile(_compressed_config_namespace()).variant
+        == QSA_VARIANT_COMPRESSED
+    )
+    assert (
+        parse_qsa_profile(_tokenwise_config_namespace()).variant
+        == QSA_VARIANT_TOKENWISE
+    )
+
+
+def test_qwen_dsa_indexer_rejects_non_tokenwise_configs():
+    from sglang.srt.layers.attention.qsa.dsa_indexer import QwenDSAIndexer
+
+    for config in (
+        _compressed_config_namespace(),
+        SimpleNamespace(hidden_size=32),
+        _tokenwise_config_namespace(index_topk=1024),
+    ):
+        try:
+            QwenDSAIndexer(config, layer_id=0)
+        except ValueError:
+            continue
+        raise AssertionError("QwenDSAIndexer must reject invalid configs")
+
+
+def test_qwen_dsa_weighted_mqa_logits_matches_explicit_formula():
+    torch.manual_seed(3)
+    q = torch.randn(3, 4, 8, dtype=torch.bfloat16)
+    w = torch.randn(3, 4, dtype=torch.bfloat16)
+    k = torch.randn(5, 1, 8, dtype=torch.bfloat16)
+    actual = dsa_indexer_module.torch_dsa_weighted_mqa_logits(q, w, k, 2.0)
+    scores = torch.einsum("mhd,nhd->mnh", q.float(), k.float())
+    expected = torch.relu(scores)
+    expected = (expected * w.float().unsqueeze(1)).sum(-1) / 2.0
+    torch.testing.assert_close(actual, expected)
+
+
+def _make_dsa_indexer_stub(topk=4):
+    return SimpleNamespace(
+        layer_id=0,
+        token_topk=topk,
+        score_scale=1.0,
+        index_n_heads=2,
+    )
+
+
+def test_qwen_dsa_select_paged_picks_per_row_windows():
+    from sglang.srt.layers.attention.qsa.dsa_indexer import QwenDSAIndexer
+
+    pool = SimpleNamespace()
+    # score(row, col) = relu(k[col, 0, 0]) * 2 (see q/w below).
+    index_k = torch.zeros(8, 1, 4, dtype=torch.bfloat16)
+    # row 0 sees slots 1,2,3 (len 3): scores 10, 6, 2 → picks cols 0,1,2.
+    index_k[1, 0, 0] = 5
+    index_k[2, 0, 0] = 3
+    index_k[3, 0, 0] = 1
+    # row 1 sees slots 2,4,6,7 (len 4): col 3 (slot 7) scores highest.
+    index_k[7, 0, 0] = 9
+    pool.get_dsa_index_k_buffer = lambda layer_id: index_k
+    metadata = SimpleNamespace(
+        sequence_lengths=torch.tensor([3, 4], dtype=torch.int32),
+        token_slot_table=torch.tensor(
+            [[1, 2, 3, 4, 5, 6], [2, 4, 6, 7, 0, 1]], dtype=torch.int32
+        ),
+        token_to_batch_idx=torch.arange(2, dtype=torch.int32),
+        token_to_kv_pool=pool,
+    )
+    indexer = _make_dsa_indexer_stub(topk=4)
+    q = torch.ones(2, 2, 4, dtype=torch.bfloat16)
+    q[..., 1:] = 0
+    w = torch.ones(2, 2, dtype=torch.bfloat16)
+    out = QwenDSAIndexer._select_paged(indexer, q, w, metadata)
+    assert out.shape == (2, 4)
+    assert sorted(out[0, :3].tolist()) == [0, 1, 2]
+    assert out[0, 3].item() == -1
+    assert sorted(out[1].tolist()) == [0, 1, 2, 3]
+
+
+def test_qwen_dsa_select_prefill_respects_causal_windows():
+    from sglang.srt.layers.attention.qsa.dsa_indexer import QwenDSAIndexer
+
+    index_k = torch.zeros(16, 1, 4, dtype=torch.bfloat16)
+    # seq 0 packed slot 4 is its logical col 1; seq 1 packed slots are
+    # [8, 9, 10, 11, 12] → slot 9 is its logical col 1, slot 12 its col 4.
+    index_k[4, 0, 0] = 8
+    index_k[9, 0, 0] = 8
+    index_k[12, 0, 0] = 20
+    pool = SimpleNamespace(get_dsa_index_k_buffer=lambda layer_id: index_k)
+    token_slot_table = torch.stack(
+        [torch.arange(3, 11, dtype=torch.int32), torch.arange(8, 16, dtype=torch.int32)]
+    )
+    metadata = SimpleNamespace(
+        sequence_lengths=torch.tensor([4, 5], dtype=torch.int32),
+        token_slot_table=token_slot_table,
+        token_to_batch_idx=torch.tensor([0, 0, 0, 1, 1, 1, 1], dtype=torch.int32),
+        token_to_kv_pool=pool,
+    )
+    indexer = _make_dsa_indexer_stub(topk=4)
+    q = torch.ones(7, 2, 4, dtype=torch.bfloat16)
+    q[..., 1:] = 0
+    w = torch.ones(7, 2, dtype=torch.bfloat16)
+    # seq 0 extends positions 1..3, seq 1 extends positions 1..4.
+    logical_positions = torch.tensor([1, 2, 3, 1, 2, 3, 4], dtype=torch.int64)
+    out = QwenDSAIndexer._select_prefill(indexer, q, w, logical_positions, metadata)
+    assert out.shape == (7, 4)
+    # A row may never select a column beyond its causal end — in particular
+    # seq 1 rows before position 4 must not see the hot col 4.
+    for row, position in enumerate(logical_positions.tolist()):
+        valid = out[row][out[row] >= 0]
+        assert int(valid.max() if valid.numel() else 0) <= position
+    # The hot columns show up once their windows open.
+    assert 1 in out[0].tolist()  # seq 0
+    assert 1 in out[3].tolist()  # seq 1
+    assert 4 in out[6].tolist()  # seq 1 at position 4
+
+
+def test_qwen_dsa_indexer_forward_trims_dp_padding_rows():
+    from sglang.srt.layers.attention.qsa.dsa_indexer import QwenDSAIndexer
+
+    calls = {}
+    pool = SimpleNamespace(
+        set_dsa_index_k_buffer=lambda layer_id, loc, k: calls.update(
+            locs=loc.clone(), k_rows=k.shape[0]
+        )
+    )
+    metadata = SimpleNamespace(
+        get_token_to_batch_idx=lambda: torch.zeros(1, dtype=torch.int32),
+        get_seqlens_expanded=lambda: torch.tensor([7], dtype=torch.int32),
+        sequence_lengths=torch.tensor([8], dtype=torch.int32),
+        token_slot_table=torch.arange(8, dtype=torch.int32).reshape(1, 8),
+        token_to_batch_idx=torch.zeros(1, dtype=torch.int32),
+        token_to_kv_pool=pool,
+        out_cache_loc=torch.tensor([10, 11], dtype=torch.int32),
+    )
+    indexer = SimpleNamespace(
+        layer_id=0,
+        token_topk=4,
+        score_scale=1.0,
+        index_n_heads=2,
+        project_qkw=lambda hidden, positions: (
+            torch.zeros(positions.shape[0], 2, 4),
+            torch.zeros(positions.shape[0], 2),
+            torch.zeros(positions.shape[0], 1, 4),
+        ),
+        _select_paged=lambda q, w, metadata: (
+            calls.update(q_rows=q.shape[0])
+            or torch.empty(q.shape[0], 4, dtype=torch.int32)
+        ),
+    )
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.DECODE,
+        positions=torch.tensor([6, 0]),
+        out_cache_loc=torch.tensor([10, 11], dtype=torch.int32),
+    )
+    hidden = torch.zeros(2, 16)
+    QwenDSAIndexer.forward_cuda(
+        indexer, hidden, forward_batch.positions, forward_batch, metadata
+    )
+    # Only the semantic row is projected, stored and selected; the padded row
+    # never reaches the pool or the selector.
+    assert calls["locs"].tolist() == [10]
+    assert calls["k_rows"] == 1
+    assert calls["q_rows"] == 1
+
+
+def test_qwen_dsa_indexer_forward_empty_batch_returns_zero_rows():
+    from sglang.srt.layers.attention.qsa.dsa_indexer import QwenDSAIndexer
+
+    metadata = SimpleNamespace(
+        get_token_to_batch_idx=lambda: torch.zeros(0, dtype=torch.int32),
+        get_seqlens_expanded=lambda: torch.zeros(0, dtype=torch.int32),
+    )
+    indexer = _make_dsa_indexer_stub()
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.IDLE,
+        positions=torch.zeros(0, dtype=torch.int64),
+        out_cache_loc=torch.zeros(0, dtype=torch.int32),
+    )
+    out = QwenDSAIndexer.forward_cuda(
+        indexer,
+        torch.zeros(0, 16),
+        forward_batch.positions,
+        forward_batch,
+        metadata,
+    )
+    assert out.shape == (0, 4)
+
+
+def test_qsa_backend_is_registered():
+    assert ATTENTION_BACKENDS["qsa"] is not None
+
+
+def test_qsa_idle_skips_metadata_construction():
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.forward_metadata = object()
+
+    backend.init_forward_metadata(SimpleNamespace(forward_mode=ForwardMode.IDLE))
+
+    assert backend.forward_metadata is None
 
 
 def _make_mtp_draft_batch(steps: int, seq_lens=(8, 16), loc_base: int = 40):
@@ -585,6 +838,58 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
     assert calls == {"token_rows": 15, "logical_rows": 15, "rope_rows": 15}
 
 
+def test_qsa_extend_matches_with_and_without_dp_attention_padding(monkeypatch):
+    kernel_q_rows = []
+
+    def fake_sparse_attention(q, k, v, slots, scale):
+        kernel_q_rows.append(q.shape[0])
+        return q + 1
+
+    monkeypatch.setattr(
+        qsa_backend_module, "qsa_sparse_attention", fake_sparse_attention
+    )
+    metadata = SimpleNamespace(
+        token_to_batch_idx=torch.zeros(15, dtype=torch.int32),
+        sequence_lengths=torch.tensor([15], dtype=torch.int32),
+        token_slot_table=torch.arange(16, dtype=torch.int32).reshape(1, 16),
+    )
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.forward_metadata = metadata
+
+    class Pool:
+        def set_kv_buffer(self, layer, loc, k, v):
+            pass
+
+        def get_key_buffer(self, layer_id):
+            return torch.zeros(16, 1, 2)
+
+        def get_value_buffer(self, layer_id):
+            return torch.zeros(16, 1, 2)
+
+    pool = Pool()
+    backend.token_to_kv_pool = pool
+    layer = SimpleNamespace(tp_q_head_num=1, head_dim=2, layer_id=0, scaling=1.0)
+    topk = torch.zeros(15, 3, dtype=torch.int32)
+
+    def run(num_rows):
+        values = torch.arange(num_rows * 2, dtype=torch.float32).reshape(num_rows, 2)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            token_to_kv_pool=pool,
+            out_cache_loc=torch.arange(num_rows, dtype=torch.int32),
+        )
+        return backend.forward_extend(
+            values, values.clone(), values.clone(), layer, batch, topk_indices=topk
+        )
+
+    unpadded = run(15)
+    padded = run(16)
+    torch.testing.assert_close(padded[:15], unpadded)
+    torch.testing.assert_close(padded[15], torch.zeros(2))
+    assert padded.shape == (16, 2)
+    assert kernel_q_rows == [15, 15]
+
+
 def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
     if not torch.cuda.is_available():
         return
@@ -710,6 +1015,34 @@ def test_qsa_paged_extend_trims_padding_rows_and_restores_output(monkeypatch):
         raise AssertionError("QSA must reject top-k rows beyond the query rows")
 
 
+def test_qsa_paged_extend_never_feeds_mismatched_rows_to_kernels(monkeypatch):
+    seen = []
+
+    def fake_paged_attention(self, q, layer, forward_batch, topk_indices):
+        # Emulates the FA3/FA2 contracts: every kernel requires one cache
+        # row per q row (the repro crashed FA3 with seqused_k 40 vs q 44).
+        seen.append((q.shape[0], topk_indices.shape[0]))
+        return q.reshape(q.shape[0], -1) + 1
+
+    monkeypatch.setattr(
+        QwenSparseAttnBackend, "_forward_paged_attention", fake_paged_attention
+    )
+    backend, pool, layer = _make_paged_extend_backend()
+    topk = torch.zeros(3, 2, dtype=torch.int32)
+    values = torch.arange(5 * 2, dtype=torch.float32).reshape(5, 2)
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        token_to_kv_pool=pool,
+        out_cache_loc=torch.arange(5, dtype=torch.int32),
+    )
+    output = backend.forward_extend(
+        values, values.clone(), values.clone(), layer, batch, topk_indices=topk
+    )
+    assert seen == [(3, 3)]
+    assert output.shape == (5, 2)
+    torch.testing.assert_close(output[3:], torch.zeros(2, 2))
+
+
 def test_qsa_indexer_rejects_shorter_source_than_request_mapping():
     metadata = SimpleNamespace(
         get_token_to_batch_idx=lambda: torch.zeros(16, dtype=torch.int32)
@@ -799,9 +1132,53 @@ def test_qsa_decode_requires_one_query_row_per_request():
         raise AssertionError("QSA decode must reject multi-row requests")
 
 
+def test_qsa_tokenwise_decode_metadata_skips_compressed_precompute():
+    """Tokenwise pools carry no compressed-page geometry; the once-per-forward
+    decode-MQA precompute is a compressed-variant fast path and must not read
+    qsa_compressed_page_size off a tokenwise pool -- an ungated read crashed
+    every tokenwise decode forward with AttributeError."""
+
+    class _TokenwisePool:
+        qsa_compress_ratio = 1
+        qsa_token_topk = 2048
+        qsa_block_topk = 2048
+
+    pool = _TokenwisePool()
+    req_to_token = torch.stack(
+        [torch.arange(i * 64, (i + 1) * 64, dtype=torch.int32) for i in range(4)]
+    )
+    runner = SimpleNamespace(
+        device="cpu",
+        token_to_kv_pool=pool,
+        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+        model_config=SimpleNamespace(
+            context_len=64, hf_config=_tokenwise_config_namespace()
+        ),
+    )
+    backend = QwenSparseAttnBackend(runner)
+    forward_batch = SimpleNamespace(
+        token_to_kv_pool=pool,
+        req_to_token_pool=runner.req_to_token_pool,
+        req_pool_indices=torch.tensor([1], dtype=torch.int32),
+        seq_lens=torch.tensor([8], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([8], dtype=torch.int32),
+        positions=torch.tensor([7], dtype=torch.int64),
+        out_cache_loc=torch.arange(1, dtype=torch.int32),
+        forward_mode=ForwardMode.DECODE,
+    )
+    backend.init_forward_metadata(forward_batch)
+    metadata = backend.forward_metadata.indexer_metadata
+    assert metadata.decode_page_table is None
+    assert metadata.decode_lengths is None
+
+
 def test_qsa_extend_rope_matrix_uses_mrope_coordinates():
-    """extend_rope_matrix must be built from forward_batch.mrope_positions ([3, N])
-    when set, so prefill- and decode-compressed keys RoPE with the same coordinates."""
+    """VL models swap the layer positions to forward_batch.mrope_positions
+    ([3, N] t/h/w); the build-time extend_rope_matrix must be built from that
+    source -- building it from the flat 1-D positions RoPEs prefill-compressed
+    keys with wrong coordinates while decode-compressed keys of the same
+    request use true mrope coords, silently corrupting indexer selection on
+    image-bearing sequences."""
     runner, pool, req_pool = _make_qsa_runner_and_pool()
     backend = QwenSparseAttnBackend(runner)
     num_tokens = 8
@@ -852,6 +1229,83 @@ def test_qsa_speculative_pseudo_extend_is_rejected():
             assert "pseudo-extend" in str(exc)
         else:
             raise AssertionError(f"QSA must reject pseudo-extend of {original_mode}")
+
+
+def test_qsa_indexer_requires_compress_ratio_above_one():
+    try:
+        QSAIndexer._validate_config(
+            SimpleNamespace(
+                indexer_n_heads=8,
+                indexer_kv_heads=1,
+                indexer_head_dim=64,
+                indexer_budget=512,
+                indexer_compress_ratio=1,
+            )
+        )
+    except ValueError as exc:
+        assert "compress_ratio" in str(exc)
+    else:
+        raise AssertionError("QSA must reject a unit compression ratio")
+
+
+def test_qsa_indexer_decode_ignores_dp_attention_token_padding():
+    calls = {}
+    mapping = torch.zeros(1, dtype=torch.int32)
+    metadata = SimpleNamespace(
+        token_to_kv_pool=None,
+        compress_member_rows=None,
+        decode_logical_positions=None,
+        pending_ring_slots=None,
+        get_token_to_batch_idx=lambda: mapping,
+        get_seqlens_expanded=lambda: torch.tensor([7], dtype=torch.int32),
+        get_seqlens_int32=lambda: torch.tensor([8], dtype=torch.int32),
+        get_decode_mqa_inputs=lambda layer_id: (
+            torch.zeros(1, 2, 1, 2),
+            torch.zeros(1, 1, dtype=torch.int32),
+            torch.zeros(1, dtype=torch.int32),
+            2,
+        ),
+    )
+    indexer = SimpleNamespace(
+        layer_id=0,
+        index_n_heads=4,
+        _pending_ring_slots=lambda metadata, logical_positions, is_extend: torch.zeros(
+            logical_positions.numel(), dtype=torch.long
+        ),
+        project_qk=lambda hidden, rope_positions, **kwargs: (
+            hidden.reshape(-1, 1, 2),
+            hidden.reshape(-1, 1, 2),
+            False,
+        ),
+        update_key_state_and_compress=lambda token_k, logical, rope, meta, state_slots=None, state_stored=False: (
+            calls.update(
+                token_rows=token_k.shape[0],
+                logical_rows=logical.numel(),
+                rope_rows=rope.numel(),
+            )
+        ),
+        select_decode_tokens=lambda q, cache, table, lengths, max_len, positions, seqlens: (
+            calls.update(q_rows=q.shape[0], positions=positions.tolist())
+            or q.squeeze(1)
+        ),
+    )
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.DECODE,
+        # One real decode position plus one DP padding row.
+        positions=torch.tensor([6, 0]),
+        out_cache_loc=torch.arange(2, dtype=torch.int32),
+    )
+    hidden = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    QSAIndexer.forward_cuda(
+        indexer, hidden, forward_batch.positions, forward_batch, metadata
+    )
+    assert calls == {
+        "token_rows": 1,
+        "logical_rows": 1,
+        "rope_rows": 1,
+        "q_rows": 1,
+        "positions": [6],
+    }
 
 
 class _FakeQSAPool:
@@ -1035,6 +1489,25 @@ class _ForwardMode:
         return self.decode
 
 
+def test_qsa_indexer_validates_config_values_instead_of_fixed_shapes():
+    QSAIndexer._validate_config(
+        SimpleNamespace(
+            indexer_n_heads=8,
+            indexer_kv_heads=1,
+            indexer_head_dim=64,
+            indexer_budget=1024,
+            indexer_compress_ratio=2,
+        )
+    )
+
+
+def test_qsa_average_pool_matches_training_reference():
+    token_keys = torch.arange(8 * 128, dtype=torch.float32).reshape(8, 1, 128)
+    expected = token_keys.reshape(2, 4, 1, 128).mean(dim=1)
+    actual = average_pool_qsa_keys(token_keys.to(torch.bfloat16).reshape(2, 4, 1, 128))
+    torch.testing.assert_close(actual.float(), expected, rtol=0, atol=2)
+
+
 def test_qsa_row_ranges_do_not_cross_sequences():
     sequence_lengths = torch.tensor([10, 7], dtype=torch.int32)
     query_positions = torch.tensor([8, 9, 4, 6], dtype=torch.int32)
@@ -1132,6 +1605,38 @@ def test_qsa_forward_cuda_dispatches_prefill_and_decode_mqa():
     assert decode_result.item() == 2
 
 
+def test_qsa_fast_topk_returns_sequence_relative_indices():
+    logits = torch.zeros(2, 1200, dtype=torch.float32)
+    starts = torch.tensor([100, 600], dtype=torch.int32)
+    ends = torch.tensor([700, 1150], dtype=torch.int32)
+    logits[0, 321] = 10
+    logits[1, 987] = 11
+    indices = qsa_fast_topk(logits, starts, ends, topk=BLOCK_TOPK)
+    assert 321 - 100 in indices[0].tolist()
+    assert 987 - 600 in indices[1].tolist()
+
+    decode_starts = torch.zeros(2, dtype=torch.int32)
+    decode_ends = torch.tensor([700, 550], dtype=torch.int32)
+    logits[0, 444] = 12
+    logits[1, 333] = 13
+    decode_indices = qsa_fast_topk(logits, decode_starts, decode_ends, topk=BLOCK_TOPK)
+    assert 444 in decode_indices[0].tolist()
+    assert 333 in decode_indices[1].tolist()
+
+
+def test_qsa_reranks_wider_candidate_set():
+    from sglang.srt.layers.attention.qsa.kernel import (
+        _rerank_qsa_topk_candidates,
+    )
+
+    logits = torch.tensor([[0.0, 9.0, 8.0, 7.0, 6.0, 10.0]], dtype=torch.float32)
+    starts = torch.tensor([1], dtype=torch.int32)
+    candidates = torch.tensor([[0, 1, 2, 3, 4]], dtype=torch.int32)
+
+    actual = _rerank_qsa_topk_candidates(logits, candidates, starts, topk=2)
+    assert actual.tolist() == [[4, 0]]
+
+
 def test_qsa_block_expansion_adds_only_incomplete_tail():
     blocks = torch.full((2, BLOCK_TOPK), -1, dtype=torch.int32)
     blocks[0, 0] = 0
@@ -1208,10 +1713,35 @@ def test_qsa_decode_mqa_reads_paged_cache():
     torch.testing.assert_close(actual, expected)
 
 
+def test_qsa_sparse_attention_matches_explicit_gqa():
+    torch.manual_seed(2)
+    q = torch.randn(2, 4, 16, dtype=torch.bfloat16)
+    k = torch.randn(7, 2, 16, dtype=torch.bfloat16)
+    v = torch.randn(7, 2, 16, dtype=torch.bfloat16)
+    slots = torch.full((2, FINAL_TOPK), -1, dtype=torch.int32)
+    slots[0, :4] = torch.tensor([0, 2, 4, 6])
+    slots[1, :3] = torch.tensor([1, 3, 5])
+    actual = qsa_sparse_attention(q, k, v, slots)
+    expected_rows = []
+    for row, selected in enumerate((slots[0, :4], slots[1, :3])):
+        keys = k[selected.long()].repeat_interleave(2, dim=1)
+        values = v[selected.long()].repeat_interleave(2, dim=1)
+        scores = torch.einsum("hd,khd->hk", q[row].float(), keys.float()) / 4
+        expected_rows.append(
+            torch.einsum("hk,khd->hd", scores.softmax(-1), values.float()).to(
+                torch.bfloat16
+            )
+        )
+    torch.testing.assert_close(actual, torch.stack(expected_rows), rtol=2e-2, atol=2e-2)
+
+
 def test_qsa_mtp_step_out_cache_loc_matches_draft_forward_layout():
-    """EagleDraftWorker.draft_forward gives each MTP draft step an out_cache_loc slice;
-    the step's metadata must reference that slice, not the first batch_size slots.
-    """
+    """Each MTP draft step's metadata must reference the same out_cache_loc
+    slice EAGLEWorker.draft_forward assigns for that step. The failure mode
+    this guards: every QSA step writing its key state into the first
+    ``batch_size`` slots of the shared buffer (the per-step layout tests
+    that covered this went with the loc-map suite; the helper is unchanged
+    and still the only mapping between the two layouts)."""
     from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
         QwenSparseMultiStepDraftBackend,
     )
@@ -1241,8 +1771,9 @@ def test_qsa_mtp_step_out_cache_loc_matches_draft_forward_layout():
 
 
 def test_qsa_graph_metadata_kernels_match_legacy_host_path():
-    """For decode rows and target-verify fan-out (boundary and non-boundary),
-    replay kernels and the host refresh must build identical graph buffers."""
+    """The recorded replay kernels and the legacy host refresh must produce
+    identical graph buffers from the same lengths + ledger sidecar, for both
+    decode rows and target-verify row fan-out (boundary and non-boundary)."""
     from sglang.srt.layers.attention.qsa.graph_metadata import launch_graph_metadata
 
     device = "cuda"
@@ -1375,7 +1906,9 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path():
 def _qsa_expected_graph_layout(
     *, mode, bs, num_rows, seq_lens, req_pool, extend_lens, extend_len, num_padding
 ):
-    """Independent host oracle for the graph row layout and padded dummy tail."""
+    """Host reimplementation of the graph layout contract (per-request rows +
+    padded dummy tail), used to check the kernels independently rather than
+    against another implementation of the same walk."""
     real_reqs = bs - num_padding
     row_lens, row_prefix, row_reqs = [], [], []
     for pid in range(bs):
@@ -1405,8 +1938,13 @@ def _qsa_expected_graph_layout(
 
 
 def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
-    """The layout kernel must rebuild speculative row fan-out and the padded dummy tail;
-    the row-metadata kernel must derive compressed slots from those rows."""
+    """The recorded layout kernel must reproduce the per-step speculative row
+    fan-out (uniform target-verify window and per-request draft-extend lengths)
+    and the padded dummy-tail contract, and the row-metadata kernel must derive
+    compressed lengths / boundary write slots / group state locs from those
+    rows under arithmetic compressed addressing (write slot = boundary token's
+    full slot // ratio; non-boundary rows keep the inert reserved slot 0).
+    """
     from sglang.srt.layers.attention.qsa.graph_metadata import launch_graph_metadata
 
     device = "cuda"

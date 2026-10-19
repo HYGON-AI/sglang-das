@@ -5,12 +5,13 @@ import torch
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
-from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
     build_unified_commit_inject_layout,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.kv_loc_plan import Cols, KVLocPlan
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
@@ -32,6 +33,11 @@ class TargetHiddenKvInjector:
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self._block_pos_offsets = block_pos_offsets
 
+    def ids_for(self, plan: KVLocPlan, *, cols: Optional[Cols] = None) -> torch.Tensor:
+        """The plan's write ids as the draft pool indexes them: the target's
+        physical ids for a fused draft, the virtual ids for a private one."""
+        return plan.write_ids(self.draft_model_runner.kv_index_translator, cols=cols)
+
     def inject_target_hidden(
         self,
         *,
@@ -43,9 +49,9 @@ class TargetHiddenKvInjector:
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
-    ) -> None:
+    ) -> Optional[torch.cuda.Event]:
         if target_hidden is None or target_hidden.numel() == 0:
-            return
+            return None
         device = self.model_runner.device
         cache_loc = cache_loc.to(device=device, dtype=torch.int64, non_blocking=True)
         positions = positions.to(device=device, dtype=torch.int64, non_blocking=True)
@@ -53,6 +59,95 @@ class TargetHiddenKvInjector:
         n_real = positions.shape[0]
         if target_hidden.shape[0] > n_real:
             target_hidden = target_hidden[:n_real]
+        if target_hidden.shape[0] != n_real or cache_loc.shape[0] != n_real:
+            raise ValueError(
+                "DSpark target hidden injection requires one hidden row and cache "
+                f"location per position; got hidden_rows={target_hidden.shape[0]}, "
+                f"cache_locs={cache_loc.shape[0]}, positions={n_real}."
+            )
+        if cache_loc_2d is not None:
+            cache_loc_2d = cache_loc_2d.to(
+                device=device, dtype=torch.int64, non_blocking=True
+            )
+            if cache_loc_2d.numel() != n_real:
+                raise ValueError(
+                    "DSpark target hidden injection requires cache_loc_2d to cover "
+                    f"every position; got cache_loc_2d={cache_loc_2d.numel()}, "
+                    f"positions={n_real}."
+                )
+        if commit_lens is not None:
+            commit_lens = commit_lens.to(
+                device=device, dtype=torch.int32, non_blocking=True
+            )
+        if state_slot is not None:
+            state_slot = state_slot.to(
+                device=device, dtype=torch.int64, non_blocking=True
+            )
+        if final_pos is not None:
+            final_pos = final_pos.to(
+                device=device, dtype=torch.int64, non_blocking=True
+            )
+
+        # `cache_loc` arrives in the draft pool's id space (`ids_for`).
+        pool = self.draft_model_runner.token_to_kv_pool
+        if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
+            if target_hidden_is_projected:
+                raise RuntimeError(
+                    "Pre-gather target-hidden projection is not supported by the "
+                    "DSpark MLA KV injection path."
+                )
+            self._inject_mla(
+                pool=pool,
+                target_hidden=target_hidden,
+                cache_loc=cache_loc,
+                positions=positions,
+                cache_loc_2d=cache_loc_2d,
+                commit_lens=commit_lens,
+                state_slot=state_slot,
+                final_pos=final_pos,
+            )
+            return self._record_cuda_event(device)
+
+        with torch.inference_mode():
+            self.draft_model.write_target_hidden_kv(
+                target_hidden=target_hidden,
+                pool=pool,
+                positions=positions,
+                cache_loc=cache_loc,
+                cache_loc_2d=cache_loc_2d,
+                commit_lens=commit_lens,
+                target_hidden_is_projected=target_hidden_is_projected,
+            )
+        return self._record_cuda_event(device)
+
+    @staticmethod
+    def _record_cuda_event(device) -> Optional[torch.cuda.Event]:
+        if not torch.cuda.is_available():
+            return None
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(device))
+        return event
+
+    def inject_projected_context(
+        self,
+        *,
+        projected_context: torch.Tensor,
+        cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc_2d: Optional[torch.Tensor] = None,
+        commit_lens: Optional[torch.Tensor] = None,
+        state_slot: Optional[torch.Tensor] = None,
+        final_pos: Optional[torch.Tensor] = None,
+    ) -> None:
+        if projected_context is None or projected_context.numel() == 0:
+            return
+        device = self.model_runner.device
+        cache_loc = cache_loc.to(device=device, dtype=torch.int64, non_blocking=True)
+        positions = positions.to(device=device, dtype=torch.int64, non_blocking=True)
+        projected_context = projected_context.to(device=device, non_blocking=True)
+        n_real = positions.shape[0]
+        if projected_context.shape[0] > n_real:
+            projected_context = projected_context[:n_real]
         if cache_loc_2d is not None:
             cache_loc_2d = cache_loc_2d.to(
                 device=device, dtype=torch.int64, non_blocking=True
@@ -71,33 +166,44 @@ class TargetHiddenKvInjector:
             )
 
         pool = self.draft_model_runner.token_to_kv_pool
-        if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
-            if target_hidden_is_projected:
-                raise RuntimeError(
-                    "Pre-gather target-hidden projection is not supported by the "
-                    "DSpark MLA KV injection path."
+        if isinstance(pool, DeepSeekV4TokenToKVPool):
+            if is_unified_kv_triton():
+                swa_loc = self._unified_inject_loc(
+                    pool=pool,
+                    positions=positions,
+                    cache_loc_2d=cache_loc_2d,
+                    commit_lens=commit_lens,
+                    state_slot=state_slot,
+                    final_pos=final_pos,
                 )
-            self._inject_mla(
-                pool=pool,
-                target_hidden=target_hidden,
-                cache_loc=cache_loc,
-                positions=positions,
-                cache_loc_2d=cache_loc_2d,
-                commit_lens=commit_lens,
-                state_slot=state_slot,
-                final_pos=final_pos,
-            )
+            else:
+                swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
+                if commit_lens is not None and cache_loc_2d is not None:
+                    bs, verify_len = cache_loc_2d.shape
+                    col = torch.arange(verify_len, device=cache_loc.device).view(1, -1)
+                    committed_mask = (
+                        col < commit_lens.to(torch.long).view(-1, 1)
+                    ).reshape(-1)
+                    swa_loc = torch.where(
+                        committed_mask, swa_loc, torch.full_like(swa_loc, -1)
+                    )
+            with torch.inference_mode():
+                self.draft_model.write_projected_context_kv(
+                    projected_context=projected_context,
+                    swa_loc=swa_loc,
+                    positions=positions,
+                    pool=pool,
+                )
             return
 
         with torch.inference_mode():
-            self.draft_model.write_target_hidden_kv(
-                target_hidden=target_hidden,
+            self.draft_model.write_projected_context_kv(
+                projected_context=projected_context,
                 pool=pool,
                 positions=positions,
                 cache_loc=cache_loc,
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
-                target_hidden_is_projected=target_hidden_is_projected,
             )
 
     def _inject_mla(
@@ -204,6 +310,7 @@ class TargetHiddenKvInjector:
         hidden_strided: torch.Tensor,
         commit_lens: torch.Tensor,
         bs: int,
+        kv_loc_plan: KVLocPlan,
     ) -> None:
         stride = self.verify_num_draft_tokens
         prefix_lens = batch.seq_lens
@@ -242,15 +349,7 @@ class TargetHiddenKvInjector:
             return
 
         positions_2d = prefix_lens.unsqueeze(1) + self._block_pos_offsets
-        verify_cache_loc = assign_extend_cache_locs_func(
-            req_pool_indices=batch.req_pool_indices,
-            req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-            start_offset=prefix_lens,
-            end_offset=prefix_lens + stride,
-            batch_size=bs,
-            draft_token_num=stride,
-            device=self.device,
-        )
+        verify_cache_loc = self.ids_for(kv_loc_plan)
         verify_cache_loc_2d = verify_cache_loc.view(bs, stride)
         self.inject_target_hidden(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),

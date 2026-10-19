@@ -242,6 +242,8 @@ def dispatch_probability(
     original_shape = topk_ids.shape
     flat_ids = topk_ids.reshape(-1).contiguous().to(torch.int32)
     n = flat_ids.shape[0]
+    if n == 0:
+        return torch.empty_like(topk_ids)
     num_logical, max_copies = log2phy_prob.shape
     assert log2phy_map.shape == (num_logical, max_copies)
     map32 = log2phy_map.contiguous().to(torch.int32)

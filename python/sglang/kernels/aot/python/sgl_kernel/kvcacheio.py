@@ -24,6 +24,7 @@ def is_hip() -> bool:
 
 _is_hip = is_hip()
 
+
 def hcu_create_extend_after_decode_spec_info(
     verified_id: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -40,6 +41,7 @@ def hcu_create_extend_after_decode_spec_info(
         new_verified_id,
         bs,
     )
+
 
 def hcu_alloc_extend_kernel(
     pre_lens_ptr: torch.Tensor,
@@ -60,13 +62,14 @@ def hcu_alloc_extend_kernel(
         page_size,
     )
 
+
 def hcu_alloc_decode_kernel(
-    seq_lens_ptr: torch.Tensor,   
-    last_loc_ptr: torch.Tensor,    
-    free_page_ptr: torch.Tensor ,   
-    out_indices: torch.Tensor , 
-    bs: int,          
-    page_size: int,              
+    seq_lens_ptr: torch.Tensor,
+    last_loc_ptr: torch.Tensor,
+    free_page_ptr: torch.Tensor,
+    out_indices: torch.Tensor,
+    bs: int,
+    page_size: int,
 ):
     torch.ops.sgl_kernel.hcu_alloc_decode_kernel(
         seq_lens_ptr,
@@ -76,6 +79,7 @@ def hcu_alloc_decode_kernel(
         bs,
         page_size,
     )
+
 
 def transfer_kv_all_kernel_lf_pf_D2H_hcu(
     src_k: torch.Tensor,
@@ -106,6 +110,7 @@ def transfer_kv_all_kernel_lf_pf_D2H_hcu(
         num_warps_per_block,
     )
 
+
 def transfer_kv_per_layer_kernel_pf_lf_H2D_hcu(
     src_k: torch.Tensor,
     dst_k: torch.Tensor,
@@ -133,6 +138,7 @@ def transfer_kv_per_layer_kernel_pf_lf_H2D_hcu(
         num_warps_per_block,
     )
 
+
 def transfer_kv_all_direct_pf_lf_H2D_hcu(
     src_ptrs_k: torch.Tensor,
     src_ptrs_v: torch.Tensor,
@@ -154,6 +160,7 @@ def transfer_kv_all_direct_pf_lf_H2D_hcu(
         page_size,
     )
 
+
 def transfer_kv_all_direct_lf_pf_D2H_hcu(
     src_ptrs_k: List[torch.Tensor],
     src_ptrs_v: List[torch.Tensor],
@@ -174,10 +181,6 @@ def transfer_kv_all_direct_lf_pf_D2H_hcu(
         start_layer_id,
         page_size,
     )
-
-def get_device_accessible_ptr(tensor: torch.Tensor, device_index: int) -> int:
-    """Return the address a kernel on ``device_index`` must use for ``tensor``."""
-    return torch.ops.sgl_kernel.get_device_accessible_ptr.default(tensor, device_index)
 
 
 def _default_mla_block_quota() -> int:
@@ -510,14 +513,15 @@ def transfer_kv_all_layer_mla_lf_pf(
         num_warps_per_block,
     )
 
+
 def hcu_assign_req_to_token_pool(
-    req_pool_indices:torch.Tensor,
-    req_to_token:torch.Tensor,
-    allocate_lens:torch.Tensor,
-    new_allocate_lens:torch.Tensor,
-    out_cache_loc:torch.Tensor,
-    shape:int,
-    bs:int,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    allocate_lens: torch.Tensor,
+    new_allocate_lens: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    shape: int,
+    bs: int,
 ):
     torch.ops.sgl_kernel.hcu_assign_req_to_token_pool(
         req_pool_indices,
@@ -528,6 +532,7 @@ def hcu_assign_req_to_token_pool(
         shape,
         bs,
     )
+
 
 def hcu_get_last_loc(
     req_to_token: torch.Tensor,
@@ -553,13 +558,14 @@ def hcu_assign_extend_cache_locs(
 ):
     torch.ops.sgl_kernel.hcu_assign_extend_cache_locs(
         req_pool_indices,
-        req_to_token, 
-        start_offset, 
+        req_to_token,
+        start_offset,
         end_offset,
-        out_cache_loc, 
-        pool_len, 
+        out_cache_loc,
+        pool_len,
         bs,
     )
+
 
 def hcu_create_chunked_prefix_cache_kv_indices(
     req_to_token: torch.Tensor,
@@ -573,26 +579,27 @@ def hcu_create_chunked_prefix_cache_kv_indices(
 ):
     torch.ops.sgl_kernel.hcu_create_chunked_prefix_cache_kv_indices(
         req_to_token,
-        req_pool_indices, 
-        chunk_starts, 
+        req_pool_indices,
+        chunk_starts,
         chunk_seq_lens,
-        chunk_cu_seq_lens, 
-        chunk_kv_indices, 
-        col_num, 
+        chunk_cu_seq_lens,
+        chunk_kv_indices,
+        col_num,
         bs,
     )
+
 
 def hcu_align_evict_mask_to_page_size(
     seq_lens: torch.Tensor,
     evict_mask: torch.Tensor,
     page_size: int,
     num_draft_tokens: int,
-    bs:int,
+    bs: int,
 ):
     torch.ops.sgl_kernel.hcu_align_evict_mask_to_page_size(
         seq_lens,
-        evict_mask, 
-        page_size, 
+        evict_mask,
+        page_size,
         num_draft_tokens,
         bs,
     )
@@ -609,4 +616,46 @@ def copy_all_layer_kv_cache_cpu(
         strides,
         tgt_loc,
         src_loc,
+    )
+
+
+def transfer_kv_per_layer_mla_lf_lf_H2D_hcu(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    page_size: int,
+    num_warps_per_block: int = 4 if _is_hip else 32,
+):
+    torch.ops.sgl_kernel.transfer_kv_per_layer_mla_lf_lf_H2D_hcu.default(
+        src,
+        dst,
+        src_indices,
+        dst_indices,
+        item_size,
+        page_size,
+        num_warps_per_block,
+    )
+
+
+def transfer_kv_all_layer_mla_lf_lf_D2H_hcu(
+    src_layers: torch.Tensor,
+    dst_layers: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    num_layers: int,
+    block_quota: int = 2,
+    num_warps_per_block: int = 4 if _is_hip else 32,
+):
+    torch.ops.sgl_kernel.transfer_kv_all_layer_mla_lf_lf_D2H_hcu.default(
+        src_layers,
+        dst_layers,
+        src_indices,
+        dst_indices,
+        item_size,
+        num_layers,
+        block_quota,
+        num_warps_per_block,
     )

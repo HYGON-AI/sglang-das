@@ -20,16 +20,12 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
-
-# HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
-register_hcu_ci(
-    est_time=600,
-    suite="stage-b-test-1-hcu-small",
-    disabled="HCU PR baseline deferred: scheduler path needs BW1100 repeat validation before required CI.",
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_hcu_ci,
 )
-
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -41,6 +37,13 @@ from sglang.utils import is_in_ci
 
 register_cuda_ci(est_time=316, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd")
+
+# HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
+register_hcu_ci(
+    est_time=600,
+    suite="stage-b-test-1-hcu-small",
+    disabled="HCU PR baseline deferred: scheduler path needs BW1100 repeat validation before required CI.",
+)
 
 
 class TestRetractDecode(CustomTestCase):
@@ -77,15 +80,15 @@ class TestRetractDecode(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         self.assertGreaterEqual(metrics["score"], 0.64)
         time.sleep(1)  # wait for mem check
 
         assert self.process.poll() is None, "Server crashed during test"
 
 
-class TestRetractDecodeChunkCachePaged(TestRetractDecode):
-    """python -m unittest test_retract_decode.TestRetractDecodeChunkCachePaged"""
+class TestRetractDecodeRadixDisabledPaged(TestRetractDecode):
+    """python -m unittest test_retract_decode.TestRetractDecodeRadixDisabledPaged"""
 
     other_args = ["--disable-radix-cache", "--page-size", "16"]
 
@@ -124,8 +127,8 @@ class TestRetractDecodeLongOutput(CustomTestCase):
 
 
 @unittest.skipIf(is_in_ci(), "Skipped in CI due to long runtime")
-class TestRetractDecodeLongOutputChunkCache(TestRetractDecodeLongOutput):
-    """python -m unittest test_retract_decode.TestRetractDecodeLongOutputChunkCache"""
+class TestRetractDecodeLongOutputRadixDisabled(TestRetractDecodeLongOutput):
+    """python -m unittest test_retract_decode.TestRetractDecodeLongOutputRadixDisabled"""
 
     other_args = ["--disable-radix-cache"]
 

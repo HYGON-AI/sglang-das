@@ -86,10 +86,12 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
+    is_hcu,
     is_hip,
     is_npu,
     round_up,
 )
+from sglang.srt.utils.common import is_building_neighbour_layer
 from sglang.srt.layers.moe.utils import (
     is_sbo_enabled,
     is_tbo_enabled,
@@ -167,12 +169,44 @@ def _get_deepep_comm_group(a2a_backend):
     return group
 
 
+def _should_use_ascend_tp_dispatcher(moe_runner_config: MoeRunnerConfig) -> bool:
+    """Whether AscendTPDispatcher is required for the effective MoE runner.
+
+    Ascend runner only registers pre/post-permute for ``ascend_tp`` (and
+    deepep_*), not ``standard``. Quant methods such as modelslim /
+    compressed_tensors W4A8 remap ``auto`` → ``ASCEND`` locally in
+    ``create_moe_runner`` (which runs before this helper), so we must not
+    rely solely on ``is_npu()`` / the global ``--moe-runner-backend`` flag.
+    """
+    if get_moe_runner_backend().is_ascend():
+        return True
+
+    layer = moe_runner_config.layer
+    if layer is None:
+        return False
+
+    for obj in (
+        getattr(layer, "quant_method", None),
+        getattr(layer, "scheme", None),
+    ):
+        if obj is None:
+            continue
+        runner = getattr(obj, "runner", None)
+        runner_backend = getattr(runner, "runner_backend", None) if runner else None
+        if runner_backend is not None and runner_backend.is_ascend():
+            return True
+    return False
+
 def create_moe_dispatcher(
     moe_runner_config: MoeRunnerConfig,
     quant_method: FusedMoEMethodBase,
 ) -> BaseDispatcher:
+    if is_building_neighbour_layer():
+        return StandardDispatcher(moe_runner_config)
     a2a_backend = get_moe_a2a_backend()
-    if a2a_backend.is_none() and is_npu():
+    if a2a_backend.is_none() and (
+        is_npu() or _should_use_ascend_tp_dispatcher(moe_runner_config)
+    ):
         return AscendTPDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_none()
@@ -203,7 +237,7 @@ def create_moe_dispatcher(
             params_dtype=moe_runner_config.params_dtype,
             deepep_mode=get_deepep_mode(),
             async_finish=True,
-            return_recv_hook=is_tbo_enabled() or is_sbo_enabled(),
+            return_recv_hook=(not is_hcu()) or is_tbo_enabled() or is_sbo_enabled(),
         )
     elif a2a_backend.is_deepep_v2():
         output_dtype = get_deepep_v2_dispatcher_output_dtype(
@@ -230,7 +264,6 @@ def create_moe_dispatcher(
             num_experts=moe_runner_config.num_experts,
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
-            moe_runner_config=moe_runner_config,
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
@@ -455,25 +488,19 @@ class FusedMoE(torch.nn.Module):
         # Set by the quant method when it repacks experts for MegaMoE.
         self._mega_moe_weights_built = False
         self._mega_moe_nvfp4 = False
+        # Read at construction: draft_model_build_scope applies the draft's own value.
+        self._mega_moe_w4a4 = get_exec().moe.enable_w4a4_mxfp4_megamoe
         self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
         self._pending_fp8_shared_scales: dict[tuple[int, str], torch.Tensor] = {}
 
-        # HCU: upstream dropped `expert_map` from FusedMoE, but DeepEPMoE still
-        # consumes it (see ep_moe/layer.py), so keep deriving it here -- and only
-        # it. `num_local_experts` is already computed above from
-        # `_num_global_routed`, which excludes the fused shared slots; the old
-        # 0.5.12-era block re-derived it from `num_experts` and guarded that with
-        # `assert num_experts % self.moe_ep_size == 0`. That check is on the
-        # wrong quantity: when the fused shared slots are not per-rank (a2a
-        # backend "none", e.g. DSpark standalone) `num_experts` is
-        # routed + n_shared and need not divide by ep_size, so the assert fired
-        # even though the routed count divides cleanly. On the DeepEP path the
-        # two expert counts coincide, so dropping the override is a no-op there.
-        self.expert_map = determine_expert_map(
-            ep_size=self.moe_ep_size,
-            ep_rank=self.moe_ep_rank,
-            global_num_experts=num_experts,
-        )[1]
+        # The routed/shared split above is the source of truth. In particular,
+        # DSpark has 256 routed experts plus one fused shared expert, so the
+        # total 257 is not divisible by EP8 even though the routed experts are,
+        # and determine_expert_map(global_num_experts=num_experts) would hand
+        # the fused shared slot out as if it were a routed expert. The only
+        # remaining consumer is DeepEPMoE -> SlimQuant W4A8 marlin apply_ep(),
+        # which already defaults this to None on its other call sites.
+        self.expert_map = None
 
         assert intermediate_size % self.moe_tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
@@ -536,6 +563,7 @@ class FusedMoE(torch.nn.Module):
             is_gated=is_gated,
             routing_method_type=routing_method_type,
             gate_up_interleaved=gate_up_interleaved,
+            layer=self,
         )
 
         self.quant_method = quant_method
@@ -745,7 +773,6 @@ class FusedMoE(torch.nn.Module):
         expert_data: torch.Tensor,
         shard_id: str,
         loaded_weight: torch.Tensor,
-        tp_rank: int,
         is_bias: bool = False,
     ):
         # Load grouped weight scales for group quantization
@@ -756,7 +783,6 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
                 is_bias=is_bias,
             )
         elif shard_id in ("w1", "w3", "w13"):
@@ -765,7 +791,6 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
                 is_bias=is_bias,
             )
 
@@ -775,7 +800,6 @@ class FusedMoE(torch.nn.Module):
         shard_dim: int,
         shard_id: str,
         loaded_weight: torch.Tensor,
-        tp_rank: int,
     ):
         # for per channel weight quantization
         if shard_id == "w2":
@@ -792,7 +816,6 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
             )
 
     def _load_w13(
@@ -801,7 +824,6 @@ class FusedMoE(torch.nn.Module):
         shard_dim: int,
         shard_id: str,
         loaded_weight: torch.Tensor,
-        tp_rank: int,
         is_bias: bool = False,
     ):
         # Index the loaded weight for tp sharding.
@@ -842,7 +864,7 @@ class FusedMoE(torch.nn.Module):
                 expert_data,
                 loaded_weight,
                 start,
-                shard_size * tp_rank,
+                shard_size * self.moe_tp_rank,
                 shard_dim,
                 shard_size,
                 not self.use_presharded_weights,
@@ -867,7 +889,7 @@ class FusedMoE(torch.nn.Module):
                 # shard size from the loaded weight so we index correctly.
                 loaded_shard_size = loaded_weight.shape[shard_dim] // self.moe_tp_size
                 loaded_weight = loaded_weight.narrow(
-                    shard_dim, loaded_shard_size * tp_rank, loaded_shard_size
+                    shard_dim, loaded_shard_size * self.moe_tp_rank, loaded_shard_size
                 )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
@@ -894,7 +916,6 @@ class FusedMoE(torch.nn.Module):
         shard_dim: int,
         shard_id: str,
         loaded_weight: torch.Tensor,
-        tp_rank: int,
         is_bias: bool = False,
     ):
         """Load w2 weights for down projection.
@@ -904,7 +925,6 @@ class FusedMoE(torch.nn.Module):
             shard_dim: The dimension to shard along
             shard_id: The shard ID (must be "w2")
             loaded_weight: The weight tensor to load from
-            tp_rank: The tensor parallel rank
         """
         if not isinstance(expert_data, torch.Tensor) or not isinstance(
             loaded_weight, torch.Tensor
@@ -942,7 +962,7 @@ class FusedMoE(torch.nn.Module):
                 expert_data,
                 loaded_weight,
                 0,  # param_data_start
-                shard_size * tp_rank,
+                shard_size * self.moe_tp_rank,
                 shard_dim,
                 shard_size,
                 not self.use_presharded_weights,
@@ -963,7 +983,7 @@ class FusedMoE(torch.nn.Module):
                 # do not cause out-of-bounds indexing into the checkpoint.
                 loaded_shard_size = loaded_weight.shape[shard_dim] // self.moe_tp_size
                 loaded_weight = loaded_weight.narrow(
-                    shard_dim, loaded_shard_size * tp_rank, loaded_shard_size
+                    shard_dim, loaded_shard_size * self.moe_tp_rank, loaded_shard_size
                 )
 
         # w2, down_proj: Load into only logical weight of w2.
@@ -990,7 +1010,6 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
         shard_dim: int,
-        tp_rank: int,
     ) -> bool:
         if (
             not self._has_fused_shared
@@ -1058,14 +1077,12 @@ class FusedMoE(torch.nn.Module):
             expert_data=weight_data,
             shard_id=shard_id,
             loaded_weight=fp4_weight,
-            tp_rank=tp_rank,
         )
         self._load_model_weight_or_group_weight_scale(
             shard_dim=shard_dim,
             expert_data=scale_data,
             shard_id=shard_id,
             loaded_weight=fp4_scale,
-            tp_rank=tp_rank,
         )
         return True
 
@@ -1083,7 +1100,6 @@ class FusedMoE(torch.nn.Module):
         expert_data: torch.Tensor,
         shard_dim: int,
         loaded_weight: torch.Tensor,
-        tp_rank: int,
     ):
         if shard_id == "w2":
             self._load_w2(
@@ -1091,7 +1107,6 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
             )
         else:
             assert shard_id in ("w1", "w3")
@@ -1222,7 +1237,6 @@ class FusedMoE(torch.nn.Module):
         loaded_weight: torch.Tensor,
         shard_id: str,
         expert_id: int,
-        tp_rank: int,
     ) -> bool:
         """Handle GGUF weight loading.
 
@@ -1231,7 +1245,6 @@ class FusedMoE(torch.nn.Module):
             loaded_weight: The weight tensor to load.
             shard_id: The shard ID (w1, w2, or w3).
             expert_id: The expert ID.
-            tp_rank: The tensor parallel rank.
 
         Returns:
             True if the weight was handled as a GGUF weight, False otherwise.
@@ -1249,7 +1262,7 @@ class FusedMoE(torch.nn.Module):
             if self.moe_tp_size > 1:
                 if shard_id in ["w1", "w3", "w2"] and output_dim == 0:
                     shard_size = loaded_weight.size(0) // self.moe_tp_size
-                    start_idx = tp_rank * shard_size
+                    start_idx = self.moe_tp_rank * shard_size
                     loaded_weight = loaded_weight.narrow(
                         0, start_idx, shard_size
                     ).clone()
@@ -1273,10 +1286,8 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        tp_rank = self.moe_tp_rank
-
         # Special case for GGUF weights
-        if self._load_gguf_weight(param, loaded_weight, shard_id, expert_id, tp_rank):
+        if self._load_gguf_weight(param, loaded_weight, shard_id, expert_id):
             return
 
         # compressed-tensors checkpoints with packed weights are stored flipped
@@ -1325,8 +1336,14 @@ class FusedMoE(torch.nn.Module):
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
 
+        use_flashinfer_trtllm_weight_layout = (
+            method.use_flashinfer_trtllm_weight_layout
+            if isinstance(method, ModelOptNvFp4FusedMoEMethod)
+            else self.use_flashinfer_trtllm_moe
+        )
+
         # Flashinfer assumes w31 format for w13_weight. Same for the scales.
-        if self.use_flashinfer_trtllm_moe and (
+        if use_flashinfer_trtllm_weight_layout and (
             isinstance(method, ModelOptNvFp4FusedMoEMethod)
             or isinstance(method, Fp8MoEMethod)
             or isinstance(method, UnquantizedFusedMoEMethod)
@@ -1359,7 +1376,6 @@ class FusedMoE(torch.nn.Module):
             shard_id=shard_id,
             expert_id=expert_id,
             shard_dim=shard_dim,
-            tp_rank=tp_rank,
         ):
             return
 
@@ -1398,7 +1414,6 @@ class FusedMoE(torch.nn.Module):
                 shard_id=shard_id,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
             )
             return
 
@@ -1426,7 +1441,6 @@ class FusedMoE(torch.nn.Module):
                     shard_dim=shard_dim,
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
-                    tp_rank=tp_rank,
                 )
             return
 
@@ -1448,7 +1462,6 @@ class FusedMoE(torch.nn.Module):
                     shard_dim=shard_dim,
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
-                    tp_rank=tp_rank,
                 )
             elif quant_method in [
                 FusedMoeWeightScaleSupported.GROUP.value,
@@ -1459,7 +1472,6 @@ class FusedMoE(torch.nn.Module):
                     shard_dim=shard_dim,
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
-                    tp_rank=tp_rank,
                 )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                 # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust FP8 per-tensor scaling number for e4m3fnuz (AMD)
@@ -1493,7 +1505,6 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
             )
             return
 
@@ -1506,7 +1517,6 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
             )
 
     def weight_loader_fused(
@@ -1516,8 +1526,6 @@ class FusedMoE(torch.nn.Module):
         weight_name: str,
         shard_id: str,
     ) -> None:
-        tp_rank = self.moe_tp_rank
-
         # Mirror _weight_loader_impl: the trtllm bf16 prep reshapes expert weights
         # into block layout; hot weight updates must restore canonical shapes first.
         method = self.quant_method
@@ -1607,7 +1615,6 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
                 is_bias=is_bias,
             )
             return

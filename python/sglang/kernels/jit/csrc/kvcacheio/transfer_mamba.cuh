@@ -1,7 +1,5 @@
 #pragma once
 
-#include <sgl_kernel/runtime.cuh>
-
 #include "hicache.cuh"
 #include <algorithm>
 #include <cstdint>
@@ -117,8 +115,8 @@ struct TransferMambaKernel {
     dim3 grid(grid_x);
 
     const auto params = MambaTransferParams{
-        .src_base = static_cast<const char*>(runtime::get_device_accessible_ptr(src)),
-        .dst_base = static_cast<char*>(runtime::get_device_accessible_ptr(dst)),
+        .src_base = static_cast<const char*>(hicache_kernel_accessible_ptr(src)),
+        .dst_base = static_cast<char*>(hicache_kernel_accessible_ptr(dst)),
         .layer_ptrs = nullptr,
         .src_indices = static_cast<const int64_t*>(src_indices.data_ptr()),
         .dst_indices = static_cast<const int64_t*>(dst_indices.data_ptr()),
@@ -171,7 +169,7 @@ struct TransferMambaKernel {
 
     const auto params = MambaTransferParams{
         .src_base = nullptr,
-        .dst_base = static_cast<char*>(runtime::get_device_accessible_ptr(dst)),
+        .dst_base = static_cast<char*>(hicache_kernel_accessible_ptr(dst)),
         .layer_ptrs = static_cast<const uintptr_t*>(src_ptrs.data_ptr()),
         .src_indices = static_cast<const int64_t*>(src_indices.data_ptr()),
         .dst_indices = static_cast<const int64_t*>(dst_indices.data_ptr()),
