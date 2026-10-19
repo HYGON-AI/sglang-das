@@ -13,22 +13,52 @@ AVAILABLE = "available"
 UNAVAILABLE = "unavailable"
 
 
-def _positive_env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    value = int(raw)
-    if value <= 0:
-        raise ValueError(f"{name} must be positive, got {value}")
-    return value
+_HEALTH_CONFIG_SOURCES = {
+    "probe_interval_s": (
+        "mooncake_dfs_health_probe_interval_s",
+        "SGLANG_MOONCAKE_DFS_HEALTH_PROBE_INTERVAL_S",
+        10,
+    ),
+    "failure_threshold": (
+        "mooncake_dfs_health_failure_threshold",
+        "SGLANG_MOONCAKE_DFS_HEALTH_FAILURE_THRESHOLD",
+        3,
+    ),
+    "success_threshold": (
+        "mooncake_dfs_health_success_threshold",
+        "SGLANG_MOONCAKE_DFS_HEALTH_SUCCESS_THRESHOLD",
+        3,
+    ),
+    "probe_timeout_s": (
+        "mooncake_dfs_health_probe_timeout_s",
+        "SGLANG_MOONCAKE_DFS_HEALTH_PROBE_TIMEOUT_S",
+        2,
+    ),
+}
 
 
-def _config_or_env(
-    config: dict[str, int], key: str, env_name: str, default: int
-) -> int:
-    if key in config:
-        return int(config[key])
-    return _positive_env_int(env_name, default)
+def resolve_dfs_health_config(
+    config: dict[str, int | None] | None = None, server_args: Any = None
+) -> dict[str, int]:
+    """Resolve DFS health settings consistently for every storage entry point.
+
+    Precedence is explicit config, explicit ServerArgs/CLI value, environment,
+    then the built-in default. None means that a source did not specify a value.
+    """
+    config = config or {}
+    resolved: dict[str, int] = {}
+    for key, (arg_name, env_name, default) in _HEALTH_CONFIG_SOURCES.items():
+        value = config.get(key)
+        if value is None and server_args is not None:
+            value = getattr(server_args, arg_name, None)
+        if value is None:
+            raw = os.environ.get(env_name)
+            value = default if raw is None else int(raw)
+        value = int(value)
+        if value <= 0:
+            raise ValueError(f"Mooncake DFS health {key} must be positive, got {value}")
+        resolved[key] = value
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -66,39 +96,11 @@ class MooncakeDfsHealthManager:
     ):
         self._store = store
         self._defer_policy_application = defer_policy_application
-        config = config or {}
-        self._interval_s = _config_or_env(
-            config,
-            "probe_interval_s",
-            "SGLANG_MOONCAKE_DFS_HEALTH_PROBE_INTERVAL_S",
-            10,
-        )
-        self._failure_threshold = _config_or_env(
-            config,
-            "failure_threshold",
-            "SGLANG_MOONCAKE_DFS_HEALTH_FAILURE_THRESHOLD",
-            3,
-        )
-        self._success_threshold = _config_or_env(
-            config,
-            "success_threshold",
-            "SGLANG_MOONCAKE_DFS_HEALTH_SUCCESS_THRESHOLD",
-            3,
-        )
-        self._probe_timeout_s = _config_or_env(
-            config,
-            "probe_timeout_s",
-            "SGLANG_MOONCAKE_DFS_HEALTH_PROBE_TIMEOUT_S",
-            2,
-        )
-        for name, value in (
-            ("probe_interval_s", self._interval_s),
-            ("failure_threshold", self._failure_threshold),
-            ("success_threshold", self._success_threshold),
-            ("probe_timeout_s", self._probe_timeout_s),
-        ):
-            if value <= 0:
-                raise ValueError(f"Mooncake DFS health {name} must be positive")
+        config = resolve_dfs_health_config(config)
+        self._interval_s = config["probe_interval_s"]
+        self._failure_threshold = config["failure_threshold"]
+        self._success_threshold = config["success_threshold"]
+        self._probe_timeout_s = config["probe_timeout_s"]
         self._lock = threading.Lock()
         self._policy_lock = threading.Lock()
         self._stop = threading.Event()

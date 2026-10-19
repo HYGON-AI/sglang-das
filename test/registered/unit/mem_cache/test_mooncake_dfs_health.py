@@ -17,6 +17,7 @@ _SPEC.loader.exec_module(_MODULE)
 AVAILABLE = _MODULE.AVAILABLE
 UNAVAILABLE = _MODULE.UNAVAILABLE
 MooncakeDfsHealthManager = _MODULE.MooncakeDfsHealthManager
+resolve_dfs_health_config = _MODULE.resolve_dfs_health_config
 
 
 class _FakeStore:
@@ -37,6 +38,55 @@ class _FakeStore:
 
 
 class MooncakeDfsHealthManagerTest(unittest.TestCase):
+    def test_resolver_uses_cli_then_environment_then_defaults(self):
+        env = {
+            "SGLANG_MOONCAKE_DFS_HEALTH_PROBE_INTERVAL_S": "4",
+            "SGLANG_MOONCAKE_DFS_HEALTH_FAILURE_THRESHOLD": "5",
+            "SGLANG_MOONCAKE_DFS_HEALTH_SUCCESS_THRESHOLD": "6",
+            "SGLANG_MOONCAKE_DFS_HEALTH_PROBE_TIMEOUT_S": "7",
+        }
+        server_args = type(
+            "ServerArgs",
+            (),
+            {
+                "mooncake_dfs_health_probe_interval_s": 8,
+                "mooncake_dfs_health_failure_threshold": None,
+                "mooncake_dfs_health_success_threshold": None,
+                "mooncake_dfs_health_probe_timeout_s": None,
+            },
+        )()
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(
+                resolve_dfs_health_config(server_args=server_args),
+                {
+                    "probe_interval_s": 8,
+                    "failure_threshold": 5,
+                    "success_threshold": 6,
+                    "probe_timeout_s": 7,
+                },
+            )
+
+    def test_resolver_uses_defaults_when_unset(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                resolve_dfs_health_config(),
+                {
+                    "probe_interval_s": 10,
+                    "failure_threshold": 3,
+                    "success_threshold": 3,
+                    "probe_timeout_s": 2,
+                },
+            )
+
+    def test_resolver_rejects_non_positive_value(self):
+        with patch.dict(
+            os.environ,
+            {"SGLANG_MOONCAKE_DFS_HEALTH_PROBE_TIMEOUT_S": "0"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "probe_timeout_s must be positive"):
+                resolve_dfs_health_config()
+
     def _manager(self, read_probes, write_probes):
         env = {
             "SGLANG_MOONCAKE_DFS_HEALTH_FAILURE_THRESHOLD": "2",

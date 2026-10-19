@@ -426,6 +426,18 @@ class UnifiedRadixCache(BasePrefixCache):
                 server_args.hicache_storage_backend_extra_config
             )
 
+            if storage_backend == "mooncake":
+                from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
+                    resolve_dfs_health_config,
+                )
+
+                # Carry the same resolved CLI/env/default values through the
+                # HiCache backend factory to MooncakeStore.
+                storage_extra_config = dict(storage_extra_config or {})
+                storage_extra_config["_mooncake_dfs_health_config"] = (
+                    resolve_dfs_health_config(server_args=server_args)
+                )
+
         attach_hybrid_pool_to_unified_cache(
             self,
             params,

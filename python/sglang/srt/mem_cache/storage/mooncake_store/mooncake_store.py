@@ -444,6 +444,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if storage_config
                 else None
             )
+            if dfs_health_config is None and extra_config:
+                dfs_health_config = extra_config.get("_mooncake_dfs_health_config")
             if enable_client_http_server is None:
                 enable_client_http_server = bool(
                     getattr(storage_config, "enable_storage_metrics", False)
