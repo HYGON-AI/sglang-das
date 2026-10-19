@@ -193,5 +193,86 @@ class TestDecoderTailCP(CustomTestCase):
             torch.testing.assert_close(result, expected)
 
 
+class TestDecoderReplayPadding(CustomTestCase):
+    def check_padding(self, lengths, cp_active=False, replay=True, prefixes=None):
+        prefixes = prefixes or [0] * len(lengths)
+        seq_lengths = [p + n for p, n in zip(prefixes, lengths)]
+        namespace = dict(torch=torch)
+        kernel_path = ACTUAL / 'kernels/ops/attention/dsv4_attn_metadata_kernels.py'
+        tail_layout = load(kernel_path, 'late_layer_tail_layout', namespace)
+        indices, tail_lens, floor = tail_layout(
+            extend_lens_cpu=lengths, seq_lens_cpu=seq_lengths,
+            tail_len=128, device=torch.device('cpu'))
+        namespace['ExpandPrefillCausallyResult'] = SimpleNamespace
+        expand = load(kernel_path, 'expand_prefill_causally', namespace)
+        namespace['ExpandPrefillCausally'] = SimpleNamespace(execute=expand)
+        namespace['is_cp_active'] = lambda batch: cp_active
+        backend_path = SOURCE / 'srt/layers/attention/deepseek_v4_backend.py'
+        tail_rows = load(backend_path, '_tail_rows', namespace)
+        physical = (sum(lengths) + 7) // 8 * 8
+        out_loc = torch.nn.functional.pad(
+            torch.arange(1, sum(lengths) + 1), (0, physical - sum(lengths)))
+        out_loc = tail_rows(out_loc, token_indices=indices,
+            contiguous_start=lengths[0] - tail_lens[0] if len(lengths) == 1 else None)
+        tail_total = sum(tail_lens)
+        metadata_rows = (tail_total + 7) // 8 * 8 if cp_active else len(out_loc)
+        cp_metadata = SimpleNamespace(per_rank_actual_token=[metadata_rows // 8] * 8)
+        forward_batch = SimpleNamespace(attn_cp_metadata=cp_metadata)
+        expand_method = load(backend_path, 'expand_prefill_casually', namespace,
+                             'DeepseekV4AttnBackend')
+        prefill = load(backend_path, 'init_forward_metadata_prefill', namespace,
+                       'DeepseekV4AttnBackend')
+
+        class MetadataCaptured(Exception):
+            pass
+
+        def capture(**kwargs):
+            self.assertEqual(kwargs['seq_lens_casual'].numel(), metadata_rows)
+            actual_floor = kwargs['swa_replay_start']
+            if replay:
+                self.assertEqual(actual_floor.numel(), metadata_rows)
+                torch.testing.assert_close(actual_floor[:tail_total], floor)
+                self.assertEqual(torch.count_nonzero(actual_floor[tail_total:]).item(), 0)
+                # The operation that failed in make_core_attn_metadata.
+                visible = kwargs['seq_lens_casual'] - actual_floor
+                expected = torch.cat([torch.arange(1, n + 1) for n in tail_lens])
+                torch.testing.assert_close(visible[:tail_total], expected.to(visible.dtype))
+                if metadata_rows == tail_total:
+                    self.assertIs(actual_floor, floor)
+            else:
+                self.assertIsNone(actual_floor)
+            raise MetadataCaptured
+
+        backend = SimpleNamespace(req_to_token=None, make_core_attn_metadata=capture)
+        backend.expand_prefill_casually = lambda **kw: expand_method(backend, **kw)
+        tail_tensor = torch.tensor(tail_lens, dtype=torch.int32)
+        with self.assertRaises(MetadataCaptured):
+            prefill(backend, max_seq_len=max(seq_lengths),
+                req_pool_indices=torch.arange(len(lengths), dtype=torch.int32),
+                seq_lens=torch.tensor(seq_lengths, dtype=torch.int32),
+                seq_lens_cpu=seq_lengths, out_cache_loc=out_loc,
+                num_tokens=tail_total, extend_seq_lens=tail_tensor,
+                extend_seq_lens_cpu=tail_lens,
+                extend_start_loc=tail_tensor.cumsum(0) - tail_tensor,
+                forward_batch=forward_batch,
+                swa_replay_start=floor if replay else None)
+
+    def test_short_hcu_fallback_and_non_aligned_tails(self):
+        for length in (1, 4, 8, 9, 127, 128, 129, 131, 32768):
+            with self.subTest(length=length):
+                self.check_padding([length], prefixes=[37])
+
+    def test_generic_cp_padding_is_preserved(self):
+        for lengths in ([9], [131], [17, 4097, 3]):
+            with self.subTest(lengths=lengths):
+                self.check_padding(lengths, cp_active=True)
+
+    def test_multiple_requests_preserve_distinct_window_floors(self):
+        self.check_padding([5, 129, 3], prefixes=[0, 4096, 100])
+
+    def test_without_replay_is_unchanged(self):
+        self.check_padding([4], replay=False)
+
+
 if __name__ == '__main__':
     unittest.main()
