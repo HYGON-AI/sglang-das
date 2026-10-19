@@ -1147,7 +1147,8 @@ def _tail_rows(
     t: torch.Tensor, *, token_indices: torch.Tensor, contiguous_start: Optional[int]
 ) -> torch.Tensor:
     if contiguous_start is not None:
-        return t[contiguous_start:]
+        # Bounded: a CP-padded extend (HCU) carries padding rows past the tail.
+        return t[contiguous_start : contiguous_start + token_indices.shape[0]]
     return t[token_indices]
 
 
@@ -1694,7 +1695,11 @@ class DeepseekV4AttnBackend(
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> DSV4Metadata:
         padded_num_tokens = out_cache_loc.shape[0]
-        cp_active = forward_batch is not None and is_cp_active(forward_batch)
+        # An explicit layout (decoder SWA tail) is CP too: HCU's legacy prefill CP
+        # never reports is_cp_active.
+        cp_active = cp_metadata is not None or (
+            forward_batch is not None and is_cp_active(forward_batch)
+        )
         if cp_active:
             if cp_metadata is None:
                 cp_metadata = forward_batch.attn_cp_metadata
@@ -1856,8 +1861,29 @@ class DeepseekV4AttnBackend(
             return True
         return int(seq_lens_cpu.max().item()) <= max_seq_len
 
+    def convert_late_layer_tail_to_hcu_cp(self, forward_batch: ForwardBatch) -> None:
+        """Rebuild the tail over this rank's rows under HCU's legacy prefill CP.
+
+        That CP splits the extend round-robin inside the model forward, after
+        init_forward_metadata built the tail over the whole extend. Its split is the
+        interleave layout (token t on rank t % cp_size at local row t // cp_size), so
+        the tail takes the CP-v2 layout; the HCU all-gather reads its gather_index.
+        """
+        if self.tail_forward_metadata is None:
+            return
+        from sglang.srt.layers.moe import get_moe_a2a_backend
+
+        if get_moe_a2a_backend().is_none():
+            raise NotImplementedError(
+                "decoder SWA bounded replay under HCU prefill CP needs an MoE A2A "
+                "backend: without one the round-robin input ids are not rank-local"
+            )
+        self.tail_forward_metadata = self._build_late_layer_tail_metadata(
+            forward_batch, legacy_cp=True
+        )
+
     def _build_late_layer_tail_metadata(
-        self, forward_batch: ForwardBatch
+        self, forward_batch: ForwardBatch, legacy_cp: bool = False
     ) -> DSV4Metadata:
         # Each request contributes only its last SWA_WINDOW extend tokens, with the
         # window floored at the tail start: window KV before it is never written here.
@@ -1882,7 +1908,7 @@ class DeepseekV4AttnBackend(
         tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
         cp_tail = (
             self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens)
-            if is_cp_active(forward_batch)
+            if legacy_cp or is_cp_active(forward_batch)
             else None
         )
 
@@ -2077,6 +2103,10 @@ class DeepseekV4AttnBackend(
         if tail.cp_metadata is not None:
             forward_batch.attn_cp_metadata = tail.cp_metadata
             set_local_dp_buffer_len(sum(tail.cp_metadata.per_rank_actual_token))
+        if is_cp_cache_layer_split_deepseek_v4_pool(self.token_to_kv_pool):
+            # The LayerSplit read pages are cached per batch from the full extend's
+            # indices; the tail reads other rows, so pick them again.
+            self.token_to_kv_pool.reset_batch_active_pages()
         return saved
 
     def exit_late_layer_tail(self, saved: tuple, forward_batch: ForwardBatch) -> None:
