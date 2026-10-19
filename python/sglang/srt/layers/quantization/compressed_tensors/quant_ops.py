@@ -14,6 +14,8 @@
 
 from typing import Optional
 
+import os
+
 import torch
 
 try:
@@ -22,6 +24,48 @@ except Exception:
     print(
         "INFO: Please install lightop if you want to infer gptq or awq or w8a8 model.\n"
     )
+
+
+# Mapping from the `tune` values used in `triton_scaled_mm` to the lightop asm
+# kernel files that `gemm_w8a8_smooth_asm` loads on first use. WARNING: the
+# keys are lightop's `Tunning_slide_block` enum values (B_32x32x256 = 1,
+# B_64x64x128_WARPN4 = 9) and the file names are hardcoded in lightop's
+# `gemm_w8a8_smooth_asm.cu`; re-verify both against the vendored lightop
+# version whenever the fast path or lightop is updated. Probing the wrong
+# file here is unsafe in the "probe passes but the real kernel is missing"
+# direction (lightop exits the process instead of raising).
+_W8A8_SMOOTH_ASM_CO_FILES = {
+    1: {
+        torch.half: "gemm_w8a8_smooth_32x32x256_TN_FP16.co",
+        torch.bfloat16: "gemm_w8a8_smooth_32x32x256_TN_BF16.co",
+    },
+    9: {
+        torch.half: "gemm_w8a8_smooth_64x64x128_WGM1_TN_FP16_WARPM1_WARPK1_WARPN4.co",
+        torch.bfloat16: "gemm_w8a8_smooth_64x64x128_WGM1_TN_BF16_WARPM1_WARPK1_WARPN4.co",
+    },
+}
+
+
+def _w8a8_smooth_asm_co_exists(tune: int, out_dtype: torch.dtype) -> bool:
+    """Check that the lightop asm kernel (.co) required by `tune` exists.
+
+    `gemm_w8a8_smooth_asm` builds a static `AiterAsmKernel` that loads the .co
+    via hipModuleLoad inside lightop's C++ `HIP_CALL` macro, which calls
+    `exit(0)` on failure. A missing file therefore kills the scheduler process
+    without raising a Python exception, so the `try/except` below can never
+    rescue it. Probe the file under `LIGHTOP_ASM_DIR` first and fall back to
+    the Triton path when it is absent (e.g. gfx928/gfx936 packages that do not
+    ship the WARPN4 kernel).
+    """
+    if tune not in _W8A8_SMOOTH_ASM_CO_FILES:
+        return False
+    co_file = _W8A8_SMOOTH_ASM_CO_FILES[tune].get(out_dtype)
+    if co_file is None:
+        return False
+    asm_dir = os.environ.get("LIGHTOP_ASM_DIR", "")
+    if not asm_dir:
+        return False
+    return os.path.exists(os.path.join(asm_dir, co_file))
 
 
 def triton_scaled_mm(
@@ -57,6 +101,11 @@ def triton_scaled_mm(
         else:
             tune = None
         # The tuned slide values are valid for complete K=256 tiles.
+        if tune is not None and k_i % 256 == 0:
+            # lightop's C++ layer exits the process when the asm kernel file is
+            # missing, so probe it here and fall back to Triton if absent.
+            if not _w8a8_smooth_asm_co_exists(tune, out_dtype):
+                tune = None
         if tune is not None and k_i % 256 == 0:
             from lightop import op as _lop
 
