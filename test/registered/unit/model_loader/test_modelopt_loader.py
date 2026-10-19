@@ -65,7 +65,7 @@ from sglang.test.test_utils import CustomTestCase
 
 # Note: PYTHONPATH=python should be set when running tests
 
-register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 # HCU BW1100 validated on 10.16.1.66/dxl-sglang: keep disabled because modelopt_fp8 is unsupported on ROCm/HIP.
 register_hcu_ci(
