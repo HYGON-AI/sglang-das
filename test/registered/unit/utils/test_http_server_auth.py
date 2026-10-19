@@ -6,8 +6,15 @@ Usage:
 """
 
 import unittest
+from contextlib import asynccontextmanager
 
-from sglang.srt.utils.auth import AuthLevel, decide_request_auth
+from sglang.srt.utils.auth import (
+    AuthConfigNotReady,
+    AuthLevel,
+    add_api_key_middleware,
+    auth_level,
+    decide_request_auth,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -291,6 +298,130 @@ class TestHttpServerAdminAuth(unittest.TestCase):
                     ).allowed,
                     msg=f"expected allowed for {path=} with {keys=}",
                 )
+
+
+class TestDynamicAuthMiddleware(unittest.TestCase):
+    def _make_app(self, keys, *, single_tokenizer=False):
+        from fastapi import FastAPI
+
+        state = {"ready": False}
+
+        def provider():
+            if single_tokenizer:
+                return None
+            if not state["ready"]:
+                raise AuthConfigNotReady()
+            return keys
+
+        @asynccontextmanager
+        async def lifespan(app):
+            # The middleware stack is already built when lifespan runs.
+            state["ready"] = True
+            yield
+            state["ready"] = False
+
+        app = FastAPI(lifespan=lifespan)
+
+        @app.get("/v1/models")
+        @app.get("/health")
+        @app.get("/metrics")
+        async def public():
+            return {"ok": True}
+
+        @app.get("/admin")
+        @auth_level(AuthLevel.ADMIN_OPTIONAL)
+        async def admin():
+            return {"ok": True}
+
+        @app.get("/admin_force")
+        @auth_level(AuthLevel.ADMIN_FORCE)
+        async def admin_force():
+            return {"ok": True}
+
+        add_api_key_middleware(
+            app, api_key=None, admin_api_key=None, auth_config_provider=provider
+        )
+        if single_tokenizer:
+            add_api_key_middleware(app, api_key=keys[0], admin_api_key=keys[1])
+        return app
+
+    def test_keys_resolved_after_lifespan_startup(self):
+        from fastapi.testclient import TestClient
+
+        for single in (False, True):
+            for api_key, admin_key in (
+                (None, None),
+                ("user", None),
+                (None, "admin"),
+                ("user", "admin"),
+            ):
+                with self.subTest(single=single, api_key=api_key, admin_key=admin_key):
+                    with TestClient(
+                        self._make_app((api_key, admin_key), single_tokenizer=single)
+                    ) as client:
+                        for path, expected_key in (
+                            ("/v1/models", api_key),
+                            ("/admin", admin_key or api_key),
+                        ):
+                            for token in (None, "wrong", "user", "admin"):
+                                headers = (
+                                    {}
+                                    if token is None
+                                    else {"Authorization": f"Bearer {token}"}
+                                )
+                                expected = (
+                                    200
+                                    if not expected_key or token == expected_key
+                                    else 401
+                                )
+                                self.assertEqual(
+                                    client.get(path, headers=headers).status_code,
+                                    expected,
+                                )
+                        self.assertEqual(client.get("/health").status_code, 200)
+                        self.assertEqual(client.get("/metrics").status_code, 200)
+                        for token in (None, "wrong", "user", "admin"):
+                            headers = (
+                                {}
+                                if token is None
+                                else {"Authorization": f"Bearer {token}"}
+                            )
+                            expected = (
+                                403
+                                if not admin_key
+                                else (200 if token == admin_key else 401)
+                            )
+                            self.assertEqual(
+                                client.get("/admin_force", headers=headers).status_code,
+                                expected,
+                            )
+
+    def test_uninitialized_config_returns_503(self):
+        from fastapi.testclient import TestClient
+
+        # Without the context manager, TestClient does not run lifespan.
+        client = TestClient(self._make_app(("user", None)))
+        self.addCleanup(client.close)
+        response = client.get("/v1/models")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.json(), {"error": "Authentication configuration is not ready"}
+        )
+
+    def test_unexpected_provider_error_is_not_bypassed(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        def broken_provider():
+            raise ValueError("bad auth configuration")
+
+        app = FastAPI()
+        add_api_key_middleware(
+            app, api_key=None, admin_api_key=None, auth_config_provider=broken_provider
+        )
+        with TestClient(app) as client:
+            with self.assertRaisesRegex(ValueError, "bad auth configuration"):
+                client.get("/v1/models")
 
 
 if __name__ == "__main__":

@@ -174,7 +174,13 @@ from sglang.srt.utils import (
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
-from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
+from sglang.srt.utils.auth import (
+    AuthConfigNotReady,
+    AuthLevel,
+    add_api_key_middleware,
+    app_has_admin_force_endpoints,
+    auth_level,
+)
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
     dumps_json,
@@ -213,6 +219,15 @@ def get_global_state() -> _GlobalState:
     return _global_state
 
 
+def _get_multi_tokenizer_auth_config():
+    if getattr(app, "is_single_tokenizer_mode", False):
+        return None  # Single-tokenizer mode uses its existing static middleware.
+    if _global_state is None:
+        raise AuthConfigNotReady()
+    server_args = _global_state.tokenizer_manager.server_args
+    return server_args.api_key, server_args.admin_api_key
+
+
 async def init_multi_tokenizer() -> ServerArgs:
     """
     Initialization function for multi-process tokenizer mode.
@@ -226,11 +241,6 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
     server_args: ServerArgs
     port_args: PortArgs
-
-    # API key authentication is not supported in multi-tokenizer mode
-    assert (
-        server_args.api_key is None
-    ), "API key is not supported in multi-tokenizer mode"
 
     # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
@@ -458,6 +468,14 @@ app = FastAPI(
     openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
 )
 app.router.route_class = ORJSONRoute
+# Spawned HTTP workers import this app before lifespan initializes their keys.
+# Register now: Starlette disallows adding middleware during lifespan startup.
+add_api_key_middleware(
+    app,
+    api_key=None,
+    admin_api_key=None,
+    auth_config_provider=_get_multi_tokenizer_auth_config,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -2660,7 +2678,7 @@ def _setup_and_run_http_server(
         )
 
         # Add api key authorization
-        # This is only supported in single tokenizer mode.
+        # Multi-tokenizer workers use the module-level dynamic middleware.
         #
         # Backward compatibility:
         # - api_key only: behavior matches legacy (all endpoints require api_key)
@@ -2671,8 +2689,6 @@ def _setup_and_run_http_server(
             or server_args.admin_api_key
             or app_has_admin_force_endpoints(app)
         ):
-            from sglang.srt.utils.auth import add_api_key_middleware
-
             add_api_key_middleware(
                 app,
                 api_key=server_args.api_key,
