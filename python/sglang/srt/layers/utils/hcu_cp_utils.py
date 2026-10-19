@@ -372,6 +372,11 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
             output_tensor,
             input_tensor,
         )
+        gather_index = getattr(forward_batch.attn_cp_metadata, "gather_index", None)
+        if gather_index is not None:
+            # Decoder SWA bounded replay tail (interleave layout): ranks hold uneven,
+            # padded shares, so map the rank-major rows straight to global tail order.
+            return output_tensor[gather_index]
         out_shape = output_tensor.shape
         output_tensor = (
             output_tensor.view(cp_size, -1, *out_shape[1:])

@@ -4038,9 +4038,20 @@ def _scatter_tail_rows(
     # Rows outside the tail are never read (see _check_late_layer_tail_readers).
     full = rows.new_empty((num_tokens, rows.shape[1]))
     if tail.contiguous_start is not None:
-        full[tail.contiguous_start :].copy_(rows)
+        # Bounded: a CP-padded extend (HCU) carries padding rows past the tail.
+        end = tail.contiguous_start + rows.shape[0]
+        full[tail.contiguous_start : end].copy_(rows)
     else:
         full[tail.token_indices] = rows[: tail.token_indices.shape[0]]
+    return full
+
+
+def _scatter_global_tail_rows(
+    tail: LateLayerTail, rows: torch.Tensor, num_tokens: int
+) -> torch.Tensor:
+    # CP-gathered tail rows are in global tail order; place them in the global extend.
+    full = rows.new_empty((num_tokens, *rows.shape[1:]))
+    full[tail.global_token_indices] = rows
     return full
 
 
@@ -4760,8 +4771,16 @@ class DeepseekV4Model(nn.Module):
                 hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
             )
         hidden_states = self.norm(hidden_states)
+        # HCU prefill CP left the decoder tail rank-local: gather it under its own
+        # layout, which yields the tail rows in global order.
+        hcu_cp_tail = (
+            cp_gather_output and tail is not None and tail.cp_metadata is not None
+        )
         if cp_gather_output:
             stream = torch.cuda.current_stream()
+            full_cp_metadata = forward_batch.attn_cp_metadata
+            if hcu_cp_tail:
+                forward_batch.attn_cp_metadata = tail.cp_metadata
             pre_hc_head = cp_all_gather_rerange_output(
                 pre_hc_head, self.cp_size, forward_batch, stream
             )
@@ -4781,16 +4800,26 @@ class DeepseekV4Model(nn.Module):
                         pd_aux_hidden, self.cp_size, forward_batch, stream
                     )
                 )
+            forward_batch.attn_cp_metadata = full_cp_metadata
 
         if tail is not None and not capture_dspark:
             # The logits processor indexes rows by the full extend layout.
-            num_tokens = input_ids.shape[0]
-            hidden_states = _scatter_tail_rows(
-                tail=tail, rows=hidden_states, num_tokens=num_tokens
-            )
-            pre_hc_head = _scatter_tail_rows(
-                tail=tail, rows=pre_hc_head, num_tokens=num_tokens
-            )
+            if hcu_cp_tail:
+                num_tokens = forward_batch.input_ids.shape[0]
+                hidden_states = _scatter_global_tail_rows(
+                    tail=tail, rows=hidden_states, num_tokens=num_tokens
+                )
+                pre_hc_head = _scatter_global_tail_rows(
+                    tail=tail, rows=pre_hc_head, num_tokens=num_tokens
+                )
+            else:
+                num_tokens = input_ids.shape[0]
+                hidden_states = _scatter_tail_rows(
+                    tail=tail, rows=hidden_states, num_tokens=num_tokens
+                )
+                pre_hc_head = _scatter_tail_rows(
+                    tail=tail, rows=pre_hc_head, num_tokens=num_tokens
+                )
 
         if capture_dspark:
             return (hidden_states, pre_hc_head), pd_aux_hidden
@@ -5122,6 +5151,25 @@ class DeepseekV4ForCausalLM(nn.Module):
                         metadata.indexer_metadata = (
                             attn_backend.init_forward_metadata_indexer(core_meta)
                         )
+                    if getattr(attn_backend, "tail_forward_metadata", None) is not None:
+                        # decoder SWA bounded replay: the tail was built before the split
+                        convert = getattr(
+                            attn_backend, "convert_late_layer_tail_to_hcu_cp", None
+                        )
+                        if convert is None:
+                            raise NotImplementedError(
+                                "decoder SWA bounded replay under HCU prefill CP is "
+                                f"not wired for {type(attn_backend).__name__}"
+                            )
+                        convert(forward_batch)
+                elif (
+                    getattr(get_attn_backend(), "tail_forward_metadata", None)
+                    is not None
+                ):
+                    raise NotImplementedError(
+                        "decoder SWA bounded replay supports only the round-robin "
+                        "(interleave) HCU prefill CP split"
+                    )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
@@ -5173,7 +5221,12 @@ class DeepseekV4ForCausalLM(nn.Module):
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             tail = get_attn_backend().tail_forward_metadata.late_layer_tail
-            input_ids = tail.rows(input_ids)
+            # an HCU CP tail was gathered to global tail order; index the global extend
+            input_ids = (
+                input_ids[tail.global_token_indices]
+                if tail.global_token_indices is not None
+                else tail.rows(input_ids)
+            )
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
             logits_metadata.extend_seq_lens = tail.extend_seq_lens
             logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
@@ -5190,7 +5243,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             ),
         )
         if tail is not None:
-            output.hidden_states_token_indices = tail.token_indices
+            output.hidden_states_token_indices = (
+                tail.global_token_indices
+                if tail.global_token_indices is not None
+                else tail.token_indices
+            )
         if pd_aux_hidden_states is not None and (
             has_pd_hidden_capture or self.model.dspark_layers_to_capture is not None
         ):
