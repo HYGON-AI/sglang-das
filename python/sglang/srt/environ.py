@@ -1116,6 +1116,10 @@ class Envs:
     SGLANG_USE_LIGHTOP_DSV41_PAGED_INDEXER = EnvBool(True)
     # HCU block selection on dense logits; 0 keeps the block-amax + top-k path.
     SGLANG_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS = EnvBool(True)
+    # Consume Prefill candidates directly from the paged index-K cache on HCU.
+    SGLANG_HCU_PREFILL_PAGED_SPARSE = EnvBool(True)
+    # Use LightOp pointwise/geometry/output fusion; GEMMs and scorer stay unchanged.
+    SGLANG_HCU_PREFILL_SPARSE_FUSION = EnvBool(True)
     SGLANG_USE_FAST_HADAMARD_TRANSFORM = EnvBool(False)
     SGLANG_USE_FUSED_DPSKV4_QNORM_ROPE_KV_ROPE_QUANT = EnvBool(False)
     SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)

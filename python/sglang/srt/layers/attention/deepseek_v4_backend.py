@@ -3960,8 +3960,6 @@ class DeepseekV4AttnBackend(
             or indexer.is_candidate_source
             or indexer.candidate_block_size != 8
             or indexer.n_local_heads != 32
-            # Below 64K, the existing dense tile is faster on HCU.
-            or max(lc_per_req, default=0) < 65536
             or max(lc_per_req, default=0) <= indexer.candidate_topk_blocks * 8
         ):
             return None
@@ -4004,9 +4002,6 @@ class DeepseekV4AttnBackend(
         indexer = layer.indexer
         page_indices = core.sparse_page_indices(ratio)
         raw_indices = core.sparse_raw_indices(ratio)
-        page_indices.fill_(-1)
-        if raw_indices is not None:
-            raw_indices.fill_(-1)
 
         seq_lens_cpu = _as_int_list(forward_batch.seq_lens_cpu)
         assert seq_lens_cpu is not None
@@ -4018,11 +4013,42 @@ class DeepseekV4AttnBackend(
         num_tokens = pos.shape[0]
         # TODO(candidate): move this to candidate indexer
         if not any(lc_per_req) or num_tokens == 0:
+            page_indices.fill_(-1)
+            if raw_indices is not None:
+                raw_indices.fill_(-1)
             if indexer.is_candidate_source:
                 self.forward_metadata.candidate_metadata = CandidateMasks(
                     request_masks=[empty_mask for _ in lc_per_req]
                 )
             return
+        if _is_hcu and indexer.uses_candidates and not indexer.is_candidate_source:
+            from sglang.srt.layers.attention.dsv4.prefill_sparse_lightop import (
+                consume_prefill_candidate_sparse,
+                prefill_paged_sparse_enabled,
+            )
+
+            if prefill_paged_sparse_enabled() and consume_prefill_candidate_sparse(
+                pool=pool,
+                indexer=indexer,
+                layer_id=layer.layer_id,
+                x=x,
+                q_lora=q_lora,
+                freqs_cis=layer.freqs_cis,
+                positions=pos,
+                req_to_token=self.req_to_token,
+                request_pool_indices=forward_batch.req_pool_indices,
+                lc_per_request=lc_per_req,
+                rows_per_request=q_lens_cpu,
+                candidate_metadata=self.forward_metadata.candidate_metadata,
+                compress_ratio=ratio,
+                page_indices=page_indices,
+                raw_indices=raw_indices,
+                budget_bytes=_TORCH_INDEXER_SCORE_BUDGET_BYTES,
+            ):
+                return
+        page_indices.fill_(-1)
+        if raw_indices is not None:
+            raw_indices.fill_(-1)
         use_hcu_prep = (
             isinstance(self.forward_metadata, DSV4Metadata)
             and self.forward_metadata.low_ratio_query_lens is not None
@@ -4180,9 +4206,17 @@ class DeepseekV4AttnBackend(
             and _hcu_candidate_logits_available()
             and indexer.candidate_block_size == 8
             and indexer.n_local_heads == 32
-            and max(lc_per_req, default=0) >= 65536
-            and max(lc_per_req, default=0) > indexer.candidate_topk_blocks * 8
         )
+        if publish is not None and _is_hcu:
+            from sglang.srt.layers.attention.dsv4.prefill_sparse_lightop import (
+                prefill_paged_sparse_enabled,
+            )
+
+            retain_blocks = retain_blocks or (
+                prefill_paged_sparse_enabled()
+                and indexer.candidate_block_size == 8
+                and indexer.n_local_heads == 32
+            )
         publish_blocks = [] if retain_blocks else None
         consume = (
             None
