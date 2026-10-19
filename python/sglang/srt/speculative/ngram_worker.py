@@ -41,7 +41,7 @@ if is_xpu() or is_hip():
     from sglang.kernels.ops.speculative.reconstruct_tree import (
         reconstruct_indices_from_tree_mask_triton as reconstruct_indices_from_tree_mask,
     )
-elif is_cuda():
+elif is_cuda() or is_hip():
     from sglang.kernels.ops.speculative.tree import reconstruct_indices_from_tree_mask
 else:
     from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
@@ -480,7 +480,13 @@ class NGRAMWorker(BaseSpecWorker):
                 predict,
                 accept_lens,
                 accept_index,
-            ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+            ) = eagle_sample(
+                verify_input,
+                batch,
+                logits_output,
+                grammar_mask,
+                watermark_state=self.model_runner.watermark_state,
+            )
             new_seq_lens = batch.seq_lens + accept_lens
             commit_mamba_states_after_verify(
                 self.target_worker,
@@ -489,7 +495,17 @@ class NGRAMWorker(BaseSpecWorker):
                 accept_index,
                 self.draft_token_num,
             )
-            accept_tokens = predict[accept_index].flatten()
+            accept_tokens = predict[accept_index]
+            if (
+                self.model_runner.watermark_state is not None
+                and batch.sampling_info.has_watermark_candidates
+            ):
+                self.model_runner.watermark_state.append_speculative(
+                    batch.req_pool_indices,
+                    accept_tokens,
+                    accept_lens,
+                )
+            accept_tokens = accept_tokens.flatten()
             next_token_ids = accept_tokens
 
             # The KV mover expects drafts-only counts. NGRAM's

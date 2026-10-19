@@ -14,6 +14,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Sequence,
     Tuple,
     Type,
     overload,
@@ -474,17 +475,13 @@ class PDHiddenRowPool:
 
             merged = []
             existing_idx = freed_idx = 0
-            while (
-                existing_idx < len(self._free_intervals)
-                or freed_idx < len(freed_intervals)
+            while existing_idx < len(self._free_intervals) or freed_idx < len(
+                freed_intervals
             ):
-                if (
-                    freed_idx == len(freed_intervals)
-                    or (
-                        existing_idx < len(self._free_intervals)
-                        and self._free_intervals[existing_idx][0]
-                        < freed_intervals[freed_idx][0]
-                    )
+                if freed_idx == len(freed_intervals) or (
+                    existing_idx < len(self._free_intervals)
+                    and self._free_intervals[existing_idx][0]
+                    < freed_intervals[freed_idx][0]
                 ):
                     interval = self._free_intervals[existing_idx]
                     existing_idx += 1
@@ -620,7 +617,9 @@ class PDHiddenTransferPlan(msgspec.Struct):
             return new_dynamic_dst
 
         if item_len > 0:
-            new_dynamic_dst["ptr"] = int(new_dynamic_dst.get("ptr", 0)) + offset * item_len
+            new_dynamic_dst["ptr"] = (
+                int(new_dynamic_dst.get("ptr", 0)) + offset * item_len
+            )
         plan = PDHiddenTransferPlan.build(new_row_count, item_len)
         new_dynamic_dst["row_chunks"] = plan.row_chunks
         return new_dynamic_dst
@@ -1382,6 +1381,28 @@ def compute_mamba_state_slice_byte_blocks(
     return blocks
 
 
+def is_elided_entry(
+    src_len: int,
+    dst_lens: Optional[Sequence[int]],
+    dst_index: int,
+    *,
+    allow_dst_elision: bool = True,
+) -> bool:
+    """True when either peer elided this entry (a 0-row DSA index-K buffer).
+
+    Nothing moves for it, and the elided side never registered the buffer.
+    allow_dst_elision=False restricts the skip to a zero-length source.
+    """
+    if src_len == 0:
+        return True
+    return (
+        allow_dst_elision
+        and dst_lens is not None
+        and dst_index < len(dst_lens)
+        and dst_lens[dst_index] == 0
+    )
+
+
 def build_transfer_entry_pairs(
     src_layer_ids: List[int],
     dst_layer_ids: List[int],
@@ -1481,9 +1502,7 @@ def build_kv_layer_ids(
         pool=draft_token_to_kv_pool, num_entries=num_draft_entries
     )
     band_index = {lid: i for i, lid in enumerate(dict.fromkeys(draft_ids))}
-    return target_layer_ids + [
-        num_hidden_layers + band_index[lid] for lid in draft_ids
-    ]
+    return target_layer_ids + [num_hidden_layers + band_index[lid] for lid in draft_ids]
 
 
 def _remap_draft_layer_ids(layer_ids: List[int], num_hidden_layers: int) -> List[int]:
@@ -1818,6 +1837,7 @@ def setup_state_kv_args(
     from sglang.srt.mem_cache.memory_pool import (
         DSATokenToKVPool,
         HybridLinearKVPool,
+        MHATokenToKVPool,
         MHATokenToKVPoolMXFP8,
         MiniMaxSparseKVPool,
     )
@@ -1837,6 +1857,8 @@ def setup_state_kv_args(
     kv_args.state_conv_shard_groups = []
 
     from sglang.srt.disaggregation.glm5_next import append_hcu_dsa_state
+
+    kv_args.swa_kv_cache_layout = None
     # V4's KVCache is organized by compression-ratio buckets rather than by layer.
     kv_args.mla_compression_ratios = (
         list(token_to_kv_pool.compression_ratios)
@@ -1887,6 +1909,12 @@ def setup_state_kv_args(
             append_state_component(
                 kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
             )
+            if isinstance(token_to_kv_pool, SWAKVPool) and isinstance(
+                token_to_kv_pool.swa_kv_pool, MHATokenToKVPool
+            ):
+                kv_args.swa_kv_cache_layout = (
+                    token_to_kv_pool.swa_kv_pool.kv_cache_layout
+                )
             # MXFP8 KV: each sub-pool's block scales ride as their own component
             # so they inherit the index payload of the KV they describe.
             # Only the concrete SWAKVPool owns a full sub-pool; other

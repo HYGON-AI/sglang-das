@@ -49,6 +49,7 @@ from sglang.kernels.ops.kvcache.cache_move import (
     set_kv_buffer_prefix_valid_tiled,
     set_kv_buffer_prefix_valid_tiled_fp8,
 )
+from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
@@ -110,6 +111,7 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
 
 from sglang.srt.utils import get_bool_env_var
 
@@ -515,6 +517,8 @@ class ReqToTokenPool:
 
 
 class MambaPool:
+    host_capacity_tokens: Optional[int] = None
+
     # Axis of each two-dimensional conv state that represents the sliding window.
     # Upstream states use (dim, K-1); subclasses may preserve another layout.
     conv_window_axis = -1
@@ -1092,6 +1096,31 @@ class MambaPool:
         self.conv_shard_groups = getattr(cache_params.shape, "conv_shard_groups", None)
         self.conv_slice_axis = getattr(cache_params.shape, "conv_slice_axis", 0)
         self._warmup_fused_copy_slot_kernel()
+
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        """Checkpoint buffers for host transfer, excluding speculative work space."""
+        from sglang.srt.mem_cache.device_pool_info import (
+            DevicePoolInfo,
+            MambaStateBufferInfo,
+        )
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        return (
+            DevicePoolInfo(
+                pool_name=PoolName.MAMBA,
+                indices_from_pool=PoolName.MAMBA,
+                layer_ids=tuple(self.mamba_layer_ids),
+                buffer_info=MambaStateBufferInfo(
+                    temporal=self.mamba_cache.temporal,
+                    conv=tuple(self.mamba_cache.conv),
+                    extra_checkpoint_buffers=tuple(
+                        buffer
+                        for sibling in self._slot_siblings
+                        for _, buffer, _, _ in sibling.iter_transfer_state_entries()
+                    ),
+                ),
+            ),
+        )
 
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
@@ -2078,6 +2107,7 @@ class KVCache(abc.ABC):
 
     def get_kv_layer_ids(self) -> List[int]:
         return list(range(self.start_layer, self.end_layer))
+
     def host_pool_decls(self):
         """Host pools HiCache keeps for the buffers this device pool (and its
         sub-pools) owns: the KV pool itself, plus dependent pools such as sparse
@@ -2529,8 +2559,7 @@ class MHATokenToKVPool(KVCache):
             strides = kv_strides + extra_strides
         else:
             strides = [
-                x.stride(0) * x.dtype.itemsize
-                for x in slot_move_pointer_buffers
+                x.stride(0) * x.dtype.itemsize for x in slot_move_pointer_buffers
             ]
         self.data_strides = torch.tensor(strides, device=self.device)
 
@@ -2621,6 +2650,8 @@ class MHATokenToKVPool(KVCache):
     # -- post-capture VA backing (opt-in; overridable per layout) --------------
 
     def _kv_tokens_per_row(self) -> int:
+        if _is_hcu and _kv_layout_hcu_fa and not self.use_hnd:
+            return self.page_size
         # A row is a whole page when the leading dim is pages (hnd, vectorized_5d),
         # a single token slot for the plain NHD [slots, ...] layout.
         return 1 if self.kv_cache_layout == "nhd" else self.page_size
@@ -2969,6 +3000,19 @@ class MHATokenToKVPool(KVCache):
             # A slot is [page, :, off, :] (not a contiguous row), so scatter by (page, off).
             k_buf = self.k_buffer[layer_id - self.start_layer]
             v_buf = self.v_buffer[layer_id - self.start_layer]
+            if (
+                _is_cuda
+                and self.head_dim == self.v_head_dim
+                and cache_k.stride()[1:] == cache_v.stride()[1:] == (self.head_dim, 1)
+            ):
+                launch_reshape_and_cache_flash(
+                    cache_k,
+                    cache_v,
+                    k_buf.permute(0, 2, 1, 3),
+                    v_buf.permute(0, 2, 1, 3),
+                    loc,
+                )
+                return
             pages = loc // self.page_size
             offs = loc % self.page_size
             k_buf[pages, :, offs, :] = cache_k
@@ -4968,6 +5012,7 @@ class MLATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         use_dsa: bool = False,
         override_kv_cache_dim: Optional[int] = None,
+        dcp_replicated: bool = False,
     ):
         super().__init__(
             size,
@@ -4983,6 +5028,7 @@ class MLATokenToKVPool(KVCache):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_dsa = use_dsa
+        self.dcp_replicated = dcp_replicated
         self.dsa_kv_cache_store_fp8 = (
             use_dsa
             and dtype == torch.float8_e4m3fn
@@ -5081,11 +5127,14 @@ class MLATokenToKVPool(KVCache):
     # False: this pool takes a WIDENED loc. The unified pool resolves it in
     # the plan's write translation (`translate_write_loc`) and flips this.
     write_loc_is_dcp_resolved = False
+    dcp_replicated = False
 
     @property
     def _write_loc_dcp_span(self) -> int:
         """How many logical ids one stored row spans in the write-loc space."""
-        return 1 if self.write_loc_is_dcp_resolved else get_parallel().attn_dcp_size
+        if self.write_loc_is_dcp_resolved or self.dcp_replicated:
+            return 1
+        return get_parallel().attn_dcp_size
 
     def _scatter_mla_rows(
         self,
@@ -5094,7 +5143,7 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> None:
-        if self.write_loc_is_dcp_resolved:
+        if self.write_loc_is_dcp_resolved or self.dcp_replicated:
             set_mla_kv_buffer_triton(dst_buffer, loc, cache_k_nope, cache_k_rope)
         else:
             set_mla_kv_buffer_dcp_sharded_triton(
@@ -5118,7 +5167,11 @@ class MLATokenToKVPool(KVCache):
         assert not self.dsa_kv_cache_store_fp8
         # No DCP-aware variant is possible: the two backends reaching this door
         # disagree on the loc space (flashinfer-MLA widened, Triton collapsed).
-        assert self.write_loc_is_dcp_resolved or not get_parallel().dcp_enabled, (
+        assert (
+            self.write_loc_is_dcp_resolved
+            or self.dcp_replicated
+            or not get_parallel().dcp_enabled
+        ), (
             "MLATokenToKVPool.set_kv_buffer has no DCP-aware write path. Under "
             "--dcp-size > 1 the MLA write must go through set_mla_kv_buffer, "
             "whose kernel resolves the owner rule; reaching the combined-row "
@@ -5499,6 +5552,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
         indexer_layer_ids: Optional[Sequence[int]] = None,
+        dcp_replicated: bool = False,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -5517,6 +5571,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             end_layer,
             use_dsa=True,
             override_kv_cache_dim=override_dim,
+            dcp_replicated=dcp_replicated,
         )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
@@ -5527,7 +5582,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
         assert self.page_size % index_kpool == 0, (
             f"page_size {self.page_size} must be a multiple of index_kpool {index_kpool}"
         )
-        self.index_page_size = self.page_size if _is_hcu else self.page_size // index_kpool
+        self.index_page_size = (
+            self.page_size if _is_hcu else self.page_size // index_kpool
+        )
         layer_range = range(self.start_layer, self.start_layer + self.layer_num)
         if indexer_layer_ids is None:
             resolved_indexer_layer_ids = tuple(layer_range)
@@ -5554,12 +5611,22 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.skip_topk_layers = (
             list(skip_topk_layers)
             if skip_topk_layers is not None
-            else [layer_id not in self.indexer_layer_id_to_index for layer_id in layer_range]
+            else [
+                layer_id not in self.indexer_layer_id_to_index
+                for layer_id in layer_range
+            ]
         )
         if len(self.skip_topk_layers) != self.layer_num:
             raise ValueError("skip_topk_layers must have one entry per local layer")
+        if dcp_replicated and not _is_hcu:
+            self.index_page_size //= get_parallel().attn_dcp_size
         if index_buf_size is None:
-            index_buf_size = size
+            dcp_size = get_parallel().attn_dcp_size
+            index_buf_size = (
+                size
+                if dcp_replicated
+                else (size + self.page_size) * dcp_size - self.page_size
+            )
         self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
@@ -5660,10 +5727,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
             )
 
         num_pages = (self.index_buf_size + self.page_size + 1) // self.page_size
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE), (
-            torch.cuda.use_mem_pool(self.custom_mem_pool)
-            if self.custom_mem_pool
-            else nullcontext()
+        with (
+            self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
+            (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ),
         ):
             self.index_k_dequant_workspace = torch.empty(
                 (
@@ -5720,7 +5790,10 @@ class DSATokenToKVPool(MLATokenToKVPool):
         kv_decls = super().host_pool_decls()
         # Shared-topk layers own a 0-row placeholder, so a non-empty buffer list
         # is not enough: some layer must actually hold index keys.
-        if (not self.index_k_with_scale_buffer and not (_is_hcu and getattr(self, "index_k_buffer", None))) or all(self.skip_topk_layers):
+        if (
+            not self.index_k_with_scale_buffer
+            and not (_is_hcu and getattr(self, "index_k_buffer", None))
+        ) or all(self.skip_topk_layers):
             return kv_decls
         return (*kv_decls, make_dsa_indexer_pool_decl(self))
 

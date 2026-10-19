@@ -49,3 +49,52 @@
 目标保持 DeepSeek-V4-Flash-0731-FP8-Channel、纯 TP8、端口 10015。需服务就绪、graph capture 与至少 3 次 replay、完整 EvalScope HumanEval；尚无本次精度结论。
 
 证据目录：`/home/proj_sglang_open/sync-evidence/20261019/`。
+
+## 第 2 批：ac187c0cd54d9cdf2772584495afe67c82293a2e
+
+| 冲突文件 | 处理 |
+|---|---|
+| `python/sglang/srt/disaggregation/mooncake/conn.py` | 合并 state type/elided entry；Mooncake 先 poison unsettled send，再内部跨 rank failure 同步。 |
+| `python/sglang/srt/disaggregation/nixl/conn.py` | 合并 state type/elided entry；Mooncake 先 poison unsettled send，再内部跨 rank failure 同步。 |
+| `python/sglang/srt/disaggregation/utils.py` | PD state append/SWA layout 并存；DSA effective mode 与 MQA budget helpers 并存。 |
+| `python/sglang/srt/distributed/parallel_state.py` | 合入 AITER graph copy-in；保留 HCU 未注册 all-gather/注册能力判断。 |
+| `python/sglang/srt/entrypoints/openai/serving_base.py` | 保留内部受控 tokenizer offload 与计时，覆盖上游 off-loop 意图。 |
+| `python/sglang/srt/entrypoints/openai/serving_chat.py` | 接新 timestamp、V4.1 多模态编码/default effort、模板缓存、逐 token logprob/tool ordinal；保留 init_glm。 |
+| `python/sglang/srt/layers/attention/deepseek_v4_backend.py` | 新版 sparse-prefill eligibility/V4.1 路径进入非 HCU 分支；HCU FlashMLA 分流保留。 |
+| `python/sglang/srt/layers/attention/dsa/dsa_indexer.py` | 使用真实 index_page_size；HCU 避开 gfx950 preshuffle。 |
+| `python/sglang/srt/layers/attention/dsa/utils.py` | PD state append/SWA layout 并存；DSA effective mode 与 MQA budget helpers 并存。 |
+| `python/sglang/srt/layers/attention/dsa_backend.py` | 新 HiSparse verify 限制使用 effective mode；修复 topk_transform_method 赋值顺序。 |
+| `python/sglang/srt/layers/attention/dsv4/sparse_prefill_utils.py` | 使用上游按请求实际 compressed 长度的扁平 gather，去掉旧矩形 gather。 |
+| `python/sglang/srt/layers/attention/linear/gdn_backend.py` | 无 block-table 才走 HCU causal-conv；否则新官方接口；删除重复 kwargs。 |
+| `python/sglang/srt/layers/attention/qsa/mqa.py` | HCU BoltOPs 仅用于 min_scored_len=0；TileLang 透传新阈值，Torch 完整计算。 |
+| `python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py` | 使用 pack_qsa_prefill_kv；HCU sparse-GQA 快路径加 _is_hcu 保护。 |
+| `python/sglang/srt/layers/cp/bcg.py` | 官方 enum 能力表；保留 HCU interleave DSV4/MegaMoE token 计数/模型 logits 合约。 |
+| `python/sglang/srt/layers/moe/moe_runner/aiter.py` | 保留 HCU input 顺序及 runner；补 EPv2 output view 字段。 |
+| `python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py` | 非 HCU 新 NVFP4 native/weight-only fallback；HCU 保留既有量化分派。 |
+| `python/sglang/srt/layers/sampler.py` | 新 watermark/logprob/mask/max-top-k；LightOp 仅 HCU 且 seed/min-p/mask 条件匹配。 |
+| `python/sglang/srt/managers/tokenizer_manager.py` | tokenize timing 与批量 request-state 安装并存。 |
+| `python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py` | 迁移 build_mamba_host_pool buffer-info API，保留 HCU 布局映射，去除重复 SWA 分配。 |
+| `python/sglang/srt/mem_cache/index_key_cache.py` | 内部 indexer layer mapping 外包新 kernel view，保留 write-buffer API。 |
+| `python/sglang/srt/mem_cache/kv_cache_configurator.py` | HiSparse 仅 target；保留 GLM HCU pool/indexer layer，合入 dcp_replicated。 |
+| `python/sglang/srt/mem_cache/memory_pool.py` | indexer-layer mapping/HCU page size 保留；新 DCP replication/preshuffle 非 HCU；修复 HCU page descriptor。 |
+| `python/sglang/srt/mem_cache/pool_host/base.py` | 新显式几何 API；HCU uneven layer shard host 容量同步；兼容 buffer-only 无 device_pool。 |
+| `python/sglang/srt/mem_cache/pool_host/mla.py` | device-buffer view 与 HCU ownership/warp 参数并存，修复 moved-method 局部变量。 |
+| `python/sglang/srt/model_executor/forward_batch_info.py` | HCU rms_quant_flag 与 full-prefill capture 字段并存。 |
+| `python/sglang/srt/model_executor/pool_configurator.py` | HCU GLM/KDA/layer-split 计费与 HiSparse draft 地址空间比例并存。 |
+| `python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py` | 保留含 capture token sizes 的日志。 |
+| `python/sglang/srt/models/deepseek_v4.py` | CP metadata 放入新 language-input 准备入口；保留 PD aux 打包并裁剪真实 tail rows。 |
+| `python/sglang/srt/models/deepseek_v4_dspark.py` | 保留 HCU 与 invariant imports。 |
+| `python/sglang/srt/models/deepseek_v4_mhc.py` | 新平台 imports 与 HCU AITER/TileLang 分派并存。 |
+| `python/sglang/srt/models/dspark.py` | 新 Markov API 结合 d2t reduced-vocab，保留 confidence features。 |
+| `python/sglang/srt/server_args.py` | 内部 dataclass 构造结合 watermark 脱敏；repr 使用 dataclasses.fields。 |
+| `python/sglang/srt/speculative/eagle_worker_v2.py` | NativeSparse 与 QwenSparse draft graph 支持集合合并。 |
+| `test/registered/unit/layers/moe/test_aiter_runner.py` | 保留 top-k remap、新 EPv2/dispatch 测试；官方 runner 合约显式模拟非 HCU。 |
+
+### 自动合并与测试
+
+- HCU MHA host pool 构造迁移显式几何 API；host common 的 lru_cache/is_hip 拆分遗漏补回。
+- 静态导入 4509 个 merged 模块相对两侧无新增；直接调用关键字相对两侧无新增。
+- AITER：9 passed，显式模拟官方非 HCU runner；不据此宣称 HCU kernel 已验收。
+- MiniMax host pool 原基线 8 failed/1 passed/1 skipped；修复 descriptor 后剩余 3 个 transfer 失败与基线相同，涉及测试 NHD 期望与 HCU 页式布局。
+- Chat/API 初次 171 passed/125 subtests passed、5 failed；logprob/tool ordinal 已接官方修复，相关复测 9 passed/3 subtests passed；其余 3 个失败在原基线同样复现。
+- 完整模型运行验收待所有增量整理后执行。

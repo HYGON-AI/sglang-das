@@ -43,6 +43,10 @@ from sglang.srt.layers.attention.dsa.utils import (
     hadamard_preserved,
     is_dsa_enable_prefill_cp,
     is_graph_dsa_split_op_surface,
+    resolve_fp8_mqa_logits_fn,
+    resolve_fp8_paged_mqa_logits_fn,
+    resolve_num_sms,
+    resolve_paged_mqa_logits_metadata_fn,
 )
 from sglang.srt.layers.attention.graph_variants import DSA_DENSE
 from sglang.srt.layers.attention.mqa_logits_utils import (
@@ -310,9 +314,9 @@ def rotate_activation(x: torch.Tensor, apply_scale: bool = True) -> torch.Tensor
         from sglang.kernels.ops.quantization.hadamard import hadamard_transform
 
     hidden_size = x.size(-1)
-    assert (
-        hidden_size & (hidden_size - 1)
-    ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
+    assert (hidden_size & (hidden_size - 1)) == 0, (
+        "Hidden size must be a power of 2 for Hadamard transform."
+    )
     scale = hidden_size**-0.5 if apply_scale else 1.0
     if _is_hcu and _use_fast_hadamard_transform:
         return hcu_fast_hadamard_transform(x, scale=scale)
@@ -397,7 +401,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.hcu_arch_name: Optional[str] = None
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if _is_cuda:
-            self.sm_count = deep_gemm.get_num_sms()
+            self.sm_count = resolve_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = get_parallel().pp_size
             self.logits_with_pp_recv = (
@@ -831,7 +835,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             pool.invalidate_index_buffer_for_layer(layer_id)
         kv_cache = (
             pool.get_index_k_with_scale_buffer(layer_id=layer_id)
-            .view(-1, pool.page_size, self.head_dim + 4)
+            .view(-1, pool.index_page_size, self.head_dim + 4)
             .view(fp8_dtype)
         )
 
@@ -932,8 +936,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return None
 
         pool = get_token_to_kv_pool()
-        if pool.page_size != PAGE_SIZE:
-            _decline_fused(f"pool page_size is {pool.page_size}, not {PAGE_SIZE}")
+        if pool.index_page_size != PAGE_SIZE:
+            _decline_fused(f"pool page_size is {pool.index_page_size}, not {PAGE_SIZE}")
             return None
         # DSA cache layer split: the standard path stores index-K per layer, and the
         # fused path addresses the same buffer directly.
@@ -1261,7 +1265,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
         pool = get_token_to_kv_pool()
-        page_size = pool.page_size
+        page_size = pool.index_page_size
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
@@ -1529,7 +1533,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         pool = get_token_to_kv_pool()
-        page_size = pool.page_size
+        page_size = pool.index_page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         if _is_hip and not _is_hcu:
             if _use_aiter_preshuffle:
@@ -1611,7 +1615,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             seqlens_32_2d = seqlens_32.contiguous().view(-1, 1)
         if _is_cuda:
             if schedule_metadata is None:
-                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
                     seqlens_32_2d, blocksize, self.sm_count
                 )
 
@@ -1760,7 +1764,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if batch_size == 0:
                 return torch.empty((0, max_len), dtype=torch.float32, device=q.device)
             if batch_size <= self.sm_count:
-                return deep_gemm.fp8_paged_mqa_logits(
+                return resolve_fp8_paged_mqa_logits_fn()(
                     q,
                     kv_cache,
                     w,
@@ -1774,11 +1778,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             for start in range(0, batch_size, self.sm_count):
                 end = min(start + self.sm_count, batch_size)
                 chunk_context_lens = context_lens[start:end]
-                chunk_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                chunk_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
                     chunk_context_lens, blocksize, self.sm_count
                 )
                 logits_chunks.append(
-                    deep_gemm.fp8_paged_mqa_logits(
+                    resolve_fp8_paged_mqa_logits_fn()(
                         q[start:end],
                         kv_cache,
                         w[start * chunk_next_n : end * chunk_next_n],
@@ -1832,7 +1836,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 dsl_atom=dsl_atom,
                 blocksize=blocksize,
                 sm_count=self.sm_count,
-                get_paged_mqa_logits_metadata_fn=deep_gemm.get_paged_mqa_logits_metadata,
+                get_paged_mqa_logits_metadata_fn=resolve_paged_mqa_logits_metadata_fn(),
             )
         elif use_dg_native:
             logits = deepgemm_paged_mqa_logits_native(
@@ -1950,7 +1954,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         assert effective_forward_mode(forward_batch).is_extend_without_speculative()
 
         pool = get_token_to_kv_pool()
-        page_size = pool.page_size
+        page_size = pool.index_page_size
         if _is_hip and not _is_hcu:
             if _use_aiter_preshuffle:
                 assert page_size % 16 == 0, (
@@ -2112,7 +2116,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
                         q_fp8[:q_offset], weights[:q_offset]
                     )
-                    logits = deep_gemm.fp8_mqa_logits(
+                    logits = resolve_fp8_mqa_logits_fn()(
                         q_padded,
                         kv_fp8,
                         w_padded,
@@ -2196,7 +2200,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
                         q_fp8[start:end], weights[start:end]
                     )
-                    logits_chunk = deep_gemm.fp8_mqa_logits(
+                    logits_chunk = resolve_fp8_mqa_logits_fn()(
                         q_padded,
                         kv_fp8,
                         w_padded,
@@ -2611,7 +2615,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and can_use_dsa_fused_store(
                 key.dtype,
                 out_cache_loc.dtype,
-                pool.page_size,
+                pool.index_page_size,
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
@@ -2620,7 +2624,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 key,
                 buf,
                 out_cache_loc,
-                pool.page_size,
+                pool.index_page_size,
             )
             return
 
@@ -2630,7 +2634,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # layout with page_size=1; the same kv_cache.view works for both cases
         # because page_size is 1 there.
         if _use_aiter:
-            page_size = pool.page_size
+            page_size = pool.index_page_size
             buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
             kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
             out_loc = forward_batch.out_cache_loc

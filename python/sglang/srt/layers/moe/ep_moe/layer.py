@@ -3041,6 +3041,8 @@ class MoriEPMoE(DeepEPMoE):
 
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
+    if get_moe_a2a_backend().is_mori_epv2():
+        return FusedMoE
     # [TODO] kk, temporary solution
     if get_moe_a2a_backend().is_mori():
         return MoriEPMoE

@@ -12,7 +12,6 @@ from typing import Optional, TypeGuard
 import torch
 
 from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
-from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
@@ -179,7 +178,12 @@ class HostKVCache(abc.ABC):
 
     def __init__(
         self,
-        device_pool: KVCache,
+        *,
+        dtype: torch.dtype,
+        device_capacity_tokens: int,
+        size_per_token: int,
+        start_layer: int,
+        end_layer: int,
         host_to_device_ratio: float,
         host_size: int,
         page_size: int,
@@ -189,10 +193,10 @@ class HostKVCache(abc.ABC):
         allocator_type: str = "default",
         dcp_size: int = 1,
         dcp_rank: int = 0,
-        *,
         pool_label: str = "kv",
+        is_dummy: bool = False,
     ):
-        self.device_pool = device_pool
+        """Allocate host pages from geometry prepared by the concrete host pool."""
         self.pool_label = pool_label
         # page_size arrives widened (x dcp_size); size/page_size/page_num are physical.
         self.dcp_size = dcp_size
@@ -209,14 +213,10 @@ class HostKVCache(abc.ABC):
         self.allocator = get_allocator_from_storage(allocator_type)
         self.can_use_write_back_jit = False
 
-        self.dtype = device_pool.store_dtype
-        self.size_per_token = self.get_size_per_token()
-        # Unified pools report token capacity separately from their buffer-row count.
-        device_capacity = getattr(device_pool, "host_capacity_tokens", None)
-        if device_capacity is None:
-            device_capacity = device_pool.size
-        self.device_capacity_tokens = device_capacity
-        layer_sharded_on_hcu = _is_hcu and self._is_device_layer_sharded(device_pool)
+        self.dtype = dtype
+        self.size_per_token = size_per_token
+        self.device_capacity_tokens = device_capacity_tokens
+        layer_sharded_on_hcu = _is_hcu and self._is_device_layer_sharded()
         if host_size > 0:
             # An empty tail shard owns no bytes. Let non-empty ranks determine
             # the shared capacity instead of dividing by zero or constraining
@@ -232,23 +232,28 @@ class HostKVCache(abc.ABC):
                 sync_tp_group=layer_sharded_on_hcu,
             )
             if self.size == torch.iinfo(torch.int64).max:
-                self.size = device_pool.size
+                self.size = device_capacity_tokens
         else:
-            self.size = int(device_capacity * host_to_device_ratio)
+            self.size = int(device_capacity_tokens * host_to_device_ratio)
         # Align up the host memory pool size to the page size
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
-        self.start_layer = device_pool.start_layer
-        self.end_layer = device_pool.end_layer
+        self.start_layer = start_layer
+        self.end_layer = end_layer
+        if not is_dummy:
+            self._allocate_host_buffer()
+        self.lock = threading.RLock()
+        self.clear()
 
-        if self.size <= device_capacity:
+    def _allocate_host_buffer(self) -> None:
+        if self.size <= self.device_capacity_tokens:
             logger.warning(
                 "HiCache %s host pool (%d tokens) is smaller than the device pool (%d tokens);"
                 "L2 cache effectiveness is reduced."
                 "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
-                pool_label,
+                self.pool_label,
                 self.size,
-                device_capacity,
+                self.device_capacity_tokens,
             )
 
         # Verify there is enough available host memory.
@@ -268,7 +273,7 @@ class HostKVCache(abc.ABC):
                     "Allocating %s hierarchical KV host pool: %d tokens, "
                     "%.2f GB host memory, packed MTP KV layers: "
                     "target_layers=%d, draft_layers=%d, total_layers=%d.",
-                    pool_label,
+                    self.pool_label,
                     self.size,
                     requested_bytes / 1e9,
                     self.target_layer_num,
@@ -278,17 +283,13 @@ class HostKVCache(abc.ABC):
             else:
                 logger.info(
                     "Allocating %s hierarchical KV host pool: %d tokens, %.2f GB host memory.",
-                    pool_label,
+                    self.pool_label,
                     self.size,
                     requested_bytes / 1e9,
                 )
 
         self.kv_buffer = self.init_kv_buffer()
         self.fd = getattr(self.allocator, "fd", None)
-
-        # A lock for synchronized operations on memory allocation and state transitions.
-        self.lock = threading.RLock()
-        self.clear()
 
     def destroy(self):
         """Unregister pinned host buffers in userspace before process exit.
@@ -363,8 +364,12 @@ class HostKVCache(abc.ABC):
         raise NotImplementedError()
 
     def _is_device_layer_sharded(self, device_pool=None) -> bool:
-        device_pool = device_pool or self.device_pool
-        return bool(device_pool.layer_shard_enabled)
+        device_pool = (
+            device_pool
+            if device_pool is not None
+            else getattr(self, "device_pool", None)
+        )
+        return bool(getattr(device_pool, "layer_shard_enabled", False))
 
     def _device_owned_layer_range(self, device_pool=None) -> tuple[int, int]:
         """Contiguous ``[start, end)`` local device layers this rank stores.

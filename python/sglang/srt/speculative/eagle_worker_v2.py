@@ -57,7 +57,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -615,6 +619,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 NativeSparseAttnBackend,
             )
 
+            from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+                QwenSparseAttnBackend,
+            )
+
             supports_hip_draft_extend_graph = (
                 isinstance(self.draft_attn_backend, AiterMultiStepDraftBackend)
                 or isinstance(self.draft_extend_attn_backend, DeepseekV4HipRadixBackend)
@@ -622,6 +630,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.draft_extend_attn_backend,
                     (DeepseekSparseAttnBackend, NativeSparseAttnBackend),
                 )
+                or isinstance(self.draft_extend_attn_backend, QwenSparseAttnBackend)
             )
 
         graph_supported_backend_types = [
@@ -904,7 +913,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_inf(
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
-                if not needs_draft_probs and logits_output.draft_top1_token_ids is not None:
+                if (
+                    not needs_draft_probs
+                    and logits_output.draft_top1_token_ids is not None
+                ):
                     topk_p = logits_output.draft_top1_probs
                     topk_index = logits_output.draft_top1_token_ids
                     forward_batch.positions.add_(1)

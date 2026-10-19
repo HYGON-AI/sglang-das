@@ -35,9 +35,17 @@ class IndexKeyCache:
         pool = self.pool
         return (
             num_pages,
-            pool.index_page_size
+            pool.page_size
+            // pool.index_kpool
             * (pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4),
         )
+
+    def _kernel_view(self, buffer: torch.Tensor) -> torch.Tensor:
+        pool = self.pool
+        kernel_pages_per_row = (
+            pool.page_size // pool.index_kpool // pool.index_page_size
+        )
+        return buffer.view(-1, buffer.shape[1] // kernel_pages_per_row)
 
     def _layer_num_pages(self, layer_idx: int, num_pages: int) -> int:
         return num_pages
@@ -80,7 +88,9 @@ class IndexKeyCache:
             self.pool.layer_transfer_counter.wait_until(
                 layer_id - self.pool.start_layer
             )
-        return self.buffer[self.pool._get_indexer_cache_index(layer_id)]
+        return self._kernel_view(
+            self.buffer[self.pool._get_indexer_cache_index(layer_id)]
+        )
 
     def get_write_buffer(self, layer_id: int) -> torch.Tensor:
         """Return storage that is safe for an in-place fused cache write."""
@@ -114,7 +124,9 @@ class IndexKeyCache:
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        buf = self.buffer[self.pool._get_indexer_cache_index(layer_id)]
+        buf = self._kernel_view(
+            self.buffer[self.pool._get_indexer_cache_index(layer_id)]
+        )
         index_buf_accessor.SetKAndS.execute(
             pool=self.pool,
             buf=buf,

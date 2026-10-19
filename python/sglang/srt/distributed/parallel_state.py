@@ -95,6 +95,11 @@ _is_musa = is_musa()
 use_quick_custom_allreduce = get_bool_env_var(
     "SGLANG_USE_QUICK_CUSTOM_ALLREDUCE", default="false"
 )
+# Under CUDA-graph capture, stage aiter custom all-gather / reduce-scatter inputs
+# through the pre-registered IPC pool instead of registering graph-pool tensors:
+# the registered path makes peers read stale data over IPC on replay (garbage
+# rows / NaN under DP attention + TP MoE on MI355X). Set to 0 to restore it.
+_AITER_CAPTURE_COPY_IN = os.environ.get("SGLANG_AITER_CAPTURE_COPY_IN", "0") == "1"
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -556,11 +561,7 @@ class GroupCoordinator:
 
             # aiter+fabric silently landing on disabled=True is treated as a
             # strict-Fabric failure.
-            if (
-                self.ca_comm is not None
-                and strict_fabric
-                and self.ca_comm.disabled
-            ):
+            if self.ca_comm is not None and strict_fabric and self.ca_comm.disabled:
                 raise RuntimeError(
                     f"[AR] Strict Fabric requested but aiter CA is disabled "
                     f"(ranks={self.ranks}). AITER_AR_TRANSPORT=fabric must not "
@@ -596,9 +597,7 @@ class GroupCoordinator:
                 if self.ca_comm is not None
                 else "n/a"
             )
-            disabled = (
-                True if self.ca_comm is None else self.ca_comm.disabled
-            )
+            disabled = True if self.ca_comm is None else self.ca_comm.disabled
             logger.info(
                 "[AR] custom_all_reduce_backend=%s requested_transport=%s "
                 "selected_transport=%s disabled=%s tp_ranks=%s world_size=%s",
@@ -1219,7 +1218,9 @@ class GroupCoordinator:
                         ca_comm.reduce_scatter(
                             input,
                             output,
-                            registered=getattr(ca_comm, "enable_register_for_capturing", False),
+                            registered=getattr(
+                                ca_comm, "enable_register_for_capturing", False
+                            ),
                         )
                         return output
                 else:
@@ -1320,7 +1321,13 @@ class GroupCoordinator:
             if torch.cuda.is_current_stream_capturing():
                 if (
                     envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-                    or not getattr(ca_comm, "enable_register_for_capturing", True)
+                    or _AITER_CAPTURE_COPY_IN
+                    or (
+                        _is_hcu
+                        and (
+                            not getattr(ca_comm, "enable_register_for_capturing", True)
+                        )
+                    )
                 ):
                     ca_comm.reduce_scatter(input, output, registered=False)
                 else:
@@ -1483,7 +1490,11 @@ class GroupCoordinator:
         ):
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
-                    if (_is_hcu or envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get() or not getattr(ca_comm, "enable_register_for_capturing", True)):
+                    if (
+                        envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+                        or _AITER_CAPTURE_COPY_IN
+                        or _is_hcu
+                    ):
                         ca_comm.all_gather_unreg(input, out=output, dim=0)
                     else:
                         ca_comm.all_gather_reg(input, out=output, dim=0)
@@ -2842,10 +2853,12 @@ def initialize_model_parallel(
         raise RuntimeError(
             f"decode_context_parallel_size ({decode_context_parallel_size}) must be >= 1"
         )
-    if decode_context_parallel_size > 1 and not (is_hip() or is_cuda() or _is_npu):
+    if decode_context_parallel_size > 1 and not (
+        is_hip() or is_cuda() or _is_npu or _is_xpu
+    ):
         raise RuntimeError(
             "Decode context parallel (decode_context_parallel_size > 1) is "
-            "currently only supported on the AMD HIP, CUDA, or NPU "
+            "currently only supported on the AMD HIP, CUDA, NPU, or Intel XPU "
             "platform, but got decode_context_parallel_size "
             f"({decode_context_parallel_size}) on an unsupported platform."
         )

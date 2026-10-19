@@ -36,14 +36,26 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import compile_in_capture_mode
-from sglang.srt.models.deepseek_v2 import MoEOutput, _is_hip, _is_npu, _is_xpu
+from sglang.srt.models.deepseek_v2 import MoEOutput
 from sglang.srt.runtime_context import get_parallel, get_platform
-from sglang.srt.utils import is_gfx95_supported, is_hcu, get_bool_env_var
+from sglang.srt.utils import (
+    is_gfx95_supported,
+    is_hcu,
+    get_bool_env_var,
+    is_hip,
+    is_npu,
+    is_xpu,
+)
 
 _is_hcu = is_hcu()
-_use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC", default="false")
+_use_aiter_tilelang_mhc = get_bool_env_var(
+    "SGLANG_ROCM_USE_AITER_TILELANG_MHC", default="false"
+)
 
 _is_gfx95_supported = is_gfx95_supported()
+_is_hip = is_hip()
+_is_npu = is_npu()
+_is_xpu = is_xpu()
 
 # ---------------------------------------------------------------------------
 # What a layer hands this module
@@ -159,18 +171,24 @@ class HcState(msgspec.Struct):
         return HcState(post(cfg, p.rows, p.residual, p.post, p.comb), self.pre)
 
     def with_residual(self, residual: torch.Tensor) -> HcState:
-        """The residual was rewritten: drop ``input``; ``pre`` weights streams, not
-        rows, so it survives."""
+        """The residual was rewritten: drop ``input`` and ``stats``, both computed
+        from the old rows; ``pre`` weights streams, not rows, so it survives."""
         return HcState(residual, self.pre)
 
     def take_rows(self, rows: Callable[[torch.Tensor], torch.Tensor]) -> HcState:
-        """Keep only the rows ``rows`` selects -- the late-layer tail's narrowing."""
+        """Keep only the rows ``rows`` selects -- the late-layer tail's narrowing.
+        A normed ``input`` and the ``stats`` are per row, so they are narrowed with
+        the residual; a quantized input is dropped (its MXFP8 scales are swizzled
+        per 128-row tile) and the next combine rebuilds it."""
         pre = None if self.pre is None else rows(self.pre)
         assert self.streams is not None
-        if isinstance(self.streams, HcPending):
+        if isinstance(self.streams, HcPending):  # HIP-only path
             return HcState(HcPending(*(rows(t) for t in self.streams)), pre)
-        else:
-            return HcState(rows(self.streams), pre)
+        input = None
+        if isinstance(self.input, HcNormed):
+            input = HcNormed(rows(self.input.rows))
+        stats = None if self.stats is None else tuple(rows(t) for t in self.stats)
+        return HcState(rows(self.streams), pre, input, stats)
 
 
 # ---------------------------------------------------------------------------
@@ -483,7 +501,8 @@ def post(
         return mhc_post_split_h(x, residual, post_mix, comb)
 
     if (
-        _is_hcu and _use_aiter_tilelang_mhc
+        _is_hcu
+        and _use_aiter_tilelang_mhc
         and envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
     ):
         from aiter.ops.tilelang import mhc_post_fwd
@@ -580,13 +599,11 @@ def _compute_triplet(
     return coefficients
 
 
-def can_use_mega_mhc_prefill(cfg: HcConfig, *, seam_open: bool = True) -> bool:
+def _can_use_mega_mhc(cfg: HcConfig) -> bool:
     return (
         envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get()
         and get_platform().is_sm100
-        and not _is_hip
         and not cfg.cp_prefill
-        and seam_open
     )
 
 
@@ -596,29 +613,34 @@ def _post_fusion(
     residual: torch.Tensor,
     coefficients: HcTriplet,
     next: Optional[HcNextBoundary],
-    mega_next: Optional[HcNextBoundary] = None,
 ) -> HcState:
     """Step 4 without a collective: the wide-tile kernel folds the next combine +
     norm in where it serves this seam, otherwise the pure post runs and the next
     combine computes itself."""
     cfg = hc.cfg
     pre, post_mix, comb = coefficients
-    if mega_next is not None and mega_next.norm_fusable and mega_next.hc is not None:
-        nxt = mega_next.hc
+    if (
+        next is not None
+        and next.norm_fusable
+        and next.hc is not None
+        and _can_use_mega_mhc(cfg)
+        and y.shape[0] > 0
+    ):
+        next_hc = next.hc
         updated, normalized, stats = mhc_mega_boundary(
             y,
             residual,
             pre,
             post_mix,
             comb,
-            nxt.fn,
-            nxt.scale,
-            nxt.base,
-            nxt.norm.weight,
-            nxt.cfg.rms_eps,
-            nxt.cfg.eps,
-            nxt.norm.variance_epsilon,
-            nxt.cfg.sinkhorn_iters,
+            next_hc.fn,
+            next_hc.scale,
+            next_hc.base,
+            next_hc.norm.weight,
+            next_hc.cfg.rms_eps,
+            next_hc.cfg.eps,
+            next_hc.norm.variance_epsilon,
+            next_hc.cfg.sinkhorn_iters,
         )
         return HcState(updated, pre, HcNormed(normalized), stats)
     if (
@@ -658,7 +680,6 @@ def run_attn_post(
     next: Optional[HcNextBoundary],
     world_size: int,
     precomputed: Optional[HcTriplet] = None,
-    mega_mhc: bool = False,
 ) -> HcState:
     """The attention post. An `AttnOutput` rides the collective kernel (which also
     folds ``next``'s norm); the attention may decline the handover even when asked,
@@ -682,9 +703,7 @@ def run_attn_post(
         )
         return HcState(updated, pre, HcNormed(normalized))
     coefficients = _compute_triplet(hc, residual, stats_stream, precomputed)
-    return _post_fusion(
-        hc, out, residual, coefficients, next, next if mega_mhc else None
-    )
+    return _post_fusion(hc, out, residual, coefficients, next)
 
 
 def run_moe_post(
@@ -696,7 +715,6 @@ def run_moe_post(
     next: Optional[HcNextBoundary],
     world_size: int,
     precomputed: Optional[HcTriplet] = None,
-    mega_next: Optional[HcNextBoundary] = None,
 ) -> HcState:
     """The MoE post. A deferred finalize the push plane can carry rides the
     collective kernel (finalize + shared add + all-reduce, quantizing ``next``'s
@@ -768,4 +786,4 @@ def run_moe_post(
         ):
             out += pieces.shared
     coefficients = _compute_triplet(hc, residual, stats_stream, precomputed)
-    return _post_fusion(hc, out, residual, coefficients, next, mega_next)
+    return _post_fusion(hc, out, residual, coefficients, next)
