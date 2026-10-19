@@ -5094,9 +5094,11 @@ class Scheduler(
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        *,
+        linker_failed_rids: Optional[set[str]] = None,
     ):
         if self.enable_unified_cache_external_linker and batch.forward_mode.is_extend():
-            self._mark_failed_linker_loads(batch)
+            self._mark_failed_linker_loads(batch, failed_rids=linker_failed_rids)
 
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
@@ -5186,7 +5188,9 @@ class Scheduler(
                 seen.add(req.rid)
                 yield req
 
-    def _mark_failed_linker_loads(self, batch: ScheduleBatch) -> None:
+    def _mark_failed_linker_loads(
+        self, batch: ScheduleBatch, *, failed_rids: Optional[set[str]] = None
+    ) -> None:
         """Mark requests whose external-linker KV load failed for this batch.
 
         Runs before the result processing that would otherwise stream their
@@ -5197,7 +5201,9 @@ class Scheduler(
         """
         deferred = self._deferred_linker_rids
         self._deferred_linker_rids = set()
-        failed = set(self.tree_cache.drain_linker_loads()) | deferred
+        failed = set(
+            self.tree_cache.drain_linker_loads() if failed_rids is None else failed_rids
+        ) | deferred
         # A request that matched the chain while the load was in flight holds
         # its pages too, and issued no load of its own -- so it is in no rid
         # list and has to be found by where it points.

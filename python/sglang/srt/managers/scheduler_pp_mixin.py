@@ -32,7 +32,10 @@ from sglang.srt.disaggregation.hidden_state import (
     get_pd_hidden_capture_layer_ids,
     get_pd_hidden_req_state as pd_hidden_state,
 )
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    poll_and_all_reduce_attn_cp_tp_group,
+)
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -223,12 +226,12 @@ class SchedulerPPMixin:
                     )
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
-                    with torch.profiler.record_function("process_batch_result"):
-                        self._pp_process_batch_result(
-                            self.mbs[next_mb_id],
-                            next_batch_result,
-                        )
-                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                    if not self.server_args.enable_unified_cache_external_linker:
+                        with torch.profiler.record_function("process_batch_result"):
+                            self._pp_process_batch_result(
+                                self.mbs[next_mb_id], next_batch_result
+                            )
+                        self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
                     if cur_batch:
                         self.device_module.current_stream().wait_event(
@@ -242,6 +245,19 @@ class SchedulerPPMixin:
                                 async_send=True,
                                 msg_type="proxy",
                             )
+
+                # Downstream must receive this proxy before it can reach the
+                # previous microbatch's failure consensus. Waiting before this
+                # send would block it in recv_proxy and deadlock the pipeline.
+                if (
+                    self.server_args.enable_unified_cache_external_linker
+                    and self.mbs[next_mb_id] is not None
+                ):
+                    with torch.profiler.record_function("process_batch_result"):
+                        self._pp_process_batch_result(
+                            self.mbs[next_mb_id], next_batch_result
+                        )
+                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 self.pp_outputs = next_pp_outputs
 
@@ -1362,7 +1378,33 @@ class SchedulerPPMixin:
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
+        if (
+            self.disaggregation_mode == DisaggregationMode.NULL
+            and self.server_args.enable_unified_cache_external_linker
+            and batch.forward_mode.is_extend()
+        ):
+            failed_rids = self._pp_sync_linker_load_failures(batch)
+            self.process_batch_result(
+                batch, output_result, linker_failed_rids=failed_rids
+            )
+            return
         self.process_batch_result(batch, output_result)
+
+    def _pp_sync_linker_load_failures(self: Scheduler, batch: ScheduleBatch) -> set[str]:
+        failed = set(self.tree_cache.drain_linker_loads())
+        if self.tree_cache.has_outstanding_failed_linker_chains():
+            failed.update(
+                req.rid
+                for req in self._iter_external_linker_candidates(batch)
+                if self.tree_cache.is_on_failed_linker_chain(
+                    getattr(req, "last_node", None)
+                )
+            )
+        stage_failures = [None] * self.ps.pp_size
+        torch.distributed.all_gather_object(
+            stage_failures, sorted(failed), group=self.pp_group.cpu_group
+        )
+        return {rid for rids in stage_failures for rid in rids}
 
     def _pp_send_output_to_next_stage(
         self: Scheduler,
