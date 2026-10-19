@@ -98,3 +98,18 @@
 - MiniMax host pool 原基线 8 failed/1 passed/1 skipped；修复 descriptor 后剩余 3 个 transfer 失败与基线相同，涉及测试 NHD 期望与 HCU 页式布局。
 - Chat/API 初次 171 passed/125 subtests passed、5 failed；logprob/tool ordinal 已接官方修复，相关复测 9 passed/3 subtests passed；其余 3 个失败在原基线同样复现。
 - 完整模型运行验收待所有增量整理后执行。
+
+## Step 03：361–540（4afae5568bdc）
+
+26 个冲突文件，保留官方接口重构并迁入内部行为：
+
+- GLM5-Next 采用官方 text/vision 分层配置；保留旧模型类型及架构别名、层覆盖校验、HCU KDA 的 CP 分片、K-head 形状与 state dtype。别名类显式转发构造，避免 Transformers 自动 dataclass 初始化绕过父类配置转换。
+- DeepSeek V4 合并 CUDA residual boundary、Mega Attention 与 FP8 einsum；HCU 继续独立的 MHC、PD 辅助隐藏态、CP 和 LightOp 路径，CUDA 专用 sparse/mega dispatch 保持 `_is_hcu` 保护。
+- PD 合并新的 DSA page payload、state TP 分片语义和 bootstrap 判断；保留 HCU PP 双轮共识、PD hidden 分块传输及实验性 DSV4 decode radix 限制。非 HCU 使用官方 decode radix 校验。
+- MultiDetokenizer 使用官方批量分组/单 tokenizer 空 IPC 支持，保留内部 least-load、RID 粘滞和完成 ACK；控制请求沿原 RID 路由但不增加负载，日志配置广播。
+- DSpark 合并 SWA ring 重置，迁移内部 projected-context 注入到官方 ring 接口；修复自动合并遗留的已删除方法引用。
+- MoE 保留 HCU DeepEP padding/remap，使用官方 remapping predicate；NVFP4 Marlin 新路径限定非 HCU；MiMo target-verify RoPE 融合限定非 HCU。
+- JIT top-k 采用无 PTX 依赖的公共 radix 实现（保留官方溢出修正），公共 dynamic shared-memory helper 增加 HIP 分支；utils.cuh 保留 HIP launcher 并合入 CUDA driver error 支持。
+- 自动合并审查另修复 MHC 常量改名和 lru_cache 导入遗漏。
+
+验证：Python 3.10 全树 compileall 通过；相对双方父提交的新增 Ruff F821/F822/F823/F811/F722 为 0。路由 23 passed、2 subtests passed。KDA 策略单测 2 项因提交容器缺少 boltops 阻塞，非精度验证结果。GLM 配置 smoke 通过；直接调用参数审计无新增不匹配，见同批证据目录；完整 TP8/HumanEval 在最后一批完成后执行。

@@ -2361,7 +2361,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 elif (
                     target_rank_registration_info is not None
-                    and self.attn_tp_size
+                    and self.state_tp_size
                     != target_rank_registration_info.dst_attn_tp_size
                 ):
                     rc = (
@@ -2796,7 +2796,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         """
         logger.warning_once(
             "Using Mamba state slice transfer for different runtime attention TP "
-            f"sizes: prefill={self.attn_tp_size}, decode={dst_attn_tp_size}. "
+            f"sizes: prefill={self.state_tp_size}, decode={dst_attn_tp_size}. "
             "Performance may be affected."
         )
         assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
@@ -2815,7 +2815,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 dst_state_item_lens,
             )
 
-        source_size = self.attn_tp_size if src_shard_size is None else src_shard_size
+        source_size = self.state_tp_size if src_shard_size is None else src_shard_size
         local_tp_rank_in_group = (
             self.kv_args.engine_rank % source_size
             if src_shard_rank is None

@@ -11,6 +11,10 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
 )
+from sglang.srt.utils.common import is_hcu
+
+_is_hcu = is_hcu()
+
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import attn_dp_enabled_of, num_dp_ranks_of
 
@@ -123,10 +127,18 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
-            if cfg.speculative_algorithm not in (
-                None,
-                "DSPARK",
-            ) and not _allow_dsv4_decode_radix_speculative(cfg):
+            if (
+                (
+                    _is_hcu
+                    and model_config_of(resolved_view(server_args)).is_deepseek_v4_arch
+                )
+                and cfg.speculative_algorithm
+                not in (
+                    None,
+                    "DSPARK",
+                )
+                and not _allow_dsv4_decode_radix_speculative(cfg)
+            ):
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with speculative decoding "
