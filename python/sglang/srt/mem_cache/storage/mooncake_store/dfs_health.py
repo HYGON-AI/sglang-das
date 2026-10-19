@@ -51,6 +51,7 @@ class _NativeProbeCall:
     started_at: float
     thread: threading.Thread | None = None
     result: int | Exception | None = None
+    timed_out: bool = False
 
 
 class MooncakeDfsHealthManager:
@@ -233,6 +234,14 @@ class MooncakeDfsHealthManager:
                     call.result = exc
                 finally:
                     call.done.set()
+                    # A timed-out result is stale: release its in-flight slot,
+                    # but never let a later probe cycle count it as success.
+                    with self._probe_lock:
+                        if (
+                            call.timed_out
+                            and self._probe_calls[call.capability] is call
+                        ):
+                            self._probe_calls[call.capability] = None
 
             call.thread = threading.Thread(
                 target=invoke,
@@ -249,6 +258,13 @@ class MooncakeDfsHealthManager:
             self._probe_timeout_s - (time.monotonic() - call.started_at),
         )
         if not call.done.wait(remaining):
+            with self._probe_lock:
+                call.timed_out = True
+                # The native call may have finished between wait() timing out
+                # and acquiring the lock. Clear it here in that case; otherwise
+                # invoke() will clear it when the call eventually returns.
+                if call.done.is_set() and self._probe_calls[call.capability] is call:
+                    self._probe_calls[call.capability] = None
             logger.warning(
                 "Mooncake native DFS %s probe timed out after %ss",
                 call.capability,
@@ -258,8 +274,11 @@ class MooncakeDfsHealthManager:
 
         with self._probe_lock:
             result = call.result
+            timed_out = call.timed_out
             if self._probe_calls[call.capability] is call:
                 self._probe_calls[call.capability] = None
+        if timed_out:
+            return -1
         if isinstance(result, Exception):
             logger.error(
                 "Mooncake native DFS %s probe raised",
