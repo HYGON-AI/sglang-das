@@ -1959,6 +1959,7 @@ class MQALayer(MqaAttentionBase):
         q_rope_out: Optional[torch.Tensor] = None,
         k_nope_out: Optional[torch.Tensor] = None,
         k_rope_out: Optional[torch.Tensor] = None,
+        overlap_layer_split_prefetch: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
@@ -2194,11 +2195,11 @@ class MQALayer(MqaAttentionBase):
                 q_out.copy_(q)
         else:
             q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
-            if _is_hip:
+            if _is_hip and not _is_hcu:
                 q, q_lora, fuse_q_rope = _hip.compute_q_b(
                     self, q_lora, q_for_wqb, positions, q_out, unified, use_cp
                 )
-            else:
+            elif not overlap_layer_split_prefetch:
                 q = self._compute_q_b(q_for_wqb, positions, q_out)
                 fuse_q_rope = False
             if unified:
@@ -2322,6 +2323,14 @@ class MQALayer(MqaAttentionBase):
                         self.layer_id,
                         self.compressor,
                     )
+
+        if overlap_layer_split_prefetch:
+            # Keep collective order unchanged. KV and indexer sources are ready;
+            # Q projection only reads q_lora and can overlap the side-stream fetch.
+            pool = get_token_to_kv_pool()
+            maybe_prefetch_cp_kv_swa(pool, self.layer_id, forward_batch)
+            maybe_prefetch_cp_kv_extra(pool, self.layer_id, forward_batch)
+            q = self._compute_q_b(q_for_wqb, positions, q_out)
 
         return q, kv
 
@@ -2497,6 +2506,17 @@ class MQALayer(MqaAttentionBase):
                 q_out = q_padded[:, tp_slice, :]
         attn_sink = self._local_attn_sink(kernel_num_heads)
 
+        overlap_layer_split_prefetch = (
+            _is_hcu
+            and self.is_dsv41
+            and layer_split_prefill
+            and self.compress_ratio in (1, 2)
+            and self.dsa_enable_prefill_cp
+            and dsa_use_prefill_cp(forward_batch)
+            and not unified
+            and not is_in_breakable_cuda_graph()
+        )
+
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
             # so the bf16 KV intermediate is gone.
@@ -2549,6 +2569,7 @@ class MQALayer(MqaAttentionBase):
                 q_rope_out=q_rope,
                 k_nope_out=k_nope,
                 k_rope_out=k_rope,
+                overlap_layer_split_prefetch=overlap_layer_split_prefetch,
             )
 
         if unified_fp8_prefill and is_cp_active(forward_batch):
@@ -2558,9 +2579,10 @@ class MQALayer(MqaAttentionBase):
             )
         if layer_split_prefill:
             pool = get_token_to_kv_pool()
-            maybe_prefetch_cp_kv_swa(pool, self.layer_id, forward_batch)
-            if self.compress_ratio in (1, 2):
-                maybe_prefetch_cp_kv_extra(pool, self.layer_id, forward_batch)
+            if not overlap_layer_split_prefetch:
+                maybe_prefetch_cp_kv_swa(pool, self.layer_id, forward_batch)
+                if self.compress_ratio in (1, 2):
+                    maybe_prefetch_cp_kv_extra(pool, self.layer_id, forward_batch)
             maybe_wait_cp_kv_swa_prefetch(pool, self.layer_id, forward_batch)
             if x.shape[0] == 0 and not get_attn_tp_context().input_scattered:
                 return x

@@ -3607,6 +3607,13 @@ class DeepseekV4AttnBackend(
         if not num_tokens:
             return kv, score
 
+        if _is_hcu and os.environ.get("SGLANG_HCU_OPT_DSV41_PAIR_PARTNERS", "1") == "1":
+            from lightop.attention import dsv41_pair_partners
+
+            return dsv41_pair_partners(
+                kv, score, req, pos, pad, state.kv_score_buffer.kv_score, ring
+            )
+
         read_pos = (pos - 1).masked_fill(pad, -1)
         carried = state.get_state_by_state_loc(
             state.translate_from_req_position_to_state_loc(req, read_pos)

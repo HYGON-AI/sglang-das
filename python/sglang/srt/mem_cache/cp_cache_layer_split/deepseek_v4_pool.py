@@ -392,6 +392,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         broadcast_kind: str,
         remap_indices: bool = True,
         selected_pages_static: bool = False,
+        in_broadcast_slot: bool = False,
     ) -> torch.Tensor:
         """Broadcast owner's compact active pages and optionally remap indices."""
         if selected_pages.numel() > staging.shape[0]:
@@ -400,7 +401,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
                 f"active_pages={selected_pages.numel()}, capacity={staging.shape[0]}"
             )
 
-        if broadcast_kind == "extra":
+        if broadcast_kind == "extra" and not in_broadcast_slot:
             # A zero-query rank can skip attention and leave the previous extra
             # broadcast active. Drain it before the owner's compact copy writes
             # the shared C4/C128 storage, not only when start() launches NCCL.
@@ -426,13 +427,18 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
                 staging[:1].copy_(source[:1])
 
         pynccl_comm = get_pynccl_broadcast_comm()
-        self._broadcast_slots.start(
-            broadcast_kind,
-            layer_id,
-            staging[:broadcast_pages],
-            owner_cp,
-            pynccl_comm,
-        )
+        if in_broadcast_slot:
+            # The caller owns the slot, including page selection and remapping.
+            with pynccl_comm.change_state(enable=True):
+                pynccl_comm.broadcast(staging[:broadcast_pages], owner_cp)
+        else:
+            self._broadcast_slots.start(
+                broadcast_kind,
+                layer_id,
+                staging[:broadcast_pages],
+                owner_cp,
+                pynccl_comm,
+            )
         if not remap_indices:
             return indices
         return remap_indices_to_staging(indices, selected_pages, page_size, max_pages)
@@ -802,41 +808,54 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             static_size = contiguous_request_page_capacity(
                 read_indices.numel(), num_reqs, pool.page_size, max_pages
             )
-        selected_pages = self._active_pages_for_indices(
-            read_indices if read_indices is not None else indices,
-            pool.page_size,
-            max_pages,
-            static_size,
+        async_pages = (
+            static_size is not None and not torch.cuda.is_current_stream_capturing()
         )
-        selected_cache = self._batch_active_pages[self._extra_family_name(ratio)]
-        selected_cache.selected_pages = selected_pages
-        selected_cache.static_selected_pages = static_size is not None
-        staging = self._get_staging_buffer(self._extra_family_name(ratio))
-        source = self.source_layer_of(layer_id)
-        owner_buf = None
-        if self._is_layer_owned(source):
-            owner_buf = pool.kv_buffer[self._low_owner_local_by_source[source]]
-        self._compact_broadcast_for_read(
-            layer_id,
-            indices,
-            owner_buf,
-            staging,
-            selected_pages,
-            pool.page_size,
-            max_pages,
-            broadcast_kind="extra",
-            remap_indices=False,
-            selected_pages_static=selected_cache.static_selected_pages,
-        )
-        self._extra_staging_layer_id = layer_id
-        self._extra_remapped_indices = remap_indices_to_staging(
-            indices,
-            selected_pages,
-            pool.page_size,
-            max_pages,
-            static_selected_pages=selected_cache.static_selected_pages,
-        )
-        self._extra_remapped_layer_id = layer_id
+        # Page-mask all-reduce shares the KV communicator. Keep it off the
+        # main stream too, otherwise it serializes Q behind the SWA broadcast.
+        # Dynamic nonzero still runs on the original path; only fixed-size
+        # selection can be submitted without a device-to-host shape sync.
+        with (
+            self._broadcast_slots.launch("extra", layer_id, indices.device)
+            if async_pages
+            else nullcontext()
+        ):
+            selected_pages = self._active_pages_for_indices(
+                read_indices if read_indices is not None else indices,
+                pool.page_size,
+                max_pages,
+                static_size,
+            )
+            selected_cache = self._batch_active_pages[self._extra_family_name(ratio)]
+            selected_cache.selected_pages = selected_pages
+            selected_cache.static_selected_pages = static_size is not None
+            staging = self._get_staging_buffer(self._extra_family_name(ratio))
+            source = self.source_layer_of(layer_id)
+            owner_buf = None
+            if self._is_layer_owned(source):
+                owner_buf = pool.kv_buffer[self._low_owner_local_by_source[source]]
+            self._compact_broadcast_for_read(
+                layer_id,
+                indices,
+                owner_buf,
+                staging,
+                selected_pages,
+                pool.page_size,
+                max_pages,
+                broadcast_kind="extra",
+                remap_indices=False,
+                selected_pages_static=selected_cache.static_selected_pages,
+                in_broadcast_slot=async_pages,
+            )
+            self._extra_staging_layer_id = layer_id
+            self._extra_remapped_indices = remap_indices_to_staging(
+                indices,
+                selected_pages,
+                pool.page_size,
+                max_pages,
+                static_selected_pages=selected_cache.static_selected_pages,
+            )
+            self._extra_remapped_layer_id = layer_id
 
     def _rebuild_compressed_layer_mapping_for_cp(self) -> None:
         """``compress_layer_id`` counts only layers owned by this CP rank."""

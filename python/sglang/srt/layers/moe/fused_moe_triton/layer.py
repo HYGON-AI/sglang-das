@@ -1147,7 +1147,11 @@ class FusedMoE(torch.nn.Module):
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
             return
 
-        global_expert_location_metadata = get_global_expert_location_metadata()
+        global_expert_location_metadata = (
+            None
+            if getattr(self, "_skip_expert_location", False)
+            else get_global_expert_location_metadata()
+        )
         if global_expert_location_metadata is None:
             if not getattr(param, "_sglang_require_global_experts", False):
                 expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)

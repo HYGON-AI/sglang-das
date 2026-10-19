@@ -21,6 +21,7 @@ from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.distributed.parallel_state import model_parallel_is_initialized
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -722,6 +723,8 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
             hc_stats_stream=hc_stats_stream,
             moe_routed_quant_stream=moe_routed_quant_stream,
         )
+        # Draft stage IDs overlap target layers, but draft experts are not EPLB-reordered.
+        self.mlp.experts._skip_expert_location = True
         self.stage_id = stage_id
         self.dim = config.hidden_size
 
@@ -1239,8 +1242,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             input_embeds = self.forward_embed(input_ids)
         x = input_embeds
         pre = None
-        for stage in self.stages:
-            x, pre = stage(positions, x, forward_batch, pre)
+        with get_global_expert_distribution_recorder().disable_this_region():
+            for stage in self.stages:
+                x, pre = stage(positions, x, forward_batch, pre)
         if self.hc_pre_from_prev_sublayer:
             from sglang.kernels.ops.layernorm.mhc import hc_combine
 
