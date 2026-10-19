@@ -1128,6 +1128,8 @@ class LateLayerTail(msgspec.Struct, frozen=True):
     local_lens: Optional[torch.Tensor] = None
     req_global: Optional[torch.Tensor] = None
     pos_global: Optional[torch.Tensor] = None
+    # DSpark injection indexes the original global extend, not rank-local rows.
+    global_token_indices: Optional[torch.Tensor] = None
 
     def rows(self, t: torch.Tensor) -> torch.Tensor:
         rows = self.real_rows(t)
@@ -1939,6 +1941,7 @@ class DeepseekV4AttnBackend(
                 local_lens=cp_tail["local_lens"],
                 req_global=metadata.low_ratio_req_indices,
                 pos_global=metadata.low_ratio_pos_i64,
+                global_token_indices=token_indices,
             )
         return metadata
 
@@ -5294,8 +5297,11 @@ class DeepseekV4AttnBackend(
                 )
 
             if forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
-                if _should_use_sparse_prefill(
-                    q, forward_batch, allow_cp=self.is_dsv41
+                if (
+                    self.forward_metadata.late_layer_tail is None
+                    and _should_use_sparse_prefill(
+                        q, forward_batch, allow_cp=self.is_dsv41
+                    )
                 ):
                     return self._forward_prefill_sparse(
                         q=q,
