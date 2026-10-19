@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 from typing import Optional
-
-import os
 
 import torch
 
@@ -26,46 +25,32 @@ except Exception:
     )
 
 
-# Mapping from the `tune` values used in `triton_scaled_mm` to the lightop asm
-# kernel files that `gemm_w8a8_smooth_asm` loads on first use. WARNING: the
-# keys are lightop's `Tunning_slide_block` enum values (B_32x32x256 = 1,
-# B_64x64x128_WARPN4 = 9) and the file names are hardcoded in lightop's
-# `gemm_w8a8_smooth_asm.cu`; re-verify both against the vendored lightop
-# version whenever the fast path or lightop is updated. Probing the wrong
-# file here is unsafe in the "probe passes but the real kernel is missing"
-# direction (lightop exits the process instead of raising).
-_W8A8_SMOOTH_ASM_CO_FILES = {
-    1: {
-        torch.half: "gemm_w8a8_smooth_32x32x256_TN_FP16.co",
-        torch.bfloat16: "gemm_w8a8_smooth_32x32x256_TN_BF16.co",
-    },
-    9: {
-        torch.half: "gemm_w8a8_smooth_64x64x128_WGM1_TN_FP16_WARPM1_WARPK1_WARPN4.co",
-        torch.bfloat16: "gemm_w8a8_smooth_64x64x128_WGM1_TN_BF16_WARPM1_WARPK1_WARPN4.co",
-    },
-}
+# lightop's `gemm_w8a8_smooth_asm` loads an arch-specific .co through
+# hipModuleLoad inside its C++ `HIP_CALL` macro, which calls `exit(0)` on
+# failure; the Python `try/except` below can never rescue that. gfx928 (K100)
+# images do not ship the w8a8 smooth asm kernels at all (lightop resolves
+# LIGHTOP_ASM_DIR to .../third_party/hsa/gfx928, which is absent), so any call
+# there kills the scheduler process during graph capture instead of raising.
+# Keep the fast path permanently disabled on those archs and always use the
+# tuned Triton path.
+_W8A8_SMOOTH_ASM_UNSUPPORTED_ARCHS = ("gfx928",)
 
 
-def _w8a8_smooth_asm_co_exists(tune: int, out_dtype: torch.dtype) -> bool:
-    """Check that the lightop asm kernel (.co) required by `tune` exists.
+@functools.lru_cache(maxsize=8)
+def _w8a8_smooth_asm_supported(device: torch.device) -> bool:
+    """Whether `lightop.gemm_w8a8_smooth_asm` can run on `device`.
 
-    `gemm_w8a8_smooth_asm` builds a static `AiterAsmKernel` that loads the .co
-    via hipModuleLoad inside lightop's C++ `HIP_CALL` macro, which calls
-    `exit(0)` on failure. A missing file therefore kills the scheduler process
-    without raising a Python exception, so the `try/except` below can never
-    rescue it. Probe the file under `LIGHTOP_ASM_DIR` first and fall back to
-    the Triton path when it is absent (e.g. gfx928/gfx936 packages that do not
-    ship the WARPN4 kernel).
+    The asm kernels are precompiled per arch and lightop exits the process
+    instead of raising when the matching .co is missing, so a wrong answer here
+    is fatal rather than just slow. Disable the fast path on known-unsupported
+    archs and stay conservative when the arch cannot be determined.
     """
-    if tune not in _W8A8_SMOOTH_ASM_CO_FILES:
+    try:
+        props = torch.cuda.get_device_properties(device)
+        arch = getattr(props, "gcnArchName", "").split(":")[0]
+    except Exception:
         return False
-    co_file = _W8A8_SMOOTH_ASM_CO_FILES[tune].get(out_dtype)
-    if co_file is None:
-        return False
-    asm_dir = os.environ.get("LIGHTOP_ASM_DIR", "")
-    if not asm_dir:
-        return False
-    return os.path.exists(os.path.join(asm_dir, co_file))
+    return arch not in _W8A8_SMOOTH_ASM_UNSUPPORTED_ARCHS
 
 
 def triton_scaled_mm(
@@ -102,9 +87,9 @@ def triton_scaled_mm(
             tune = None
         # The tuned slide values are valid for complete K=256 tiles.
         if tune is not None and k_i % 256 == 0:
-            # lightop's C++ layer exits the process when the asm kernel file is
-            # missing, so probe it here and fall back to Triton if absent.
-            if not _w8a8_smooth_asm_co_exists(tune, out_dtype):
+            # lightop's C++ layer exits the process when the arch-specific asm
+            # kernel is missing, so gate the fast path by arch before calling.
+            if not _w8a8_smooth_asm_supported(a.device):
                 tune = None
         if tune is not None and k_i % 256 == 0:
             from lightop import op as _lop
