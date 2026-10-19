@@ -25,8 +25,6 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 import torch
 from torch.nn.parameter import Parameter
 
-_SMALLM_MOE_ON = os.environ.get("SGLANG_ROCM_SMALLM_MOE", "1") != "0"
-
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
@@ -45,6 +43,8 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hcu,
 )
+
+_SMALLM_MOE_ON = envs.SGLANG_ROCM_SMALLM_MOE.get()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput

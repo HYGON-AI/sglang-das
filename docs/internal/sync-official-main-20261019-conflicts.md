@@ -113,3 +113,20 @@
 - 自动合并审查另修复 MHC 常量改名和 lru_cache 导入遗漏。
 
 验证：Python 3.10 全树 compileall 通过；相对双方父提交的新增 Ruff F821/F822/F823/F811/F722 为 0。路由 23 passed、2 subtests passed。KDA 策略单测 2 项因提交容器缺少 boltops 阻塞，非精度验证结果。GLM 配置 smoke 通过；直接调用参数审计无新增不匹配，见同批证据目录；完整 TP8/HumanEval 在最后一批完成后执行。
+
+## Step 04：541–722（a90e9c5dd897）
+
+37 个冲突文件。关键决策与自动合并修正：
+
+- MHA/MLA host pool 采用官方 `DevicePoolInfo` / buffer 描述和 controller-layer 映射；保留 `_is_hcu` 下 page-major MHA host pool、GLM KPool/LayerSplit 所有权、indexer 预算及远程缓存失效处理。GLM host 构造显式转换为新版描述输入。
+- 保留官方 `kv_layout` 字段，同时保留内部 MHA `kv_cache_layout`（两者语义不同）；PD hidden 分块传输与官方 REQUEST_ROW 状态合并。
+- NIXL frame 23 保留官方 state buffer lengths，内部 state types 放在 frame 24；读取兼容旧内部只有 type 的 frame 23。prepared transfer 遇到组件顺序差异时转入按 type/occurrence 映射的通用路径。回归覆盖新组合、纯官方和旧内部三种 packet。
+- HTTP 保留内部 warmup owner/result 协调与 spawn bootstrap，合入 post-warmup callback 和自定义 ASGI app path；状态码判断采用官方任意 4xx/5xx abort。
+- Wan 合入官方 GELU MLP 融合，同时保留内部 SLA 参数解析；MegaMoE 合入 CUDA EPLB 的 UTCCP scale 参数注册并保留 HCU权重转换。
+- 官方删除的旧 compressor、HIP fused compressor 与 c4/c128/common JIT 仍有内部调用，保留；无调用的旧 moe_fused_gate header 按官方删除。修复 split-prefill shared-read helper 移动后的导入。
+- 官方 AMD cooperative top-k 保留在 `topk.hip`；已验证 HCU 实现在 `topk_hcu.hip`，构建时按 `_is_hcu` 选择。HCU packed KV 量化/反量化和 int64 地址计算保留。
+- 删除已失效的 FormatSignature import；补回 HCU AITER 路径使用的 os 和 SWAKVPool 类型导入。
+
+静态检查：1004 个变更 Python 文件 AST 通过，全树 compileall 通过，相对双方父提交新增 Ruff 错误为 0；直接调用参数审计无新增不匹配。完整导入审计发现 3 项合并问题均已修复（FormatSignature、shared-read helper、HIP compressor）。
+
+NIXL/control/MLA host 单测：67 passed、9 subtests passed。HTTP warmup 单测因提交容器旧 LightOp 缺少 fuse_situ_mul_quant_contiguous 在收集阶段阻塞，需在验证容器复验。最终 TP8/HumanEval 尚未执行，不代表精度通过。

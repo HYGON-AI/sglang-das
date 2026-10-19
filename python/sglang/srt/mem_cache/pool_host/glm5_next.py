@@ -9,10 +9,14 @@ from sglang.srt.mem_cache.pool_host import dsa, mla
 from sglang.srt.mem_cache.pool_host.common import kernel_accessible_host_ptr
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
+from sglang.srt.utils import is_hcu
+
+_is_hcu = is_hcu()
 
 
 def is_hcu_glm_pool(pool):
-    return bool(getattr(pool, "is_hcu_glm5_next_pool", False))
+    return _is_hcu and bool(getattr(pool, "is_hcu_glm5_next_pool", False))
 
 
 def index_bytes_per_page(pool):
@@ -25,6 +29,9 @@ def index_bytes_per_page(pool):
 
 
 class _HcuLayerOwnership:
+    def maybe_dcp_kernel_indices(self, indices):
+        return maybe_dcp_kernel_indices(indices, self.dcp_size, self.dcp_rank)
+
     def _init_hcu_transfer_ptrs(self):
         if self.layout != "layer_first":
             return
@@ -77,7 +84,7 @@ class _HcuLayerOwnership:
             num_layers=host_ptrs.numel(),
         )
 
-    def _draft_layer_num(self):
+    def _owned_draft_layer_num(self):
         return sum(
             len(self._owned_device_layer_ids(pool))
             for pool in self.mtp_draft_device_pools
@@ -149,7 +156,22 @@ class Glm5NextMLAPoolHost(_HcuLayerOwnership, MLATokenToKVPoolHost):
                 index_bytes_per_page(device_pool),
             ):
                 raise ValueError("Target and draft HCU HiCache geometry must match")
-        super().__init__(device_pool, *args, **kwargs)
+        self.device_pool = device_pool
+        self.mtp_draft_device_pools = tuple(kwargs.pop("mtp_draft_device_pools", ()))
+        # get_size_per_token reserves the indexer budget before HostKVCache allocates.
+        self.page_size = kwargs.get("page_size", args[2] if len(args) > 2 else device_pool.page_size)
+        capacity = device_pool.host_capacity_tokens
+        super().__init__(
+            device_pool.get_device_pool_infos()[0].buffer_info,
+            *args,
+            device_capacity_tokens=device_pool.size if capacity is None else capacity,
+            start_layer=device_pool.start_layer,
+            end_layer=device_pool.end_layer,
+            target_layer_num=self._effective_host_layer_num(device_pool),
+            layer_shard_enabled=device_pool.layer_shard_enabled,
+            draft_buffer_infos=tuple(pool.get_device_pool_infos()[0].buffer_info for pool in self.mtp_draft_device_pools),
+            **kwargs,
+        )
         self.data_ptrs = torch.tensor(
             [kernel_accessible_host_ptr(x) for x in self.data_refs],
             dtype=torch.uint64,
@@ -167,7 +189,7 @@ class Glm5NextMLAPoolHost(_HcuLayerOwnership, MLATokenToKVPoolHost):
 
     def get_size_per_token(self):
         super().get_size_per_token()
-        self.layer_num = self.target_layer_num + self._draft_layer_num()
+        self.layer_num = self.target_layer_num + self._owned_draft_layer_num()
         # Reserve target + draft + indexer before allocating the anchor. The
         # worst-rank count keeps fixed-size host slot capacity identical across
         # CP ranks even though only the draft owner allocates its host layer.
@@ -394,7 +416,7 @@ class Glm5NextIndexerPoolHost(_HcuLayerOwnership, DSAIndexerPoolHost):
         self.end_layer = device_pool.end_layer
         self.target_layer_num = self._effective_host_layer_num()
         self.mtp_draft_device_pools = tuple(packed_draft_device_pools or anchor_host.mtp_draft_device_pools)
-        self.layer_num = self.target_layer_num + self._draft_layer_num()
+        self.layer_num = self.target_layer_num + self._owned_draft_layer_num()
 
         self.index_head_dim = device_pool.index_head_dim
         self.indexer_quant_block_size = device_pool.quant_block_size

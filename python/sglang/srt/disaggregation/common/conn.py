@@ -163,6 +163,7 @@ class PrefillServerInfo:
     enable_dsa_cache_layer_split: bool = False
     dsv41_spec_layout: Optional[dict] = None
     kv_cache_layout: Optional[str] = None
+    kv_layout: Optional[str] = None
     decode_allocation_policy: str = "early"
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
@@ -330,6 +331,7 @@ class CommonKVManager(BaseKVManager):
     kv_status_msg_tag: Optional[bytes] = None
     kv_status_msg_carries_reason: bool = False
 
+    kv_layout: Optional[str] = None
     dsv41_spec_layout: Optional[dict] = None
 
     # Used by decode when the prefill reported Failed without a reason frame.
@@ -347,6 +349,7 @@ class CommonKVManager(BaseKVManager):
         self.kv_args = args
         self.kv_cache_layout = getattr(args, "kv_cache_layout", None)
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
+        self.kv_layout = args.kv_layout
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
@@ -589,6 +592,7 @@ class CommonKVManager(BaseKVManager):
                     f"(dst item_len={dst_item_len}, page scale={dst_page_scale})"
                 )
         return src_token_lens
+
     def supports_pd_hidden_streaming(self) -> bool:
         return False
 
@@ -1344,6 +1348,17 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
+        if (
+            info.kv_layout is not None
+            and self.kv_layout is not None
+            and info.kv_layout != self.kv_layout
+        ):
+            raise RuntimeError(
+                f"KV layout mismatch: prefill server has kv_layout={info.kv_layout}, "
+                f"but decode server has kv_layout={self.kv_layout}. Both servers "
+                f"must use the same --dsv4-attn-backend and SGLANG_DSV4_KV_LAYOUT."
+            )
+
         local_layout = self.dsv41_spec_layout
         if local_layout is not None or info.dsv41_spec_layout is not None:
             if local_layout != info.dsv41_spec_layout:
@@ -1563,6 +1578,7 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "kv_cache_layout": self.kv_cache_layout,
             "kv_cache_dtype": self.kv_cache_dtype_str,
+            "kv_layout": self.kv_layout,
             "dsv41_spec_layout": self.dsv41_spec_layout,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
@@ -1766,8 +1782,7 @@ class CommonKVManager(BaseKVManager):
             else:
                 dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
                 dst_v_ptrs = dst_kv_ptrs[
-                    dst_num_total_layers
-                    + start_layer : dst_num_total_layers
+                    dst_num_total_layers + start_layer : dst_num_total_layers
                     + end_layer
                 ]
             return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, len(src_k_ptrs)
@@ -1861,8 +1876,7 @@ class CommonKVManager(BaseKVManager):
             if compact_end_layer <= main_total_layers:
                 dst_k_ptrs = dst_kv_ptrs[compact_start_layer:compact_end_layer]
                 dst_v_ptrs = dst_kv_ptrs[
-                    dst_num_total_layers
-                    + compact_start_layer : dst_num_total_layers
+                    dst_num_total_layers + compact_start_layer : dst_num_total_layers
                     + compact_end_layer
                 ]
                 layers_current_pp_stage = len(src_k_ptrs)
@@ -3084,6 +3098,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dp_size = None
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
+        self.kv_layout: Optional[str] = None
         self.dsv41_spec_layout: Optional[dict] = None
         self.kv_cache_layout: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
@@ -3157,6 +3172,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
         kv_cache_layout = data.get("kv_cache_layout")
+        kv_layout = data.get("kv_layout")
         prefill_http_port = data.get("prefill_http_port")
         dsv41_spec_layout = data.get("dsv41_spec_layout")
 
@@ -3193,6 +3209,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.kv_cache_layout is None and kv_cache_layout is not None:
             self.kv_cache_layout = kv_cache_layout
+        if self.kv_layout is None and kv_layout is not None:
+            self.kv_layout = kv_layout
 
         if self.prefill_http_port is None and prefill_http_port is not None:
             self.prefill_http_port = int(prefill_http_port)
@@ -3266,6 +3284,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 pp_size=self.pp_size,
                 page_size=self.page_size,
                 kv_cache_dtype=self.kv_cache_dtype,
+                kv_layout=self.kv_layout,
                 dsv41_spec_layout=self.dsv41_spec_layout,
                 kv_cache_layout=self.kv_cache_layout,
                 follow_bootstrap_room=(
@@ -3280,6 +3299,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             payload = dataclasses.asdict(info)
             if info.dsv41_spec_layout is None:
                 payload.pop("dsv41_spec_layout")
+            if info.kv_layout is None:
+                payload.pop("kv_layout")
             return web.json_response(payload, status=200)
 
         if not self._is_ready():

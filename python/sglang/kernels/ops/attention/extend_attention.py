@@ -565,7 +565,9 @@ def _fwd_kernel(
                 mask=(mask_m[:, None] & mask_n[None, :]),
                 other=0,
             )
-            final_mask &= custom_mask
+            # The mask buffer is int8; narrow it to i1, since a score_mod hands
+            # final_mask to tl.load, which rejects an i8 mask.
+            final_mask &= custom_mask != 0
         if SLIDING_WINDOW_SIZE > 0:
             # Add mask where q_id <= kv_id + sliding_window_size
             # q_id = prefix_len + cur_m, kv_id = cur_n
@@ -754,7 +756,8 @@ def _fwd_kernel(
                 mask=(mask_m[:, None] & mask_n[None, :]),
                 other=0,
             )
-            custom_mask &= mask_m[:, None] & mask_n[None, :]
+            # int8 -> i1 before the &=; see the prefix loop above.
+            custom_mask = (custom_mask != 0) & mask_m[:, None] & mask_n[None, :]
             final_mask &= custom_mask
         elif IS_CAUSAL:
             mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
@@ -1085,8 +1088,8 @@ def extend_attention_fwd(
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
-    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride, _ = (
-        _extract_kv_strides(k_buffer, page_size, is_value=False)
+    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride, _ = _extract_kv_strides(
+        k_buffer, page_size, is_value=False
     )
     v_slot_stride, v_head_stride, v_page_stride, v_tok_stride, v_d_stride = (
         _extract_kv_strides(v_buffer, page_size, is_value=True)
@@ -1171,43 +1174,6 @@ def extend_attention_fwd(
         num_stages=num_stages,
         **extra_kargs,
     )
-
-
-def redundant_attention(
-    q_extend,
-    o_extend,
-    k_buffer,
-    v_buffer,
-    b_req_idx,
-    b_start_loc,
-    b_seq_len,
-    b_seq_len_prefix,
-    max_len_in_batch,
-):
-    total_token_num = k_buffer.shape[0]
-    B, H_Q, D = b_req_idx.shape[0], q_extend.shape[-2], q_extend.shape[-1]
-    q_buffer = torch.empty(
-        (total_token_num, H_Q, D), dtype=q_extend.dtype, device=q_extend.device
-    )
-
-    pt = 0
-    for i in range(B):
-        cur_seq_len_extend = b_seq_len[i] - b_seq_len_prefix[i]
-        pl, pr = b_start_loc[i] + b_seq_len_prefix[i], b_start_loc[i] + b_seq_len[i]
-        q_buffer[pl:pr] = q_extend[pt : pt + cur_seq_len_extend]
-        pt += cur_seq_len_extend
-
-    o_buffer = torch.empty_like(q_buffer)
-    context_attention_fwd(
-        q_buffer, k_buffer, v_buffer, o_buffer, b_start_loc, b_seq_len, max_len_in_batch
-    )
-
-    pt = 0
-    for i in range(B):
-        cur_seq_len_extend = b_seq_len[i] - b_seq_len_prefix[i]
-        pl, pr = b_start_loc[i] + b_seq_len_prefix[i], b_start_loc[i] + b_seq_len[i]
-        o_extend[pt : pt + cur_seq_len_extend] = o_buffer[pl:pr]
-        pt += cur_seq_len_extend
 
 
 @triton.jit
@@ -1358,7 +1324,8 @@ def _fwd_kernel_unified(
                 mask=(mask_m[:, None] & mask_n[None, :]),
                 other=0,
             )
-            final_mask &= custom_mask
+            # int8 -> i1 before the &=; see `_fwd_kernel`'s prefix loop.
+            final_mask &= custom_mask != 0
 
         # Apply causal mask for extend part
         if IS_CAUSAL and not USE_CUSTOM_MASK:
@@ -1636,8 +1603,8 @@ def extend_attention_fwd_unified(
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
-    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride, _ = (
-        _extract_kv_strides(k_buffer, page_size, is_value=False)
+    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride, _ = _extract_kv_strides(
+        k_buffer, page_size, is_value=False
     )
     v_slot_stride, v_head_stride, v_page_stride, v_tok_stride, v_d_stride = (
         _extract_kv_strides(v_buffer, page_size, is_value=True)

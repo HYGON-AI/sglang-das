@@ -418,15 +418,23 @@ def _rlc_prefix_aligned(forward_batch: ForwardBatch, ratio: int) -> bool:
     return all((int(s) - int(e)) % ratio == 0 for s, e in zip(seq, ext))
 
 
-def _get_rlc_bundle(extend_lens, prefix_lens, ratio, cp_size, cp_rank, device, write_plan):
+def _get_rlc_bundle(
+    extend_lens, prefix_lens, ratio, cp_size, cp_rank, device, write_plan
+):
     """Build (and cache) the data-independent RLC metadata for one prefill chunk: routing tensors, the
     local compress plan (v1) with PER-SEGMENT PREFIX, expansion rows, the per-segment global sequence
     indices (used to gather load pages from the global paged metadata), and the state-pool WRITE
     indices (compact/remap gather -- pure geometry from `write_plan`). Cached by
     (ratio, cp_size, cp_rank, device, extend_lens, prefix_lens) -> reused across all c4 layers of a
     forward."""
-    key = (ratio, cp_size, cp_rank, str(device),
-           tuple(int(x) for x in extend_lens), tuple(int(x) for x in prefix_lens))
+    key = (
+        ratio,
+        cp_size,
+        cp_rank,
+        str(device),
+        tuple(int(x) for x in extend_lens),
+        tuple(int(x) for x in prefix_lens),
+    )
     bundle = _rlc_bundle_cache.get(key)
     if bundle is not None:
         return bundle
@@ -442,14 +450,25 @@ def _get_rlc_bundle(extend_lens, prefix_lens, ratio, cp_size, cp_rank, device, w
     local_ev = torch.empty(0, dtype=torch.long, device=device)
     if n_recv > 0 and meta.local_extend_lens:
         segs = meta.local_extend_lens
-        prefix_local = [int(prefix_lens[meta.local_seg_seqs[i]]) if meta.local_seg_boundary[i] else 0
-                        for i in range(len(segs))]
+        prefix_local = [
+            int(prefix_lens[meta.local_seg_seqs[i]])
+            if meta.local_seg_boundary[i]
+            else 0
+            for i in range(len(segs))
+        ]
         seq_local = [prefix_local[i] + segs[i] for i in range(len(segs))]
         seq_t = torch.tensor(seq_local, dtype=torch.int64, device=device)
         ext_t = torch.tensor(segs, dtype=torch.int64, device=device)
         local_plan = CompressorPrefillPlan.generate(
-            compress_ratio=R, num_q_tokens=n_recv, seq_lens=seq_t, extend_lens=ext_t, device=device)
-        lev = local_plan.compress_plan.detach().cpu().contiguous().view(torch.int32)[:, 0]
+            compress_ratio=R,
+            num_q_tokens=n_recv,
+            seq_lens=seq_t,
+            extend_lens=ext_t,
+            device=device,
+        )
+        lev = (
+            local_plan.compress_plan.detach().cpu().contiguous().view(torch.int32)[:, 0]
+        )
         local_ev = lev[(lev >= 0) & (lev < n_recv)].sort().values.long().to(device)
         empty16 = torch.zeros((0, 16), dtype=torch.uint8, device=device)
         local_plan_c = local_plan._replace(write_plan=empty16)
@@ -475,7 +494,7 @@ def _get_rlc_bundle(extend_lens, prefix_lens, ratio, cp_size, cp_rank, device, w
             remap[:, 0] = torch.arange(write_W, dtype=torch.int32, device=device)
             write_remap = remap.view(torch.uint8)
 
-    local_ev_kept = local_ev[meta.n_halo:]
+    local_ev_kept = local_ev[meta.n_halo :]
 
     compact_rows = []
     for r in range(cp_size):
@@ -484,11 +503,19 @@ def _get_rlc_bundle(extend_lens, prefix_lens, ratio, cp_size, cp_rank, device, w
     compact_idx = torch.tensor(compact_rows, dtype=torch.long, device=device)
 
     bundle = dict(
-        meta=meta, send_idx=send_idx, recv_perm=recv_perm, ev=ev,
-        local_plan_c=local_plan_c, local_ev_kept=local_ev_kept, seg_seqs=seg_seqs,
+        meta=meta,
+        send_idx=send_idx,
+        recv_perm=recv_perm,
+        ev=ev,
+        local_plan_c=local_plan_c,
+        local_ev_kept=local_ev_kept,
+        seg_seqs=seg_seqs,
         compact_idx=compact_idx,
-        write_W=write_W, write_mine_idx=write_mine_idx, write_src=write_src,
-        write_remap=write_remap, empty16=empty16,
+        write_W=write_W,
+        write_mine_idx=write_mine_idx,
+        write_src=write_src,
+        write_remap=write_remap,
+        empty16=empty16,
     )
     if len(_rlc_bundle_cache) > 8:
         _rlc_bundle_cache.clear()
@@ -515,9 +542,14 @@ def _rlc_write_state(state_pool, kv_score_local, ape, paged, bundle, ratio, head
         compress_plan=bundle["empty16"], write_plan=bundle["write_remap"]
     )
     compress_forward(
-        kv_score_buffer=state_pool, kv_score_input=write_buf, ape=ape,
-        indices=paged.write_loc, plan=write_plan_c, compress_ratio=ratio,
-        head_dim=head_dim, extra_data=paged.extra_data,
+        kv_score_buffer=state_pool,
+        kv_score_input=write_buf,
+        ape=ape,
+        indices=paged.write_loc,
+        plan=write_plan_c,
+        compress_ratio=ratio,
+        head_dim=head_dim,
+        extra_data=paged.extra_data,
     )
 
 
@@ -671,9 +703,7 @@ class Compressor(BaseFusedOp):
                 new_compressed_kv.bfloat16(), 1e-8
             )
         else:
-            pack = quant_to_nope_fp8_rope_bf16_pack_triton(
-                new_compressed_kv.bfloat16()
-            )
+            pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
         token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
 
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
@@ -770,7 +800,9 @@ class Compressor(BaseFusedOp):
         )
         meta = bundle["meta"]
 
-        state_pool = self.get_state_pool(attn_backend).kv_score_buffer.kv_score.view(-1, R, last_dim)
+        state_pool = self.get_state_pool(attn_backend).kv_score_buffer.kv_score.view(
+            -1, R, last_dim
+        )
         core_meta = attn_backend.forward_metadata.core_metadata
         out_loc = core_meta.c4_out_loc if R == 4 else core_meta.c128_out_loc
         num_q_out = out_loc.shape[0]
@@ -782,26 +814,39 @@ class Compressor(BaseFusedOp):
             f"* cp({cp_size}) != out_loc({num_q_out})"
         )
 
-        send = (kv_score_local[bundle["send_idx"]].contiguous()
-                if bundle["send_idx"].numel() else kv_score_local.new_empty((0, last_dim)))
+        send = (
+            kv_score_local[bundle["send_idx"]].contiguous()
+            if bundle["send_idx"].numel()
+            else kv_score_local.new_empty((0, last_dim))
+        )
         recv = kv_score_local.new_empty((sum(meta.out_splits), last_dim))
         attn_cp_all_to_all_single(recv, send, meta.out_splits, meta.in_splits)
-        local_kv = recv[bundle["recv_perm"]].contiguous() if bundle["recv_perm"].numel() else recv
+        local_kv = (
+            recv[bundle["recv_perm"]].contiguous()
+            if bundle["recv_perm"].numel()
+            else recv
+        )
 
         ape = self.ape.view(-1, H)
         if local_kv.shape[0] > 0 and bundle["local_plan_c"] is not None:
             seg_seqs = bundle["seg_seqs"]
             local_sparse = compress_forward(
-                kv_score_buffer=state_pool, kv_score_input=local_kv, ape=ape,
-                indices=paged.write_loc[seg_seqs], plan=bundle["local_plan_c"],
-                compress_ratio=R, head_dim=H, extra_data=paged.extra_data[seg_seqs])
+                kv_score_buffer=state_pool,
+                kv_score_input=local_kv,
+                ape=ape,
+                indices=paged.write_loc[seg_seqs],
+                plan=bundle["local_plan_c"],
+                compress_ratio=R,
+                head_dim=H,
+                extra_data=paged.extra_data[seg_seqs],
+            )
             local_out = local_sparse[bundle["local_ev_kept"]].clone()
         else:
             local_out = kv_score_local.new_empty((0, H))
 
         padded = local_out.new_zeros((meta.max_c, H))
         if local_out.shape[0] > 0:
-            padded[:local_out.shape[0]] = local_out
+            padded[: local_out.shape[0]] = local_out
         gathered = local_out.new_empty((cp_size * meta.max_c, H))
         attn_cp_all_gather_into_tensor(gathered, padded)
         compact = gathered[bundle["compact_idx"]]

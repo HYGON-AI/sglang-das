@@ -80,7 +80,12 @@ if torch.cuda.is_available():
 else:
     print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
 
-if amdgpu_target not in ["gfx938", "gfx942", "gfx950", "gfx1250"]:
+# Build-time HCU detection cannot import sglang before its wheel is installed.
+_is_hcu = amdgpu_target in ("gfx936", "gfx938", "gfx928")
+if _is_hcu:
+    sources[sources.index("csrc/elementwise/topk.hip")] = "csrc/elementwise/topk_hcu.hip"
+
+if not _is_hcu and amdgpu_target not in ["gfx942", "gfx950", "gfx1250"]:
     print(
         f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx938', 'gfx942', 'gfx950', or 'gfx1250'."
     )
@@ -97,7 +102,7 @@ fp8_macro = (
 # - gfx95x (MI350) and gfx1250: LDS is larger. Large dynamic budget wastes LDS
 #   and pins occupancy to 1 block/CU. Keep it small (40KB) for better occupancy.
 topk_dynamic_smem_bytes = (
-    48 * 1024 if amdgpu_target in ["gfx942", "gfx938"] else 40 * 1024
+    48 * 1024 if _is_hcu or amdgpu_target == "gfx942" else 40 * 1024
 )
 
 hipcc_flags = [

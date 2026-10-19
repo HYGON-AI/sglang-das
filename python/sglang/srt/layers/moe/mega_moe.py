@@ -282,8 +282,12 @@ def _use_amd_flydsl_mega_moe() -> bool:
 def _mega_moe_mma_type(experts) -> str:
     if _is_hcu:
         # HCU W4A8 experts predate upstream per-layer NVFP4/W4A4 flags.
-        return "nvfp4xnvfp4" if getattr(experts, "_mega_moe_nvfp4", False) else (
-            "mxf4xmxf4" if getattr(experts, "_mega_moe_w4a4", False) else "fp8xfp4"
+        return (
+            "nvfp4xnvfp4"
+            if getattr(experts, "_mega_moe_nvfp4", False)
+            else (
+                "mxf4xmxf4" if getattr(experts, "_mega_moe_w4a4", False) else "fp8xfp4"
+            )
         )
     if experts._mega_moe_nvfp4:
         return "nvfp4xnvfp4"
@@ -477,7 +481,8 @@ def should_fuse_mega_moe_shared_experts(moe: DeepseekV2MoE) -> bool:
         and is_sm100_supported()
         and _mega_moe_mma_type(moe.experts) == "fp8xfp4"
         and moe.shared_experts_is_fp8
-        and moe.shared_experts_weight_block_size == [128, 128]
+        and moe.shared_experts_weight_block_size is not None
+        and moe.shared_experts_weight_block_size[1] % 32 == 0
     )
 
 
@@ -528,7 +533,8 @@ def forward_mega_moe(
         overlap_stream.wait_stream(current_stream)
         if eager_w4a8_overlap:
             for tensor in (
-                hidden_states, input_ids_global,
+                hidden_states,
+                input_ids_global,
                 getattr(forward_batch, "num_token_non_padded", None),
             ):
                 if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
@@ -710,9 +716,7 @@ def run_mega_routed_experts(
         runtime=runtime,
         cuda_graph_max_tokens_per_rank=cuda_graph_max_tokens_per_rank,
         quant_mode=(
-            "w4a8"
-            if getattr(experts, "_mega_moe_hcu_w4a8_weights", False)
-            else "fp8"
+            "w4a8" if getattr(experts, "_mega_moe_hcu_w4a8_weights", False) else "fp8"
         ),
     )
 
@@ -957,9 +961,7 @@ def _run_standalone_hcu_w8a8_mega_moe(
         experts.mega_l2_weights,
         buf,
         cumulative_local_expert_recv_stats=(
-            None
-            if is_graph_capture
-            else getattr(experts, "mega_moe_recv_stats", None)
+            None if is_graph_capture else getattr(experts, "mega_moe_recv_stats", None)
         ),
         activation_clamp=activation_clamp,
         fast_math=True,
@@ -1001,31 +1003,49 @@ def build_hcu_w4a8_mega_moe_experts_weights(experts) -> None:
     if getattr(experts, "_mega_moe_weights_built", False):
         return
     if not _is_hcu or get_hcu_mega_moe_runtime() != "megamoe":
-        raise ValueError("W4A8 MegaMoE requires HCU and SGLANG_HCU_MEGA_MOE_RUNTIME=megamoe")
+        raise ValueError(
+            "W4A8 MegaMoE requires HCU and SGLANG_HCU_MEGA_MOE_RUNTIME=megamoe"
+        )
     if get_exec().moe.enable_eplb:
-        raise ValueError("W4A8 MegaMoE supports offline EPLB via --init-expert-location; online EPLB is unsupported")
+        raise ValueError(
+            "W4A8 MegaMoE supports offline EPLB via --init-expert-location; online EPLB is unsupported"
+        )
     if not get_exec().graph.disable_cuda_graph:
         raise ValueError("W4A8 MegaMoE prefill currently requires --disable-cuda-graph")
     # The loader has already placed logical experts into the static physical
     # slots. Repack each slot independently without changing expert order.
     for name in ("w13_weight", "w2_weight"):
         weight = getattr(experts, name)
-        setattr(experts, name, torch.nn.Parameter(
-            pack_w4a8_moe_hipc_weight(weight.data), requires_grad=False,
-        ))
+        setattr(
+            experts,
+            name,
+            torch.nn.Parameter(
+                pack_w4a8_moe_hipc_weight(weight.data),
+                requires_grad=False,
+            ),
+        )
     for name in ("w13_weight_scale", "w2_weight_scale"):
         scale = getattr(experts, name)
-        setattr(experts, name, torch.nn.Parameter(scale.data * 16.0, requires_grad=False))
+        setattr(
+            experts, name, torch.nn.Parameter(scale.data * 16.0, requires_grad=False)
+        )
     experts.mega_l1_weights = (experts.w13_weight, experts.w13_weight_scale)
     experts.mega_l2_weights = (experts.w2_weight, experts.w2_weight_scale)
     metadata = get_global_expert_location_metadata()
     if metadata is not None:
         logical_experts = metadata.num_logical_experts
         if logical_experts % 8:
-            raise ValueError("W4A8 MegaMoE canonical reduction requires logical experts divisible by EP8")
+            raise ValueError(
+                "W4A8 MegaMoE canonical reduction requires logical experts divisible by EP8"
+            )
         groups = (
-            metadata.physical_to_logical_map[experts.layer_id] // (logical_experts // 8)
-        ).to(torch.int32).contiguous()
+            (
+                metadata.physical_to_logical_map[experts.layer_id]
+                // (logical_experts // 8)
+            )
+            .to(torch.int32)
+            .contiguous()
+        )
         physical_groups = torch.arange(
             groups.numel(), device=groups.device, dtype=torch.int32
         ) // (groups.numel() // 8)
@@ -1145,6 +1165,16 @@ def build_mega_moe_experts_weights(experts) -> None:
 
         experts.mega_l1_weights = (experts.w13_weight.data, w13_sf_utccp)
         experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
+        # EPLB moves each expert's slice of every parameter, so the UTCCP copies
+        # move with the scales they are transposed from.
+        experts.register_parameter(
+            "mega_w13_weight_scale_utccp",
+            torch.nn.Parameter(w13_sf_utccp, requires_grad=False),
+        )
+        experts.register_parameter(
+            "mega_w2_weight_scale_utccp",
+            torch.nn.Parameter(w2_sf_utccp, requires_grad=False),
+        )
     else:
         l1_pair, l2_pair = transform_weights_for_mega_moe((w13, w13_sf), (w2, w2_sf))
 
@@ -1272,6 +1302,8 @@ def build_hcu_w8a8_mega_moe_experts_weights(experts) -> None:
     experts._mega_moe_hcu_runtime = runtime
     experts._mega_moe_hcu_w8a8_weights = True
     experts._mega_moe_weights_built = True
+
+
 def build_mega_moe_shared_weights(
     shared_experts,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
@@ -1296,10 +1328,21 @@ def _transform_mega_moe_shared_sf(linear) -> torch.Tensor:
     if sf.dtype == torch.int32:
         # Requantized for the DeepGEMM linear runner.
         sf = inverse_transform_scale_ue8m0(sf, mn=n)[:, : k // 128]
+        block_m, block_k = 128, 128
+    else:
+        block_m, block_k = linear.quant_method.quant_config.weight_block_size
+    sf = sf.repeat_interleave(block_k // 32, dim=-1)
+    if block_m == 128:
+        return transform_sf_into_required_layout(
+            sf, mn=n, k=k, recipe=(128, 32), disable_ue8m0_cast=False
+        )
+    if block_m != 1:
+        sf = sf.repeat_interleave(block_m, dim=0)
     return transform_sf_into_required_layout(
-        sf.repeat_interleave(4, dim=-1),
+        sf.unsqueeze(0).contiguous(),
         mn=n,
         k=k,
-        recipe=(128, 32),
+        recipe=(1, 32),
+        num_groups=1,
         disable_ue8m0_cast=False,
-    )
+    ).squeeze(0)

@@ -1195,6 +1195,11 @@ class ModelRunner:
         self.eager_runner = capture.eager_runner
         self.prefill_cuda_graph_runner = capture.prefill.runner
         self.decode_cuda_graph_runner = capture.decode.runner
+        # Reuse startup decode graphs on a subsequent PD role switch.
+        self.decode_cuda_graph_captured = self.decode_cuda_graph_runner is not None
+        self.decode_cuda_graph_capture_bs = list(
+            getattr(self.decode_cuda_graph_runner, "capture_bs", []) or []
+        )
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
 
@@ -1786,7 +1791,7 @@ class ModelRunner:
             self.attn_backend.prepare_prefill_shared_read_snapshot(
                 forward_batch, num_qo_tokens=len(forward_batch.input_ids)
             )
-            from sglang.srt.model_executor.runner_utils import (
+            from sglang.srt.model_executor.runner_utils.shared_read_event import (
                 maybe_publish_prefill_shared_read_done,
             )
 
@@ -1827,7 +1832,11 @@ class ModelRunner:
 
         # Step span
         step_span_ctx = profile_range(
-            build_step_span_name(forward_batch, is_draft_worker=self.is_draft_worker)
+            build_step_span_name(
+                forward_batch,
+                is_draft_worker=self.is_draft_worker,
+                forward_id=self.forward_pass_id,
+            )
         )
 
         canary_ctx = (
@@ -1971,6 +1980,9 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        prepare = getattr(self.model, "prepare_for_forward", None)
+        if prepare is not None:
+            prepare(forward_batch)
         if has_forward_context():
             ctx_mgr = contextlib.nullcontext()
         else:

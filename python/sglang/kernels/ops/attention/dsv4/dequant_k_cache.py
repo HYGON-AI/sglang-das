@@ -297,9 +297,7 @@ def gather_upconvert_k_cache_paged(
     quant_k_cache_u8 = quant_k_cache.view(torch.uint8)
     num_pages = quant_k_cache_u8.shape[0]
     page_stride_bytes = quant_k_cache_u8.stride(0)
-    assert page_stride_bytes >= page_size * (
-        NOPE_ROPE_BYTES + PADDED_SCALE_PER_TOKEN
-    )
+    assert page_stride_bytes >= page_size * (NOPE_ROPE_BYTES + PADDED_SCALE_PER_TOKEN)
 
     if out is None:
         output_topk = topk
@@ -699,9 +697,7 @@ def _gather_upconvert_k_cache_paged_kernel(
     output_col = output_offset + topk_id
     in_valid_prefix = topk_id < valid_length
     loc = tl.load(
-        token_indices_ptr
-        + query_id * indices_stride_0
-        + topk_id * indices_stride_1,
+        token_indices_ptr + query_id * indices_stride_0 + topk_id * indices_stride_1,
         mask=in_valid_prefix,
         other=0,
     ).to(tl.int64)
@@ -719,9 +715,7 @@ def _gather_upconvert_k_cache_paged_kernel(
     nope_offs = tl.arange(0, TILE_SIZE)
     for tile_id in tl.static_range(NUM_SCALE_TILES):
         fp8_off = token_data_base + tile_id * TILE_SIZE + nope_offs
-        fp8_vals = tl.load(buf_fp8_ptr + fp8_off, mask=valid, other=0.0).to(
-            tl.float32
-        )
+        fp8_vals = tl.load(buf_fp8_ptr + fp8_off, mask=valid, other=0.0).to(tl.float32)
         scale_u8 = tl.load(
             buf_uint8_ptr + token_scale_base + tile_id,
             mask=valid,

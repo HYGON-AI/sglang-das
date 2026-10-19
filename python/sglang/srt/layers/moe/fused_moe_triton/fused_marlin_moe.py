@@ -47,6 +47,7 @@ num_cus = torch.cuda.get_device_properties(
 ).multi_processor_count
 
 
+# Not the JIT situ_and_mul: tanh as 2 * sigmoid(2x) - 1 is not bit-exact with it.
 @triton.jit
 def _tl_tanh(x):
     return 2.0 * tl.sigmoid(2.0 * x) - 1.0

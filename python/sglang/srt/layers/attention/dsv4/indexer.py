@@ -72,7 +72,7 @@ from sglang.srt.utils.common import is_gfx942_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-    from sglang.srt.layers.attention.dsv4.compressor import (
+    from sglang.srt.layers.attention.dsv4.compressor_v2 import (
         CompressorBackendMixin,
     )
     from sglang.srt.layers.quantization import QuantizationConfig
