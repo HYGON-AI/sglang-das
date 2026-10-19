@@ -180,6 +180,11 @@ def add_api_key_middleware(
             self.admin_api_key = admin_api_key
             self.fastapi_app = fastapi_app
             self.auth_config_provider = auth_config_provider
+            # Route auth metadata is treated as immutable after the middleware stack
+            # is built. Adding ADMIN_FORCE routes or changing route auth levels later
+            # without updating this cache is unsupported. Lifespan-added routes (such
+            # as /metrics) therefore must not require ADMIN_FORCE authentication.
+            self.has_admin_force = app_has_admin_force_endpoints(fastapi_app)
 
         async def __call__(self, scope, receive, send):
             if scope["type"] != "http":
@@ -201,6 +206,10 @@ def add_api_key_middleware(
                     await self.app(scope, receive, send)
                     return
                 api_key, admin_api_key = auth_config
+
+            if not api_key and not admin_api_key and not self.has_admin_force:
+                await self.app(scope, receive, send)
+                return
 
             request = Request(scope, receive=receive)
             path = request.url.path

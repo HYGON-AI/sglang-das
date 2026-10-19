@@ -896,7 +896,11 @@ class TestMultiSamHttpMock(CustomTestCase):
         try:
             from starlette.testclient import TestClient
 
-            from sglang.srt.entrypoints.http_server import app, set_global_state
+            from sglang.srt.entrypoints.http_server import (
+                app,
+                get_global_state,
+                set_global_state,
+            )
         except (ImportError, OSError):
             raise unittest.SkipTest(
                 "http_server import requires CUDA libraries not available on CPU"
@@ -909,6 +913,8 @@ class TestMultiSamHttpMock(CustomTestCase):
 
         mock_state = MagicMock()
         tm = mock_state.tokenizer_manager
+        tm.server_args.api_key = None
+        tm.server_args.admin_api_key = None
 
         # Wire up async methods that the HTTP handlers call
         tm.add_external_corpus = AsyncMock(
@@ -929,8 +935,11 @@ class TestMultiSamHttpMock(CustomTestCase):
                 success=True, corpus_token_counts={"a": 100, "b": 200}
             )
         )
+        previous_state = get_global_state()
+        cls.addClassCleanup(set_global_state, previous_state)
         set_global_state(mock_state)
         cls.client = TestClient(app)
+        cls.addClassCleanup(cls.client.close)
         cls.mock_tm = tm
 
     def test_add_corpus(self):

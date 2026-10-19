@@ -408,6 +408,157 @@ class TestDynamicAuthMiddleware(unittest.TestCase):
             response.json(), {"error": "Authentication configuration is not ready"}
         )
 
+    def test_no_keys_without_force_route_skips_route_matching(self):
+        from unittest.mock import patch
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        app = FastAPI()
+
+        @app.get("/v1/models")
+        async def models():
+            return {"ok": True}
+
+        add_api_key_middleware(
+            app,
+            api_key=None,
+            admin_api_key=None,
+            auth_config_provider=lambda: (None, None),
+        )
+        with patch(
+            "sglang.srt.utils.auth._get_auth_level_from_app_and_scope"
+        ) as match_auth_level:
+            with TestClient(app) as client:
+                self.assertEqual(client.get("/v1/models").status_code, 200)
+            match_auth_level.assert_not_called()
+
+    def test_no_keys_with_force_route_preserves_force_auth(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        app = FastAPI()
+
+        @app.get("/v1/models")
+        async def models():
+            return {"ok": True}
+
+        @app.get("/admin_force")
+        @auth_level(AuthLevel.ADMIN_FORCE)
+        async def admin_force():
+            return {"ok": True}
+
+        add_api_key_middleware(
+            app,
+            api_key=None,
+            admin_api_key=None,
+            auth_config_provider=lambda: (None, None),
+        )
+        with TestClient(app) as client:
+            self.assertEqual(client.get("/v1/models").status_code, 200)
+            self.assertEqual(client.get("/admin_force").status_code, 403)
+
+    def test_not_ready_precedes_no_key_fast_path(self):
+        from unittest.mock import patch
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        state = {"ready": False}
+
+        def provider():
+            if not state["ready"]:
+                raise AuthConfigNotReady()
+            return None, None
+
+        app = FastAPI()
+
+        @app.get("/v1/models")
+        async def models():
+            return {"ok": True}
+
+        add_api_key_middleware(
+            app, api_key=None, admin_api_key=None, auth_config_provider=provider
+        )
+        with patch(
+            "sglang.srt.utils.auth._get_auth_level_from_app_and_scope"
+        ) as match_auth_level:
+            with TestClient(app) as client:
+                self.assertEqual(client.get("/v1/models").status_code, 503)
+                state["ready"] = True
+                self.assertEqual(client.get("/v1/models").status_code, 200)
+            match_auth_level.assert_not_called()
+
+    def test_dynamic_key_change_takes_effect_immediately(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        state = {"keys": (None, None)}
+        app = FastAPI()
+
+        @app.get("/v1/models")
+        async def models():
+            return {"ok": True}
+
+        add_api_key_middleware(
+            app,
+            api_key=None,
+            admin_api_key=None,
+            auth_config_provider=lambda: state["keys"],
+        )
+        with TestClient(app) as client:
+            self.assertEqual(client.get("/v1/models").status_code, 200)
+            state["keys"] = ("user", None)
+            self.assertEqual(client.get("/v1/models").status_code, 401)
+            self.assertEqual(
+                client.get(
+                    "/v1/models", headers={"Authorization": "Bearer user"}
+                ).status_code,
+                200,
+            )
+
+    def test_force_route_added_before_stack_build_is_detected(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        app = FastAPI()
+        add_api_key_middleware(
+            app,
+            api_key=None,
+            admin_api_key=None,
+            auth_config_provider=lambda: (None, None),
+        )
+
+        @app.get("/admin_force")
+        @auth_level(AuthLevel.ADMIN_FORCE)
+        async def admin_force():
+            return {"ok": True}
+
+        with TestClient(app) as client:
+            self.assertEqual(client.get("/admin_force").status_code, 403)
+
+    def test_non_http_scope_does_not_call_provider(self):
+        from unittest.mock import Mock
+
+        from fastapi import FastAPI, WebSocket
+        from fastapi.testclient import TestClient
+
+        provider = Mock(side_effect=AssertionError("provider must not be called"))
+        app = FastAPI()
+
+        @app.websocket("/ws")
+        async def websocket_endpoint(websocket: WebSocket):
+            await websocket.accept()
+            await websocket.close()
+
+        add_api_key_middleware(
+            app, api_key=None, admin_api_key=None, auth_config_provider=provider
+        )
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws"):
+                pass
+        provider.assert_not_called()
+
     def test_unexpected_provider_error_is_not_bypassed(self):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
