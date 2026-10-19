@@ -628,8 +628,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
                 # Constructor installs fail-closed read/write policy before
                 # warmup. No setup parameter is used for the initial policy.
+                coordinate_health_policy = (
+                    storage_config is not None
+                    and torch.distributed.is_available()
+                    and torch.distributed.is_initialized()
+                    and (
+                        getattr(storage_config, "tp_size", 1) > 1
+                        or getattr(storage_config, "attn_cp_size", 1) > 1
+                    )
+                )
                 self._dfs_health_manager = MooncakeDfsHealthManager(
-                    self.store, dfs_health_config
+                    self.store,
+                    dfs_health_config,
+                    defer_policy_application=coordinate_health_policy,
                 )
 
             self.local_rank = (
@@ -1515,6 +1526,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if self._dfs_health_manager is not None:
             self._dfs_health_manager.close()
             self._dfs_health_manager = None
+
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        if self._dfs_health_manager is None:
+            return None
+        return self._dfs_health_manager.local_policy()
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        if self._dfs_health_manager is not None:
+            self._dfs_health_manager.apply_effective_policy(allow_read, allow_write)
 
     def clear(self) -> None:
         self.store.remove_all()

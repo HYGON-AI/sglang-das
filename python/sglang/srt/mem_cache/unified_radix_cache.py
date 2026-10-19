@@ -2782,6 +2782,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        self._sync_dfs_health_policy()
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [
@@ -2860,6 +2861,22 @@ class UnifiedRadixCache(BasePrefixCache):
                 storage_metrics = StorageMetrics()
             storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+
+    def _sync_dfs_health_policy(self) -> None:
+        """Apply one conservative DFS policy across all attention ranks."""
+        owner = self.linker
+        if owner is None and self.cache_controller is not None:
+            owner = self.cache_controller.storage_backend
+        getter = getattr(owner, "get_local_dfs_health_policy", None)
+        apply_policy = getattr(owner, "apply_dfs_health_policy", None)
+        if not callable(getter) or not callable(apply_policy):
+            return
+        local_policy = getter()
+        if local_policy is None:
+            return
+        effective = torch.tensor(local_policy, dtype=torch.int, device="cpu")
+        self._all_reduce_attn_groups(effective, torch.distributed.ReduceOp.MIN)
+        apply_policy(*(bool(value) for value in effective.tolist()))
 
     def drain_linker_loads(self) -> list[str]:
         """Retire finished linker loads and return the rids that must abort.

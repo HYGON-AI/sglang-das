@@ -84,6 +84,29 @@ class MooncakeDfsHealthManagerTest(unittest.TestCase):
         self.assertEqual(snapshot.write_state, AVAILABLE)
         self.assertEqual(store.policies[-1], (True, True))
 
+    def test_deferred_policy_waits_for_coordinated_result(self):
+        store = _FakeStore([0], [0])
+        manager = MooncakeDfsHealthManager(
+            store,
+            {
+                "probe_interval_s": 10,
+                "failure_threshold": 1,
+                "success_threshold": 1,
+                "probe_timeout_s": 1,
+            },
+            defer_policy_application=True,
+        )
+
+        snapshot = manager.probe_once()
+        self.assertEqual(snapshot.read_state, AVAILABLE)
+        self.assertEqual(snapshot.write_state, AVAILABLE)
+        self.assertEqual(manager.local_policy(), (True, True))
+        self.assertEqual(store.policies, [(False, False)])
+
+        manager.apply_effective_policy(True, False)
+        manager.apply_effective_policy(True, False)
+        self.assertEqual(store.policies, [(False, False), (True, False)])
+
     def test_stuck_read_does_not_block_or_fail_write_probe(self):
         release_read = threading.Event()
 

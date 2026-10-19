@@ -575,6 +575,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def waiting_queue_prefetch_enabled(self) -> bool:
         return self.host_prefetch_enabled
 
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        return self.storage.get_local_dfs_health_policy()
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        self.storage.apply_dfs_health_policy(allow_read, allow_write)
+
     def disable_waiting_queue_prefetch(self) -> None:
         # Startup only, before any request or prefetch submission. Keep the
         # native client and its pinned arena consistent with the final switch.

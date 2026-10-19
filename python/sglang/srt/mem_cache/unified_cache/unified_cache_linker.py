@@ -88,6 +88,13 @@ class UnifiedCacheLinker(ABC):
         """Whether waiting-queue host prefetch is enabled on every rank."""
         return False
 
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        """Return a rank-local DFS policy candidate, if the backend has one."""
+        return None
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        """Apply a cross-rank DFS policy, if the backend supports it."""
+
     def disable_waiting_queue_prefetch(self) -> None:
         """Turn waiting-queue host prefetch off before any job is submitted."""
 
@@ -252,6 +259,17 @@ class UnifiedCacheLinkerWrapper:
 
     def waiting_queue_prefetch_enabled(self) -> bool:
         return self._waiting_queue_prefetch_enabled
+
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        linker = getattr(self, "cache_linker", None)
+        getter = getattr(linker, "get_local_dfs_health_policy", None)
+        return getter() if callable(getter) else None
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        linker = getattr(self, "cache_linker", None)
+        apply_policy = getattr(linker, "apply_dfs_health_policy", None)
+        if callable(apply_policy):
+            apply_policy(allow_read, allow_write)
 
     def disable_waiting_queue_prefetch(self) -> None:
         self._waiting_queue_prefetch_enabled = False

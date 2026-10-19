@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.unified_cache.components import LinkerTransferPhase
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -74,3 +75,21 @@ def test_every_pp_stage_probes_l3_and_agrees_on_extend_boundary():
     assert len(pp0_match.device_indices) + pp0_match.host_hit_length == canonical_hit_len
     assert len(pp1_match.device_indices) + pp1_match.host_hit_length == canonical_hit_len
     assert prompt_len - canonical_hit_len == 2
+
+
+def test_sync_dfs_health_policy_applies_attention_group_minimum():
+    applied = []
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.linker = SimpleNamespace(
+        get_local_dfs_health_policy=lambda: (True, True),
+        apply_dfs_health_policy=lambda read, write: applied.append((read, write)),
+    )
+
+    def reduce_to_common_policy(policy, op):
+        assert op == torch.distributed.ReduceOp.MIN
+        policy.copy_(torch.tensor([0, 1], dtype=torch.int))
+
+    cache._all_reduce_attn_groups = reduce_to_common_policy
+    cache._sync_dfs_health_policy()
+
+    assert applied == [(False, True)]
