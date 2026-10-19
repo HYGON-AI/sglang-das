@@ -619,7 +619,12 @@ def _hip_runtime() -> ctypes.CDLL:
     """
     path = find_loaded_library("libamdhip64")
     if path is None:
-        raise RuntimeError("libamdhip64 is not loaded in the current process")
+        # HCU DTK maps the real library name rather than its libamdhip64 symlink.
+        path = find_loaded_library("libgalaxyhip")
+    if path is None:
+        raise RuntimeError(
+            "HIP runtime (libamdhip64 or libgalaxyhip) is not loaded in the current process"
+        )
     lib = ctypes.CDLL(path)
     lib.hipHostGetDevicePointer.restype = ctypes.c_int
     lib.hipHostGetDevicePointer.argtypes = [

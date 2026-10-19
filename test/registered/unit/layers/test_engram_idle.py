@@ -1,10 +1,11 @@
 """Regression tests for padded Engram IDLE batches."""
 
 import ast
+import ctypes
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
 import torch
 
@@ -15,6 +16,47 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+class TestEngramHipRuntime(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        engram._hip_runtime.cache_clear()
+        self.addCleanup(engram._hip_runtime.cache_clear)
+
+    def test_resolves_loaded_runtime_and_caches_binding(self):
+        for amd_path in ("/opt/rocm/lib/libamdhip64.so", None):
+            with self.subTest(amd_path=amd_path):
+                engram._hip_runtime.cache_clear()
+                galaxy_path = "/opt/dtk/lib/libgalaxyhip.so"
+                paths = {"libamdhip64": amd_path, "libgalaxyhip": galaxy_path}
+                library = MagicMock()
+                with (
+                    patch.object(engram, "find_loaded_library", side_effect=paths.get)
+                    as finder,
+                    patch.object(engram.ctypes, "CDLL", return_value=library) as loader,
+                ):
+                    self.assertIs(engram._hip_runtime(), library)
+                    self.assertIs(engram._hip_runtime(), library)
+                    loader.assert_called_once_with(amd_path or galaxy_path)
+                    expected = [call("libamdhip64")]
+                    if amd_path is None:
+                        expected.append(call("libgalaxyhip"))
+                    self.assertEqual(finder.call_args_list, expected)
+                self.assertIs(library.hipHostGetDevicePointer.restype, ctypes.c_int)
+                self.assertEqual(
+                    library.hipHostGetDevicePointer.argtypes,
+                    [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint],
+                )
+
+    def test_missing_runtime_does_not_load_another_library(self):
+        with (
+            patch.object(engram, "find_loaded_library", return_value=None),
+            patch.object(engram.ctypes, "CDLL") as loader,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "not loaded"):
+                engram._hip_runtime()
+            loader.assert_not_called()
 
 
 class TestEngramHCUDefaults(CustomTestCase):

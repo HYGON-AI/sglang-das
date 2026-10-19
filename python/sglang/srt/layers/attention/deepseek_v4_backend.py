@@ -1705,14 +1705,15 @@ class DeepseekV4AttnBackend(
                 cp_metadata = forward_batch.attn_cp_metadata
             assert cp_metadata is not None
             padded_num_tokens = sum(cp_metadata.per_rank_actual_token)
-            if (
-                swa_replay_start is not None
-                and swa_replay_start.shape[0] < padded_num_tokens
-            ):
-                swa_replay_start = torch.nn.functional.pad(
-                    swa_replay_start,
-                    (0, padded_num_tokens - swa_replay_start.shape[0]),
-                )
+        # Execution padding also applies when a short HCU batch cannot use CP.
+        if (
+            swa_replay_start is not None
+            and swa_replay_start.shape[0] < padded_num_tokens
+        ):
+            swa_replay_start = torch.nn.functional.pad(
+                swa_replay_start,
+                (0, padded_num_tokens - swa_replay_start.shape[0]),
+            )
 
         # BCG replay restores the captured out_cache_loc length, so the global
         # (compressor write) fields must be sized by it rather than the live rows.
