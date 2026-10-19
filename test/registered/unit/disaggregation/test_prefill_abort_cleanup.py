@@ -80,6 +80,13 @@ class TestPrefillAbortCleanup(unittest.TestCase):
 
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
+        self.stack.enter_context(
+            patch.object(
+                prefill,
+                "all_reduce_min_attn_cp_tp_group",
+                side_effect=lambda values, *_groups: list(values),
+            )
+        )
         self.metadata = self.stack.enter_context(
             patch.object(prefill, "maybe_release_metadata_buffer")
         )

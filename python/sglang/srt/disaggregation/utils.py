@@ -272,6 +272,16 @@ def poll_and_all_reduce_attn_cp_tp_group(
     return _all_reduce_polls(polls, attn_cp_cpu_group)
 
 
+def all_reduce_min_attn_cp_tp_group(
+    values: List[int],
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+) -> List[int]:
+    """MIN-reduce per-request integer flags across attention TP, then CP."""
+    values = _all_reduce_polls(values, attn_tp_cpu_group)
+    return _all_reduce_polls(values, attn_cp_cpu_group)
+
+
 def poll_and_all_reduce_with_staging(
     decode_reqs,
     staging_handler,

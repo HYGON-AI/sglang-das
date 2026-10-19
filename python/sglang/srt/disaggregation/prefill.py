@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    all_reduce_min_attn_cp_tp_group,
     build_kv_layer_ids,
     get_dsv4_c128_state_indices,
     get_kv_class,
@@ -2206,6 +2207,29 @@ class SchedulerDisaggregationPrefillMixin:
                 raise RuntimeError(
                     f"Unexpected poll state {poll} for req {req.rid} in inflight queue"
                 )
+
+        # Local cleanup can finish before its TP/CP peers. Keep the request in
+        # every inflight queue until all peers agree it can be removed.
+        keep_ids = {id(req) for req in undone_reqs}
+        remove_flags = [
+            int(id(req) not in keep_ids) for req in self.disagg_prefill_inflight_queue
+        ]
+        global_remove_flags = all_reduce_min_attn_cp_tp_group(
+            remove_flags,
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+        ready_ids = {
+            id(req)
+            for req, remove_flag in zip(
+                self.disagg_prefill_inflight_queue, global_remove_flags
+            )
+            if remove_flag
+        }
+        done_reqs = [req for req in done_reqs if id(req) in ready_ids]
+        undone_reqs = [
+            req for req in self.disagg_prefill_inflight_queue if id(req) not in ready_ids
+        ]
 
         for req in done_reqs:
             req.time_stats.set_completion_time()
