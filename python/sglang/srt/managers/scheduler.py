@@ -1217,10 +1217,8 @@ class Scheduler(
         # Failed external-linker rids that matched no scheduled request on the
         # pass that drained them; retried once, see _mark_failed_linker_loads.
         self._deferred_linker_rids: Set[str] = set()
-        # Track requests marked for external KV abort and cleanup to ensure
-        # proper lifecycle and prevent duplicate releases.
+        # Track requests marked for external KV abort.
         self._external_kv_abort_rids: Set[str] = set()
-        self._external_kv_cleanup_rids: Set[str] = set()
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -3852,9 +3850,9 @@ class Scheduler(
         self._release_aborted_request(req.rid)
 
         # Ensure idempotent KV release
-        if req.rid not in self._external_kv_cleanup_rids:
+        if not req.external_kv_cache_released:
             release_kv_cache(req, self.tree_cache, is_insert=False)
-            self._external_kv_cleanup_rids.add(req.rid)
+            req.external_kv_cache_released = True
 
         self._external_kv_abort_rids.discard(req.rid)
 
@@ -5225,8 +5223,8 @@ class Scheduler(
             if not rid_match and not chain_match:
                 continue
 
-            # Already in cleanup phase - don't duplicate release
-            if req.rid in self._external_kv_cleanup_rids:
+            # Cache release state belongs to this request, not its reusable RID.
+            if req.external_kv_cache_released:
                 handled_rids.add(req.rid)
                 continue
 

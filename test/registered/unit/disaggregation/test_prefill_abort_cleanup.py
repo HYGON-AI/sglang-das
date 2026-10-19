@@ -63,7 +63,6 @@ class TestPrefillAbortCleanup(unittest.TestCase):
         )
         s = self.scheduler
         s._external_kv_abort_rids = set()
-        s._external_kv_cleanup_rids = set()
         s._pending_chunked_abort_req = None
         s.disagg_prefill_pending_chunk_rids = {self.req.rid}
         s.disagg_prefill_inflight_queue = []

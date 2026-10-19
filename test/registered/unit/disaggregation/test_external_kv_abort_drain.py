@@ -159,7 +159,7 @@ class TestAbortDrain(unittest.TestCase):
         self.req.disagg_kv_sender.is_transfer_drained.return_value = True
         s = self.s
         s._external_kv_abort_rids = {"r"}
-        s._external_kv_cleanup_rids = {"r"}
+        s._external_kv_cleanup_rids = set()
         s._external_kv_chunked_abort_reqs = {}
         s._deferred_linker_rids = set()
         s._pending_chunked_abort_req = self.req
@@ -174,6 +174,24 @@ class TestAbortDrain(unittest.TestCase):
         s.tree_cache = object()
         s.output_streamer = Mock()
         s.ipc_channels = SimpleNamespace(send_to_tokenizer=Mock())
+
+    def queue_client_abort(self, req, mode):
+        self.s.disaggregation_mode = mode
+        self.s._external_kv_abort_rids.discard(req.rid)
+        self.s._pending_chunked_abort_req = req
+        self.s.chunked_req = req
+        self.s.process_pending_chunked_abort()
+
+    def new_request_with_same_rid(self, template):
+        req = SimpleNamespace(**vars(template))
+        req.to_finish = Reason("new request cancellation")
+        req.finished_reason = None
+        req.external_kv_cache_released = False
+        req.external_kv_cleanup_done = False
+        req.time_stats = Mock()
+        req.disagg_kv_sender = Mock()
+        req.pending_bootstrap = False
+        return req
 
     def finalize(self, **kwargs):
         facts = dict(forward_drained=True, sender_terminal=True, emit_response=True)
@@ -190,6 +208,61 @@ class TestAbortDrain(unittest.TestCase):
         self.s.process_pending_chunked_abort()
         self.env["release_kv_cache"].assert_called_once()
         self.assertTrue(self.req.external_kv_response_sent)
+
+    def test_client_abort_release_is_idempotent_per_req_for_null_and_prefill(self):
+        for mode in (
+            self.env["DisaggregationMode"].NULL,
+            self.env["DisaggregationMode"].PREFILL,
+        ):
+            with self.subTest(mode=mode):
+                case = type(self)()
+                case.setUp()
+                try:
+                    case.queue_client_abort(case.req, mode)
+                    case.env["release_kv_cache"].assert_called_once_with(
+                        case.req, case.s.tree_cache, is_insert=False
+                    )
+
+                    # Reprocessing the same Req remains idempotent.
+                    case.queue_client_abort(case.req, mode)
+                    case.env["release_kv_cache"].assert_called_once()
+
+                    # A new Req may reuse the RID and still owns its own KV.
+                    second = case.new_request_with_same_rid(case.req)
+                    case.queue_client_abort(second, mode)
+                    case.queue_client_abort(second, mode)
+                    self.assertEqual(case.env["release_kv_cache"].call_count, 2)
+                finally:
+                    case.doCleanups()
+
+    def test_failed_linker_load_marks_fresh_req_with_reused_rid(self):
+        fresh = self.new_request_with_same_rid(self.req)
+        fresh.to_finish = None
+        fresh.finished_reason = None
+        fresh.external_kv_cache_released = False
+        fresh.last_node = None
+        self.s._external_kv_cleanup_rids = {fresh.rid}
+        self.s._deferred_linker_rids = set()
+        self.s._external_kv_chunked_abort_reqs = {}
+        self.s.running_batch = None
+        self.s.chunked_req = None
+        self.s.disagg_prefill_inflight_queue = []
+        self.s.waiting_queue = []
+        self.s.disagg_prefill_bootstrap_queue = None
+        self.s.tree_cache = Mock()
+        self.s.tree_cache.drain_linker_loads.return_value = {fresh.rid}
+        self.s.tree_cache.has_outstanding_failed_linker_chains.return_value = False
+
+        self.s._mark_failed_linker_loads(SimpleNamespace(reqs=[fresh]))
+
+        self.assertTrue(fresh.external_kv_abort_requested)
+        self.assertEqual(
+            fresh.to_finish.message, "Aborted: external KV cache load failed."
+        )
+        self.assertEqual(fresh.to_finish.status_code, HTTPStatus.INTERNAL_SERVER_ERROR)
+        self.assertEqual(fresh.to_finish.err_type, "external")
+        self.s._release_aborted_request.assert_called_once_with(fresh.rid)
+        self.env["logger"].exception.assert_not_called()
 
     def test_drained_abort_notification_waits_for_forward_and_source_drain(self):
         self.req.disagg_kv_sender.notify_drained_abort = Mock()

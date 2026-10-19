@@ -1833,7 +1833,6 @@ class SchedulerDisaggregationPrefillMixin:
                 req.external_kv_response_sent = True
 
             self._external_kv_abort_rids.discard(req.rid)
-            self._external_kv_cleanup_rids.discard(req.rid)
             # The chunked protocol owner clears its marker after delivery.
             req.external_kv_cleanup_done = True
             return True
