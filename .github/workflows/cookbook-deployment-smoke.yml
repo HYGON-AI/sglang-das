@@ -63,5 +63,6 @@ jobs:
         with:
           image: ${{ inputs.image || '' }}
           dashhub-token: ${{ secrets.DASHHUB_CI_TOKEN }}
+          pypi-url: ${{ vars.PYPI_URL }}
           cases: ${{ inputs.cases || '' }}
           mode: ${{ inputs.mode || 'execute' }}
