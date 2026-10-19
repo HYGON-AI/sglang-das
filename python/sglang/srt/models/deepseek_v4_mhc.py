@@ -22,7 +22,6 @@ TODO: move dsv4 MHC into the same abstraction
 
 from __future__ import annotations
 
-import logging
 from typing import Any, Callable, NamedTuple, Optional, Tuple, TypeAlias, Union
 
 import msgspec
@@ -44,25 +43,6 @@ _is_hcu = is_hcu()
 _use_lightop = get_bool_env_var("SGLANG_USE_LIGHTOP")
 _hc_mix_stats_opt = envs.SGLANG_HCU_HC_MIX_STATS_OPT.get()
 _use_hcu_hc_mix_stats = _is_hcu and _use_lightop and _hc_mix_stats_opt
-if _use_hcu_hc_mix_stats:
-    import lightop
-
-logger = logging.getLogger(__name__)
-if _is_hcu:
-    logger.info(
-        "HCU hc_mix_stats: enabled=%s, implementation=%s",
-        _hc_mix_stats_opt,
-        "lightop" if _use_hcu_hc_mix_stats else "torch",
-    )
-
-if _use_hcu_hc_mix_stats:
-    logger.info(
-        "HCU compensated mHC: BF16x3 M=4096..65536; TF32 for other supported M; "
-        "Torch fallback, lightop=%s, extension=%s",
-        getattr(lightop, "__version__", "unknown"),
-        lightop.op.__file__,
-    )
-
 _use_aiter_tilelang_mhc = get_bool_env_var(
     "SGLANG_ROCM_USE_AITER_TILELANG_MHC", default="false"
 )
