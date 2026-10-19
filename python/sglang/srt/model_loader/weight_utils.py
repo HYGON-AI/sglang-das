@@ -22,6 +22,7 @@ import tempfile
 import threading
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Callable,
     Dict,
     Generator,
@@ -38,6 +39,7 @@ import numpy as np
 import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
+from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
@@ -523,11 +525,10 @@ def _find_local_hf_snapshot_dir_unlocked(
                 ),
             )
             rev_to_use = revision
-            if not rev_to_use:
-                ref_main = os.path.join(repo_folder, "refs", "main")
-                if os.path.isfile(ref_main):
-                    with open(ref_main) as f:
-                        rev_to_use = f.read().strip()
+            ref_path = os.path.join(repo_folder, "refs", revision or "main")
+            if os.path.isfile(ref_path):
+                with open(ref_path) as f:
+                    rev_to_use = f.read().strip()
             if rev_to_use:
                 rev_dir = os.path.join(repo_folder, "snapshots", rev_to_use)
                 if os.path.isdir(rev_dir):
@@ -666,7 +667,18 @@ def download_weights_from_hf(
         if not huggingface_hub.constants.HF_HUB_OFFLINE:
             # Before we download we look at what is available:
             fs = HfFileSystem()
-            file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
+            try:
+                file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
+            except HfHubHTTPError as e:
+                # Fail open (e.g. a 429 rate limit): pick the format from the local
+                # snapshot; snapshot_download below re-raises errors it cannot recover.
+                logger.warning(
+                    "Listing %s on the Hub failed, using the local snapshot: %s",
+                    model_name_or_path,
+                    e,
+                )
+                local_dir = find_local_repo_dir(model_name_or_path, revision)
+                file_list = os.listdir(local_dir) if local_dir else []
 
             # depending on what is available we download different things
             for pattern in allow_patterns:
@@ -1141,8 +1153,9 @@ def safetensors_weights_iterator(
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
 
+    prefetch_handle = None
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(
+        prefetch_handle = _prefetch_all_checkpoints(
             sorted(hf_weights_files), num_threads=prefetch_num_threads
         )
 
@@ -1164,6 +1177,8 @@ def safetensors_weights_iterator(
                     yield name, f.get_tensor(name)
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
+    if prefetch_handle is not None:
+        prefetch_handle.stop()
 
 
 def fastsafetensors_weights_iterator(
@@ -1208,17 +1223,46 @@ def fastsafetensors_weights_iterator(
         "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
     )
 
+    # fastsafetensors' nogds copier lazily page-locks
+    # bbuf_size_kb*1024*max_threads per reader (defaults 64MB*16 = 1GB).
+    # On HCU (no GDS) that 1GB cudaHostAlloc can fail transiently and abort
+    # the whole load with "submit_io: submit_nogds_read failed, err=-1".
+    # Shrink the bounce buffer (tunable via env) and retry the transient
+    # failure once with a fresh loader.
+    bbuf_size_kb = int(
+        os.getenv("SGLANG_FASTSAFETENSORS_BBUF_KB", str(16 * 1024))
+    )
+    max_threads = int(os.getenv("SGLANG_FASTSAFETENSORS_MAX_THREADS", "8"))
+
     for f_list in tqdm(
         weight_files_sub_lists,
         desc="Loading safetensors using Fastsafetensor loader",
         disable=False,
         bar_format=_BAR_FORMAT,
     ):
-        loader = SafeTensorsFileLoader(pg, device, nogds=not enable_gds)
         rank_file_map = {i: [f] for i, f in enumerate(f_list)}
-        loader.add_filenames(rank_file_map)
+        for attempt in range(2):
+            loader = SafeTensorsFileLoader(
+                pg,
+                device,
+                nogds=not enable_gds,
+                bbuf_size_kb=bbuf_size_kb,
+                max_threads=max_threads,
+            )
+            loader.add_filenames(rank_file_map)
+            try:
+                fb = loader.copy_files_to_device()
+                break
+            except Exception:
+                loader.close()
+                if attempt == 1:
+                    raise
+                logger.warning(
+                    "fastsafetensors copy_files_to_device failed "
+                    "(attempt %d/2); retrying with a fresh loader",
+                    attempt + 1,
+                )
         try:
-            fb = loader.copy_files_to_device()
             try:
                 keys = list(fb.key_to_rank_lidx.keys())
                 for k in keys:
@@ -1229,6 +1273,10 @@ def fastsafetensors_weights_iterator(
                 fb.close()
         finally:
             loader.close()
+        # Return fully free segments before the next batch can split and pin them.
+        # Keep post-load reclamation for buffers still held by temporary tensors.
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
         if drop_cache_after_load:
             for loaded_file in rank_file_map.get(rank, []):
                 _drop_file_cache_after_load(loaded_file)
@@ -1248,8 +1296,9 @@ def buffered_multi_thread_safetensors_weights_iterator(
     max_workers loading concurrently + 1 prefetched and ready to yield.
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
     """
+    prefetch_handle = None
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(
+        prefetch_handle = _prefetch_all_checkpoints(
             sorted(hf_weights_files), num_threads=prefetch_num_threads
         )
     enable_tqdm = (
@@ -1301,6 +1350,8 @@ def buffered_multi_thread_safetensors_weights_iterator(
                     # but later mmap-backed tensor access may fault pages again.
                     _drop_file_cache_after_load(st_file)
                 pbar.update(1)
+    if prefetch_handle is not None:
+        prefetch_handle.stop()
 
 
 def _load_pt_file(bin_file: str) -> dict:
@@ -1482,6 +1533,18 @@ def gguf_quant_weights_iterator(
             yield name, param
 
 
+def supports_quantized_rl_reload(func: Callable) -> Callable:
+    """Allow FlashRL to defer FP8 parameter writes until this method returns.
+
+    Checkpoint names must use the parameter names or QKV/gate-up aliases supported
+    by QuantizedRLModelLoader. FP8 writes must go through param.weight_loader;
+    the method must not read their values afterward, and source tensors must
+    remain unchanged until return. Non-FP8 parameters are loaded immediately.
+    """
+    func._supports_quantized_rl_reload = func
+    return func
+
+
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     if param.numel() == 1 and loaded_weight.numel() == 1:
@@ -1497,30 +1560,47 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
         param.data.copy_(loaded_weight)
 
 
+if TYPE_CHECKING:
+    from sglang.srt.layers.linear import LinearParallelGroup
+
+
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
 def sharded_weight_loader(
     shard_axis: int,
     tp_rank_getter=None,
+    *,
+    parallel_group: Optional["LinearParallelGroup"] = None,
 ) -> LoaderFunction:
-    """Create a weight loader that shards the weights along the given axis"""
+    """Create a weight loader with placement frozen in its construction scope.
 
-    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+    Without a group selection, retain the attention rank and legacy CPU padding
+    width. An explicit rank getter is evaluated once when creating the loader.
+    """
+    if parallel_group is not None:
+        if tp_rank_getter is not None:
+            raise ValueError("parallel_group cannot be combined with tp_rank_getter")
+        from sglang.srt.layers.linear import resolve_linear_parallel_group
+
+        tp_rank, tp_size = resolve_linear_parallel_group(parallel_group)
+    else:
         tp_rank = (
             tp_rank_getter()
             if tp_rank_getter is not None
             else get_parallel().attn_tp_rank
         )
+        tp_size = get_parallel().tp_size
 
+    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
 
         if (
             is_cpu()
             and (
-                loaded_weight.size(0) % get_parallel().tp_size != 0
-                or loaded_weight.size(0) < get_parallel().tp_size * shard_size
+                loaded_weight.size(0) % tp_size != 0
+                or loaded_weight.size(0) < tp_size * shard_size
             )
             and loaded_weight.dim() == 1
         ):

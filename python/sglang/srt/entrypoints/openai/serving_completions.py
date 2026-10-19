@@ -31,6 +31,7 @@ from sglang.srt.entrypoints.openai.utils import (
     spec_tokens_details_from_meta_info,
     to_openai_style_logprobs,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
@@ -357,8 +358,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 # /abort_request or session lifecycle cleanup) falls through
                 # to the normal chunk path, matching the non-stream behavior
                 # in tokenizer_manager._handle_abort_finish_reason.
-                if finish_reason_type == "abort" and isinstance(
-                    finish_reason.get("status_code"), HTTPStatus
+                if (
+                    finish_reason_type == "abort"
+                    and not envs.GLM_USE_ABORT_FINISH_REASON.get()
+                    and isinstance(finish_reason.get("status_code"), HTTPStatus)
                 ):
                     code = finish_reason["status_code"]
                     error = self.create_streaming_error_response(

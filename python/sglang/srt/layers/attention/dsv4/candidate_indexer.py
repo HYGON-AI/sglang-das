@@ -11,13 +11,9 @@ import triton.language as tl
 from sglang.kernels.ops.attention.dsv4 import lightop_indexer
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
-from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_hcu
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
-        DeepGemmCandidateIndexer,
-    )
     from sglang.srt.layers.attention.dsv4.candidate_indexer_lightop import (
         LightopCandidateIndexer,
     )
@@ -92,10 +88,12 @@ class IndexerInputs:
 def make_candidate_indexer(
     topk_blocks: int,
     block_size: int,
-) -> Optional[Union[DeepGemmCandidateIndexer, LightopCandidateIndexer]]:
-    """The paged fp4 decode path's two-level indexer; None on Hopper, whose decode
-    indexer selects through masks inline. HCU uses the LightOp implementation
-    when the installed LightOp provides it, else None (slot-based path)."""
+) -> Optional[LightopCandidateIndexer]:
+    """HCU adapter for the validated LightOp paged FP4 ABI.
+
+    Non-HCU platforms use the v41_indexer protocols. HCU falls back to the
+    slot-based path when its installed LightOp lacks this ABI.
+    """
     if topk_blocks <= 0:
         return None
     if block_size <= 0:
@@ -116,22 +114,7 @@ def make_candidate_indexer(
         )
 
         return LightopCandidateIndexer(topk_blocks, block_size)
-    if get_platform().device_sm < 100:
-        return None
-    from sglang.srt.layers.deep_gemm_wrapper.configurer import (
-        DEEPGEMM_PAGED_SPARSE_MQA_LOGITS,
-    )
-
-    if not DEEPGEMM_PAGED_SPARSE_MQA_LOGITS:
-        raise RuntimeError(
-            "the candidate indexer needs DeepGEMM's paged sparse MQA logits "
-            "(sgl-deep-gemm >= 0.2.0 with SGLANG_ENABLE_JIT_DEEPGEMM on)"
-        )
-    from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
-        DeepGemmCandidateIndexer,
-    )
-
-    return DeepGemmCandidateIndexer(topk_blocks, block_size)
+    return None
 
 
 # TODO(candidate): Hopper decode and prefill still select through these masks

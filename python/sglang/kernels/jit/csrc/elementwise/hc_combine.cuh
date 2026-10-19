@@ -78,9 +78,10 @@ __global__ __launch_bounds__(256) void hc_combine_kernel(const HcCombineParams _
       const Storage w_vec = gmem.load(wc_ptr, j);
 #pragma unroll
       for (uint32_t i = 0; i < kVecLen / 2; ++i) {
-        const auto [nx, ny] = cast<fp32x2_t>(n_vec[j][i]);
-        const auto [wx, wy] = cast<fp32x2_t>(w_vec[i]);
-        sum += nx * wx + ny * wy;
+        // HIP vector types cannot be destructured; read .x/.y instead.
+        const auto nxy = cast<fp32x2_t>(n_vec[j][i]);
+        const auto wxy = cast<fp32x2_t>(w_vec[i]);
+        sum += nxy.x * wxy.x + nxy.y * wxy.y;
       }
     }
     acc[c] = warp::reduce_sum(sum);
@@ -122,9 +123,9 @@ __global__ __launch_bounds__(256) void hc_combine_kernel(const HcCombineParams _
     Storage out_vec;
 #pragma unroll
     for (uint32_t i = 0; i < kVecLen / 2; ++i) {
-      const auto [rx, ry] = cast<fp32x2_t>(r_vec[i]);
-      const auto [yx, yy] = cast<fp32x2_t>(y_vec[i]);
-      out_vec[i] = cast<Float2>(fp32x2_t{rx + a * yx, ry + a * yy});
+      const auto rxy = cast<fp32x2_t>(r_vec[i]);
+      const auto yxy = cast<fp32x2_t>(y_vec[i]);
+      out_vec[i] = cast<Float2>(fp32x2_t{rxy.x + a * yxy.x, rxy.y + a * yxy.y});
     }
     gmem.store(out_ptr, out_vec, j);
   }
@@ -258,9 +259,10 @@ __global__ __launch_bounds__(hc_combine_split_detail::kGateThreads) void hc_comb
       w_vec.load(wc_ptr, ref_tid + j * kRefThreads);
 #pragma unroll
       for (uint32_t i = 0; i < kVecLen / 2; ++i) {
-        const auto [nx, ny] = cast<fp32x2_t>(n_vec[j][i]);
-        const auto [wx, wy] = cast<fp32x2_t>(w_vec[i]);
-        sum += nx * wx + ny * wy;
+        // HIP vector types cannot be destructured; read .x/.y instead.
+        const auto nxy = cast<fp32x2_t>(n_vec[j][i]);
+        const auto wxy = cast<fp32x2_t>(w_vec[i]);
+        sum += nxy.x * wxy.x + nxy.y * wxy.y;
       }
     }
     sum = warp::reduce_sum(sum);
@@ -322,9 +324,9 @@ __global__ __launch_bounds__(hc_combine_split_detail::kApplyThreads) void hc_com
     Storage out_vec;
 #pragma unroll
     for (uint32_t i = 0; i < kVecLen / 2; ++i) {
-      const auto [rx, ry] = cast<fp32x2_t>(r_vec[i]);
-      const auto [yx, yy] = cast<fp32x2_t>(y_vec[i]);
-      out_vec[i] = cast<Float2>(fp32x2_t{rx + a * yx, ry + a * yy});
+      const auto rxy = cast<fp32x2_t>(r_vec[i]);
+      const auto yxy = cast<fp32x2_t>(y_vec[i]);
+      out_vec[i] = cast<Float2>(fp32x2_t{rxy.x + a * yxy.x, rxy.y + a * yxy.y});
     }
     out_vec.store(out_ptr, vec_idx);
   }

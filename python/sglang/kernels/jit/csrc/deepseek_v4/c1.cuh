@@ -138,6 +138,8 @@ __global__ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(
 
   latent.store(params.kv_output + row * kHeadDim, tx);
   PDLTriggerSecondary<kUsePDL>();
+  // LayerSplit non-owners need the replicated index latent, not a KV store.
+  if (params.kvcache == nullptr) return;
 
   // Match finish()'s bf16 rounding before the main-KV RoPE.
 #pragma unroll
@@ -200,8 +202,8 @@ __global__ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(
   if (out_loc <= 0) return;
   const auto kv_row = Paged::row(params.kvcache, out_loc);
 
-  if constexpr (kLayout == KVLayout::V41) {
-    // fp8 with one ue8m0 scale per 32 elements over the whole row, RoPE included.
+  if constexpr (kLayout == KVLayout::V41 || kLayout == KVLayout::UNIFORM_FP8) {
+    // FP8 over the whole row, RoPE included; the layout selects the scaling.
     return deepseek_v4::v41::store_row<kLayout>(kv_row.data, kv_row.scale, tx, data);
   }
 
@@ -276,7 +278,7 @@ struct FlashCompress1Kernel {
 
     auto N = SymbolicSize{"num_tokens"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({N, kHeadDim})  //
         .with_dtype<bf16_t>()
@@ -306,7 +308,7 @@ struct FlashCompress1Kernel {
         .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
         .positions = positions.data_ptr(),
         .out_loc = out_loc.data_ptr(),
-        .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
+        .kvcache = kvcache.size(0) == 0 ? nullptr : static_cast<uint8_t*>(kvcache.data_ptr()),
         .eps = eps,
     };
     const auto k = select(pos_dtype.is_type<int32_t>(), loc_dtype.is_type<int32_t>());

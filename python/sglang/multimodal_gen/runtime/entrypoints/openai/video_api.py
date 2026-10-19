@@ -27,8 +27,13 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.prompt_enhancement import (
+    maybe_enhance_prompt,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    MiniMaxH3VideoGenerationsRequest,
     VideoGenerationsRequest,
+    VideoHTTPError,
     VideoListResponse,
     VideoResponse,
 )
@@ -45,7 +50,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     merge_image_input_list,
     process_generation_batch,
     request_extra_value,
+    request_field_value,
+    request_model_kwargs,
     resolve_sampling_params_cls,
+    sanitize_upload_filename,
     save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -94,13 +102,23 @@ async def shutdown_video_jobs() -> None:
 
 
 def _extra_value(request: VideoGenerationsRequest, name: str) -> Any:
+    """Read a model-task extension field.
+
+    These fields are declared explicitly on ``VideoGenerationsRequest`` so
+    they appear in the OpenAPI document, but older clients may still send
+    them through pydantic's ``extra="allow"`` channel (or the extra_body
+    containers), so ``request_extra_value`` remains a fallback.
+    JSON-encoded-string normalization for multipart forms is handled by the
+    pipeline adapters' ``_parse_extra_value``.
+    """
+
+    value = getattr(request, name, None)
+    if value is not None:
+        return value
     return request_extra_value(request, name)
 
 
 def _request_value(request: VideoGenerationsRequest, name: str) -> Any:
-    value = getattr(request, name, None)
-    if value is not None:
-        return value
     return _extra_value(request, name)
 
 
@@ -225,15 +243,17 @@ def _is_probably_video_source(source: Any) -> bool:
 
 
 def _resolve_video_path(req: VideoGenerationsRequest) -> str | None:
-    video_path = _request_value(req, "video_path") or _request_value(req, "video_url")
+    video_path = request_field_value(req, "video_path") or request_field_value(
+        req, "video_url"
+    )
     if video_path:
         return str(video_path)
 
-    input_reference = _request_value(req, "input_reference")
+    input_reference = request_field_value(req, "input_reference")
     if _is_probably_video_source(input_reference):
         return str(input_reference)
 
-    reference_url = _request_value(req, "reference_url")
+    reference_url = request_field_value(req, "reference_url")
     if _is_probably_video_source(reference_url):
         return str(reference_url)
 
@@ -243,7 +263,7 @@ def _resolve_video_path(req: VideoGenerationsRequest) -> str | None:
 def _resolve_image_path(
     req: VideoGenerationsRequest, video_path: str | None
 ) -> str | None:
-    image_path = _request_value(req, "input_reference")
+    image_path = request_field_value(req, "input_reference")
     if video_path and image_path == video_path:
         return None
     if _is_probably_video_source(image_path):
@@ -267,6 +287,8 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
 
     kwargs = {
         "prompt": request.prompt,
+        "task_type": request.task_type,
+        "request_data_type": DataType.VIDEO,
         "num_outputs_per_prompt": max(1, min(int(num_outputs), 10)),
         "size": request.size,
         "width": request.width,
@@ -286,14 +308,14 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "max_sequence_length": request.max_sequence_length,
         "flow_shift": request.flow_shift,
         "enable_teacache": request.enable_teacache,
-        "use_diffusion_decoder": _extra_value(request, "use_diffusion_decoder"),
-        "enable_cache_dit": _extra_value(request, "enable_cache_dit"),
-        "cache_dit_params": _extra_value(request, "cache_dit_params"),
-        "cfg_gate_step": _extra_value(request, "cfg_gate_step"),
-        "attention_backend_override": _extra_value(
+        "use_diffusion_decoder": request_extra_value(request, "use_diffusion_decoder"),
+        "enable_cache_dit": request_extra_value(request, "enable_cache_dit"),
+        "cache_dit_params": request_extra_value(request, "cache_dit_params"),
+        "cfg_gate_step": request_extra_value(request, "cfg_gate_step"),
+        "attention_backend_override": request_extra_value(
             request, "attention_backend_override"
         ),
-        "skip_softmax_params": _extra_value(request, "skip_softmax_params"),
+        "skip_softmax_params": request_extra_value(request, "skip_softmax_params"),
         "enable_frame_interpolation": request.enable_frame_interpolation,
         "frame_interpolation_exp": request.frame_interpolation_exp,
         "frame_interpolation_scale": request.frame_interpolation_scale,
@@ -302,15 +324,16 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "upscaling_model_path": request.upscaling_model_path,
         "upscaling_scale": request.upscaling_scale,
         "output_path": request.output_path,
-        "quality": _extra_value(request, "quality"),
+        "quality": request_extra_value(request, "quality"),
         "output_compression": request.output_compression,
+        "x264_preset": request.x264_preset,
         "output_quality": request.output_quality,
         "perf_dump_path": request.perf_dump_path,
         "profile": request.profile,
         "num_profiled_timesteps": request.num_profiled_timesteps,
         "profile_all_stages": request.profile_all_stages,
         "diffusers_kwargs": request.diffusers_kwargs,
-        **_video_request_model_kwargs(request, sampling_params_cls),
+        **request_model_kwargs(request, sampling_params_cls, "video"),
     }
 
     kwargs = sampling_params_cls.lower_video_request_kwargs(request, kwargs)
@@ -365,9 +388,13 @@ async def _save_first_input_image(
     os.makedirs(uploads_dir, exist_ok=True)
 
     filename = image.filename if hasattr(image, "filename") else "url_image"
-    target_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
+    safe_name = sanitize_upload_filename(filename, "url_image")
+    target_path = os.path.join(uploads_dir, f"{request_id}_{safe_name}")
     return await save_image_to_path(
-        image, target_path, prefer_remote_source=prefer_remote_source
+        image,
+        target_path,
+        prefer_remote_source=prefer_remote_source,
+        uploads_root=uploads_dir,
     )
 
 
@@ -459,24 +486,119 @@ async def _dispatch_job_async(
             shutil.rmtree(td, ignore_errors=True)
 
 
+def _inline_local_json_schema_refs(schema: dict[str, Any]) -> dict[str, Any]:
+    """Inline Pydantic's local ``#/$defs`` references for OpenAPI embedding."""
+
+    definitions = schema.get("$defs", {})
+
+    def inline(value: Any) -> Any:
+        if isinstance(value, list):
+            return [inline(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        ref = value.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/$defs/"):
+            name = ref.removeprefix("#/$defs/")
+            if name not in definitions:
+                raise RuntimeError(f"unresolved local JSON Schema reference: {ref}")
+            return inline(definitions[name])
+        return {
+            key: inline(item)
+            for key, item in value.items()
+            if key != "$defs"
+        }
+
+    return inline(schema)
+
+
+# The endpoint's handler signature is multipart-only, so FastAPI would document
+# just ``multipart/form-data`` even though JSON bodies are accepted and parsed in
+# the handler. Augment the generated document with the JSON variant. Local
+# Pydantic definitions are inlined because this schema is embedded below the
+# OpenAPI document root, where a raw ``#/$defs/...`` reference would be invalid.
+_VIDEO_REQUEST_JSON_SCHEMA = _inline_local_json_schema_refs(
+    VideoGenerationsRequest.model_json_schema()
+)
+_MINIMAX_H3_VIDEO_REQUEST_JSON_SCHEMA = _inline_local_json_schema_refs(
+    MiniMaxH3VideoGenerationsRequest.model_json_schema()
+)
+
+# Model-task extensions declared on VideoGenerationsRequest (consumed by
+# task-specific pipeline adapters, e.g. MiniMax H3); multipart forms carry
+# them as plain form fields, JSON bodies as top-level keys.
+_MODEL_TASK_EXTENSION_FIELDS = (
+    "task",
+    "conditions",
+    "target",
+    "audio_flow_shift",
+)
+
+
+def configure_video_openapi(app: Any, *, minimax_h3: bool) -> None:
+    """Select the JSON request schema for the model served by this app.
+
+    ``VideoGenerationsRequest`` must remain permissive because this router is
+    shared by multiple model families. A MiniMax-H3 process has a stricter
+    admission contract, so only that process advertises the H3-required fields.
+    """
+
+    schema = (
+        _MINIMAX_H3_VIDEO_REQUEST_JSON_SCHEMA
+        if minimax_h3
+        else _VIDEO_REQUEST_JSON_SCHEMA
+    )
+    for route in app.routes:
+        if route.path != "/v1/videos" or "POST" not in (route.methods or set()):
+            continue
+        openapi_extra = dict(route.openapi_extra or {})
+        request_body = dict(openapi_extra.get("requestBody") or {})
+        content = dict(request_body.get("content") or {})
+        content["application/json"] = {"schema": schema}
+        request_body["content"] = content
+        openapi_extra["requestBody"] = request_body
+        route.openapi_extra = openapi_extra
+        return
+    raise RuntimeError("POST /v1/videos route is missing")
+
+
 # TODO: support image to video generation
-@router.post("", response_model=VideoResponse)
+@router.post(
+    "",
+    response_model=VideoResponse,
+    responses={
+        400: {
+            "model": VideoHTTPError,
+            "description": "The video request was rejected before queue admission",
+        }
+    },
+    openapi_extra={
+        "requestBody": {
+            "content": {
+                "application/json": {"schema": _VIDEO_REQUEST_JSON_SCHEMA},
+            },
+        }
+    },
+)
 async def create_video(
     request: Request,
     # multipart/form-data fields (optional; used only when content-type is multipart)
     prompt: Optional[str] = Form(None),
+    enhance_prompt: Optional[bool] = Form(None),
     input_reference: Optional[UploadFile] = File(None),
     reference_url: Optional[str] = Form(None),
     video_reference: Optional[UploadFile] = File(None),
     video_url: Optional[str] = Form(None),
     video_path: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
+    task_type: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
     num_outputs_per_prompt: Optional[int] = Form(None),
     seconds: Optional[int] = Form(None),
     size: Optional[str] = Form(None),
     fps: Optional[int] = Form(None),
     num_frames: Optional[int] = Form(None),
+    width: Optional[int] = Form(None),
+    height: Optional[int] = Form(None),
     seed: Optional[int] = Form(None),
     generator_device: Optional[str] = Form("cuda"),
     negative_prompt: Optional[str] = Form(None),
@@ -496,16 +618,20 @@ async def create_video(
     upscaling_scale: Optional[int] = Form(None),
     output_quality: Optional[str] = Form(None),
     output_compression: Optional[int] = Form(None),
+    x264_preset: Optional[str] = Form(None),
     output_path: Optional[str] = Form(None),
     perf_dump_path: Optional[str] = Form(None),
     extra_params: Optional[str] = Form(None),
     extra_body: Optional[str] = Form(None),
+    task: Optional[str] = Form(None),
+    conditions: Optional[str] = Form(None),
+    target: Optional[str] = Form(None),
+    audio_flow_shift: Optional[float] = Form(None),
 ):
     content_type = request.headers.get("content-type", "").lower()
     request_id = generate_request_id()
 
     server_args = get_global_server_args()
-    task_type = server_args.pipeline_config.task_type
     is_multipart = "multipart/form-data" in content_type
     raw_form: Any = None
     extra_from_form: Dict[str, Any] = {}
@@ -513,14 +639,15 @@ async def create_video(
     # Parse model-specific multipart metadata before creating request-owned
     # directories or saving uploads, so malformed JSON leaves no resources.
     if is_multipart:
-        if not prompt:
+        sampling_params_cls = resolve_sampling_params_cls(server_args)
+        if not prompt and not sampling_params_cls.prompt_optional:
             raise HTTPException(status_code=400, detail="prompt is required")
         raw_form = await request.form()
         extra_from_form = _multipart_video_extras(
             raw_form,
             extra_body=extra_body,
             extra_params=extra_params,
-            sampling_params_cls=resolve_sampling_params_cls(server_args),
+            sampling_params_cls=sampling_params_cls,
         )
 
     # Resolve input upload directory (may be a temp dir when saving is disabled)
@@ -563,12 +690,6 @@ async def create_video(
             video_input_path = reference_url
             image_sources = merge_image_input_list(input_reference)
 
-        # Validate image input based on model task type
-        if task_type.requires_image_input() and not image_sources:
-            raise HTTPException(
-                status_code=400,
-                detail="input_reference or reference_url is required for image-to-video generation",
-            )
         input_path = None
         if image_sources:
             try:
@@ -597,20 +718,44 @@ async def create_video(
             return value if value is not None else extra_from_form.get(name)
 
         request_field_names = set(VideoGenerationsRequest.model_fields)
+        # Model-task extensions are declared request fields now, so the
+        # ``extra_request_fields`` filter below would silently drop them;
+        # pass them through explicitly from the form extras instead.
+        explicit_extension_values = {
+            "task": task,
+            "conditions": conditions,
+            "target": target,
+            "audio_flow_shift": audio_flow_shift,
+        }
+        extension_kwargs = {
+            field_name: form_value(
+                field_name,
+                explicit_extension_values[field_name],
+            )
+            for field_name in _MODEL_TASK_EXTENSION_FIELDS
+        }
         extra_request_fields = {
             key: value
             for key, value in extra_from_form.items()
-            if key not in request_field_names
+            if key not in request_field_names and key not in extension_kwargs
         }
         fps_val = form_value("fps", fps)
         num_frames_val = form_value("num_frames", num_frames)
+        width_val = form_value("width", width)
+        height_val = form_value("height", height)
 
         req = VideoGenerationsRequest(
-            prompt=prompt,
+            # ``prompt`` is a required str field on VideoGenerationsRequest; it is only
+            # ``None`` here for a prompt-optional pipeline (the gate above already
+            # rejected a missing prompt for every other one), so an empty string is the
+            # correct substitute, not a real (ignored) prompt value.
+            prompt=prompt or "",
+            enhance_prompt=form_value("enhance_prompt", enhance_prompt) or False,
             input_reference=input_path,
             video_path=form_value("video_path", video_input_path),
             video_url=form_value("video_url", video_url),
             model=form_value("model", model),
+            task_type=form_text_value("task_type", task_type),
             n=form_value("n", n),
             num_outputs_per_prompt=form_value(
                 "num_outputs_per_prompt", num_outputs_per_prompt
@@ -619,6 +764,8 @@ async def create_video(
             size=form_value("size", size),
             fps=fps_val,
             num_frames=num_frames_val,
+            width=width_val,
+            height=height_val,
             seed=form_value("seed", seed),
             generator_device=form_value("generator_device", generator_device),
             negative_prompt=form_text_value("negative_prompt", negative_prompt),
@@ -647,10 +794,12 @@ async def create_video(
             ),
             upscaling_scale=form_value("upscaling_scale", upscaling_scale),
             output_compression=form_value("output_compression", output_compression),
+            x264_preset=form_value("x264_preset", x264_preset),
             output_quality=form_value("output_quality", output_quality),
             output_path=form_value("output_path", output_path),
             perf_dump_path=form_value("perf_dump_path", perf_dump_path),
             diffusers_kwargs=form_value("diffusers_kwargs", None),
+            **extension_kwargs,
             **extra_request_fields,
         )
     else:
@@ -683,18 +832,6 @@ async def create_video(
             if _is_probably_video_source(payload.get("input_reference")):
                 payload.setdefault("video_path", payload.get("input_reference"))
 
-            has_image_input = (
-                payload.get("reference_url")
-                and not _is_probably_video_source(payload.get("reference_url"))
-            ) or (
-                payload.get("input_reference")
-                and not _is_probably_video_source(payload.get("input_reference"))
-            )
-            if task_type.requires_image_input() and not has_image_input:
-                raise HTTPException(
-                    status_code=400,
-                    detail="input_reference or reference_url is required for image-to-video generation",
-                )
             # for non-multipart/form-data type
             if payload.get("reference_url") and not _is_probably_video_source(
                 payload.get("reference_url")
@@ -712,6 +849,8 @@ async def create_video(
                         detail=f"Failed to process image source: {str(e)}",
                     )
                 payload["input_reference"] = input_path
+            if resolve_sampling_params_cls(server_args).prompt_optional:
+                payload.setdefault("prompt", "")
             req = VideoGenerationsRequest(**payload)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
@@ -730,10 +869,20 @@ async def create_video(
     logger.debug(f"Server received from create_video endpoint: req={req}")
 
     try:
+        image_path = _resolve_image_path(req, _resolve_video_path(req))
+        req.prompt = await maybe_enhance_prompt(
+            request,
+            req.prompt,
+            enabled=req.enhance_prompt,
+            task="video",
+            image_paths=[image_path] if image_path else None,
+        )
         sampling_params = _build_video_sampling_params(request_id, req)
-    except (ValueError, TypeError) as e:
+    except (asyncio.CancelledError, HTTPException, ValueError, TypeError) as e:
         for td in temp_dirs:
             shutil.rmtree(td, ignore_errors=True)
+        if isinstance(e, (asyncio.CancelledError, HTTPException)):
+            raise
         raise HTTPException(status_code=400, detail=str(e))
 
     batch: Req | None = None
@@ -766,6 +915,8 @@ async def create_video(
             sampling_params,
             server_args.served_model_name,
         )
+        if req.enhance_prompt:
+            job["revised_prompt"] = req.prompt
         job.update(sampling_params.project_video_queued_job_fields(batch))
         await VIDEO_STORE.upsert(request_id, job)
     except Exception as e:

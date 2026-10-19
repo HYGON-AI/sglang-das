@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, List
 
 import numpy as np
@@ -159,3 +160,72 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+@warmup("prefill_input_shapes")
+async def prefill_input_shapes(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    """Run caller-configured input-length warmup requests before serving traffic."""
+    server_args = getattr(tokenizer_manager, "server_args", None)
+    raw_lengths = os.getenv(
+        "SGLANG_PREFILL_WARMUP_INPUT_LENS",
+        "32,96,192,384,768,4096,8192,16384,24576",
+    )
+    if not raw_lengths.strip():
+        return
+    try:
+        input_lengths = list(
+            dict.fromkeys(
+                int(value.strip()) for value in raw_lengths.split(",") if value.strip()
+            )
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "SGLANG_PREFILL_WARMUP_INPUT_LENS must be a comma-separated "
+            f"list of positive integers, got {raw_lengths!r}."
+        ) from exc
+
+    if not input_lengths or any(length <= 0 for length in input_lengths):
+        raise ValueError(
+            "SGLANG_PREFILL_WARMUP_INPUT_LENS must contain positive lengths, "
+            f"got {raw_lengths!r}."
+        )
+
+    chunk_size = getattr(server_args, "chunked_prefill_size", None)
+    if chunk_size and chunk_size > 0:
+        skipped = [length for length in input_lengths if length > chunk_size]
+        input_lengths = [length for length in input_lengths if length <= chunk_size]
+        if skipped:
+            logger.warning(
+                "Skipping warmup lengths > chunked_prefill_size=%s: %s",
+                chunk_size,
+                skipped,
+            )
+    if not input_lengths:
+        logger.warning("No warmup lengths remain after chunk-size filtering")
+        return
+
+    for input_length in input_lengths:
+        request = GenerateReqInput(
+            input_ids=[1] * input_length,
+            sampling_params={"max_new_tokens": 1, "temperature": 0.0},
+        )
+        if disaggregation_mode != "null":
+            request.bootstrap_room = 0
+            request.bootstrap_host = FAKE_BOOTSTRAP_HOST
+
+        generator = tokenizer_manager.generate_request(request, None)
+        try:
+            async for _ in generator:
+                pass
+        finally:
+            await generator.aclose()
+
+        flush_result = await tokenizer_manager.flush_cache(timeout_s=30)
+        if not flush_result.success:
+            logger.warning(
+                "Could not flush cache after warmup length %s: %s",
+                input_length,
+                flush_result.message,
+            )

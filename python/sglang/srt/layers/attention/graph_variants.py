@@ -3,6 +3,9 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Optional, Protocol
+from sglang.srt.utils import is_hcu
+
+_is_hcu = is_hcu()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -34,8 +37,7 @@ class DsaGraphVariants:
         if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
             # Plain decode maintains this host mirror without a D2H sync.
             max_kv_len = int(seq_lens_cpu.max().item())
-        elif forward_batch.seq_lens is not None and forward_batch.seq_lens.numel() > 0:
-            # Fallback: a single scalar reduction d2h (cheap, per-step).
+        elif not _is_hcu and forward_batch.seq_lens is not None and forward_batch.seq_lens.numel() > 0:
             max_kv_len = int(forward_batch.seq_lens.max().item())
         else:
             # No length info: be safe and use the correct-for-all sparse graph.
@@ -44,10 +46,24 @@ class DsaGraphVariants:
 
 
 def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariants]:
-    from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
-    from sglang.srt.utils import is_hip
+    from sglang.srt.configs.model_config import (
+        get_dsa_index_kpool,
+        get_dsa_index_topk,
+        is_deepseek_dsa,
+    )
+    from sglang.srt.utils import is_hcu, is_hip
+    _is_hcu = is_hcu()
+    if _is_hcu:
+        from sglang.srt.layers.attention.glm5_next import is_glm5_next_hcu
+        if is_glm5_next_hcu(hf_config):
+            return None
 
     if is_hip() and is_deepseek_dsa(hf_config):
+        # KPool has no dense-skip path: both variants run the full indexer.
+        # Capture it once, keeping the regular DSA dense/sparse split intact.
+        if get_dsa_index_kpool(hf_config) > 1:
+            return None
+
         index_topk = get_dsa_index_topk(hf_config)
         logger.info(
             "[dense-decode] DSA dual-graph enabled: capturing "
@@ -96,17 +112,17 @@ def _candidate_indexer_capturable(model_runner) -> bool:
     """Whether this device can capture the two-level candidate decode graphs.
 
     HCU runs the same two-level indexer as CUDA but through LightOp, so it
-    qualifies once LightOp provides the paged fp4 ABI; other HIP targets and
-    pre-SM100 CUDA keep the single-graph path.
+    qualifies once LightOp provides the paged fp4 ABI. Other platforms keep
+    main's gfx95/SM100 eligibility checks.
     """
     import torch
 
-    from sglang.srt.utils import is_hcu, is_hip
+    from sglang.srt.utils import is_gfx95_supported, is_hcu, is_hip
 
     if not is_hip():
         return torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 10
     if not is_hcu():
-        return False
+        return is_gfx95_supported()
     from sglang.kernels.ops.attention.dsv4 import lightop_indexer
 
     return lightop_indexer.lightop_paged_indexer_available()

@@ -127,6 +127,13 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     if batch.prefill_input_ids_cpu is not None:
         prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
         if batch.mix_running_indices is not None:
+            # Keep mix_running_indices (= the mixed-in running batch's req_pool_indices, freed
+            # after merge_batch) alive on the forward stream until this gather completes.
+            # CPU has no cross-stream reuse hazard (and record_stream rejects CPU tensors).
+            if batch.mix_running_indices.device.type != "cpu":
+                batch.mix_running_indices.record_stream(
+                    torch.get_device_module(batch.device).current_stream()
+                )
             if batch.enable_overlap and not batch.spec_algorithm.is_none():
                 future_map.resolve_mixed_spec_tails(batch)
             decode_gpu = future_map.output_tokens_buf[batch.mix_running_indices]
@@ -459,6 +466,8 @@ class FutureMap:
             # FIXME(lsyin): only prefill; not compatible with mixed mode
             return
         indices = draft_input.future_indices
+        if indices is None:
+            return
         if indices.shape[0] == 0:
             return
         # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
@@ -567,12 +576,15 @@ class FutureMap:
                 # forward publish; a stale consume means a publish went missing.
                 assert self._publish_fresh, "resolve without a fresh forward publish"
                 self._publish_fresh = False
-            if _is_hip and not _is_hcu:
+            if _is_hip and (not _is_hcu or self.needs_cpu_seq_lens):
                 # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
+                # HCU only takes it when the CPU seq_lens copy below will block
+                # anyway; otherwise synchronize() stalls the scheduler host
+                # thread and defeats single-batch overlap.
                 self.publish_ready.synchronize()
             else:
-                # Device-side wait: on HCU a host sync here stalls the draft
-                # launch behind the previous verify's GPU tail (13-20ms measured).
+                # HCU GPU-only backends can wait on the stream without blocking
+                # the host from preparing the next forward pass.
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
 

@@ -13,33 +13,40 @@ import torch
 from torch import nn
 
 logger = logging.getLogger(__name__)
-
-from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
 from sglang.kernels.ops.attention.dsv4.torch_quant import (
     fake_quant_compressed_kv,
     fake_quant_fp4,
 )
+from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
+from sglang.kernels.ops.gemm.router_gemv_hip import rocm_gemv_split_k_max_tokens
 from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import add_prefix, is_hcu
+from sglang.srt.utils import add_prefix, is_gfx95_supported, is_hcu
+
 
 _is_hcu = is_hcu()
 
+def _fused_dsv41_kernels(x: torch.Tensor) -> bool:
+    # validated on CUDA and gfx950; other ROCm GPUs keep the torch forms
+    return x.is_cuda and (torch.version.cuda is not None or is_gfx95_supported())
 
-def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False):
-    # Both CUDA and HIP tensors report ``is_cuda``.  Select the backend from
-    # the runtime rather than treating ``torch.version.cuda`` as the device
-    # capability gate: ROCm uses the AOT path below, CUDA uses Triton.
-    if x.is_cuda and torch.version.hip is None and x.dtype == torch.bfloat16:
+
+def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False, positions=None):
+    """RoPE plus fake FP4 quantization, fused for bf16 inputs on CUDA and ROCm. With
+    positions, freqs is the whole table and the fused kernel gathers freqs[positions]."""
+    if not _is_hcu and _fused_dsv41_kernels(x) and x.dtype == torch.bfloat16:
         from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
             rope_tail_fake_quant_fp4,
         )
 
-        return rope_tail_fake_quant_fp4(x, freqs, rope_dim, compressed_kv=compressed_kv)
-
+        return rope_tail_fake_quant_fp4(
+            x, freqs, rope_dim, compressed_kv=compressed_kv, positions=positions
+        )
+    if positions is not None:
+        freqs = freqs[positions]
     # HIP/DCU: fused sgl-kernel AOT path.
-    if x.is_cuda and torch.version.hip is not None and x.dtype == torch.bfloat16:
+    if _is_hcu and x.is_cuda and x.dtype == torch.bfloat16:
         try:
             from sgl_kernel import rope_fp4_fake_quant as _rope_fp4_hip
 
@@ -137,18 +144,13 @@ def rope_tail(
 
 
 def fused_low_ratio_compress_supported() -> bool:
-    """Whether the one-launch c1/c2 decode compressor can be used.
-
-    CUDA still requires SM100 because its V4.1 cache writer uses the native
-    FP4 conversion instructions.  The HIP c1/c2 kernels use the portable
-    software FP4 path in ``fp4_utils.cuh`` and keep the HCU V4 cache layout, so
-    ROCm is eligible as well.  The index-K epilogue uses the same portable
-    encoder in its fused norm/RoPE/pack/store kernel.
-    """
+    """The fused c1 / c2 / index-K decode kernels need sm100+ on CUDA (they pack fp4
+    with `cvt.rn.satfinite.e2m1x2`) or gfx950 on ROCm; the answer also fixes the
+    ratio-2 weight layout (`wkv_gate`, or `wkv` plus `wgate`)."""
     if not torch.cuda.is_available():
         return False
     if torch.version.hip is not None:
-        return True
+        return _is_hcu or is_gfx95_supported()
     return torch.cuda.get_device_capability()[0] >= 10
 
 
@@ -265,6 +267,10 @@ class DeepseekV41Indexer(nn.Module):
             quant_config=None,
             prefix=add_prefix("weights_proj", prefix),
         )
+        # -1 off gfx950 or for shapes the split-K GEMV lacks
+        self.weights_proj_hip_max_tokens = rocm_gemv_split_k_max_tokens(
+            n=self.n_heads, k=config.hidden_size, weight_dtype=torch.bfloat16
+        )
         # The decode GEMM matches tiny_gemm's reduction order, not cuBLAS's.
         self.weights_proj_small_max_m = _small_weights_proj_max_m(
             self.n_heads, config.hidden_size
@@ -293,10 +299,17 @@ class DeepseekV41Indexer(nn.Module):
         k = self.k_norm(self.forward_wk(latent))
         return _rope_fq4(k, freqs, self.rope_head_dim)
 
-    def queries(self, q_lora: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    def queries(
+        self,
+        q_lora: torch.Tensor,
+        freqs: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """freqs per token, or the whole table with positions (gathered inside the
+        fused RoPE launch)."""
         q, _ = self.wq_b(q_lora)
         q = q.view(q.shape[0], self.n_local_heads, self.index_head_dim)
-        return _rope_fq4(q, freqs, self.rope_head_dim)
+        return _rope_fq4(q, freqs, self.rope_head_dim, positions=positions)
 
     def head_weights_raw(self, x: torch.Tensor) -> torch.Tensor:
         """`weights_proj(x)` before the scale, [tokens, n_heads] bf16."""

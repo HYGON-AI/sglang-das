@@ -39,12 +39,14 @@ from sglang.srt.managers.io_struct import (
     BatchStrOutput,
     BatchTokenIDOutput,
     ConfigureLoggingReq,
+    DetokenizerCompletionReq,
     FreezeGCReq,
     sock_recv,
     sock_send,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import (
     get_device,
     get_model,
@@ -72,6 +74,15 @@ logger = logging.getLogger(__name__)
 # Use power of 2 values for better memory allocation.
 DETOKENIZER_MAX_STATES = int(os.environ.get("SGLANG_DETOKENIZER_MAX_STATES", 1 << 16))
 
+# A UTF-8 character is at most 4 bytes, so an incomplete character can only be
+# carried by the last 3 tokens (each token contributes at least one byte).
+MAX_UTF8_TAIL_TOKENS = 3
+# Consecutive streaming steps the incremental-decoding offsets may stay frozen
+# while the decoded tail ends with U+FFFD and no clean boundary exists in the
+# last MAX_UTF8_TAIL_TOKENS tokens. A real incomplete character completes long
+# before this; past it the tail is output (e.g. a run of genuine U+FFFD).
+MAX_STALLED_DECODE_STEPS = 8
+
 
 @dataclasses.dataclass
 class DecodeStatus:
@@ -83,6 +94,8 @@ class DecodeStatus:
     read_offset: int
     # Offset that's sent to tokenizer for incremental update.
     sent_offset: int = 0
+    # Consecutive streaming steps the offsets above have stayed frozen.
+    stalled_steps: int = 0
     decoded_text_len: int = dataclasses.field(init=False)
     decoded_text_chunks: List[str] = dataclasses.field(default_factory=list)
 
@@ -122,10 +135,19 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.init_request_dispatcher()
 
     def init_ipc_channels(self, port_args: PortArgs, server_args: ServerArgs):
-        context = zmq.Context(2)
+        context = zmq.Context(3)
         self.recv_from_scheduler = get_zmq_socket(
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
         )
+        self.detokenizer_worker_ipc_name = port_args.detokenizer_ipc_name
+        self.send_to_detokenizer_router = None
+        if port_args.detokenizer_ack_ipc_name is not None:
+            self.send_to_detokenizer_router = get_zmq_socket(
+                context,
+                zmq.PUSH,
+                port_args.detokenizer_ack_ipc_name,
+                False,
+            )
         # In multi-tokenizer mode, results are pushed back to each TokenizerWorker
         # directly via SocketMapping inside multi_http_worker_event_loop, so the
         # single send_to_tokenizer socket is unused.
@@ -145,6 +167,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 trust_remote_code=get_model().trust_remote_code,
                 revision=get_model().revision,
                 tokenizer_backend=get_serving().tokenizer_backend,
+                glm_special_token_escape_seed=get_serving().glm_special_token_escape_seed,
             )
             try:
                 self.vocab_size = len(self.tokenizer)
@@ -184,9 +207,38 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             with self.soft_watchdog.disable():
                 recv_obj = sock_recv(self.recv_from_scheduler)
             output = self._request_dispatcher(recv_obj)
-            if output is not None:
+            if isinstance(output, list):
+                for chunk in output:
+                    sock_send(self.send_to_tokenizer, chunk)
+            elif output is not None:
                 sock_send(self.send_to_tokenizer, output)
+            if output is not None:
+                self.acknowledge_finished_requests(recv_obj)
             self.soft_watchdog.feed()
+
+    def acknowledge_finished_requests(self, recv_obj):
+        """Release router-side load only after final outputs have been sent."""
+        if self.send_to_detokenizer_router is None:
+            return
+
+        rids = getattr(recv_obj, "rids", None)
+        finished_reasons = getattr(recv_obj, "finished_reasons", None)
+        if not rids or not finished_reasons:
+            return
+
+        finished_rids = [
+            rid
+            for rid, finished_reason in zip(rids, finished_reasons)
+            if finished_reason is not None
+        ]
+        if finished_rids:
+            sock_send(
+                self.send_to_detokenizer_router,
+                DetokenizerCompletionReq(
+                    worker_ipc_name=self.detokenizer_worker_ipc_name,
+                    finished_rids=finished_rids,
+                ),
+            )
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
@@ -195,7 +247,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             return output
 
         matched = finished_reason.get("matched", None)
-        if not matched:
+        if matched is None:
             return output
 
         # TODO(lmzheng): handle the case where multiple stop strs are hit
@@ -389,23 +441,51 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if recv_obj.finished_reasons[i] is None:
                 # Streaming. Invariant: sent_offset >= decoded_text_len. The
                 # gap (`pending`) is "printable but uncommitted" text emitted
-                # in a prior "�" recovery step; we skip it from this step's
+                # in a prior U+FFFD recovery step; we skip it from this step's
                 # emission so we don't double-send.
                 pending = s.sent_offset - s.decoded_text_len
-                if new_text and not new_text.endswith("�"):
+                if new_text and not new_text.endswith("\ufffd"):
                     # Clean text: commit to decoded_text and advance offsets.
-                    s.append_decoded_text(new_text)
-                    s.surr_offset = s.read_offset
-                    s.read_offset = len(s.decode_ids)
-                    s.sent_offset = s.decoded_text_len
+                    self._commit_stream_text(s, new_text, len(s.decode_ids))
                     output_strs.append(new_text[pending:] if pending else new_text)
-                else:
-                    # Incomplete UTF-8: emit the printable prefix only; do not
-                    # commit (token offsets stay so the next iteration retries
-                    # with more tokens).
-                    printable = find_printable_text(new_text)
-                    s.sent_offset = s.decoded_text_len + len(printable)
-                    output_strs.append(printable[pending:] if pending else printable)
+                    continue
+
+                # The tail ends with U+FFFD. That is either an incomplete UTF-8
+                # character (wait for more tokens) or a genuine U+FFFD the model
+                # emitted -- byte-fallback vocabularies have hundreds of tokens
+                # that decode to one on their own. In the latter case the old
+                # gate never fired again: the client received nothing until the
+                # request finished, and the re-decoded window grew with the
+                # output. First commit up to the latest clean token boundary;
+                # an incomplete character only ever spans the last few tokens.
+                commit = self._find_clean_commit(
+                    s,
+                    surr_texts[i],
+                    recv_obj.skip_special_tokens[i],
+                    recv_obj.spaces_between_special_tokens[i],
+                    pending,
+                )
+                if commit is not None:
+                    boundary, clean_text = commit
+                    self._commit_stream_text(s, clean_text, boundary)
+                    output_strs.append(clean_text[pending:] if pending else clean_text)
+                    continue
+
+                if s.stalled_steps >= MAX_STALLED_DECODE_STEPS:
+                    # No clean boundary at all (e.g. a pure run of U+FFFD) and
+                    # far more tokens than any incomplete character needs: the
+                    # tail is output, not a pending character. Commit it.
+                    self._commit_stream_text(s, new_text, len(s.decode_ids))
+                    output_strs.append(new_text[pending:] if pending else new_text)
+                    continue
+
+                # Incomplete UTF-8: emit the printable prefix only; do not
+                # commit (token offsets stay so the next iteration retries
+                # with more tokens).
+                s.stalled_steps += 1
+                printable = find_printable_text(new_text)
+                s.sent_offset = s.decoded_text_len + len(printable)
+                output_strs.append(printable[pending:] if pending else printable)
                 continue
 
             if rid in self.decode_status:
@@ -422,6 +502,46 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_strs.append(incremental_output)
 
         return output_strs
+
+    @staticmethod
+    def _commit_stream_text(s: DecodeStatus, text: str, boundary: int) -> None:
+        """Commit `text` (decoded from decode_ids[surr_offset:boundary]) and
+        advance the incremental-decoding offsets to `boundary`."""
+        s.append_decoded_text(text)
+        s.surr_offset = s.read_offset
+        s.read_offset = boundary
+        s.sent_offset = s.decoded_text_len
+        s.stalled_steps = 0
+
+    def _find_clean_commit(
+        self,
+        s: DecodeStatus,
+        surr_text: str,
+        skip_special_tokens: bool,
+        spaces_between_special_tokens: bool,
+        pending: int,
+    ) -> Optional[Tuple[int, str]]:
+        """Find the latest token boundary within the last MAX_UTF8_TAIL_TOKENS
+        tokens whose decoded text does not end with U+FFFD.
+
+        Returns (boundary, new_text) for decode_ids[surr_offset:boundary], or
+        None if there is no such boundary (or committing it would rewind text
+        already sent in a previous recovery step).
+        """
+        n = len(s.decode_ids)
+        lowest = max(s.read_offset, n - MAX_UTF8_TAIL_TOKENS - 1)
+        for boundary in range(n - 1, lowest, -1):
+            text = self._grouped_batch_decode(
+                [s.decode_ids[s.surr_offset : boundary]],
+                [skip_special_tokens],
+                [spaces_between_special_tokens],
+            )[0]
+            clean_text = text[len(surr_text) :]
+            if clean_text and not clean_text.endswith("\ufffd"):
+                if len(clean_text) < pending:
+                    return None
+                return boundary, clean_text
+        return None
 
     @staticmethod
     def _b64_encode_per_request(
@@ -497,7 +617,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
             output_token_entropy_val=recv_obj.output_token_entropy_val,
             output_token_sampling_mask=recv_obj.output_token_sampling_mask,
-            output_token_sampling_logprobs=recv_obj.output_token_sampling_logprobs,
             output_hidden_states=recv_obj.output_hidden_states,
             routed_experts=routed_experts,
             indexer_topk=indexer_topk,
@@ -545,6 +664,7 @@ def run_detokenizer_process(
 ):
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer")
+    load_plugins()
     configure_logger(server_args)
     publish(server_args, role="detokenizer")
     parent_process = psutil.Process().parent()
