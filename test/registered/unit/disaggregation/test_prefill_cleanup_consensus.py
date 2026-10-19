@@ -31,7 +31,13 @@ class _Sender:
         self.state = state
 
     def poll(self):
-        return KVPoll.Failed
+        return self.state["poll"]
+
+    def failure_exception(self):
+        return None
+
+    def clear(self):
+        self.state["clear_count"] += 1
 
     def is_transfer_drained(self):
         return self.state["drained"]
@@ -56,7 +62,15 @@ def _make_scheduler(rank, tp_group, cp_group, mode, state):
         inflight_middle_chunks=0,
         pending_bootstrap=False,
         disagg_kv_sender=sender,
-        time_stats=SimpleNamespace(set_completion_time=lambda: None),
+        time_stats=SimpleNamespace(
+            set_completion_time=lambda: None,
+            trace_ctx=SimpleNamespace(
+                abort=lambda **_kwargs: state.__setitem__(
+                    "trace_count", state["trace_count"] + 1
+                )
+            ),
+        ),
+        prefill_transfer_failure_reported=False,
         external_kv_abort_response_via_chunked=False,
         external_kv_response_sent=False,
         external_kv_metadata_released=False,
@@ -84,12 +98,19 @@ def _make_scheduler(rank, tp_group, cp_group, mode, state):
         disagg_prefill_inflight_queue=[req],
         attn_cp_cpu_group=cp_group,
         attn_tp_cpu_group=tp_group,
-        _external_kv_abort_rids={rid} if mode == "external" else set(),
+        _external_kv_abort_rids={rid} if mode.startswith("external") else set(),
         _external_kv_cleanup_rids=set(),
         result_queue=[],
         req_to_metadata_buffer_idx_allocator=object(),
         disagg_metadata_buffers=SimpleNamespace(pd_hidden_pool=None),
         tree_cache=object(),
+        ps=SimpleNamespace(tp_rank=rank),
+        metrics_reporter=SimpleNamespace(enable_metrics=True),
+        metrics_collector=SimpleNamespace(
+            increment_transfer_failed_reqs=lambda: state.__setitem__(
+                "failure_count", state["failure_count"] + 1
+            )
+        ),
         output_streamer=SimpleNamespace(
             stream_output=lambda *_args, **_kwargs: state.__setitem__(
                 "response_count", state["response_count"] + 1
@@ -115,17 +136,11 @@ def _make_scheduler(rank, tp_group, cp_group, mode, state):
         )
 
     def handle_failure(target, *, sender_terminal):
-        if target.to_finish is None and target.finished_reason is None:
-            target.to_finish = FINISH_ABORT("transfer failed")
-        done = abort_external(
+        return prefill.SchedulerDisaggregationPrefillMixin.handle_inflight_transfer_failure(
+            scheduler,
             target,
-            forward_drained=forward_drained(target),
             sender_terminal=sender_terminal,
-            emit_response=True,
         )
-        if not done:
-            scheduler._external_kv_abort_rids.add(target.rid)
-        return None, done
 
     scheduler.prefill_abort_forward_drained = forward_drained
     scheduler.prefill_abort_sender_terminal = sender_terminal
@@ -156,7 +171,7 @@ def _gloo_prefill_cleanup_worker(rank, port):
         tp_group = tp_groups[rank // 2]
         cp_group = cp_groups[rank % 2]
 
-        for mode in ("failed", "external", "pp"):
+        for mode in ("failed", "external", "pp", "external_success"):
             # Rank 2 is locally undrained. The other ranks can finish local
             # cleanup on tick one, but no request may leave the shared queue
             # until rank 2 drains. This pattern exercises both TP and CP MINs.
@@ -167,6 +182,10 @@ def _gloo_prefill_cleanup_worker(rank, port):
                 "metadata_release_count": 0,
                 "response_count": 0,
                 "abort_count": 0,
+                "clear_count": 0,
+                "failure_count": 0,
+                "trace_count": 0,
+                "poll": KVPoll.Success if mode == "external_success" else KVPoll.Failed,
             }
             scheduler, req = _make_scheduler(rank, tp_group, cp_group, mode, state)
 
@@ -219,6 +238,9 @@ def _gloo_prefill_cleanup_worker(rank, port):
                 assert state["metadata_release_count"] == 1
                 assert state["response_count"] == 1
                 assert state["abort_count"] == 1
+                assert state["clear_count"] == 0
+                assert state["failure_count"] == int(not mode.startswith("external"))
+                assert state["trace_count"] == int(not mode.startswith("external"))
                 assert req.external_kv_cleanup_done
     finally:
         dist.destroy_process_group()

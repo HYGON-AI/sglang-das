@@ -2115,6 +2115,11 @@ class SchedulerDisaggregationPrefillMixin:
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+            if req.external_kv_cleanup_done:
+                # Local cleanup is terminal; only the shared removal verdict
+                # remains pending. Do not re-enter failure or success cleanup.
+                done_reqs.append(req)
+                continue
             # Check if this request was marked for external KV abort
             external_abort_pending = req.rid in self._external_kv_abort_rids
 
@@ -2301,11 +2306,15 @@ class SchedulerDisaggregationPrefillMixin:
         except Exception as e:
             exc = e
             error_message += f" with exception {e}"
-        if getattr(exc, "is_from_another_rank", False):
-            logger.debug(error_message)
-        else:
-            logger.warning(error_message)
-        req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        if not req.prefill_transfer_failure_reported:
+            req.prefill_transfer_failure_reported = True
+            if getattr(exc, "is_from_another_rank", False):
+                logger.debug(error_message)
+            else:
+                logger.warning(error_message)
+            req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+            if self.metrics_reporter.enable_metrics:
+                self.metrics_collector.increment_transfer_failed_reqs()
 
         if req.to_finish is None and req.finished_reason is None:
             req.to_finish = FINISH_ABORT(
@@ -2321,8 +2330,6 @@ class SchedulerDisaggregationPrefillMixin:
         )
         if not cleanup_done:
             self._external_kv_abort_rids.add(req.rid)
-        if self.metrics_reporter.enable_metrics:
-            self.metrics_collector.increment_transfer_failed_reqs()
         return exc, cleanup_done
 
     def get_transferred_rids(

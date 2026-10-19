@@ -34,6 +34,7 @@ class TestPrefillAbortCleanup(unittest.TestCase):
             mamba_pool_idx=None,
             bootstrap_room=7,
             bootstrap_host="peer",
+            prefill_transfer_failure_reported=False,
             time_stats=Mock(),
             disagg_kv_sender=Mock(),
         )
@@ -314,6 +315,20 @@ class TestPrefillAbortCleanup(unittest.TestCase):
         self.req.disagg_kv_sender.abort.assert_called_once()
         self.scheduler.output_streamer.stream_output.assert_called_once()
         self.scheduler.metrics_collector.increment_transfer_failed_reqs.assert_called_once()
+
+    def test_retried_failure_handler_reports_each_request_once(self):
+        with patch.object(
+            self.scheduler, "abort_external_kv_request", side_effect=[False, True]
+        ) as finalizer:
+            self.scheduler.handle_inflight_transfer_failure(
+                self.req, sender_terminal=False
+            )
+            self.scheduler.handle_inflight_transfer_failure(
+                self.req, sender_terminal=True
+            )
+        self.assertEqual(finalizer.call_count, 2)
+        self.scheduler.metrics_collector.increment_transfer_failed_reqs.assert_called_once()
+        self.req.time_stats.trace_ctx.abort.assert_called_once()
 
     def test_remote_failure_and_pending_bootstrap_do_not_prove_local_terminal(self):
         self.scheduler.disagg_prefill_inflight_queue = [self.req]

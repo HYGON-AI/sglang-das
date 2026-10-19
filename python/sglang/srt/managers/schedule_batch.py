@@ -990,6 +990,7 @@ class Req(ReqDllmMixin):
         self.external_kv_response_sent = False
         self.external_kv_abort_response_via_chunked = False
         self.external_kv_cleanup_done = False
+        self.prefill_transfer_failure_reported = False
         self.external_kv_cleanup_steps = {}
         self.stream = stream
         self.eos_token_ids = eos_token_ids

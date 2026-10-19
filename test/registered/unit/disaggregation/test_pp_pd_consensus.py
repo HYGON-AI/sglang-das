@@ -200,6 +200,7 @@ class TestPPPDConsensus(CustomTestCase):
         )
         req.external_kv_response_sent = False
         req.external_kv_metadata_released = False
+        req.external_kv_cleanup_done = False
 
         def mark_abort(target_req, message, status_code):
             del message, status_code
