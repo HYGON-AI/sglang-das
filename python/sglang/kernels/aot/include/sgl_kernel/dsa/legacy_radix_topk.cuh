@@ -1,6 +1,10 @@
 #pragma once
 
+#ifdef USE_ROCM
+#include <hip/hip_fp16.h>
+#else
 #include <cuda_fp16.h>
+#endif
 
 #include <cstddef>
 #include <cstdint>

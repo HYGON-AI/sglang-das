@@ -185,7 +185,7 @@ class TestDSparkPPContext(CustomTestCase):
             max_num_token=max_num_token,
             hidden_size=4,
             dtype=torch.float32,
-            dp_size=1,
+            num_dp_ranks=1,
             pp_size=8,
             is_encoder_decoder=False,
             require_mlp_tp_gather=False,
@@ -197,9 +197,11 @@ class TestDSparkPPContext(CustomTestCase):
             hc_hidden_size=16,
         )
         eager_kwargs = {
-            k: v for k, v in common_kwargs.items() if k not in ("dp_size", "pp_size")
+            k: v for k, v in common_kwargs.items() if k not in ("num_dp_ranks", "pp_size")
         }
-        with get_parallel().override(dp_size=1, pp_size=8, moe_ep_size=1):
+        with get_parallel().override(
+            dp_size=1, attn_dp_size=1, pp_size=8, moe_ep_size=1
+        ):
             eager_buffers = _allocate_decode_buffers(vocab_size=8, **eager_kwargs)
             graph_buffers = DecodeInputBuffers.create(
                 next_token_logits_buffer=torch.zeros((max_num_token, 8)),
@@ -222,6 +224,7 @@ class TestDSparkPPContext(CustomTestCase):
         torch.nn.Module.__init__(model)
         model.config = SimpleNamespace(hidden_size=hidden_size)
         model.is_nemotron_35_draft = False
+        model.quantizable = False
         model.num_context_features = 3
         model.fc = torch.nn.Linear(3 * hidden_size, hidden_size, bias=False)
         model.hidden_norm = RMSNorm(hidden_size, eps=1e-6)

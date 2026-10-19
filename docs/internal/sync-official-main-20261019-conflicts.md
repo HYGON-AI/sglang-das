@@ -43,7 +43,7 @@
 - 上游新增 Hunyuan 文件采用 CRLF；以 `core.whitespace=cr-at-eol` 检查通过，保留原始换行。
 - 路由/增量 detokenizer：17 passed；PP deferred-bootstrap/consensus：32 passed、11 subtests passed。DSpark PP context 测试在收集阶段被提交容器旧 LightOp 缺少 fuse_situ_mul_quant_contiguous 阻断，留待验证容器复测。
 
-## 运行验收（待执行）
+## 运行验收（合并阶段历史状态，已由最终验收更新）
 
 整理完成后，用户已授权停止 `zz-nmz28 | rye_sglang_dpsk-v41` 的 prefill 进程用于验证。只停止经核对属于该服务的进程。
 目标保持 DeepSeek-V4-Flash-0731-FP8-Channel、纯 TP8、端口 10015。需服务就绪、graph capture 与至少 3 次 replay、完整 EvalScope HumanEval；尚无本次精度结论。
@@ -130,3 +130,24 @@
 静态检查：1004 个变更 Python 文件 AST 通过，全树 compileall 通过，相对双方父提交新增 Ruff 错误为 0；直接调用参数审计无新增不匹配。完整导入审计发现 3 项合并问题均已修复（FormatSignature、shared-read helper、HIP compressor）。
 
 NIXL/control/MLA host 单测：67 passed、9 subtests passed。HTTP warmup 单测因提交容器旧 LightOp 缺少 fuse_situ_mul_quant_contiguous 在收集阶段阻塞，需在验证容器复验。最终 TP8/HumanEval 尚未执行，不代表精度通过。
+
+## 最终运行前适配（2026-10-19）
+
+- `setup_hip.py` 与 `setup_rocm.py` 一致，对 gfx928/gfx936/gfx938 的 `_is_hcu` 构建选择保留的 `topk_hcu.hip`，避免 hipify 覆盖官方 AMD `topk.hip`。
+- 完整 AOT 编译暴露 `legacy_radix_topk.cuh` 在 HIP 下直接包含 `cuda_fp16.h`；增加 `USE_ROCM` 条件包含 HIP half 头，CUDA 路径不变。重编译成功，产物 `wheels/sglang_kernel-0.4.10-cp39-abi3-linux_x86_64.whl`；日志 `runtime-28/aot-build-retry1.log`。
+- nmz28/dpsk-v41 源码导入与 HTTP/server warmup 单测通过：4 passed、2 subtests passed。
+- nmz26 卡忙；nmz28/dpsk-v41 实际为 V4.1 decode（10016），未停止。使用此前获准且 8 卡空闲的 nmz22/latest，指定 0731 checkpoint 和纯 TP8；运行结果待记录。
+- 验证容器保留 DTK PyTorch 2.11/Python 3.10；editable 安装使用 `--no-deps --ignore-requires-python`，未将上游 CUDA 依赖安装到 HCU 环境。仅代表本次指定路径待验，不宣称全部 Python 3.10 兼容。EvalScope 1.13.0 使用独立 system-site-packages venv。
+
+- nmz22 attempt1 在 wo_a BF16 einsum 的 rocBLAS/Tensile kernel 加载处失败；该表达式同步前已存在，同形状独立 GEMM 通过。attempt2 设置 `TORCH_BLAS_PREFER_HIPBLASLT=1` 后越过该位置，后续环境保留该设置；不能据此归因于本次模型代码变更。
+- attempt2 暴露 JIT `CHECK_CUDA` 的 HIP 分支缺失 `runtime::is_cuda_error/get_cuda_error_string` 定义。将共用 runtime error helpers 移到 HIP/CUDA launcher 分支之前，driver `CUresult` overload 仍仅 CUDA 编译。
+
+- Hash TopK GPU probe 进一步发现 padding mask 仅接受 `kDLCUDA`，HIP 张量的 `kDLROCM` 被拒绝；按 `USE_ROCM` 选择设备类型。修复后 n=1/7/32 的索引、sqrtsoftplus 归一化权重及 padding mask 实际 GPU 对照均通过：`runtime-22/jit-hash-topk-probe-fixed.log`。初版 probe 错误将 routed scaling factor 乘到归一化权重，已按现有 API（共享专家权重使用其倒数）修正 probe，未更改生产权重语义。
+
+- 提交容器曾被旧 LightOp 阻塞的 DSpark PP context 测试已在 nmz28/dpsk-v41 补跑。fixture 跟进 `quantizable`、`attn_dp_size` 及 `DecodeInputBuffers.create(num_dp_ranks=...)` 新接口，生产代码未因此修改；最终 15 passed，见 `runtime-28/dspark-pp-context-tests-fixed.log`。
+
+## 最终验收结论
+
+2026-10-19：指定纯 TP8 验收通过。上述各阶段“待执行/尚未执行”均为当时状态；最终结果以本节及 summary 的最终验收章节为准。旧 main 同环境 HumanEval 134/164；同步首次 145/164，最终重复 140/164；三组均无 API 错误、空输出和长度截断。最终 8 rank graph capture 完成，10 条 graph decode 日志，health=200。最终生产代码 diff 与两次评测一致。
+
+验证位置 nmz22/latest；未停止 nmz28 decode。启动需 TORCH_BLAS_PREFER_HIPBLASLT=1，默认 BLAS 环境根因未解决；完整复现命令、依赖限制与证据路径见 [最终验收记录](sync-official-main-20261019-summary.md)。仅验收本次指定纯 TP8，不覆盖全部新模型和分布式组合。

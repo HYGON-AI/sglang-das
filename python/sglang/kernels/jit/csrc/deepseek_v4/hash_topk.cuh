@@ -187,8 +187,13 @@ struct MaskKernel {
     const int32_t* ntn_ptr = nullptr;
     int32_t ntn_value = 0;
     const auto ntn_dev = num_token_non_padded.device().device_type;
-    if (ntn_dev == kDLCUDA) {
-      RuntimeCheck(is_type<int32_t>(num_token_non_padded.dtype()), "num_token_non_padded on CUDA must be int32");
+#ifdef USE_ROCM
+    constexpr auto gpu_device_type = kDLROCM;
+#else
+    constexpr auto gpu_device_type = kDLCUDA;
+#endif
+    if (ntn_dev == gpu_device_type) {
+      RuntimeCheck(is_type<int32_t>(num_token_non_padded.dtype()), "num_token_non_padded on GPU must be int32");
       ntn_ptr = static_cast<const int32_t*>(num_token_non_padded.data_ptr());
     } else if (ntn_dev == kDLCPU) {
       if (is_type<int32_t>(num_token_non_padded.dtype())) {
@@ -199,7 +204,7 @@ struct MaskKernel {
         RuntimeCheck(false, "num_token_non_padded on CPU must be int32 or int64");
       }
     } else {
-      RuntimeCheck(false, "num_token_non_padded must be on CPU or CUDA");
+      RuntimeCheck(false, "num_token_non_padded must be on CPU or the current GPU backend");
     }
 
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());

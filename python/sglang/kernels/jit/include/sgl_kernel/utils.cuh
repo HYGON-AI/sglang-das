@@ -354,6 +354,33 @@ SGL_DEVICE_HOST constexpr uint32_t get_tmem_cols(uint32_t num_cols) {
 
 namespace host {
 
+namespace runtime {
+
+inline bool is_cuda_error(::cudaError_t error) {
+  return error != ::cudaSuccess;
+}
+
+inline const char* get_cuda_error_string(::cudaError_t error) {
+  return ::cudaGetErrorString(error);
+}
+
+#ifndef USE_ROCM
+
+inline bool is_cuda_error(::CUresult error) {
+  return error != ::CUDA_SUCCESS;
+}
+
+inline const char* get_cuda_error_string(::CUresult error) {
+  const char* error_string = "";
+  // cuGetErrorString only fails with CUDA_ERROR_INVALID_VALUE, leaving the string null.
+  const auto new_error = ::cuGetErrorString(error, &error_string);
+  return new_error == ::CUDA_SUCCESS ? error_string : "Unknown error";
+}
+
+#endif
+
+}  // namespace runtime
+
 #ifdef USE_ROCM
 inline void RuntimeDeviceCheck(::hipError_t error, DebugInfo location = {}) {
   if (error != ::hipSuccess) {
@@ -449,32 +476,7 @@ struct LaunchKernel {
   const DebugInfo m_location;
 };
 #else
-namespace runtime {
 
-inline bool is_cuda_error(::cudaError_t error) {
-  return error != ::cudaSuccess;
-}
-
-inline const char* get_cuda_error_string(::cudaError_t error) {
-  return ::cudaGetErrorString(error);
-}
-
-#ifndef USE_ROCM
-
-inline bool is_cuda_error(::CUresult error) {
-  return error != ::CUDA_SUCCESS;
-}
-
-inline const char* get_cuda_error_string(::CUresult error) {
-  const char* error_string = "";
-  // cuGetErrorString only fails with CUDA_ERROR_INVALID_VALUE, leaving the string null.
-  const auto new_error = ::cuGetErrorString(error, &error_string);
-  return new_error == ::CUDA_SUCCESS ? error_string : "Unknown error";
-}
-
-#endif
-
-}  // namespace runtime
 
 /**
  * \brief Check a CUDA runtime (`cudaError_t`) or driver (`CUresult`) error code

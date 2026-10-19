@@ -6,6 +6,51 @@
 
 本次冻结 `/home/officials/sglang` 的官方 main 为 `a90e9c5dd8973cdb84af4ff6154c7b4958083b31`（2026-10-19 16:37:50 +08:00）。范围 `438df9a2a4645d39c87e33c4a27792e568ac2701..a90e9c5dd8973cdb84af4ff6154c7b4958083b31` 共 **722 笔提交**，包含 v0.5.22 周期以及 release 后继续进入 main 的改动。下面的提交索引只对应这个范围，不能当作完整 release diff。
 
+## 最终验收（2026-10-19，PASS）
+
+已完成四批增量合并及 HCU 兼容性修复；本次指定的 DeepSeek-V4-Flash-0731-FP8-Channel 纯 TP8 启动、图执行和完整 HumanEval 验收通过。验证位置为 `zz-nmz22 | rye_sglang_latest`，提交位置为 `zz-nmz26 | rye_sglang_open`。nmz26 当时卡忙；nmz28 decode 停止授权已收到，但本次未停止该服务。
+
+| 代码 | HumanEval 正确数 | 准确率 | 结果 |
+|---|---:|---:|---|
+| 同环境冻结旧 main `f89209aa84a4fd0619d0662f6adf6980740efc78` | 134/164 | 81.71% | 对照基线 |
+| 同步代码第一次完整验证 | 145/164 | 88.41% | 通过 |
+| 同步代码最终重复验证 | 140/164 | 85.37% | 通过 |
+
+三次使用相同数据集元数据、评测配置和 checkpoint，均无 API 错误、空输出或长度截断；temperature=1.0，存在采样波动。两次同步结果均高于匹配基线，未观察到精度回退；这不是统计显著性或性能提升声明，也不要求所有题正确。此前 10 月 9 日不同 checkpoint/greedy 结果不能直接比较。
+
+最终服务 8 个 TP rank 均完成 graph capture，batch sizes 为 `[1,2,4,8,12,16,24,32]`；最终评测日志有 10 条 `cuda graph: True` decode 记录，健康检查 HTTP 200，无 traceback。评测 batch=64 时部分批次走 eager，后续小批次走 graph。端口 10015 服务保留运行。
+
+### 复现配置与环境限制
+
+启动前使用本次构建的 `sglang-kernel==0.4.10`，SGLang editable 源码指向本仓库。实际启动命令：
+
+```bash
+export PYTHONPATH=/home/proj_sglang_open/sglang-das/python:${PYTHONPATH}
+export PD_MODE=none PD_OPEN=0 MTP_MODE=none HCU_NUM=8
+export TORCH_BLAS_PREFER_HIPBLASLT=1
+bash /home/proj_sglang_open/scripts_local/run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel
+```
+
+本环境默认 rocBLAS/Tensile 在既有 BF16 wo_a einsum 路径发生 kernel 加载失败；上述 HIPBLASLT 设置用于基线和两次同步验证，作为必要运行配置记录，未宣称已修复默认 BLAS 环境根因。
+
+EvalScope 1.13.0 使用独立 system-site-packages venv，执行：
+
+```bash
+export PATH=/tmp/sglang-sync-evalscope-20261019/bin:$PATH
+export TMPDIR=/tmp/sglang-sync-humaneval-20261019
+limit=all batch=64 bash /home/scripts/acc_test/run-all-acc.sh /module/DeepSeek-V4-Flash-0731-FP8-Channel 10015 dataset=humaneval
+```
+
+配置为 seed=42、temperature=1.0、top_p=1.0、max_tokens=4096、thinking=false；164 题完整执行。服务器为 gfx938×8、Python 3.10.12、DTK Torch 2.11.0、LightOp 0.6.0、Transformers 5.12.1、Triton 3.6.0、AITER 0.1.6，精确构建版本见 runtime manifest。官方 Python>=3.11 元数据保持不变；HCU editable 安装使用 `--no-deps --no-build-isolation --no-index --ignore-requires-python`，保留现有 DTK 依赖。本次仅证明指定路径在该 Python 3.10 环境可运行，不代表全部上游功能兼容。
+
+### 修复与证据
+
+最终修复覆盖 HCU AOT top-k 构建选择、HIP half 头、JIT runtime error helpers 和 Hash TopK padding mask 的 ROCm device type；HCU 专属分派用 `_is_hcu` 保护，通用 HIP 编译兼容使用 `USE_ROCM`。DSpark PP context fixture 跟进官方参数接口后 15 passed；HTTP/server warmup 4 passed、2 subtests passed；NIXL/control/MLA host 67 passed、9 subtests passed。各批 AST、compileall、相对父提交新增 Ruff 错误和调用参数检查详见冲突台账。未执行 EP/DP/CP/PD/MTP 的完整模型运行验收；KDA 测试的 boltops 环境阻塞及既有 fixture 问题保留在台账，不泛化为全部测试通过。
+
+证据根目录：`/home/proj_sglang_open/sync-evidence/20261019`。关键文件：`runtime-22/final-verdict.json`、`runtime-22/runtime-manifest.json`、`runtime-22/server-final.log`、`runtime-22/humaneval-final.log`、`runtime-22/baseline-comparison-audit.json`、`final-fix-static-checks.json`。三次报告分别位于 `runtime-22/accuracy-attempt1`、`accuracy-baseline`、`accuracy-final`。最终运行生产代码 diff SHA256 为 `a9e162aad1afcd5bd3a68f8c0a189f8da0d42751c63f4211ab0141f8328a481c`，两次同步验证之间未变更。
+
+另见 [v0.5.22 模型与组件发布汇总](sglang-v0.5.22-release-summary.md) 和 [冲突与验证台账](sync-official-main-20261019-conflicts.md)。
+
 ## 模型与组件要点
 
 - **DeepSeek-V4/V4.1**：重点是 mHC 小 batch 算子、MXFP8 与稀疏 prefill、BCG 长上下文 replay、DSpark draft metadata、V4.1 多模态输入与 ROCm 路径。最新冻结点包含 AMD mHC fused post+pre buffer cache 有界化，避免无限缓存增长。

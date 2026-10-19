@@ -68,6 +68,15 @@ sources = [
     # "csrc/sgl_diffusion/elementwise/timestep_embedding.cu",
 ]
 
+# Keep HCU's validated radix implementation and avoid hipify overwriting
+# the tracked upstream AMD cooperative implementation in topk.hip.
+_build_arch = os.environ.get("AMDGPU_TARGET", "")
+if torch.cuda.is_available():
+    _build_arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", _build_arch)
+_is_hcu = any(arch in _build_arch for arch in ("gfx936", "gfx938", "gfx928"))
+if _is_hcu:
+    sources[sources.index("csrc/elementwise/topk.cu")] = "csrc/elementwise/topk_hcu.hip"
+
 cxx_flags = ["-O3", "-w"]
 libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
