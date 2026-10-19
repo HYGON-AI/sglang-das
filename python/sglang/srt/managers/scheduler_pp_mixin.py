@@ -102,6 +102,7 @@ def _pp_exchange_outputs_before_forward(
         return False
     return not (cur_batch.forward_mode.is_extend() or cur_batch.is_extend_in_batch)
 
+
 def _pp_ordered_intersection(left: List[str], right: List[str]) -> List[str]:
     right_set = set(right)
     return [rid for rid in left if rid in right_set]
@@ -206,10 +207,7 @@ class SchedulerPPMixin:
                     recv_reqs = self.ingest_requests(
                         before_process=self._pp_preforward_expert_distribution_req
                     )
-                if (
-                    not self.pp_group.is_last_rank
-                    and not self._pp_reqs_preforwarded
-                ):
+                if not self.pp_group.is_last_rank and not self._pp_reqs_preforwarded:
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(
@@ -298,18 +296,15 @@ class SchedulerPPMixin:
         ====================================================================
         Stage P
         recv ith req from previous stage
-        recv ith bootstrap req from previous stage
+        pop bootstrapped reqs (PPConsensusStore + pp_sync polls)
         recv ith transferred req from previous stage
         recv ith proxy from previous stage
         run ith batch
-        recv prev (i+1) % mb_size th consensus bootstrapped req from previous stage
-        local consensus on bootstrapped req
         recv prev (i+1) % mb_size th release req from previous stage
         local consensus on release req
         recv prev (i+1) % mb_size th outputs
         process batch result of prev (i+1)% mb_size th batch (can be run in parallel with the curr batch GPU computation)
         send ith req to next stage
-        send ith bootstrap req to next stage
         send ith transferred req to next stage
         send ith proxy to next stage
         send current stage's outputs to next stage (can be stashed and delayed to send later)
@@ -317,23 +312,21 @@ class SchedulerPPMixin:
         the above order can be optimized and reordered to minimize communication-related CPU stall and overhead bubbles.
         ====================================================================
 
-        There are two additional elements compared to the regular schedule:
-
-        Bootstrap Requests + Release Requests:
-        - Both can have local failure and need to be consensus on. PP needs to guarantee eventual consistency of local failure and flush malfunc requests out as soft error.
+        Release Requests still use the two-pass PP consensus. Bootstrap uses
+        PPConsensusStore instead of the legacy two-round RID sync.
 
         """
         self.init_pp_loop_state()
 
         # PD additional state initialization
-        bmbs = [None] * self.pp_loop_size
+        bmbs = [None] * self.pp_loop_size if _is_hcu else None
         tmbs = [None] * self.pp_loop_size
         consensus_bootstrapped_rids: Optional[List[str]] = None
         transferred_rids: PPTransferStatus = ([], [])
         release_rids: Optional[PPTransferStatus] = None
         send_bootstrapped_work = []
-        send_transfer_work = []
         send_consensus_bootstrapped_work = []
+        send_transfer_work = []
         send_release_work = []
 
         while True:
@@ -357,9 +350,12 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
-                bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
-                bmbs[mb_id] = bootstrapped_rids
-                self._pp_commit_comm_work(send_bootstrapped_work)
+                if _is_hcu:
+                    bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
+                    bmbs[mb_id] = bootstrapped_rids
+                    self._pp_commit_comm_work(send_bootstrapped_work)
+                else:
+                    self.process_bootstrapped_queue()
 
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
                 self._pp_commit_comm_work(send_transfer_work)
@@ -407,28 +403,32 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
-                    self._pp_pd_send_consensus_bootstrapped_ids(
-                        bmbs,
-                        next_first_rank_mb_id,
-                        consensus_bootstrapped_rids,
-                        bootstrapped_rids,
+                if _is_hcu:
+                    send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
+                        self._pp_pd_send_consensus_bootstrapped_ids(
+                            bmbs,
+                            next_first_rank_mb_id,
+                            consensus_bootstrapped_rids,
+                            bootstrapped_rids,
+                        )
                     )
-                )
                 send_release_work, release_rids = (
                     self._pp_pd_send_consensus_release_ids(
                         tmbs, next_first_rank_mb_id, release_rids, transferred_rids
                     )
                 )
 
-                if bmbs[next_mb_id] is not None:
-                    next_consensus_bootstrapped_rids = (
-                        self._pp_recv_pyobj_from_prev_stage()
-                    )
-                    next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
-                        next_consensus_bootstrapped_rids
-                    )
-                self._pp_commit_comm_work(send_consensus_bootstrapped_work)
+                if _is_hcu:
+                    if bmbs[next_mb_id] is not None:
+                        next_consensus_bootstrapped_rids = (
+                            self._pp_recv_pyobj_from_prev_stage()
+                        )
+                        next_consensus_bootstrapped_rids = (
+                            self.process_bootstrapped_queue(
+                                next_consensus_bootstrapped_rids
+                            )
+                        )
+                    self._pp_commit_comm_work(send_consensus_bootstrapped_work)
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
                 self._pp_commit_comm_work(send_release_work)
@@ -447,9 +447,10 @@ class SchedulerPPMixin:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
                     )
-                    send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                        bootstrapped_rids, async_send=True
-                    )
+                    if _is_hcu:
+                        send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
+                            bootstrapped_rids, async_send=True
+                        )
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
@@ -712,8 +713,12 @@ class SchedulerPPMixin:
         ] = defaultdict(deque)
 
     def process_bootstrapped_queue(
-        self: Scheduler, bootstrapped_rids: Optional[List[str]]
+        self: Scheduler, bootstrapped_rids: Optional[List[str]] = None
     ):
+        if not _is_hcu:
+            reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+            self.waiting_queue.extend(reqs)
+            return
         # Finished consensus bootstrap requests.
         # In PP disagg prefill parallel mode, requests may already be enqueued into
         # waiting_queue before bootstrap notify is done. Here we only advance
@@ -1040,6 +1045,7 @@ class SchedulerPPMixin:
         if not result.can_run_cuda_graph:
             return tensor_dict
         return {name: tensor.clone() for name, tensor in tensor_dict.items()}
+
     def _pp_should_owner_direct_pd_hidden(
         self: Scheduler, batch: ScheduleBatch
     ) -> bool:
@@ -1050,9 +1056,7 @@ class SchedulerPPMixin:
         if not batch or not get_pd_hidden_capture_layer_ids(batch.reqs):
             return False
         capture_reqs = [
-            req
-            for req in batch.reqs
-            if pd_hidden_state(req).capture_layer_ids
+            req for req in batch.reqs if pd_hidden_state(req).capture_layer_ids
         ]
         if not capture_reqs:
             return False
@@ -1070,9 +1074,7 @@ class SchedulerPPMixin:
         if proxy is None:
             return
         tensors = proxy.tensors
-        aux_keys = [
-            key for key in tensors if key.startswith("pd_aux_hidden_states_")
-        ]
+        aux_keys = [key for key in tensors if key.startswith("pd_aux_hidden_states_")]
         for key in aux_keys:
             tensors.pop(key, None)
 
@@ -1208,6 +1210,7 @@ class SchedulerPPMixin:
         d2h_event = self.device_module.Event()
         d2h_event.record(self.device_module.current_stream())
         return None, batch_result, d2h_event
+
     def _pp_prep_batch_result(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -2179,4 +2182,3 @@ class SchedulerPPMixin:
                 self.hisparse_coordinator.admit_request_direct(req)
         self.waiting_queue.extend(released_reqs)
         return [req.rid for req in released_reqs]
-

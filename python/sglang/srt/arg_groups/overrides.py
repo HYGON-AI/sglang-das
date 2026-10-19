@@ -691,27 +691,54 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     return {}
 
 
+def _check_dsa_backend_constraints(
+    kv_cache_dtype: str,
+    prefill_backend: Optional[str],
+    decode_backend: Optional[str],
+    *,
+    hip: bool,
+    dcp_size: int = 1,
+) -> None:
+    """Validate DSA backend / platform / kv-cache-dtype constraints."""
+    chosen = {prefill_backend, decode_backend}
+
+    rocm_only = {"triton"} & chosen
+    if not hip and rocm_only:
+        raise ValueError(
+            f"The {'/'.join(sorted(rocm_only))} DSA backend is only supported on "
+            "ROCm/HIP. Pick an alternative DSA backend for CUDA "
+            "(flashmla_kv on Hopper, trtllm on Blackwell)."
+        )
+
+    if hip or kv_cache_dtype != "fp8_e4m3" or "tilelang" not in chosen:
+        return
+    if prefill_backend != "tilelang" or decode_backend != "tilelang":
+        raise ValueError(
+            "CUDA TileLang FP8 KV requires both DSA backends to be tilelang; "
+            "raw and scaled FP8 KV layouts cannot be mixed."
+        )
+    if dcp_size > 1:
+        raise ValueError("CUDA TileLang FP8 KV does not support --dcp-size > 1.")
+
+    import torch
+
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) < (8, 9):
+        raise ValueError("CUDA TileLang FP8 KV requires SM89 or newer.")
+
+
 def _check_tilelang_dsa_fp8_kv(
     kv_cache_dtype: str,
     prefill_backend: Optional[str],
     decode_backend: Optional[str],
     *,
     hip: bool,
+    dcp_size: int = 1,
 ) -> None:
-    """tilelang's fp8 KV path is ROCm-only; the CUDA kernel hardcodes bfloat16.
-    Reject here instead of crashing at decode CUDA-graph capture."""
-    if (
-        not hip
-        and kv_cache_dtype == "fp8_e4m3"
-        and "tilelang" in {prefill_backend, decode_backend}
-    ):
-        raise ValueError(
-            "The tilelang DSA prefill/decode kernels only support an fp8_e4m3 KV "
-            "cache on ROCm/HIP; on CUDA they require a bfloat16 KV cache. Use "
-            "--kv-cache-dtype bfloat16 with the tilelang backend, or keep "
-            "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
-            "(flashmla_kv on Hopper, trtllm on Blackwell)."
-        )
+    """Backward-compatible entry point for the TileLang DSA validation."""
+    _check_dsa_backend_constraints(
+        kv_cache_dtype, prefill_backend, decode_backend, hip=hip, dcp_size=dcp_size
+    )
 
 
 @register_post_process
@@ -801,6 +828,22 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_decode_backend"] = backend
         prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
         decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
+        if (
+            not get_platform().is_hip
+            and kv_cache_dtype == "fp8_e4m3"
+            and "tilelang" in (prefill, decode)
+        ):
+            raise ValueError("CUDA TileLang FP8 KV does not support HiSparse.")
+        # The hisparse allow-list in hisparse_hook is platform- but not
+        # dtype-aware, so an explicitly requested backend still has to clear the
+        # shared backend/kv-cache-dtype rules before this arm returns early.
+        _check_dsa_backend_constraints(
+            kv_cache_dtype,
+            prefill,
+            decode,
+            hip=get_platform().is_hip,
+            dcp_size=getattr(view, "dcp_size", 1) or 1,
+        )
         logger.warning(
             f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
             f"prefill={prefill}, decode={decode}."
@@ -833,8 +876,12 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
-    _check_tilelang_dsa_fp8_kv(
-        kv_cache_dtype, prefill, decode, hip=get_platform().is_hip
+    _check_dsa_backend_constraints(
+        kv_cache_dtype,
+        prefill,
+        decode,
+        hip=get_platform().is_hip,
+        dcp_size=getattr(view, "dcp_size", 1) or 1,
     )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
@@ -1890,6 +1937,12 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     False for any config the runtime won't post-capture-size, else it gets an
     under-reserved fraction."""
     cfg = resolving_view(server_args)
+    # Logical-page sharding always runs prefill eagerly. This predicate runs
+    # before the sharding hook disables prefill capture, so gate on the feature
+    # itself to retain eager activation headroom in the memory heuristic.
+    if cfg.enable_kv_cache_sharding:
+        return False
+
     mla_enabled = use_mla_backend(server_args)
     if not envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get():
         return False

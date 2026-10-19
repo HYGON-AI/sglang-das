@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
+from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
@@ -294,9 +295,11 @@ class TpModelWorker(BaseTpWorker):
         context_length: Optional[int] = None,
         draft_attention_backend: Optional[str] = None,
         random_seed: Optional[int] = None,
+        load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
     ):
         # Parse args
         self.server_args = server_args
+        self.load_group = load_group
         self.gpu_id = gpu_id
         self.nccl_port = nccl_port
         self.is_draft_worker = is_draft_worker
@@ -491,6 +494,7 @@ class TpModelWorker(BaseTpWorker):
             memory_pool_config=self.memory_pool_config,
             draft_attention_backend=self.draft_attention_backend,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
+            load_group=self.load_group,
         )
 
     def _init_multi_layer_eagle_model_runners(self):
@@ -511,6 +515,7 @@ class TpModelWorker(BaseTpWorker):
                     memory_pool_config=self.memory_pool_config,
                     draft_attention_backend=self.draft_attention_backend,
                     draft_model_idx=i,
+                    load_group=self.load_group,
                 )
             )
 

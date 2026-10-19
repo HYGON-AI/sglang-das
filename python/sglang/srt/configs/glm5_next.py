@@ -1,6 +1,7 @@
 from transformers import CONFIG_MAPPING, PretrainedConfig
 from transformers.models.glm4v.configuration_glm4v import Glm4vVisionConfig
 
+from transformers.models.glm_ocr.configuration_glm_ocr import GlmOcrVisionConfig
 from sglang.srt.configs.linear_attn_model_registry import (
     LinearAttnModelSpec,
     register_linear_attn_model,
@@ -11,6 +12,9 @@ from sglang.srt.configs.mamba_utils import (
     mamba2_state_dtype,
 )
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_hcu
+
+_is_hcu = is_hcu()
 
 
 class Glm5NextVisionConfig(Glm4vVisionConfig):
@@ -339,11 +343,16 @@ class Glm5NextConfig(PretrainedConfig):
     @property
     def mamba2_cache_params(self) -> KimiLinearCacheParams:
         from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+        from sglang.srt.runtime_context import linear_attn_tp_size
 
         head_shard_size = (
-            get_parallel().attn_cp_size
-            if is_dsa_enable_prefill_cp()
-            else get_parallel().attn_tp_size
+            (
+                get_parallel().attn_cp_size
+                if is_dsa_enable_prefill_cp()
+                else get_parallel().attn_tp_size
+            )
+            if _is_hcu
+            else linear_attn_tp_size()
         )
 
         shape = KimiLinearStateShape.create(
