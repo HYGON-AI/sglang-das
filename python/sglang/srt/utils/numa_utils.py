@@ -152,12 +152,13 @@ def get_numa_node_if_available(server_args: ServerArgs, gpu_id: int) -> Optional
     return None
 
 
-def get_libnuma():
+def get_libnuma(*, use_errno: bool = False):
+    """Locate libnuma, optionally preserving errno for syscall error reporting."""
     libnuma = None
 
     for libnuma_so in ["libnuma.so", "libnuma.so.1"]:
         try:
-            libnuma = ctypes.CDLL(libnuma_so)
+            libnuma = ctypes.CDLL(libnuma_so, use_errno=use_errno)
         except OSError as e:
             logger.debug(f"{e}")
             libnuma = None

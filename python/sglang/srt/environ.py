@@ -1704,6 +1704,8 @@ class Envs:
 
     # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
     # below) and gather rows from the GPU instead of sharding them over HBM.
+    # The HCU shared allocator requires HSA_USERPTR_FOR_PAGED_MEM=0 in the
+    # launch environment, before HIP/HSA initialization, for IPC export.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     # HCU-only loading optimizations for DeepSeek-V4.1 W4A8 EnGram tables.
     # Keep disabled by default so the upstream loading and page-cache behavior

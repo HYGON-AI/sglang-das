@@ -35,7 +35,7 @@ from sglang.kernels.ops.embeddings.engram_hash import (
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.cuda_wrapper import (
-    find_loaded_library,
+    get_loaded_hip_runtime,
 )
 from sglang.srt.distributed.parallel_state import inplace_all_reduce
 from sglang.srt.environ import envs
@@ -617,15 +617,7 @@ def _hip_runtime() -> ctypes.CDLL:
     torch.cuda.cudart() does not expose hipHostGetDevicePointer, so call it
     through ctypes to map a registered host address to its device address.
     """
-    path = find_loaded_library("libamdhip64")
-    if path is None:
-        # HCU DTK maps the real library name rather than its libamdhip64 symlink.
-        path = find_loaded_library("libgalaxyhip")
-    if path is None:
-        raise RuntimeError(
-            "HIP runtime (libamdhip64 or libgalaxyhip) is not loaded in the current process"
-        )
-    lib = ctypes.CDLL(path)
+    lib = get_loaded_hip_runtime()
     lib.hipHostGetDevicePointer.restype = ctypes.c_int
     lib.hipHostGetDevicePointer.argtypes = [
         ctypes.POINTER(ctypes.c_void_p),
@@ -652,8 +644,8 @@ def _registered_device_ptr(host_ptr: int) -> int:
 class _HostTable:
     """Host-memory backing for one engram table ('shared' or 'per_rank' layout).
 
-    Lives for the whole process: the mapping, the memfd and the cudaHostRegister
-    pin are never released because the table is read by every forward.
+    Lives for the whole process: shared allocations, mappings and registration
+    pins remain alive because the table is read by every forward.
     """
 
     def __init__(self, layout: str, nbytes: int, name: str, group):
@@ -666,6 +658,16 @@ class _HostTable:
         self.nbytes = nbytes
         self.group = group
         self.dirty = False
+        self._shared_manager = None
+        if layout == "shared" and is_hcu():
+            from sglang.srt.utils.host_shared_memory import HostSharedMemoryManager
+
+            self._shared_manager = HostSharedMemoryManager(
+                name, group=group, use_hsa_ipc=True
+            )
+            self.bytes = self._shared_manager.malloc(shape=(nbytes,), dtype=torch.uint8)
+            self.device_ptr = self._shared_manager.device_pointer(self.bytes)
+            return
         if layout == "shared":
             self.fd = self._open_shared_fd(nbytes, name)
             self.mm = mmap.mmap(
@@ -750,6 +752,15 @@ class _HostTable:
         self.dirty = False
         if self.layout == "shared":
             self.group.barrier()
+        if self._shared_manager is not None:
+            logger.info(
+                "engram host table %s: layout=shared, backend=hsa_ipc, "
+                "%.0f MiB shared by %d ranks via HostSharedMemoryManager",
+                label,
+                self.nbytes / 2**20,
+                self.group.world_size,
+            )
+            return
         mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
         if self.layout == "per_rank":
             # The loader's own reads refilled the page cache; empty it again so the
