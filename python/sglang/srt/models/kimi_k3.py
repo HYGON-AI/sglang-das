@@ -312,6 +312,30 @@ def _maybe_map_fp8_pb_scale_name(name: str, params_dict: dict) -> str:
     return name
 
 
+def _truncate_moe_gate_for_config(name, param, loaded_weight, num_experts):
+    """Keep routing rows consistent with an explicitly smaller expert config."""
+    if num_experts is None or not name.endswith(
+        (".mlp.gate.weight", ".mlp.gate.e_score_correction_bias")
+    ):
+        return loaded_weight
+    if loaded_weight.shape == param.shape:
+        return loaded_weight
+    keep = int(num_experts)
+    if (
+        keep <= 0
+        or loaded_weight.ndim != param.ndim
+        or loaded_weight.ndim == 0
+        or loaded_weight.shape[0] < keep
+        or param.shape[0] != keep
+        or loaded_weight.shape[1:] != param.shape[1:]
+    ):
+        raise ValueError(
+            f"Cannot truncate Kimi-K3 gate {name}: checkpoint={tuple(loaded_weight.shape)}, "
+            f"parameter={tuple(param.shape)}, num_experts={keep}"
+        )
+    return loaded_weight.narrow(0, 0, keep)
+
+
 def _get_k3_dense_weight(module: nn.Module) -> torch.Tensor:
     """Return a dense weight with serialized block-FP8 scales applied."""
     weight = module.weight.data
@@ -3805,6 +3829,13 @@ class KimiK3LinearForCausalLM(nn.Module):
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
+                    loaded_weight = _truncate_moe_gate_for_config(
+                        name,
+                        param,
+                        loaded_weight,
+                        getattr(self.config, "n_routed_experts", None)
+                        or self.config.num_experts,
+                    )
                     if name.endswith(".b_proj.weight_scale_inv"):
                         # All TP ranks share K3's single beta output-scale block.
                         param.data.copy_(loaded_weight)
