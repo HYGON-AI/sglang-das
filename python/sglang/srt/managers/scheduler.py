@@ -5845,7 +5845,8 @@ class Scheduler(
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                     self._release_aborted_request(req.rid)
 
-                    self.abort_disagg_prefill_request(req)
+                    if hasattr(req.disagg_kv_sender, "abort"):
+                        req.disagg_kv_sender.abort()
                     if self.ps.pp_size > 1:
                         prepare_abort(req, "Aborted by AbortReq.")
 

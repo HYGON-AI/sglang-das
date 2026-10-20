@@ -114,6 +114,7 @@ class TestAbortDrain(unittest.TestCase):
                 "abort_external_kv_request",
                 "clear_pending_chunk_send",
                 "process_disagg_prefill_inflight_queue",
+                "handle_bootstrap_failure",
             ],
             self.env,
         )
@@ -214,7 +215,8 @@ class TestAbortDrain(unittest.TestCase):
         s.mm_receiver = None
         s.dllm_config = None
         s.grammar_manager = Mock()
-        s.ps = SimpleNamespace(pp_size=1)
+        s.ps = SimpleNamespace(pp_size=1, tp_rank=0)
+        s.metrics_reporter = SimpleNamespace(enable_metrics=False)
         s.running_batch = s.last_batch = None
         s.waiting_queue = []
         s.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
@@ -255,6 +257,8 @@ class TestAbortDrain(unittest.TestCase):
                     s, req = case.s, case.req
                     s.abort_request(SimpleNamespace(rid=req.rid, abort_all=abort_all))
                     req.disagg_kv_sender.abort.assert_called_once()
+                    if queue == "bootstrap":
+                        s.handle_bootstrap_failure(req)
                     self.assertTrue(req.external_kv_abort_requested)
                     self.assertIn(req.rid, s._external_kv_abort_rids)
                     case.env["maybe_release_metadata_buffer"].assert_not_called()
@@ -307,6 +311,44 @@ class TestAbortDrain(unittest.TestCase):
         self.s.waiting_queue.append(other)
         self.s.abort_request(SimpleNamespace(rid=self.req.rid, abort_all=False))
         self.assertEqual(self.s.waiting_queue, [other])
+
+    def test_bootstrap_cancel_preserves_failure_for_late_decode_handshake(self):
+        self.setup_client_abort("bootstrap")
+        sender = self.req.disagg_kv_sender
+        room = self.req.bootstrap_room
+        statuses = {}
+
+        def abort():
+            statuses[room] = KVPoll.Failed
+            sender.poll.return_value = KVPoll.Failed
+
+        def failure_exception():
+            # Mooncake's failure_exception clears manager state, while the
+            # sender's cached conclude_state remains Failed.
+            statuses.pop(room, None)
+            raise RuntimeError("Aborted by AbortReq.")
+
+        sender.abort.side_effect = abort
+        sender.failure_exception.side_effect = failure_exception
+        sender.is_transfer_drained.return_value = True
+        self.s.abort_request(SimpleNamespace(rid=self.req.rid, abort_all=False))
+        self.s.handle_bootstrap_failure(self.req)
+
+        cls = load_methods(
+            CONN,
+            ["_notify_drained_abort_target_if_needed"],
+            dict(KVPoll=KVPoll, logger=Mock()),
+        )
+        manager = cls()
+        manager.request_status = statuses
+        manager.source_transfers_drained = Mock(return_value=True)
+        manager.sync_status_to_decode_endpoint = Mock()
+        manager._prefill_unique_rank = lambda: 0
+        target = SimpleNamespace(endpoint="decode-late", dst_port=456, is_dummy=False)
+        manager._notify_drained_abort_target_if_needed(room, target)
+        manager.sync_status_to_decode_endpoint.assert_called_once_with(
+            "decode-late", 456, room, KVPoll.Failed, 0, is_drained_abort=True
+        )
 
     def test_chunked_result_queue_blocks_release_even_with_zero_counter(self):
         self.s.result_queue = [(SimpleNamespace(reqs=[self.req]), object())]
