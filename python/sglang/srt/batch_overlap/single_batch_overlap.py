@@ -104,6 +104,11 @@ def compute_overlap_args(dispatch_output, alt_stream):
 
     hidden_states = dispatch_output.hidden_states
 
+    # HCU W4A8/W8A8 INT8 kernels do not provide the signaling required
+    # by down-GEMM/combine overlap. Preserve dispatch/shared-expert overlap.
+    if _is_hcu and hidden_states.dtype == torch.int8:
+        return None, None, {}
+
     # DeepEP normal mode (prefill) returns a contiguous [num_tokens, hidden_dim]
     # tensor. Its contiguous GroupGEMM/combine path does not implement the
     # down-GEMM/combine signaling below, which is defined for the 3-D masked
