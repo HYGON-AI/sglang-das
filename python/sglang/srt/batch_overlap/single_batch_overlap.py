@@ -104,9 +104,14 @@ def compute_overlap_args(dispatch_output, alt_stream):
 
     hidden_states = dispatch_output.hidden_states
 
-    # HCU W4A8/W8A8 INT8 kernels do not provide the signaling required
-    # by down-GEMM/combine overlap. Preserve dispatch/shared-expert overlap.
-    if _is_hcu and hidden_states.dtype == torch.int8:
+    # HCU W4A8/W8A8 INT8 and FP8 DeepGEMM kernels do not provide the signaling
+    # required by down-GEMM/combine overlap (the FP8 masked path raises if asked).
+    # Preserve dispatch/shared-expert overlap.
+    if _is_hcu and hidden_states.dtype in (
+        torch.int8,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+    ):
         return None, None, {}
 
     # DeepEP normal mode (prefill) returns a contiguous [num_tokens, hidden_dim]
