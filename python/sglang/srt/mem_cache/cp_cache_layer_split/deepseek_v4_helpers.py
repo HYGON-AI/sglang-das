@@ -64,15 +64,26 @@ def maybe_prefetch_cp_kv_extra(pool, layer_id: int, forward_batch=None) -> None:
             cache = getattr(metadata, "sparse_prefill_cache", None)
             core = _get_core_attn_metadata()
             read_indices = None
+            read_token_capacity = None
+            num_reqs = cache.num_reqs if cache is not None else None
             if cache is not None:
                 # The workspace dequantizes every compressed position before
                 # TopK selects rows; broadcasting only TopK pages is unsafe.
                 read_indices = cache.ensure_compressed(
                     ratio, core.page_table, pool.kv_pools[ratio].page_size
                 ).flat_token_ids
+            elif metadata.late_layer_tail is not None:
+                # Tail queries can select keys anywhere in each full history.
+                # Bound their page union without materializing a chunk cache.
+                seq_lens = forward_batch.seq_lens_cpu.tolist()
+                read_token_capacity = sum(
+                    (seq_len + ratio - 1) // ratio for seq_len in seq_lens
+                )
+                num_reqs = len(seq_lens)
             pool.prefetch_low_ratio_extra_layer(
                 layer_id,
                 core.sparse_page_indices(ratio),
                 read_indices=read_indices,
-                num_reqs=cache.num_reqs if cache is not None else None,
+                num_reqs=num_reqs,
+                read_token_capacity=read_token_capacity,
             )
