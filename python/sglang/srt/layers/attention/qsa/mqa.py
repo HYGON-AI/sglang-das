@@ -546,6 +546,49 @@ def qsa_mqa_prefill(
     return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
 
 
+def _use_fp8_shadow(
+    q: torch.Tensor, k_cache: torch.Tensor, k_cache_fp8: torch.Tensor
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Validate a pool-maintained fp8 shadow cache and quantize only ``q``.
+
+    The shadow pool (see QSATokenToKVPool.update_qsa_compressed_fp8_k_buffer)
+    is updated incrementally on every compressed-K write, so decode skips the
+    whole-pool repack that _maybe_pack_fp8_decode would otherwise do per step.
+    Returns ``(q_fp8, k_cache_fp8)`` or ``None`` when the inputs do not match
+    the FP8 kernel contract.
+    """
+    if not _fp8_decode_enabled() or not is_hip():
+        return None
+    if (
+        k_cache_fp8.dtype is not torch.uint8
+        or k_cache_fp8.ndim != 4
+        or k_cache_fp8.shape[2] != 1
+        or k_cache_fp8.shape[0] != k_cache.shape[0]
+        or k_cache_fp8.shape[1] != k_cache.shape[1]
+        or k_cache_fp8.shape[-1] != k_cache.shape[-1] + 4
+    ):
+        return None
+    if k_cache.dtype is not torch.bfloat16 or k_cache.dtype is not q.dtype:
+        return None
+    if (
+        k_cache.ndim != 4
+        or k_cache.shape[2] != 1
+        or q.ndim != 3
+        or k_cache.shape[-1] != q.shape[-1]
+    ):
+        return None
+    page_size = int(k_cache.shape[1])
+    heads = int(q.shape[1])
+    if (
+        q.shape[-1] != _FP8_DECODE_HEAD_DIM
+        or page_size not in _FP8_DECODE_PAGE_SIZES
+        or heads not in _FP8_DECODE_HEADS
+    ):
+        return None
+    q_fp8 = q.float().clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+    return q_fp8, k_cache_fp8
+
+
 def qsa_mqa_decode(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -553,10 +596,15 @@ def qsa_mqa_decode(
     context_lens: torch.Tensor,
     max_model_len: int,
     score_scale: Optional[float] = None,
+    k_cache_fp8: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     from sglang.srt.layers.attention.qsa.boltops_mqa import try_boltops_qsa_mqa_decode
 
-    fp8_packed = _maybe_pack_fp8_decode(q, k_cache)
+    fp8_packed = None
+    if k_cache_fp8 is not None:
+        fp8_packed = _use_fp8_shadow(q, k_cache, k_cache_fp8)
+    if fp8_packed is None:
+        fp8_packed = _maybe_pack_fp8_decode(q, k_cache)
     if fp8_packed is not None:
         q_fp8, cache_fp8 = fp8_packed
         boltops_logits = try_boltops_qsa_mqa_decode(

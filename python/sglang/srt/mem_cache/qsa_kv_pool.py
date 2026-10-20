@@ -8,6 +8,7 @@ Qwen3Next-DSA) adds only the flat per-token index-K cache.
 
 from __future__ import annotations
 
+import os
 from typing import List, Optional
 
 import torch
@@ -16,6 +17,11 @@ from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
 from sglang.srt.utils import is_hip
 
 _IS_HIP = is_hip()
+
+# Must stay in sync with _FP8_DECODE_ENV in
+# sglang/srt/layers/attention/qsa/mqa.py.
+_SGLANG_QSA_INDEXER_FP8_DECODE_ENV = "SGLANG_QSA_INDEXER_FP8_DECODE"
+_FP8_DECODE_OFF_VALUES = ("0", "off", "false")
 
 
 def _index_k_bytes(*, kv_heads: int, head_dim: int, dtype: torch.dtype) -> int:
@@ -127,6 +133,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         # placeholders first and recompute mem_usage at the end.
         self.qsa_key_state_buffer_pool = []
         self.qsa_compressed_k_buffer_pool = []
+        self.qsa_compressed_fp8_k_buffer_pool = []
         self.qsa_rope_position_buffer = torch.empty(0)
         super().__init__(
             size=size,
@@ -216,6 +223,51 @@ class QSATokenToKVPool(HybridLinearKVPool):
             )
             for layer_offset in range(len(full_attention_layer_ids))
         ]
+        # FP8 shadow of the compressed-K cache, in the aiter packed layout the
+        # gfx938 BoltOPs fp8 decode kernel consumes ([pages, page_size *
+        # (head_dim + 4)] bytes: per page, page_size*head_dim K bytes followed
+        # by page_size fp32 per-token scales). It is kept in sync incrementally
+        # by update_qsa_compressed_fp8_k_buffer on every compressed-K write so
+        # decode never repacks the whole pool per step.
+        #
+        # One extra scratch page per layer absorbs the QSA dump rows
+        # (write_locs == 0): the inert bf16 dump slot would otherwise make the
+        # vectorized scatter target duplicate destinations, which VMFaults on
+        # HIP. Redirecting every dump row to the scratch page keeps all
+        # destinations unique, so the update stays a single vectorized store
+        # that is also CUDA-graph capture safe.
+        self.qsa_compressed_fp8_k_buffer_pool = []
+        if (
+            _IS_HIP
+            and self.qsa_index_kv_heads == 1
+            and self.qsa_compressed_capacity % self.qsa_compressed_page_size == 0
+            and os.environ.get(
+                _SGLANG_QSA_INDEXER_FP8_DECODE_ENV, "1"
+            ).strip().lower()
+            not in _FP8_DECODE_OFF_VALUES
+        ):
+            pages = self.qsa_compressed_capacity // self.qsa_compressed_page_size
+            if pages > 0:
+                page_bytes = self.qsa_compressed_page_size * (
+                    self.qsa_index_head_dim + 4
+                )
+                self.qsa_compressed_fp8_pages = pages
+                self.qsa_compressed_fp8_flat = torch.zeros(
+                    (len(full_attention_layer_ids), (pages + 1) * page_bytes),
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                for layer_offset in range(len(full_attention_layer_ids)):
+                    shadow = self.qsa_compressed_fp8_flat[layer_offset].view(
+                        pages + 1, page_bytes
+                    )
+                    # Unwritten rows keep a zero K payload; the unit fp32
+                    # scale keeps their logit contribution at zero, matching
+                    # the zero rows of the bf16 pool.
+                    shadow[
+                        :, self.qsa_index_head_dim * self.qsa_compressed_page_size :
+                    ].view(torch.float32).fill_(1.0)
+                    self.qsa_compressed_fp8_k_buffer_pool.append(shadow)
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
 
@@ -252,11 +304,73 @@ class QSATokenToKVPool(HybridLinearKVPool):
             self._transfer_full_attention_id(layer_id)
         ]
 
+    def get_qsa_compressed_fp8_k_buffer(self, layer_id: int) -> Optional[torch.Tensor]:
+        """Return the fp8 shadow cache view ``[pages, page_size, 1, D+4]``.
+
+        The trailing scratch page is excluded. ``None`` when the fp8 decode
+        shadow pool is unavailable (NVIDIA, kv_heads != 1, or disabled via
+        SGLANG_QSA_INDEXER_FP8_DECODE).
+        """
+        if not self.qsa_compressed_fp8_k_buffer_pool:
+            return None
+        shadow = self.qsa_compressed_fp8_k_buffer_pool[
+            self._transfer_full_attention_id(layer_id)
+        ]
+        return shadow[: self.qsa_compressed_fp8_pages].view(
+            -1, self.qsa_compressed_page_size, 1, self.qsa_index_head_dim + 4
+        )
+
+    def update_qsa_compressed_fp8_k_buffer(
+        self, layer_id: int, loc: torch.Tensor
+    ) -> None:
+        """Mirror the compressed-K rows at ``loc`` into the fp8 shadow pool.
+
+        Reads back the rows just written to the bf16 pool (small, batch-sized
+        gather), quantizes them to e4m3 with a per-row amax/448 scale, and
+        scatters the bytes into the aiter-packed shadow layout. All ops are
+        shape-static tensor math, so this is CUDA-graph capture safe.
+        """
+        if not self.qsa_compressed_fp8_k_buffer_pool:
+            return
+        shadow = self.qsa_compressed_fp8_k_buffer_pool[
+            self._transfer_full_attention_id(layer_id)
+        ]
+        buffer = self.get_qsa_compressed_k_buffer(layer_id)
+        rows = buffer.reshape(buffer.shape[0], -1)
+        dim = rows.shape[1]
+        page_size = self.qsa_compressed_page_size
+        loc = loc.long().reshape(-1).clamp(0, max(rows.shape[0] - 1, 0))
+        if loc.numel() == 0:
+            return
+        vals = rows[loc].float()
+        amax = vals.abs().amax(dim=-1, keepdim=True)
+        # Zero rows keep a unit scale (their fp8 payload is 0, so the
+        # kernel's `reduced * scale` still yields a 0 logit).
+        scale = torch.where(amax > 0, amax / 448.0, torch.ones_like(amax))
+        k8 = (vals / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(
+            torch.uint8
+        )
+        s4 = scale.contiguous().view(torch.uint8)
+
+        pages = self.qsa_compressed_fp8_pages
+        # Redirect inert dump rows (write slot 0) to the scratch page; row 0
+        # of the compressed pool is never allocated to a request, so nothing
+        # reads it back through the page table. Unique destinations keep the
+        # vectorized store VMFault-free on eager HIP.
+        dest = torch.where(loc == 0, torch.full_like(loc, pages * page_size), loc)
+        page = dest // page_size
+        offset = dest % page_size
+        k_view = shadow[:, : page_size * dim].view(pages + 1, page_size, dim)
+        s_view = shadow[:, page_size * dim :].view(pages + 1, page_size, 4)
+        k_view[page, offset] = k8
+        s_view[page, offset] = s4
+
     def set_qsa_compressed_k_buffer(
         self, layer_id: int, loc: torch.Tensor, compressed_k: torch.Tensor
     ) -> None:
         buffer = self.get_qsa_compressed_k_buffer(layer_id)
         _scatter_rows(buffer, loc, compressed_k)
+        self.update_qsa_compressed_fp8_k_buffer(layer_id, loc)
 
     def get_kv_size_bytes(self):
         k_size, v_size = super().get_kv_size_bytes()
@@ -268,6 +382,9 @@ class QSATokenToKVPool(HybridLinearKVPool):
             + sum(
                 tensor.numel() * tensor.element_size()
                 for tensor in self.qsa_compressed_k_buffer_pool
+            )
+            + sum(
+                tensor.numel() for tensor in self.qsa_compressed_fp8_k_buffer_pool
             )
             + self.qsa_rope_position_buffer.numel() * 8
         )
