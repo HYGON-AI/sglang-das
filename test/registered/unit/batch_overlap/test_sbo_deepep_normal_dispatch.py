@@ -45,6 +45,29 @@ class TestSboDeepEPNormalDispatch(CustomTestCase):
                 zeros.assert_not_called()
 
     @patch("sglang.srt.batch_overlap.single_batch_overlap._is_hcu", True)
+    @patch.object(
+        SboFlags, "enable_combine_down_gemm_two_stream_overlap", return_value=True
+    )
+    def test_hcu_fp8_skips_secondary_overlap(self, _down):
+        # The HCU FP8 masked DeepGEMM raises on down-GEMM completion signals, and
+        # the decode layer has no alt stream for the combine on ROCm.
+        for dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            with (
+                self.subTest(dtype=dtype),
+                patch("torch.cuda.get_device_properties") as properties,
+                patch("torch.zeros") as zeros,
+            ):
+                dispatch_output = SimpleNamespace(
+                    hidden_states=torch.empty((4, 129, 16), dtype=dtype)
+                )
+                self.assertEqual(
+                    compute_overlap_args(dispatch_output, alt_stream=None),
+                    (None, None, {}),
+                )
+                properties.assert_not_called()
+                zeros.assert_not_called()
+
+    @patch("sglang.srt.batch_overlap.single_batch_overlap._is_hcu", True)
     @patch(
         "sglang.srt.batch_overlap.single_batch_overlap.is_sbo_enabled",
         return_value=True,
