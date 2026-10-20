@@ -279,7 +279,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
         w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
-            is_aiter_moe=not aiter_runner_no_pad,
+            is_aiter_moe=_should_use_aiter_runner() and not aiter_runner_no_pad,
             is_concat=True,
             is_packed=False,
         )
