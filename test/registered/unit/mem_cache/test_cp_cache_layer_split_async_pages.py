@@ -165,8 +165,11 @@ class _Harness:
             self.record("broadcast")
             self.events.append(("owner", owner))
             if rank != owner:
+                swa = self.pool._broadcast_slots.pending("swa")
                 layer = self.pool._broadcast_slots.pending("extra").layer_id
-                family = self.pool._extra_family_name(self.pool.compression_ratios[layer])
+                family = "swa" if swa.active else self.pool._extra_family_name(
+                    self.pool.compression_ratios[layer]
+                )
                 selected = self.pool._batch_active_pages[family].selected_pages
                 if selected.numel():
                     value.value.copy_(self.reference[selected.clamp_min(0).long()])
@@ -190,7 +193,8 @@ class _Harness:
             self.namespace[name] = tracked
         methods = ["_pool_num_pages", "_active_pages_for_indices",
                    "_compact_broadcast_for_read", "_extra_family_name",
-                   "_clear_extra_read_state", "prefetch_low_ratio_extra_layer"]
+                   "_clear_extra_read_state", "prefetch_low_ratio_extra_layer",
+                   "prefetch_swa_layer"]
         _load_nodes("deepseek_v4_pool.py", methods, self.namespace, methods=True)
         cls = type("PoolUnderTest", (), {name: self.namespace[name] for name in methods})
         cls._pool_num_pages = staticmethod(self.namespace["_pool_num_pages"])
@@ -199,19 +203,22 @@ class _Harness:
         self.pool.compression_ratios = {8: 1, 9: 2}
         self.pool.cp_rank = rank
         self.pool.request_window = None
-        self.pool._broadcast_slots = Slots(("extra",))
+        self.pool._broadcast_slots = Slots(("extra", "swa"))
         kv_pool = SimpleNamespace(page_size=2, size=13,
                                  kv_buffer=[self.reference + 999, self.reference])
         self.pool.kv_pools = {1: kv_pool, 2: kv_pool}
+        self.pool.swa_kv_pool = kv_pool
+        self.pool.sliding_window = 128
+        self.pool._swa_local_layer_id = lambda layer: 1
         self.pool._low_owner_local_by_source = {4: 1, 6: 1}
         self.pool.source_layer_of = lambda layer: {8: 4, 9: 6}[layer]
-        self.pool._get_layer_owner_rank = lambda source: {4: 0, 6: 1}[source]
+        self.pool._get_layer_owner_rank = lambda source: {4: 0, 6: 1}.get(source, 0)
         self.pool._is_layer_owned = lambda source: rank == {4: 0, 6: 1}[source]
         self.pool._get_staging_buffer = lambda family: self.staging
         self.pool.wait_layer_transfer = lambda layer: self.events.append(("transfer", layer))
         self.pool._batch_active_pages = {
             name: SimpleNamespace(selected_pages=None, static_selected_pages=False)
-            for name in ("extra_c1", "extra_c2")
+            for name in ("extra_c1", "extra_c2", "swa")
         }
 
     def record(self, name):
@@ -245,8 +252,139 @@ class _Harness:
         self.namespace["maybe_prefetch_cp_kv_extra"](self.pool, layer, batch)
         return metadata
 
+    def fetch_swa(self, *, layer=0, indices=None, seq_lens=(13,),
+                  extend_lens=(8,), tail_lens=None, cache=None):
+        if indices is None:
+            indices = torch.tensor([2, 3, 8, 9, -1], dtype=torch.int32)
+        tail = (
+            SimpleNamespace(extend_seq_lens_cpu=tail_lens, local_lens_cpu=[0])
+            if tail_lens is not None else None
+        )
+        metadata = SimpleNamespace(
+            sparse_prefill_cache=cache, late_layer_tail=tail,
+            core_attn_metadata=SimpleNamespace(swa_page_indices=indices),
+        )
+        self.namespace["get_attn_backend"] = lambda: SimpleNamespace(
+            forward_metadata=metadata
+        )
+        self.namespace["_should_sync_cp_cache_layer_split"] = lambda *args: True
+        _load_nodes("deepseek_v4_helpers.py",
+                    ["_get_core_attn_metadata", "maybe_prefetch_cp_kv_swa"],
+                    self.namespace)
+        batch = SimpleNamespace(seq_lens_cpu=torch.tensor(seq_lens),
+                                extend_seq_lens_cpu=list(extend_lens))
+        self.namespace["maybe_prefetch_cp_kv_swa"](self.pool, layer, batch)
+        return metadata
+
 
 class TestLayerSplitAsyncPages(CustomTestCase):
+    def test_swa_first_layer_and_replay_tail_use_static_union_without_chunk_cache(self):
+        for layer, tail_lens in ((0, None), (21, (8,))):
+            for rank in (0, 1):
+                for empty_rank in (False, True):
+                    with self.subTest(layer=layer, rank=rank, empty_rank=empty_rank):
+                        harness = _Harness(rank=rank, peer_pages=(1, 4, 6))
+                        indices = torch.empty(0, dtype=torch.int32) if empty_rank else None
+                        metadata = harness.fetch_swa(
+                            layer=layer, tail_lens=tail_lens, indices=indices,
+                        )
+                        selected = harness.pool._batch_active_pages["swa"].selected_pages
+                        torch.testing.assert_close(selected[:3], torch.tensor([1, 4, 6]))
+                        self.assertTrue(bool((selected[3:] == -1).all()))
+                        self.assertIsNone(metadata.sparse_prefill_cache)
+                        self.assertIn(("nonzero_static", "main"), harness.events)
+                        self.assertFalse(any(e[0] == "nonzero" for e in harness.events))
+                        expected = (
+                            torch.empty(0, dtype=torch.int32) if empty_rank else
+                            torch.tensor([0, 1, 2, 3, -1], dtype=torch.int32)
+                        )
+                        torch.testing.assert_close(harness.pool._swa_remapped_indices, expected)
+                        torch.testing.assert_close(
+                            harness.staging.value[:3], harness.reference[[1, 4, 6]]
+                        )
+                        self.assertEqual(harness.events.count(("all_reduce", "main")), 1)
+                        self.assertEqual(harness.events.count(("broadcast", "side1")), 1)
+                        harness.pool._broadcast_slots.finish("swa", layer)
+                        self.assertEqual(harness.events[-1], ("wait", "main", "side1"))
+
+    def test_swa_capacity_uses_global_chunk_history_or_floored_tail(self):
+        cases = (
+            ((), ()), ((0,), (0,)), ((4,), (4,)), ((129,), (1,)),
+            ((32768,), (32768,)), ((1048576,), (32768,)),
+            ((1, 129, 65536, 1048576), (1, 1, 32768, 7)),
+        )
+        for lengths, extends in cases:
+            for tail in (False, True):
+                with self.subTest(lengths=lengths, tail=tail):
+                    harness = _Harness()
+                    captured = {}
+                    harness.pool.prefetch_swa_layer = (
+                        lambda *args, **kwargs: captured.update(kwargs)
+                    )
+                    tail_lens = tuple(min(n, 128) for n in extends) if tail else None
+                    harness.fetch_swa(seq_lens=lengths, extend_lens=extends,
+                                      tail_lens=tail_lens)
+                    spans = tail_lens if tail else tuple(
+                        min(seq, ext + 127) for seq, ext in zip(lengths, extends)
+                    )
+                    self.assertEqual(captured["read_token_capacity"], sum(spans))
+                    self.assertEqual(captured["num_reqs"], len(lengths))
+                    self.assertIsNone(captured["read_indices"])
+                    page_size = 256
+                    # Each request starts at the worst offset. Physical pages
+                    # can be fragmented; CP peers see arbitrary subsets.
+                    pages = sum((n + 2 * page_size - 2) // page_size
+                                for n in spans if n > 0)
+                    max_pages = pages + 31
+                    owners = torch.randperm(
+                        max_pages, generator=torch.Generator().manual_seed(42)
+                    )[:pages]
+                    static_size = harness.namespace["contiguous_request_page_capacity"](
+                        sum(spans), len(lengths), page_size, max_pages
+                    )
+                    self.assertGreaterEqual(static_size, pages)
+                    for rank in range(8):
+                        harness.peer_pages = owners.tolist()
+                        selected = harness.namespace["active_pages_for_indices"](
+                            owners[rank::8].to(torch.int32) * page_size,
+                            page_size, max_pages,
+                            harness.namespace["get_pynccl_broadcast_comm"](), static_size,
+                        )
+                        torch.testing.assert_close(selected[:pages], owners.sort().values)
+                        self.assertTrue(bool((selected[pages:] == -1).all()))
+
+    def test_swa_cache_span_keeps_priority_over_capacity(self):
+        harness = _Harness(peer_pages=(6,))
+        cache = SimpleNamespace(swa_token_ids=torch.tensor([2, 3, 8, 9, 12, -1]),
+                                num_reqs=1)
+        harness.fetch_swa(cache=cache)
+        self.assertIn(("nonzero_static", "main"), harness.events)
+        selected = harness.pool._batch_active_pages["swa"].selected_pages
+        torch.testing.assert_close(selected[:3], torch.tensor([1, 4, 6]))
+        # A second layer reuses this selection instead of running nonzero again.
+        harness.pool._broadcast_slots.finish("swa", 0)
+        harness.fetch_swa(layer=1, cache=cache)
+        self.assertIs(harness.pool._batch_active_pages["swa"].selected_pages, selected)
+        self.assertEqual(harness.events.count(("nonzero_static", "main")), 1)
+
+    def test_swa_disabled_request_window_and_legacy_call_keep_dynamic_fallback(self):
+        for options in ({"enabled": False}, {"window": 16}, {"legacy": True}):
+            with self.subTest(options=options):
+                harness = _Harness(enabled=options.get("enabled", True), peer_pages=(6,))
+                harness.pool.request_window = options.get("window")
+                if options.get("legacy"):
+                    harness.pool.prefetch_swa_layer(
+                        0, torch.tensor([2, 3, 8, 9, -1], dtype=torch.int32)
+                    )
+                else:
+                    harness.fetch_swa()
+                self.assertIn(("nonzero", "main"), harness.events)
+                self.assertFalse(any(e[0] == "nonzero_static" for e in harness.events))
+                torch.testing.assert_close(
+                    harness.pool._swa_remapped_indices,
+                    torch.tensor([0, 1, 2, 3, -1], dtype=torch.int32),
+                )
+
     def test_tail_without_chunk_cache_selects_static_pages_on_broadcast_slot(self):
         for layer in (8, 9):
             for rank in (0, 1):
