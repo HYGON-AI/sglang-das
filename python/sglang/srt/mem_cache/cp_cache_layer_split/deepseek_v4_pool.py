@@ -789,6 +789,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         indices: torch.Tensor,
         read_indices: Optional[torch.Tensor] = None,
         num_reqs: Optional[int] = None,
+        read_token_capacity: Optional[int] = None,
     ) -> None:
         """Fetch all pages read by attention or sparse-prefill dequantization."""
         ratio = self.compression_ratios[layer_id]
@@ -801,12 +802,15 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         static_size = None
         if (
             _USE_STATIC_CP_LAYER_SPLIT_PAGES
-            and read_indices is not None
+            and (read_indices is not None or read_token_capacity is not None)
             and num_reqs is not None
             and getattr(self, "request_window", None) is None
         ):
             static_size = contiguous_request_page_capacity(
-                read_indices.numel(), num_reqs, pool.page_size, max_pages
+                read_indices.numel() if read_indices is not None else read_token_capacity,
+                num_reqs,
+                pool.page_size,
+                max_pages,
             )
         async_pages = (
             static_size is not None and not torch.cuda.is_current_stream_capturing()

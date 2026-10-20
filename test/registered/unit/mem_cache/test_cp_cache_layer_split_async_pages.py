@@ -116,6 +116,7 @@ class _Harness:
             "__name__": __name__, "Optional": Optional, "Iterable": Iterable,
             "Iterator": Iterator, "dataclass": dataclass,
             "nullcontext": nullcontext, "contextmanager": contextmanager,
+            "_is_hcu": False,
         }
         harness = self
 
@@ -225,8 +226,114 @@ class _Harness:
             layer, indices, read_indices=read_indices, num_reqs=num_reqs
         )
 
+    def fetch_tail(self, *, layer=8, indices=None, seq_lens=(13,), tail=True):
+        if indices is None:
+            indices = torch.tensor([2, 3, 8, 9, -1], dtype=torch.int32)
+        core = SimpleNamespace(sparse_page_indices=lambda ratio: indices)
+        metadata = SimpleNamespace(
+            sparse_prefill_cache=None, late_layer_tail=object() if tail else None,
+            core_attn_metadata=core,
+        )
+        self.namespace["get_attn_backend"] = lambda: SimpleNamespace(
+            forward_metadata=metadata
+        )
+        self.namespace["_should_sync_cp_cache_layer_split"] = lambda *args: True
+        _load_nodes("deepseek_v4_helpers.py",
+                    ["_get_core_attn_metadata", "maybe_prefetch_cp_kv_extra"],
+                    self.namespace)
+        batch = SimpleNamespace(seq_lens_cpu=torch.tensor(seq_lens))
+        self.namespace["maybe_prefetch_cp_kv_extra"](self.pool, layer, batch)
+        return metadata
+
 
 class TestLayerSplitAsyncPages(CustomTestCase):
+    def test_tail_without_chunk_cache_selects_static_pages_on_broadcast_slot(self):
+        for layer in (8, 9):
+            for rank in (0, 1):
+                with self.subTest(layer=layer, rank=rank):
+                    harness = _Harness(rank=rank, peer_pages=(6,))
+                    metadata = harness.fetch_tail(layer=layer)
+                    family = harness.pool._extra_family_name(
+                        harness.pool.compression_ratios[layer]
+                    )
+                    selected = harness.pool._batch_active_pages[family].selected_pages
+                    torch.testing.assert_close(selected[:3], torch.tensor([1, 4, 6]))
+                    self.assertTrue(bool((selected[3:] == -1).all()))
+                    torch.testing.assert_close(
+                        harness.pool._extra_remapped_indices,
+                        torch.tensor([0, 1, 2, 3, -1], dtype=torch.int32),
+                    )
+                    torch.testing.assert_close(
+                        harness.staging.value[:3], harness.reference[[1, 4, 6]]
+                    )
+                    self.assertIn(("nonzero_static", "side1"), harness.events)
+                    self.assertFalse(any(e[0] == "nonzero" for e in harness.events))
+                    self.assertIsNone(metadata.sparse_prefill_cache)
+                    self.assertIsNotNone(metadata.late_layer_tail)
+                    harness.pool._broadcast_slots.finish("extra", layer)
+                    self.assertEqual(harness.events[-1], ("wait", "main", "side1"))
+
+    def test_tail_empty_rank_still_fetches_peer_pages(self):
+        harness = _Harness(peer_pages=(1, 4, 6))
+        harness.fetch_tail(indices=torch.empty(0, dtype=torch.int32))
+        selected = harness.pool._batch_active_pages["extra_c1"].selected_pages
+        torch.testing.assert_close(selected[:3], torch.tensor([1, 4, 6]))
+        self.assertEqual(harness.pool._extra_remapped_indices.numel(), 0)
+        self.assertEqual(harness.events.count(("all_reduce", "side1")), 1)
+        self.assertEqual(harness.events.count(("broadcast", "side1")), 1)
+        self.assertIn(("nonzero_static", "side1"), harness.events)
+
+    def test_tail_history_bound_covers_fragmented_cp_page_union(self):
+        for layer, ratio in ((8, 1), (9, 2)):
+            for lengths in ((), (0,), (1,), (32768,), (1048576,),
+                            (1, 129, 32768, 1048575)):
+                harness = _Harness()
+                captured = {}
+                harness.pool.prefetch_low_ratio_extra_layer = (
+                    lambda *args, **kwargs: captured.update(kwargs)
+                )
+                harness.fetch_tail(layer=layer, seq_lens=lengths)
+                capacity = captured["read_token_capacity"]
+                self.assertEqual(capacity, sum((n + ratio - 1) // ratio for n in lengths))
+                self.assertEqual(captured["num_reqs"], len(lengths))
+                self.assertIsNone(captured["read_indices"])
+                page_size = 256 // ratio
+                # Maximal boundary misalignment, with unrelated physical page IDs.
+                compressed_lens = [(n + ratio - 1) // ratio for n in lengths]
+                pages = sum((n + 2 * page_size - 2) // page_size
+                            for n in compressed_lens if n > 0)
+                max_pages = pages + 31
+                owners = torch.randperm(max_pages, generator=torch.Generator().manual_seed(42))[:pages]
+                static_size = harness.namespace["contiguous_request_page_capacity"](
+                    capacity, len(lengths), page_size, max_pages
+                )
+                self.assertGreaterEqual(static_size, pages)
+                for rank in range(8):
+                    with self.subTest(layer=layer, lengths=lengths, rank=rank):
+                        # The local rank sees only its part; peers can select any
+                        # other page in the same full request histories.
+                        local = owners[rank::8]
+                        harness.peer_pages = owners.tolist()
+                        selected = harness.namespace["active_pages_for_indices"](
+                            local.to(torch.int32) * page_size, page_size, max_pages,
+                            harness.namespace["get_pynccl_broadcast_comm"](), static_size,
+                        )
+                        torch.testing.assert_close(selected[:pages], owners.sort().values)
+                        self.assertTrue(bool((selected[pages:] == -1).all()))
+                        self.assertLess(static_size, max_pages)
+
+    def test_tail_disabled_window_and_missing_metadata_keep_dynamic_fallback(self):
+        for options in ({"enabled": False}, {"window": 16}, {"tail": False}):
+            with self.subTest(options=options):
+                harness = _Harness(enabled=options.get("enabled", True), peer_pages=(6,))
+                harness.pool.request_window = options.get("window")
+                harness.fetch_tail(tail=options.get("tail", True))
+                self.assertIn(("nonzero", "main"), harness.events)
+                torch.testing.assert_close(
+                    harness.pool._extra_remapped_indices,
+                    torch.tensor([0, 1, 2, 3, -1], dtype=torch.int32),
+                )
+
     def test_static_selection_copy_broadcast_and_remap_share_one_slot(self):
         for rank in (0, 1):
             with self.subTest(rank=rank):
