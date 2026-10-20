@@ -14,6 +14,54 @@ register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
 
 
 class TestSboDeepEPNormalDispatch(CustomTestCase):
+    @patch("sglang.srt.batch_overlap.single_batch_overlap._is_hcu", True)
+    def test_hcu_int8_skips_secondary_overlap(self):
+        for down_enabled, shared_enabled in ((True, False), (False, True)):
+            with (
+                self.subTest(down=down_enabled, shared=shared_enabled),
+                patch.object(
+                    SboFlags,
+                    "enable_combine_down_gemm_two_stream_overlap",
+                    return_value=down_enabled,
+                ),
+                patch.object(
+                    SboFlags,
+                    "enable_combine_shared_two_stream_overlap",
+                    return_value=shared_enabled,
+                ),
+                patch("torch.cuda.get_device_properties") as properties,
+                patch("torch.cuda.Event") as event,
+                patch("torch.zeros") as zeros,
+            ):
+                dispatch_output = SimpleNamespace(
+                    hidden_states=torch.empty((4, 129, 16), dtype=torch.int8)
+                )
+                self.assertEqual(
+                    compute_overlap_args(dispatch_output, alt_stream=None),
+                    (None, None, {}),
+                )
+                properties.assert_not_called()
+                event.assert_not_called()
+                zeros.assert_not_called()
+
+    @patch("sglang.srt.batch_overlap.single_batch_overlap._is_hcu", True)
+    @patch(
+        "sglang.srt.batch_overlap.single_batch_overlap.is_sbo_enabled",
+        return_value=True,
+    )
+    @patch(
+        "sglang.srt.batch_overlap.single_batch_overlap.is_blackwell", return_value=False
+    )
+    def test_hcu_dispatch_shared_overlap_stays_enabled(self, _blackwell, _sbo):
+        self.assertTrue(SboFlags.enable_dispatch_shared_one_stream_overlap())
+        self.assertTrue(SboFlags.fuse_shared_experts_inside_sbo())
+        dispatch_output = SimpleNamespace(
+            hidden_states=torch.empty((4, 129, 16), dtype=torch.int8)
+        )
+        self.assertEqual(compute_overlap_args(dispatch_output, None), (None, None, {}))
+        self.assertTrue(SboFlags.enable_dispatch_shared_one_stream_overlap())
+        self.assertTrue(SboFlags.fuse_shared_experts_inside_sbo())
+
     @patch.object(
         SboFlags, "enable_combine_shared_two_stream_overlap", return_value=False
     )
