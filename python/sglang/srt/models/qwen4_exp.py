@@ -991,7 +991,7 @@ def _try_host_register(tensor: torch.Tensor) -> bool:
                 rc = int(hip.hipHostRegister(ptr, nbytes, flags))
             except Exception as exc:
                 logger.warning(
-                    "PLE BF16 hipHostRegister raised flags=%s nbytes=%s: %s",
+                    "PLE hipHostRegister raised flags=%s nbytes=%s: %s",
                     flags,
                     nbytes,
                     exc,
@@ -999,7 +999,7 @@ def _try_host_register(tensor: torch.Tensor) -> bool:
             else:
                 if rc == 0:
                     logger.info(
-                        "PLE BF16 hipHostRegister ok flags=%s nbytes=%.2fGB ptr=%#x device=%s",
+                        "PLE hipHostRegister ok flags=%s nbytes=%.2fGB ptr=%#x device=%s",
                         flags,
                         nbytes / (1024**3),
                         ptr,
@@ -1007,7 +1007,7 @@ def _try_host_register(tensor: torch.Tensor) -> bool:
                     )
                     return True
                 logger.warning(
-                    "PLE BF16 hipHostRegister failed flags=%s nbytes=%s ptr=%#x device=%s rc=%s",
+                    "PLE hipHostRegister failed flags=%s nbytes=%s ptr=%#x device=%s rc=%s",
                     flags,
                     nbytes,
                     ptr,
@@ -1020,7 +1020,7 @@ def _try_host_register(tensor: torch.Tensor) -> bool:
             err = register(ptr, nbytes, flags)
         except Exception as exc:
             logger.warning(
-                "PLE BF16 cudaHostRegister raised flags=%s nbytes=%s: %s",
+                "PLE cudaHostRegister raised flags=%s nbytes=%s: %s",
                 flags,
                 nbytes,
                 exc,
@@ -1028,7 +1028,7 @@ def _try_host_register(tensor: torch.Tensor) -> bool:
             continue
         if err is None or int(err) == 0:
             logger.info(
-                "PLE BF16 cudaHostRegister ok flags=%s nbytes=%.2fGB ptr=%#x device=%s",
+                "PLE cudaHostRegister ok flags=%s nbytes=%.2fGB ptr=%#x device=%s",
                 flags,
                 nbytes / (1024**3),
                 ptr,
@@ -1036,7 +1036,7 @@ def _try_host_register(tensor: torch.Tensor) -> bool:
             )
             return True
         logger.warning(
-            "PLE BF16 cudaHostRegister failed flags=%s nbytes=%s ptr=%#x device=%s %s",
+            "PLE cudaHostRegister failed flags=%s nbytes=%s ptr=%#x device=%s %s",
             flags,
             nbytes,
             ptr,
@@ -1046,7 +1046,8 @@ def _try_host_register(tensor: torch.Tensor) -> bool:
     return False
 
 
-def _register_bf16_table_for_uva(tensor: torch.Tensor) -> bool:
+def _register_table_for_uva(tensor: torch.Tensor) -> bool:
+    """Map a pageable CPU PLE table for UVA without a second hipHostMalloc."""
     if tensor.is_pinned():
         return True
     # Serialize across TP ranks. A barrier during construct can no-op, and
@@ -1057,7 +1058,7 @@ def _register_bf16_table_for_uva(tensor: torch.Tensor) -> bool:
         lock_file = open(lock_path, "w")
         fcntl.flock(lock_file, fcntl.LOCK_EX)
     except Exception as exc:
-        logger.warning("PLE BF16 hostRegister lock unavailable: %s", exc)
+        logger.warning("PLE hostRegister lock unavailable: %s", exc)
         lock_file = None
     try:
         return _try_host_register(tensor)
@@ -1133,14 +1134,57 @@ def _wrap_mapped_host_as_cuda_tensor(
     return tensor, holder
 
 
+_PLE_PIN_ENV = "SGLANG_PLE_PIN_MEMORY"
+_PLE_REGISTER_MAX_ATTEMPTS = 8
+_PLE_OOM_EXCEPTIONS = (
+    RuntimeError,
+    getattr(torch, "AcceleratorError", RuntimeError),
+)
+
+
+def _ple_pin_requested() -> bool:
+    """Allow ops to skip the pinned attempt on GTT-limited HCU nodes."""
+    return os.environ.get(_PLE_PIN_ENV, "auto").strip().lower() != "off"
+
+
+def _alloc_cpu_table(
+    shape: Tuple[int, ...], dtype: torch.dtype, *, name: str
+) -> torch.Tensor:
+    """Allocate a CPU PLE tensor: pinned when possible, pageable on OOM.
+
+    hipHostMalloc carves pinned pages out of the limited HCU GTT, so a
+    multi-GB int8/fp8 ngram table can fail with hipErrorOutOfMemory even
+    when host RAM is free (Qwen3.8-Flash-Next ngram-int8, AIOPT-1536).
+    Fall back to pageable memory; _maybe_register_uva then hostRegisters
+    the same pages for UVA gathers without a second GTT allocation.
+    Set SGLANG_PLE_PIN_MEMORY=off to skip the pinned attempt entirely.
+    """
+    if _ple_pin_requested():
+        try:
+            return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+        except _PLE_OOM_EXCEPTIONS as exc:
+            message = str(exc).lower()
+            if "out of memory" not in message and "hiperroroutofmemory" not in message:
+                raise
+            logger.warning(
+                "PLE pinned host alloc failed for %s (%s); "
+                "falling back to pageable memory",
+                name,
+                exc,
+            )
+    return torch.empty(shape, dtype=dtype, device="cpu")
+
+
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     """CPU-resident PLE table.
 
-    INT8/FP8 allocate pinned host memory for UVA gathers. BF16 reuses a
-    pageable CPU table and hostRegister-maps it without a second multi-GB
-    hipHostMalloc. On HIP the mapped table is wrapped as a CUDA tensor and
-    gathered with ATen embedding so full decode CUDA graphs replay the
-    current ids; Triton ``tl.load`` from mapped host is not graph-safe.
+    INT8/FP8 prefer pinned host memory for UVA gathers and fall back to a
+    pageable table + hostRegister when hipHostMalloc exhausts the HCU GTT.
+    BF16 reuses a pageable CPU table and hostRegister-maps it without a
+    second multi-GB hipHostMalloc. On HIP the mapped table is wrapped as a
+    CUDA tensor and gathered with ATen embedding so full decode CUDA graphs
+    replay the current ids; Triton ``tl.load`` from mapped host is not
+    graph-safe.
 
     The table stays in its checkpoint storage dtype (int8/fp8 with per-row
     channel scales, fp8/bf16 with a scalar scale, or bf16); gathers emit bf16.
@@ -1216,15 +1260,15 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         elif source_weight.device.type == "cpu" and source_weight.is_pinned():
             cpu_weight = source_weight
         else:
-            cpu_weight = nn.Parameter(
-                torch.empty(
-                    source_weight.shape,
-                    dtype=source_weight.dtype,
-                    device="cpu",
-                    pin_memory=True,
-                ),
-                requires_grad=False,
+            # INT8/FP8 prefer a pinned twin for UVA gathers, but hipHostMalloc
+            # draws from the limited HCU GTT and a multi-GB table can OOM with
+            # hipErrorOutOfMemory even when host RAM is free. _alloc_cpu_table
+            # falls back to pageable memory, which _maybe_register_uva
+            # hostRegisters for the same UVA gathers.
+            table = _alloc_cpu_table(
+                tuple(source_weight.shape), source_weight.dtype, name="ngram weight"
             )
+            cpu_weight = nn.Parameter(table, requires_grad=False)
             # This wrapper is installed while the model is being constructed;
             # the checkpoint loader fills cpu_weight afterwards. Copying the
             # uninitialized source would touch the full PLE table once for no
@@ -1239,21 +1283,15 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             if source_scale.device.type == "cpu" and source_scale.is_pinned():
                 cpu_scale = source_scale
             else:
-                cpu_scale = torch.empty(
-                    source_scale.shape,
-                    dtype=source_scale.dtype,
-                    device="cpu",
-                    pin_memory=True,
+                cpu_scale = _alloc_cpu_table(
+                    source_scale.shape, source_scale.dtype, name="ngram scalar scale"
                 )
                 cpu_scale.copy_(source_scale.detach().to("cpu"))
         elif source_scale.device.type == "cpu" and source_scale.is_pinned():
             cpu_scale = source_scale
         else:
-            cpu_scale = torch.empty(
-                source_scale.shape,
-                dtype=source_scale.dtype,
-                device="cpu",
-                pin_memory=True,
+            cpu_scale = _alloc_cpu_table(
+                source_scale.shape, source_scale.dtype, name="ngram per-row scale"
             )
             cpu_scale.copy_(source_scale.to("cpu"))
         self.register_buffer("weight_scale", cpu_scale, persistent=True)
@@ -1271,17 +1309,23 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self._device_weight_view = None
         self._device_weight_holder = None
         self._uva_register_pending = False
-        if cpu_weight.dtype == torch.bfloat16 and not cpu_weight.is_pinned():
+        self._uva_register_attempts = 0
+        scale_needs_register = (
+            cpu_scale.device.type == "cpu" and not cpu_scale.is_pinned()
+        )
+        if not cpu_weight.is_pinned() or scale_needs_register:
+            # Pageable table (BF16 reuse, or the pinned-alloc OOM fallback):
+            # hostRegister it for UVA gathers. Registered pages dereference
+            # like pinned GTT, so the int8/fp8 Triton path works unchanged.
             self._use_uva_gather = False
             self._uva_register_pending = True
             self._maybe_register_uva()
         else:
-            self._use_uva_gather = cpu_weight.is_pinned()
-            if self._use_uva_gather:
-                self._kernel_weight_ptr = _device_ptr_for_host_tensor(cpu_weight)
-                if cpu_scale.device.type == "cpu":
-                    self._kernel_scale_ptr = _device_ptr_for_host_tensor(cpu_scale)
-                self._bind_mapped_cuda_view()
+            self._use_uva_gather = True
+            self._kernel_weight_ptr = _device_ptr_for_host_tensor(cpu_weight)
+            if cpu_scale.device.type == "cpu" and cpu_scale.is_pinned():
+                self._kernel_scale_ptr = _device_ptr_for_host_tensor(cpu_scale)
+            self._bind_mapped_cuda_view()
         self._pageable_id_scratch = None
         self._pageable_row_scratch = None
         self._block_d = triton.next_power_of_2(self.embedding_dim)
@@ -1292,21 +1336,43 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         # hostRegister is a host-side map; skipping it during CUDA graph
         # capture leaves the pageable D2H path inside the graph.
         logger.info(
-            "PLE BF16 hostRegister begin nbytes=%.2fGB device=%s",
+            "PLE hostRegister begin dtype=%s nbytes=%.2fGB device=%s",
+            self.weight.dtype,
             self.weight.numel() * self.weight.element_size() / (1024**3),
             torch.cuda.current_device() if torch.cuda.is_available() else None,
         )
-        ok = _register_bf16_table_for_uva(self.weight)
-        if ok:
+        registered = True
+        for name, tensor in (("weight", self.weight), ("scale", self.weight_scale)):
+            if tensor.device.type != "cpu" or tensor.is_pinned() or tensor.numel() == 0:
+                continue
+            if not _register_table_for_uva(tensor):
+                logger.warning(
+                    "PLE %s hostRegister failed nbytes=%.2fGB",
+                    name,
+                    tensor.numel() * tensor.element_size() / (1024**3),
+                )
+                registered = False
+        if registered:
             self._uva_register_pending = False
             self._use_uva_gather = True
             self._kernel_weight_ptr = _device_ptr_for_host_tensor(self.weight)
             if self.weight_scale.device.type == "cpu":
                 self._kernel_scale_ptr = _device_ptr_for_host_tensor(self.weight_scale)
             self._bind_mapped_cuda_view()
+            return
+        self._uva_register_attempts += 1
+        if self._uva_register_attempts >= _PLE_REGISTER_MAX_ATTEMPTS:
+            # Stop retrying in the decode loop; stay on the pageable gather.
+            self._uva_register_pending = False
+            logger.warning(
+                "PLE hostRegister abandoned after %s attempts; using the "
+                "pageable gather fallback",
+                self._uva_register_attempts,
+            )
         else:
             logger.warning(
-                "PLE BF16 hostRegister failed; will retry, else pageable gather (not full-graph-safe)"
+                "PLE hostRegister failed; will retry, else pageable gather "
+                "(not full-graph-safe)"
             )
 
     def _bind_mapped_cuda_view(self) -> None:
@@ -1323,14 +1389,14 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 ptr, tuple(self.weight.shape), self.weight.dtype, device
             )
         except Exception as exc:
-            logger.warning("PLE BF16 mapped CUDA view wrap failed: %s", exc)
+            logger.warning("PLE mapped CUDA view wrap failed: %s", exc)
             self._device_weight_view = None
             self._device_weight_holder = None
             return
         self._device_weight_view = view
         self._device_weight_holder = holder
         logger.info(
-            "PLE BF16 mapped CUDA view ok shape=%s ptr=%#x device=%s",
+            "PLE mapped CUDA view ok shape=%s ptr=%#x device=%s",
             tuple(view.shape),
             int(view.data_ptr()),
             view.device,
@@ -1380,7 +1446,15 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         tp_end = self.shard_indices.org_vocab_end_index
         in_range = (host_ids >= tp_start) & (host_ids < tp_end)
         local = torch.where(in_range, host_ids - tp_start, torch.zeros_like(host_ids))
-        rows = self.weight.detach()[local.long()].to(dtype=torch.bfloat16)
+        local_rows = local.long()
+        rows = self.weight.detach()[local_rows]
+        if rows.dtype != torch.bfloat16:
+            # Match the pinned/registered UVA kernel: dequantize int8/fp8 rows
+            # with the per-row scale (a scalar scale is applied downstream).
+            rows = rows.to(dtype=torch.bfloat16)
+            if self.weight_scale.numel() > 1:
+                scale = self.weight_scale.detach().to(dtype=torch.bfloat16)
+                rows = rows * scale[local_rows].unsqueeze(-1)
         rows = torch.where(in_range.unsqueeze(-1), rows, torch.zeros_like(rows))
         self._pageable_row_scratch[:n].copy_(rows)
         output.view(n, self.embedding_dim).copy_(
