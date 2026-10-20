@@ -3,6 +3,7 @@
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 
 import ctypes
+import ipaddress
 import json
 import logging
 import os
@@ -28,6 +29,8 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import StorageMetrics
+from sglang.srt.runtime_context import get_server_args
+from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 DEFAULT_LOCAL_BUFFER_SIZE = int(
     __import__("os").environ.get(
@@ -99,9 +102,29 @@ def _normalize_tenant_id(value) -> str:
     return tenant_id if tenant_id else DEFAULT_TENANT_ID
 
 
+def _get_service_endpoint(server_args) -> str:
+    """Use existing serving/network settings for both direct and HiCache stores."""
+    host = server_args.host or "0.0.0.0"
+    address = ipaddress.ip_address(NetworkAddress.resolve_host(host))
+    if address.is_unspecified:
+        if server_args.nnodes > 1:
+            # All nodes already share the leader address. Never substitute a
+            # worker's local IP in a multi-node service.
+            host = NetworkAddress.parse(server_args.dist_init_addr).host
+            address = ipaddress.ip_address(NetworkAddress.resolve_host(host))
+        else:
+            address = ipaddress.ip_address(get_local_ip_auto())
+    port = int(server_args.port)
+    if address.is_unspecified or not 1 <= port <= 65535:
+        raise ValueError("Cannot resolve a concrete SGLang service IP:business-port")
+    return NetworkAddress(str(address), port).to_host_port_str()
+
+
 def _get_mooncake_client_http_port(dp_rank: Optional[int] = None) -> int:
-    """Return a metrics port unique to this physical scheduler process."""
+    """Let the server bind an OS-assigned port unless a fixed base is configured."""
     base_port = envs.MOONCAKE_CLIENT_METRICS_PORT_BASE.get()
+    if base_port == 0:
+        return 0
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         global_rank = torch.distributed.get_rank()
         if dp_rank is not None:
@@ -617,6 +640,31 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 raise RuntimeError(
                     f"Failed to setup Mooncake store, error code: {ret_code}"
                 )
+            try:
+                service_endpoint = _get_service_endpoint(get_server_args())
+            except (TypeError, ValueError) as exc:
+                # Standalone storage users may not have a serving runtime.
+                # Identity discovery must not prevent cache I/O.
+                logger.warning(
+                    "Cannot identify SGLang service for Mooncake metrics: %s", exc
+                )
+                service_endpoint = None
+            if service_endpoint is not None:
+                set_service_endpoint = getattr(self.store, "set_service_endpoint", None)
+                if not callable(set_service_endpoint):
+                    logger.warning(
+                        "Mooncake Master service metrics are disabled: rebuild/install "
+                        "Mooncake with set_service_endpoint support."
+                    )
+                elif set_service_endpoint(service_endpoint) != 0:
+                    raise RuntimeError(
+                        "Failed to enable Mooncake Master service metrics for "
+                        f"{service_endpoint}. Check Mooncake client support."
+                    )
+                else:
+                    logger.info(
+                        "Mooncake Master service metrics endpoint: %s", service_endpoint
+                    )
             logger.info("Mooncake store setup successfully.")
 
             distributed_dfs = (
