@@ -1685,6 +1685,17 @@ class SchedulerDisaggregationPrefillMixin:
         )
         return True
 
+    def abort_disagg_prefill_request(self: Scheduler, req: Req) -> None:
+        """Close publication now; the request's queue owns drained cleanup."""
+        if req.to_finish is None and req.finished_reason is None:
+            req.to_finish = FINISH_ABORT("Aborted by AbortReq.")
+        self.abort_external_kv_request(
+            req,
+            forward_drained=False,
+            sender_terminal=False,
+            emit_response=False,
+        )
+
     def prefill_abort_sender_terminal(self: Scheduler, req: Req) -> bool:
         """A failure on a peer rank does not prove the local sender stopped."""
         if req.disagg_kv_sender is None:
@@ -1921,9 +1932,8 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 # KV this forward consumed never arrived, so it must not be
-                # sent on: finish here as handle_bootstrap_failure does. Kept
-                # narrower than is_aborted() because a user abort already
-                # reaches decode via its own AbortReq.
+                # sent on: finish here as handle_bootstrap_failure does. User
+                # cancellation also uses this path to notify decode after drain.
                 #
                 # Must precede the is_aborted() drop below, which queues the
                 # request for KV transfer instead of retiring it.

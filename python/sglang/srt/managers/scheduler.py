@@ -5774,6 +5774,8 @@ class Scheduler(
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    self.abort_disagg_prefill_request(chunked_req)
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Abort requests still waiting for encoder embeddings (EPD language-only)
@@ -5797,19 +5799,14 @@ class Scheduler(
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
-            # For disaggregation prefill mode, free the metadata buffer index
+            # Keep prefill resources alive until forward and source transfers
+            # drain. The inflight queue also delivers the terminal notice to D.
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                bootstrap_pending = req.pending_bootstrap
-                maybe_release_metadata_buffer(
-                    req, self.req_to_metadata_buffer_idx_allocator
-                )
-                if (
-                    bootstrap_pending
-                    and hasattr(req, "disagg_kv_sender")
-                    and req.disagg_kv_sender is not None
-                ):
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
+                self.abort_disagg_prefill_request(req)
+                req.external_kv_response_sent = True
+                if req not in self.disagg_prefill_inflight_queue:
+                    self.disagg_prefill_inflight_queue.append(req)
+                continue
 
             # For mamba radix cache
             if (
@@ -5848,8 +5845,7 @@ class Scheduler(
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                     self._release_aborted_request(req.rid)
 
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
+                    self.abort_disagg_prefill_request(req)
                     if self.ps.pp_size > 1:
                         prepare_abort(req, "Aborted by AbortReq.")
 
@@ -5857,8 +5853,7 @@ class Scheduler(
             for req in self.disagg_prefill_inflight_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
+                    self.abort_disagg_prefill_request(req)
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # Mark Failed and record the rid for PP failed-union. Do not free
@@ -5900,6 +5895,8 @@ class Scheduler(
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    self.abort_disagg_prefill_request(req)
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

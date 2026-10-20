@@ -52,6 +52,10 @@ class Reason:
         return vars(self).copy()
 
 
+class Request(SimpleNamespace):
+    __hash__ = object.__hash__
+
+
 def load_methods(path, names, env):
     tree = ast.parse(path.read_text(encoding="utf-8"))
     methods = []
@@ -96,6 +100,7 @@ class TestAbortDrain(unittest.TestCase):
             release_kv_cache=Mock(),
             prepare_abort=Mock(),
             AbortReq=SimpleNamespace,
+            _make_abort_req=lambda req: SimpleNamespace(rid=req.rid),
             DisaggregationMode=SimpleNamespace(
                 NULL="null", PREFILL="prefill", DECODE="decode"
             ),
@@ -103,10 +108,12 @@ class TestAbortDrain(unittest.TestCase):
         prefill_cls = load_methods(
             PREFILL,
             [
+                "abort_disagg_prefill_request",
                 "prefill_abort_sender_terminal",
                 "prefill_abort_forward_drained",
                 "abort_external_kv_request",
                 "clear_pending_chunk_send",
+                "process_disagg_prefill_inflight_queue",
             ],
             self.env,
         )
@@ -117,12 +124,13 @@ class TestAbortDrain(unittest.TestCase):
                 "_process_external_kv_chunked_abort",
                 "_iter_external_linker_candidates",
                 "_mark_failed_linker_loads",
+                "abort_request",
             ],
             self.env,
         )
         cls = type("Combined", (prefill_cls, sched_cls), {})
         self.s = cls()
-        self.req = SimpleNamespace(
+        self.req = Request(
             rid="r",
             bootstrap_room=7,
             to_finish=Reason("original Mooncake failure"),
@@ -197,6 +205,108 @@ class TestAbortDrain(unittest.TestCase):
         facts = dict(forward_drained=True, sender_terminal=True, emit_response=True)
         facts.update(kwargs)
         return self.s.abort_external_kv_request(self.req, **facts)
+
+    def setup_client_abort(self, queue):
+        s = self.s
+        s._external_kv_abort_rids.clear()
+        s._pending_chunked_abort_req = None
+        s.chunked_req = None
+        s.mm_receiver = None
+        s.dllm_config = None
+        s.grammar_manager = Mock()
+        s.ps = SimpleNamespace(pp_size=1)
+        s.running_batch = s.last_batch = None
+        s.waiting_queue = []
+        s.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
+        s.disagg_prefill_inflight_queue = []
+        s.attn_cp_cpu_group = s.attn_tp_cpu_group = None
+        req = self.req
+        req.to_finish = None
+        req.finished_reason = None
+        req.pending_bootstrap = queue == "bootstrap"
+        req.finished = lambda: req.finished_reason is not None
+        req.disagg_kv_sender.poll.return_value = KVPoll.Transferring
+        req.disagg_kv_sender.abort.side_effect = lambda: setattr(
+            req.disagg_kv_sender.poll, "return_value", KVPoll.Failed
+        )
+        req.disagg_kv_sender.is_transfer_drained.return_value = False
+        if queue == "waiting":
+            s.waiting_queue.append(req)
+        elif queue == "bootstrap":
+            s.disagg_prefill_bootstrap_queue.queue.append(req)
+        elif queue == "inflight":
+            s.disagg_prefill_inflight_queue.append(req)
+        elif queue == "running":
+            s.running_batch = SimpleNamespace(reqs=[req])
+        elif queue == "chunked":
+            s.chunked_req = req
+        self.env["poll_and_all_reduce_attn_cp_tp_group"] = lambda senders, *groups: [
+            sender.poll() for sender in senders
+        ]
+        self.env["all_reduce_min_attn_cp_tp_group"] = lambda flags, *groups: flags
+
+    def test_client_abort_routes_each_prefill_owner_to_drained_cleanup(self):
+        for queue in ("waiting", "bootstrap", "inflight", "running", "chunked"):
+            for abort_all in (False, True):
+                with self.subTest(queue=queue, abort_all=abort_all):
+                    case = type(self)()
+                    case.setUp()
+                    case.setup_client_abort(queue)
+                    s, req = case.s, case.req
+                    s.abort_request(SimpleNamespace(rid=req.rid, abort_all=abort_all))
+                    req.disagg_kv_sender.abort.assert_called_once()
+                    self.assertTrue(req.external_kv_abort_requested)
+                    self.assertIn(req.rid, s._external_kv_abort_rids)
+                    case.env["maybe_release_metadata_buffer"].assert_not_called()
+                    case.env["release_kv_cache"].assert_not_called()
+                    req.disagg_kv_sender.notify_drained_abort.assert_not_called()
+                    if queue == "waiting":
+                        self.assertEqual(s.waiting_queue, [])
+                        self.assertEqual(s.disagg_prefill_inflight_queue, [req])
+                        self.assertTrue(req.external_kv_response_sent)
+                    if queue == "chunked":
+                        s.process_pending_chunked_abort()
+                        self.assertIs(s._pending_chunked_abort_req, req)
+                        req.disagg_kv_sender.is_transfer_drained.return_value = True
+                        s.process_pending_chunked_abort()
+                        req.disagg_kv_sender.notify_drained_abort.assert_called_once()
+                        self.assertIsNone(s._pending_chunked_abort_req)
+                    else:
+                        # Existing bootstrap/result handling hands these owners
+                        # to the inflight queue after leaving their original queue.
+                        s.disagg_prefill_inflight_queue = [req]
+                        self.assertEqual(s.process_disagg_prefill_inflight_queue(), [])
+                        req.disagg_kv_sender.notify_drained_abort.assert_not_called()
+                        req.disagg_kv_sender.is_transfer_drained.return_value = True
+                        self.assertEqual(
+                            s.process_disagg_prefill_inflight_queue(), [req]
+                        )
+                        self.assertEqual(s.process_disagg_prefill_inflight_queue(), [])
+                        req.disagg_kv_sender.notify_drained_abort.assert_called_once()
+                    case.env["release_kv_cache"].assert_called_once()
+                    case.env["maybe_release_metadata_buffer"].assert_called_once()
+                    if queue == "waiting":
+                        s.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
+                        s.output_streamer.stream_output.assert_not_called()
+
+    def test_waiting_client_abort_waits_for_forward_result_before_notify(self):
+        self.setup_client_abort("waiting")
+        self.s.result_queue = [(SimpleNamespace(reqs=[self.req]), object())]
+        self.req.disagg_kv_sender.is_transfer_drained.return_value = True
+        self.s.abort_request(SimpleNamespace(rid=self.req.rid, abort_all=False))
+        self.assertEqual(self.s.process_disagg_prefill_inflight_queue(), [])
+        self.req.disagg_kv_sender.notify_drained_abort.assert_not_called()
+        self.env["release_kv_cache"].assert_not_called()
+        self.s.result_queue.clear()
+        self.assertEqual(self.s.process_disagg_prefill_inflight_queue(), [self.req])
+        self.req.disagg_kv_sender.notify_drained_abort.assert_called_once()
+
+    def test_client_abort_does_not_cancel_other_waiting_request(self):
+        self.setup_client_abort("waiting")
+        other = SimpleNamespace(rid="other")
+        self.s.waiting_queue.append(other)
+        self.s.abort_request(SimpleNamespace(rid=self.req.rid, abort_all=False))
+        self.assertEqual(self.s.waiting_queue, [other])
 
     def test_chunked_result_queue_blocks_release_even_with_zero_counter(self):
         self.s.result_queue = [(SimpleNamespace(reqs=[self.req]), object())]
