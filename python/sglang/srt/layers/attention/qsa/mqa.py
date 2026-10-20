@@ -7,7 +7,7 @@ kernels, then the Torch reference.
 import logging
 import math
 from functools import lru_cache
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -426,6 +426,101 @@ def tilelang_qsa_mqa_decode(
     return logits
 
 
+# ---------------------------------------------------------------------------
+# BoltOPs FP8 paged-decode packing (gfx938)
+#
+# The BoltOPs `tilelang_qsa_mqa_decode` dispatches on input layout: a bf16
+# [pages, page_size, 1, D] cache selects the BF16 kernel, while Q/K in
+# float8_e4m3fn with the aiter-packed cache [pages, page_size, 1, D+4]
+# (per-token fp32 scale in the trailing 4 bytes of every row) selects the
+# dedicated FP8 kernel.  The BF16 decode kernel does not compile on the DTK
+# tilelang toolchain ([ThreadSync] lowering failure with a non-warp-multiple
+# thread count), which silently degraded every QSA decode step to the full
+# gather + fp32 einsum Torch reference.  The FP8 kernel compiles and runs, so
+# pack the decode inputs at this boundary (per-token amax/448 scale, exact
+# inverse applied by the kernel's `reduced * scale` epilogue) and let the
+# vendor dispatch choose it.  All ops are shape-static tensor math -- no host
+# syncs -- so packing is CUDA-graph capture safe.
+# ---------------------------------------------------------------------------
+
+_FP8_DECODE_ENV = "SGLANG_QSA_INDEXER_FP8_DECODE"
+_FP8_E4M3_MAX = 448.0
+# BoltOPs FP8 decode kernel constraints (gfx938): query heads in {4,8,16,32,64},
+# head_dim exactly 128, compressed page size one of 8/16/32/64.
+_FP8_DECODE_HEADS = (4, 8, 16, 32, 64)
+_FP8_DECODE_HEAD_DIM = 128
+_FP8_DECODE_PAGE_SIZES = (8, 16, 32, 64)
+
+
+def _fp8_decode_enabled() -> bool:
+    import os
+
+    return os.environ.get(_FP8_DECODE_ENV, "1").strip().lower() not in (
+        "0",
+        "off",
+        "false",
+    )
+
+
+def _maybe_pack_fp8_decode(
+    q: torch.Tensor, k_cache: torch.Tensor
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Quantize decode MQA inputs into the aiter packed FP8 layout.
+
+    Returns ``(q_fp8, k_cache_packed)`` with the cache shaped
+    ``[pages, page_size, 1, D+4]`` (per-token fp32 scale in the trailing 4
+    bytes of every row), or ``None`` when the inputs do not match the FP8
+    kernel contract or packing is disabled.
+    """
+    if not _fp8_decode_enabled() or not is_hip():
+        return None
+    if k_cache.dtype is not torch.bfloat16 or k_cache.dtype is not q.dtype:
+        return None
+    if (
+        k_cache.ndim != 4
+        or k_cache.shape[2] != 1
+        or q.ndim != 3
+        or k_cache.shape[-1] != q.shape[-1]
+    ):
+        return None
+    page_size = int(k_cache.shape[1])
+    heads = int(q.shape[1])
+    if (
+        q.shape[-1] != _FP8_DECODE_HEAD_DIM
+        or page_size not in _FP8_DECODE_PAGE_SIZES
+        or heads not in _FP8_DECODE_HEADS
+    ):
+        return None
+
+    pages = int(k_cache.shape[0])
+    dim = int(k_cache.shape[-1])
+    rows = pages * page_size
+    k = k_cache.reshape(rows, dim).float()
+    amax = k.abs().amax(dim=-1, keepdim=True)
+    # Per-token scale; zero rows keep a unit scale (their fp8 payload is 0,
+    # so the kernel's `reduced * scale` still yields a 0 logit).
+    scale = torch.where(
+        amax > 0, amax / _FP8_E4M3_MAX, torch.ones_like(amax)
+    )
+    k_fp8 = (k / scale).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(
+        torch.float8_e4m3fn
+    )
+    q_fp8 = q.float().clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+
+    k_bytes = k_fp8.view(torch.uint8).reshape(pages, page_size * dim)
+    s_bytes = (
+        scale.view(torch.float32)
+        .view(torch.uint8)
+        .reshape(pages, page_size * 4)
+    )
+    packed = torch.empty(
+        (pages, page_size * (dim + 4)), dtype=torch.uint8, device=k_cache.device
+    )
+    packed[:, : page_size * dim] = k_bytes
+    packed[:, page_size * dim :] = s_bytes
+    return q_fp8, packed.view(pages, page_size, 1, dim + 4)
+
+
 def qsa_mqa_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -460,6 +555,17 @@ def qsa_mqa_decode(
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
     from sglang.srt.layers.attention.qsa.boltops_mqa import try_boltops_qsa_mqa_decode
+
+    fp8_packed = _maybe_pack_fp8_decode(q, k_cache)
+    if fp8_packed is not None:
+        q_fp8, cache_fp8 = fp8_packed
+        boltops_logits = try_boltops_qsa_mqa_decode(
+            q_fp8, cache_fp8, page_table, context_lens, max_model_len, score_scale
+        )
+        if boltops_logits is not None:
+            return boltops_logits
+        # BoltOPs fp8 decode unavailable: fall through to the legacy bf16
+        # path below with the original tensors.
 
     boltops_logits = try_boltops_qsa_mqa_decode(
         q, k_cache, page_table, context_lens, max_model_len, score_scale
