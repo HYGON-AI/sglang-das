@@ -519,6 +519,81 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
             self.assertIs(full.low_ratio_query_lens, q_lens)
         self.assertEqual(lightop.dsv41_mqa_query_lens.call_count, 1)
 
+    def test_hcu_legacy_round_robin_reuses_device_query_lens_without_tensor_copy(self):
+        from sglang.srt.layers.utils.hcu_cp_utils import ContextParallelMetadata
+
+        for rank in range(8):
+            with self.subTest(rank=rank):
+                backend, batch, layer, pos, q_cpu, _, _ = self._mqa_prep_fixture(rank)
+                batch.attn_cp_metadata = ContextParallelMetadata()
+                captured = {}
+                stack, lightop = self._mqa_prep_context(backend, rank=rank)
+                with stack:
+                    stack.enter_context(
+                        patch(
+                            "sglang.srt.layers.attention.dsa.utils."
+                            "is_dsa_prefill_cp_round_robin_split",
+                            return_value=True,
+                        )
+                    )
+                    first = backend._low_ratio_hcu_query_lens(batch, pos, q_cpu)
+                    self.assertIsNotNone(first)
+                    self.assertEqual(first.tolist(), q_cpu)
+                    x = torch.zeros(pos.numel() + 2, 1)
+                    padded_pos = torch.cat((pos, pos.new_full((2,), -1)))
+                    stack.enter_context(
+                        patch.object(
+                            backend,
+                            "_low_ratio_index_topk_extend",
+                            side_effect=self._dense_capture(batch, captured),
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            torch, "tensor",
+                            side_effect=AssertionError("query lengths must stay on device"),
+                        )
+                    )
+                    backend._forward_low_ratio_sources_cp(
+                        layer=layer, x=x, q_lora=x, positions=padded_pos,
+                        forward_batch=batch, run_compressor=False, run_indexer=True,
+                    )
+                    self.assertIs(captured["q_lens"], first)
+                    self.assertEqual(lightop.dsv41_mqa_query_lens.call_count, 1)
+
+    def test_hcu_legacy_rank_without_queries_keeps_zero_request_counts(self):
+        from sglang.srt.layers.utils.hcu_cp_utils import ContextParallelMetadata
+
+        backend, batch, _, pos, _, _, _ = self._mqa_prep_fixture()
+        batch.attn_cp_metadata = ContextParallelMetadata()
+        batch.extend_seq_lens = torch.tensor([1, 0, 2], dtype=torch.int32)
+        batch.extend_start_loc = torch.tensor([0, 1, 1], dtype=torch.int32)
+        stack, lightop = self._mqa_prep_context(backend)
+        with stack, patch(
+            "sglang.srt.layers.attention.dsa.utils.is_dsa_prefill_cp_round_robin_split",
+            return_value=True,
+        ):
+            actual = backend._low_ratio_hcu_query_lens(batch, pos[:0], [0, 0, 0])
+            self.assertIsNotNone(actual)
+            self.assertEqual(actual.tolist(), [0, 0, 0])
+            self.assertEqual(lightop.dsv41_mqa_query_lens.call_count, 1)
+
+    def test_hcu_legacy_tail_reuses_existing_device_query_lengths(self):
+        from sglang.srt.layers.utils.hcu_cp_utils import ContextParallelMetadata
+
+        backend, batch, _, pos, q_cpu, _, _ = self._mqa_prep_fixture()
+        batch.attn_cp_metadata = ContextParallelMetadata()
+        local_lens = torch.tensor(q_cpu, dtype=torch.int32)
+        backend.forward_metadata.late_layer_tail = SimpleNamespace(local_lens=local_lens)
+        stack, lightop = self._mqa_prep_context(backend)
+        with stack, patch(
+            "sglang.srt.layers.attention.dsa.utils.is_dsa_prefill_cp_round_robin_split",
+            return_value=True,
+        ):
+            actual = backend._low_ratio_hcu_query_lens(batch, pos, q_cpu)
+            self.assertIs(actual, local_lens)
+            lightop.dsv41_mqa_query_lens.assert_not_called()
+
     def test_hcu_mqa_prep_rejects_unsupported_routes(self):
         cases = (
             "flag_off",
@@ -531,6 +606,7 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
             "capture",
             "breakable_graph",
             "non_interleave",
+            "legacy_zigzag",
             "indexed_full_layout",
             "non_dense",
             "wrong_dtype",
@@ -582,6 +658,17 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
                         )
                     elif case == "non_interleave":
                         batch.attn_cp_metadata = SimpleNamespace()
+                    elif case == "legacy_zigzag":
+                        from sglang.srt.layers.utils.hcu_cp_utils import ContextParallelMetadata
+
+                        batch.attn_cp_metadata = ContextParallelMetadata()
+                        stack.enter_context(
+                            patch(
+                                "sglang.srt.layers.attention.dsa.utils."
+                                "is_dsa_prefill_cp_round_robin_split",
+                                return_value=False,
+                            )
+                        )
                     elif case == "indexed_full_layout":
                         batch.attn_cp_metadata.local_index = torch.tensor([0])
                     elif case == "non_dense":

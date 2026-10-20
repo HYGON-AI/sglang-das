@@ -3299,13 +3299,22 @@ class DeepseekV4AttnBackend(
             or getattr(forward_batch, "actual_forward_mode", ForwardMode.EXTEND)
             != ForwardMode.EXTEND
             or not isinstance(self.forward_metadata, DSV4Metadata)
-            or not isinstance(
-                forward_batch.attn_cp_metadata, InterleaveContextParallelMetadata
-            )
             or not self._use_dense_fp4_prefill_indexer(forward_batch)
             or not _hcu_mqa_prep_available()
         ):
             return None
+        cp_metadata = forward_batch.attn_cp_metadata
+        if not isinstance(cp_metadata, InterleaveContextParallelMetadata):
+            from sglang.srt.layers.attention.dsa.utils import (
+                is_dsa_prefill_cp_round_robin_split,
+            )
+            from sglang.srt.layers.utils.hcu_cp_utils import ContextParallelMetadata
+
+            # Legacy HCU CP uses the same original-row round-robin ownership.
+            if not isinstance(
+                cp_metadata, ContextParallelMetadata
+            ) or not is_dsa_prefill_cp_round_robin_split():
+                return None
         from sglang.srt.model_executor.runner_utils.capture_mode import (
             is_in_breakable_cuda_graph,
         )
@@ -3351,7 +3360,7 @@ class DeepseekV4AttnBackend(
             ):
                 return None
         else:
-            if forward_batch.attn_cp_metadata.local_index is not None:
+            if getattr(cp_metadata, "local_index", None) is not None:
                 return None
             for value in (
                 forward_batch.extend_start_loc,
