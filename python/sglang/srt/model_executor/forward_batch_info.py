@@ -1399,8 +1399,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                             (total + parallel.attn_cp_size - 1 - parallel.attn_cp_rank)
                             // parallel.attn_cp_size,
                         )
-                        metadata.moe_local_token_count = torch.tensor(
-                            local, dtype=torch.int32, device=self.input_ids.device
+                        # Fill on device instead of synchronously uploading a CPU scalar.
+                        metadata.moe_local_token_count = torch.full(
+                            (), local, dtype=torch.int32, device=self.input_ids.device
                         )
                     return metadata.moe_local_token_count
 
