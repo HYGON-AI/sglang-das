@@ -1429,7 +1429,7 @@ class SchedulerPPMixin:
     def _pp_collect_linker_load_failures(
         self: Scheduler, batch: ScheduleBatch
     ) -> set[str]:
-        failed = set(self.tree_cache.drain_linker_loads())
+        failed = set(self.tree_cache.drain_linker_loads(wait_for_completion=True))
         if self.tree_cache.has_outstanding_failed_linker_chains():
             failed.update(
                 req.rid

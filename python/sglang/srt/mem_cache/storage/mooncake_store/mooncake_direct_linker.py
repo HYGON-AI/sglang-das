@@ -1153,6 +1153,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def num_completed_loads(self) -> int:
         return self.completed_loads.qsize()
 
+    def wait_for_pending_loads(self) -> None:
+        self.load_queue.join()
+
     def pop_completed_load(self) -> tuple[list[str], bool]:
         return self.completed_loads.get_nowait()
 

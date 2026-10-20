@@ -2890,14 +2890,17 @@ class UnifiedRadixCache(BasePrefixCache):
         self._all_reduce_attn_groups(effective, torch.distributed.ReduceOp.MIN)
         apply_policy(*(bool(value) for value in effective.tolist()))
 
-    def drain_linker_loads(self) -> list[str]:
+    def drain_linker_loads(self, *, wait_for_completion: bool = False) -> list[str]:
         """Retire finished linker loads and return the rids that must abort.
 
         The batch count is MIN-reduced first because a load failure is
-        rank-local: unreduced, one rank aborts a request the others keep.
+        rank-local: unreduced, one rank aborts a request the others keep. The
+        optional wait covers only loads already issued to the backend worker.
         """
         if self.linker is None:
             return []
+        if wait_for_completion:
+            self.linker.wait_for_pending_loads()
         finish_count = torch.tensor(
             [self.linker.num_completed_loads()], dtype=torch.int, device="cpu"
         )

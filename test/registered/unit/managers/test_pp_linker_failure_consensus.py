@@ -2,7 +2,9 @@
 
 import datetime
 import pickle
+import queue
 import socket
+import threading
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -21,6 +23,17 @@ from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers import scheduler_pp_mixin as pp  # noqa: E402
 from sglang.srt.managers.schedule_batch import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.mem_cache.storage.mooncake_store import (  # noqa: E402
+    mooncake_direct_linker,
+)
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (  # noqa: E402
+    LayerWiseLoadCounter,
+    MooncakeDirectLinker,
+)
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (  # noqa: E402
+    UnifiedCacheLinkerWrapper,
+)
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 
 register_cpu_ci(est_time=180, suite="base-a-test-cpu")
@@ -116,6 +129,9 @@ class _Stage(pp.SchedulerPPMixin):
         self.server_args = SimpleNamespace(enable_unified_cache_external_linker=True)
         self.responses = []
         self.failures = []
+        self.failure_drain_requested = threading.Event()
+        self.failure_jobs = queue.Queue()
+        self.failure_workers = []
         self.requests = {
             rid: _Req(rid) for rid in ("warmup", "failed-load", "next-request")
         }
@@ -181,8 +197,24 @@ class _Stage(pp.SchedulerPPMixin):
             and self.failing_rank is not None
             and self.rank == self.failing_rank
         ):
-            self.failures.append(request.rid)
             self.failure_tick = self.tick
+            self.failure_drain_requested.clear()
+            self.failure_jobs.put(request.rid)
+
+            def publish_after_drain_request():
+                rid = self.failure_jobs.get()
+                try:
+                    # The load has signalled the model-layer failure, but its
+                    # completion record is delayed until the PP collector asks
+                    # to wait for worker publication.
+                    self.failure_drain_requested.wait()
+                    self.failures.append(rid)
+                finally:
+                    self.failure_jobs.task_done()
+
+            worker = threading.Thread(target=publish_after_drain_request, daemon=True)
+            self.failure_workers.append(worker)
+            worker.start()
         self._mark_next_event_as_launch = True
         return SimpleNamespace(
             can_run_cuda_graph=False,
@@ -193,11 +225,25 @@ class _Stage(pp.SchedulerPPMixin):
             next_token_ids=torch.tensor([self.tick], dtype=torch.int64),
         )
 
-    def drain_loads(self):
-        if self.failures and self.completed_launch_tick != self.failure_tick:
-            raise AssertionError("linker failure drained before launch event sync")
+    def drain_loads(self, *, wait_for_completion=False):
+        if wait_for_completion:
+            if self.failure_tick is not None and (
+                self.completed_launch_tick != self.failure_tick
+            ):
+                raise AssertionError("linker failure drained before launch event sync")
+            self.failure_drain_requested.set()
+            self.failure_jobs.join()
+            self.failure_tick = None
         failed, self.failures = self.failures, []
         return failed
+
+    def release_failure_workers(self):
+        self.failure_drain_requested.set()
+        self.failure_jobs.join()
+        for worker in self.failure_workers:
+            worker.join(timeout=2)
+            if worker.is_alive():
+                raise AssertionError("delayed linker failure worker did not exit")
 
     def _iter_external_linker_candidates(self, batch):
         return Scheduler._iter_external_linker_candidates(self, batch)
@@ -269,9 +315,12 @@ def _pp_failure_worker(rank, port, pp_size):
                                 lambda **_kwargs: _pure_chunk_plan(stage)
                             )
                         try:
-                            stage.event_loop_pp()
-                        except _StopLoop:
-                            pass
+                            try:
+                                stage.event_loop_pp()
+                            except _StopLoop:
+                                pass
+                        finally:
+                            stage.release_failure_workers()
                     stage._pp_commit_comm_work(stage.send_proxy_work)
                     stage._pp_commit_comm_work(stage.send_output_work)
                     reports = [None] * pp_size
@@ -304,7 +353,115 @@ def _pure_chunk_plan(stage):
     return SimpleNamespace(running_batch=None, batch_to_run=batch)
 
 
+class _ObservedJoinQueue(queue.Queue):
+    """Expose the moment a real backend worker queue is joined by the test."""
+
+    def __init__(self, on_join=None):
+        super().__init__()
+        self.join_entered = threading.Event()
+        self.on_join = on_join
+
+    def join(self):
+        self.join_entered.set()
+        if self.on_join is not None:
+            self.on_join()
+        super().join()
+
+
+class _CacheDrainHarness:
+    """Run the production UnifiedRadixCache drain against one local rank."""
+
+    def __init__(self, linker):
+        self.linker = linker
+        self._failed_linker_rids = []
+
+    def _all_reduce_attn_groups(self, _tensor, _op):
+        pass
+
+    def _collect_failed_linker_loads(self, finish_count):
+        UnifiedRadixCache._collect_failed_linker_loads(self, finish_count)
+
+    def drain_linker_loads(self, *, wait_for_completion=False):
+        if wait_for_completion:
+            return UnifiedRadixCache.drain_linker_loads(self, wait_for_completion=True)
+        return UnifiedRadixCache.drain_linker_loads(self)
+
+    def has_outstanding_failed_linker_chains(self):
+        return False
+
+
 class TestPPLinkerFailureConsensus(unittest.TestCase):
+    def test_pp_collect_waits_for_backend_failure_publication(self):
+        cleanup_release = threading.Event()
+        failure_signalled = threading.Event()
+
+        backend = object.__new__(MooncakeDirectLinker)
+        backend.pending_loads = {"failed-load": []}
+        backend.pending_load_tokens = {}
+        backend.host_prefetch_enabled = False
+        backend.gc_frozen = True
+        backend.stats = {"load": 0}
+        backend.load_queue = _ObservedJoinQueue(on_join=cleanup_release.set)
+        backend.completed_loads = queue.Queue()
+        backend.layer_done_counter = LayerWiseLoadCounter(1)
+
+        def fail_then_wait_for_cleanup(counter_index, _request_transfers):
+            backend.layer_done_counter.fail(
+                counter_index, RuntimeError("injected linker load failure")
+            )
+            failure_signalled.set()
+            if not cleanup_release.wait(timeout=5):
+                raise TimeoutError("test did not release the delayed load cleanup")
+            return False
+
+        backend.load_layer_wise = fail_then_wait_for_cleanup
+        ready_event = SimpleNamespace(record=lambda: None, synchronize=lambda: None)
+        with patch.object(
+            mooncake_direct_linker,
+            "device_module",
+            SimpleNamespace(Event=lambda: ready_event),
+        ):
+            backend.start_layer_wise_loading()
+
+        worker = threading.Thread(target=backend.load_thread_func, daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(
+                failure_signalled.wait(timeout=5),
+                "backend worker did not signal the layer failure",
+            )
+            self.assertEqual(backend.num_completed_loads(), 0)
+
+            wrapper_cache = SimpleNamespace(
+                tree_core=SimpleNamespace(
+                    enable_external_cache_linker=False,
+                    detach_external_load_chain=lambda _node, _anchor: [],
+                ),
+                write_through_threshold=0,
+                dec_lock_ref=Mock(),
+            )
+            linker = UnifiedCacheLinkerWrapper(wrapper_cache, backend)
+            linker.pending_loads["failed-load"] = (1, object(), 0)
+            cache = _CacheDrainHarness(linker)
+
+            # The public drain remains nonblocking unless PP explicitly opts in.
+            self.assertEqual(cache.drain_linker_loads(), [])
+            self.assertFalse(backend.load_queue.join_entered.is_set())
+
+            stage = _Stage(rank=0, pp_size=2, failing_rank=None)
+            stage.tree_cache = cache
+            batch = SimpleNamespace(reqs=[stage.requests["failed-load"]])
+            failed_rids = stage._pp_collect_linker_load_failures(batch)
+            self.assertEqual(failed_rids, {"failed-load"})
+            self.assertTrue(backend.load_queue.join_entered.is_set())
+        finally:
+            # A broken PP wait must not leave the simulated backend thread held.
+            cleanup_release.set()
+            backend.load_queue.join()
+            backend.load_queue.put(None)
+            worker.join(timeout=5)
+            self.assertFalse(worker.is_alive(), "backend worker did not exit")
+
     def test_failure_consensus_uses_proxy_and_output_rings(self):
         for pp_size in (2, 3):
             with socket.socket() as listener:
