@@ -1,4 +1,4 @@
-name: Cookbook deployment smoke
+name: Cookbook deployment smoke (SGLang)
 
 on:
   workflow_call:
@@ -7,12 +7,20 @@ on:
         description: Exact dated image built and pushed by the caller
         type: string
         required: true
+      image-id:
+        description: Immutable image ID recorded by the image build
+        type: string
+        default: ''
+      hardware:
+        description: all, BW1100 or BW1000
+        type: string
+        default: all
       mode:
         description: preflight or execute
         type: string
         default: execute
       cases:
-        description: Exact cookbook section; empty tests all single-host deployments
+        description: Exact Cookbook sections; select one hardware for hardware-specific sections
         type: string
         default: ''
     secrets:
@@ -22,17 +30,22 @@ on:
         required: false
   workflow_dispatch:
     inputs:
+      hardware:
+        description: all runs both hardware suites in parallel
+        type: choice
+        options: [all, BW1100, BW1000]
+        default: all
       mode:
         description: First run preflight; then execute
         type: choice
         options: [preflight, execute]
         default: preflight
       image:
-        description: SGLang image to test (full reference); empty uses the newest dated jenkins/model_test_env/sglang tag
+        description: Dated sglang 0.5.18 image; empty selects the newest dated image once
         type: string
         default: ''
       cases:
-        description: Exact cookbook section; empty tests all single-host deployments
+        description: Exact Cookbook sections; empty tests all single-host deployments per hardware
         type: string
         default: ''
 
@@ -44,25 +57,91 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  smoke:
+  prepare:
     runs-on: bw1100
-    timeout-minutes: 840
+    timeout-minutes: 45
+    outputs:
+      enabled: ${{ steps.prepare.outputs.enabled }}
+      image: ${{ steps.prepare.outputs.image_ref }}
+      image-id: ${{ steps.prepare.outputs.image_id }}
+      cookbook-ref: ${{ steps.prepare.outputs.cookbook_ref }}
+      controller-ref: ${{ steps.prepare.outputs.controller_ref }}
+      matrix: ${{ steps.prepare.outputs.matrix }}
     steps:
-      - name: Checkout private test controller
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           repository: guochenyang99/ci-model-test
-          # The maintained main branch supplies all test behavior.
           ref: main
           token: ${{ secrets.MODEL_SMOKE_REPO_TOKEN }}
           persist-credentials: false
-          # Fresh code-only directory bypasses reports left by the previous controller.
           path: model-ci-tools
-      - name: Invoke maintained test controller
+      - id: prepare
+        uses: ./model-ci-tools/.github/actions/deployment-smoke-prepare
+        with:
+          framework: sglang
+          framework-version: '0.5.18'
+          image: ${{ inputs.image || '' }}
+          image-id: ${{ inputs.image-id || '' }}
+          hardware: ${{ inputs.hardware || 'all' }}
+
+  smoke:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.enabled == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    name: Smoke (${{ matrix.hardware }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 840
+    steps:
+      - name: Checkout pinned private test controller
+        uses: actions/checkout@v4
+        with:
+          repository: guochenyang99/ci-model-test
+          ref: ${{ needs.prepare.outputs.controller-ref }}
+          token: ${{ secrets.MODEL_SMOKE_REPO_TOKEN }}
+          persist-credentials: false
+          path: model-ci-tools
+      - name: Test this hardware and transfer evidence
         uses: ./model-ci-tools/.github/actions/deployment-smoke
         with:
-          image: ${{ inputs.image || '' }}
-          dashhub-token: ${{ secrets.DASHHUB_CI_TOKEN }}
+          framework: sglang
+          framework-version: '0.5.18'
+          image: ${{ needs.prepare.outputs.image }}
+          expected-image-id: ${{ needs.prepare.outputs.image-id }}
+          cookbook-ref: ${{ needs.prepare.outputs.cookbook-ref }}
+          controller-ref: ${{ needs.prepare.outputs.controller-ref }}
+          hardware: ${{ matrix.hardware }}
+          cases: ${{ inputs.cases || '' }}
+          mode: ${{ inputs.mode || 'execute' }}
+          collect-only: 'true'
+
+  report:
+    needs: [prepare, smoke]
+    if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.enabled == 'true' }}
+    runs-on: bw1100
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: guochenyang99/ci-model-test
+          ref: ${{ needs.prepare.outputs.controller-ref }}
+          token: ${{ secrets.MODEL_SMOKE_REPO_TOKEN }}
+          persist-credentials: false
+          path: model-ci-tools
+      - name: Publish one report and one DashHub submission
+        uses: ./model-ci-tools/.github/actions/deployment-smoke-aggregate
+        with:
+          framework: sglang
+          framework-version: '0.5.18'
           pypi-url: ${{ vars.PYPI_URL }}
           cases: ${{ inputs.cases || '' }}
+          matrix: ${{ needs.prepare.outputs.matrix }}
+          image: ${{ needs.prepare.outputs.image }}
+          image-id: ${{ needs.prepare.outputs.image-id }}
+          cookbook-ref: ${{ needs.prepare.outputs.cookbook-ref }}
+          controller-ref: ${{ needs.prepare.outputs.controller-ref }}
+          dashhub-token: ${{ secrets.DASHHUB_CI_TOKEN }}
           mode: ${{ inputs.mode || 'execute' }}
