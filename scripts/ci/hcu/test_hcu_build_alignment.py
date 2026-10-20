@@ -135,7 +135,7 @@ class TestBuildAlignment(unittest.TestCase):
         hcu = re.search(r"hcu_path_pattern='([^']+)'", scripts).group(1)
         wheel = next(
             p
-            for p in re.findall(r"grep -Eq '([^']+)'", scripts)
+            for p in re.findall(r"grep -Eq? '([^']+)'", scripts)
             if "requirements_hcu" in p
         )
         for path in ["rust/Cargo.lock", "rust/tree/src/lib.rs", "python/setup.py"]:
@@ -211,9 +211,10 @@ class TestBuildAlignment(unittest.TestCase):
             ("2.10.0", "0.5.18"),
             ("2.11.0", "0.5.15.post1"),
         ]:
-            with self.subTest(
-                torch=torch_version
-            ), tempfile.TemporaryDirectory() as temp:
+            with (
+                self.subTest(torch=torch_version),
+                tempfile.TemporaryDirectory() as temp,
+            ):
                 staged = Path(temp) / "ORG_REPO/pr-1/abcdef123456"
                 wheels = staged / "wheels"
                 wheels.mkdir(parents=True)
@@ -228,18 +229,18 @@ class TestBuildAlignment(unittest.TestCase):
                     "sglang_kernel-0.4.6.whl",
                 ]:
                     (wheels / name).touch()
-                with patch.dict(
-                    os.environ,
-                    HCU_WHEEL_STAGING_ROOT=temp,
-                    HCU_WHEEL_TARGET_SHA="abcdef123456",
-                    GITHUB_REPOSITORY="ORG/REPO",
-                    HCU_WHEEL_WAIT_TIMEOUT="1",
-                ), patch("time.time", side_effect=[0, 0, 2]), patch(
-                    "time.sleep"
-                ), contextlib.redirect_stdout(
-                    io.StringIO()
-                ), contextlib.redirect_stderr(
-                    io.StringIO()
+                with (
+                    patch.dict(
+                        os.environ,
+                        HCU_WHEEL_STAGING_ROOT=temp,
+                        HCU_WHEEL_TARGET_SHA="abcdef123456",
+                        GITHUB_REPOSITORY="ORG/REPO",
+                        HCU_WHEEL_WAIT_TIMEOUT="1",
+                    ),
+                    patch("time.time", side_effect=[0, 0, 2]),
+                    patch("time.sleep"),
+                    contextlib.redirect_stdout(io.StringIO()),
+                    contextlib.redirect_stderr(io.StringIO()),
                 ):
                     with self.assertRaises(SystemExit) as result:
                         exec(code, {})
@@ -286,13 +287,15 @@ class TestBuildAlignment(unittest.TestCase):
                     version = "0.5.15.post1" if kind == "wrong-version" else "0.5.18"
                     (wheels / f"sglang-{version}-py3-none-any.whl").touch()
                 out = io.StringIO()
-                with patch.dict(
-                    os.environ,
-                    HCU_WHEEL_STAGING_ROOT=temp,
-                    HCU_WHEEL_TARGET_SHA="abcdef123456",
-                    GITHUB_REPOSITORY="ORG/REPO",
-                ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(
-                    io.StringIO()
+                with (
+                    patch.dict(
+                        os.environ,
+                        HCU_WHEEL_STAGING_ROOT=temp,
+                        HCU_WHEEL_TARGET_SHA="abcdef123456",
+                        GITHUB_REPOSITORY="ORG/REPO",
+                    ),
+                    contextlib.redirect_stdout(out),
+                    contextlib.redirect_stderr(io.StringIO()),
                 ):
                     try:
                         exec(code, {})
@@ -340,15 +343,14 @@ class TestBuildAlignment(unittest.TestCase):
                         "sglang.dist-info/METADATA",
                         f"Name: sglang\nVersion: {metadata_version}\n",
                     )
-                with patch.dict(
-                    os.environ, HCU_CI_INSTALL_WHEEL_URLS=str(path)
-                ), patch.dict(
-                    sys.modules,
-                    torch=types.SimpleNamespace(__version__="2.11.0+dtk2604"),
-                ), patch(
-                    "subprocess.check_output", return_value="abcdef123456\n"
-                ), contextlib.redirect_stdout(
-                    io.StringIO()
+                with (
+                    patch.dict(os.environ, HCU_CI_INSTALL_WHEEL_URLS=str(path)),
+                    patch.dict(
+                        sys.modules,
+                        torch=types.SimpleNamespace(__version__="2.11.0+dtk2604"),
+                    ),
+                    patch("subprocess.check_output", return_value="abcdef123456\n"),
+                    contextlib.redirect_stdout(io.StringIO()),
                 ):
                     if kind == "valid":
                         exec(code, {})

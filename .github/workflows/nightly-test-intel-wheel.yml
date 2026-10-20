@@ -31,7 +31,7 @@ on:
 
 concurrency:
   group: nightly-test-intel-wheel-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || format('{0}-{1}', github.ref, github.event.schedule) }}
-  cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
+  cancel-in-progress: ${{ inputs.ref == '' && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
   nightly-xpu-kernel-wheel-1-gpu:

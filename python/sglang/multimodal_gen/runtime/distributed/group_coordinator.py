@@ -2,13 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-import os
-
 # Copyright 2024 xDiT team.
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/distributed/parallel_state.py
 # Copyright 2023 The vLLM team.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+import os
 import pickle
 import weakref
 from collections import namedtuple
