@@ -5,10 +5,27 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <torch/all.h>
+#include <type_traits>
 
 #include "utils.h"
 
 namespace {
+
+template <typename scalar_t>
+__device__ scalar_t rounded_product(scalar_t a, scalar_t b) {
+  scalar_t result = static_cast<scalar_t>(float(a) * float(b));
+#if defined(__HIP_DEVICE_COMPILE__)
+  if constexpr (std::is_same_v<scalar_t, at::Half>) {
+    // Keep the half rounding boundary visible to the HIP optimizer. Merely
+    // casting to Half (or using float RN intrinsics) can still contract the
+    // first product into the subsequent half add/subtract on gfx938.
+    uint32_t bits = result.x;
+    asm volatile("" : "+v"(bits));
+    result.x = static_cast<uint16_t>(bits);
+  }
+#endif
+  return result;
+}
 
 template <typename scalar_t>
 __device__ void rotate_pair(scalar_t* row, const scalar_t* cache, int offset, int half) {
@@ -16,8 +33,13 @@ __device__ void rotate_pair(scalar_t* row, const scalar_t* cache, int offset, in
   const scalar_t y = row[half + offset];
   const scalar_t cos = SGLANG_LDG(cache + offset);
   const scalar_t sin = SGLANG_LDG(cache + half + offset);
-  row[offset] = x * cos - y * sin;
-  row[half + offset] = y * cos + x * sin;
+  // Match the unfused reference: each product rounds to the input dtype.
+  const scalar_t xc = rounded_product(x, cos);
+  const scalar_t ys = rounded_product(y, sin);
+  const scalar_t yc = rounded_product(y, cos);
+  const scalar_t xs = rounded_product(x, sin);
+  row[offset] = static_cast<scalar_t>(float(xc) - float(ys));
+  row[half + offset] = static_cast<scalar_t>(float(yc) + float(xs));
 }
 
 template <typename scalar_t>
