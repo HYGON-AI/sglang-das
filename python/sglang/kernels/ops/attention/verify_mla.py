@@ -18,10 +18,26 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.decode_attention import (
+    _extract_kv_strides,
+    _kv_layout_hcu_fa,
+)
 from sglang.kernels.ops.attention.verify_splitkv import _AMD_LAUNCH_KWARGS
+from sglang.srt.utils import is_hcu
+
+_is_hcu = is_hcu()
+
+# Opt-in page64 split-KV vector loads; geometry-specific tuning stays separate.
+# Read once at import; set on every worker before starting the service.
+_DSPARK_SPLITKV_V2 = os.environ.get("SGLANG_DSPARK_SPLITKV_V2", "0") == "1"
 
 MAX_N_SPLITS = 32  # Grid split dim upper bound
 TARGET_PROGRAMS = 512  # Target total stage-1 programs
+# DSpark/BW1100: measured for page64, D64, gamma7, Hq8/Hkv2.
+# Retain the existing launch hints for all other attention geometries.
+_DSPARK_PAGED_LAUNCH_KWARGS = (
+    dict(_AMD_LAUNCH_KWARGS, waves_per_eu=1, kpack=2) if _AMD_LAUNCH_KWARGS else {}
+)
 MINIMAX_GQA16_TARGET_PROGRAMS = int(
     os.environ.get("SGLANG_MINIMAX_GQA16_VERIFY_TARGET_PROGRAMS", "128")
 )
@@ -83,6 +99,11 @@ def _verify_mla_prefix_stage1(
     stride_buf_vbs,
     stride_buf_kh,
     stride_buf_vh,
+    stride_buf_kpage,
+    stride_buf_ktok,
+    stride_buf_vpage,
+    stride_buf_vtok,
+    stride_buf_vd,
     stride_ob,
     stride_oh,
     stride_os,
@@ -102,10 +123,18 @@ def _verify_mla_prefix_stage1(
     BLOCK_DPE: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    PAGED_V2: tl.constexpr = False,
+    PRESERVE_Q_PRECISION: tl.constexpr = False,
 ):
     cur_batch = tl.program_id(0)
     head_block = tl.program_id(1)
     split_kv_id = tl.program_id(2)
+
+    # FP8 cache storage must not quantize BF16 Q or softmax probabilities.
+    COMPUTE_DTYPE: tl.constexpr = (
+        Q.dtype.element_ty if PRESERVE_Q_PRECISION else K_Buffer.dtype.element_ty
+    )
 
     # row tile size for each workgroup
     R: tl.constexpr = BLOCK_H * L_EXT
@@ -138,7 +167,13 @@ def _verify_mla_prefix_stage1(
         row_mask = tl.reshape((offs_h[:, None] < H_Q) & (offs_l[None, :] < l_ext), (R,))
 
         # the last kv split completes the remaining
-        kv_len_per_split = cur_batch_seq_len // active
+        if PAGED_V2:
+            # Keep each partition on a BLOCK_N (and thus page64) boundary.
+            # active <= floor(seq_len / BLOCK_N), except the single short/empty
+            # partition, so every non-empty prefix still has non-empty splits.
+            kv_len_per_split = (cur_batch_seq_len // BLOCK_N // active) * BLOCK_N
+        else:
+            kv_len_per_split = cur_batch_seq_len // active
         split_start = kv_len_per_split * split_kv_id
         split_end = tl.where(
             split_kv_id == active - 1, cur_batch_seq_len, split_start + kv_len_per_split
@@ -155,13 +190,13 @@ def _verify_mla_prefix_stage1(
             Q + q_row[:, None] + offs_dn[None, :],
             mask=row_mask[:, None] & (offs_dn[None, :] < NOPE_DIM),
             other=0.0,
-        ).to(K_Buffer.dtype.element_ty)
+        ).to(COMPUTE_DTYPE)
         if PE_DIM > 0:
             q_pe = tl.load(
                 Q + q_row[:, None] + (NOPE_DIM + offs_dp)[None, :],
                 mask=row_mask[:, None] & (offs_dp[None, :] < PE_DIM),
                 other=0.0,
-            ).to(K_Buffer.dtype.element_ty)
+            ).to(COMPUTE_DTYPE)
 
         e_max = tl.zeros([R], dtype=tl.float32) - float("inf")
         e_sum = tl.zeros([R], dtype=tl.float32)
@@ -174,12 +209,29 @@ def _verify_mla_prefix_stage1(
             kv_loc = tl.load(
                 kv_indices + cur_batch_kv_start_idx + offs_n, mask=n_mask, other=0
             )
-            base = kv_loc[None, :] * stride_buf_kbs + kv_head_off_k
+            # Token IDs address pages, not whole-page strides.
+            if PAGE_SIZE == 1:
+                base = kv_loc[None, :] * stride_buf_kbs + kv_head_off_k
+                v_base = kv_loc[:, None] * stride_buf_vbs + kv_head_off_v
+            else:
+                page_id = kv_loc // PAGE_SIZE
+                token_offset = kv_loc % PAGE_SIZE
+                base = (
+                    page_id[None, :] * stride_buf_kpage
+                    + token_offset[None, :] * stride_buf_ktok
+                    + kv_head_off_k
+                )
+                v_base = (
+                    page_id[:, None] * stride_buf_vpage
+                    + token_offset[:, None] * stride_buf_vtok
+                    + kv_head_off_v
+                )
             k_nope = tl.load(
                 K_Buffer + base + offs_dn[:, None],
                 mask=(offs_dn[:, None] < NOPE_DIM) & n_mask[None, :],
                 other=0.0,
             )
+            k_nope = k_nope.to(COMPUTE_DTYPE)
             qk = tl.dot(q_nope, k_nope)
             if PE_DIM > 0:
                 k_pe = tl.load(
@@ -187,24 +239,58 @@ def _verify_mla_prefix_stage1(
                     mask=(offs_dp[:, None] < PE_DIM) & n_mask[None, :],
                     other=0.0,
                 )
-                qk += tl.dot(q_pe, k_pe)
+                qk += tl.dot(q_pe, k_pe.to(COMPUTE_DTYPE))
             qk *= sm_scale * k_scale
             qk = tl.where(n_mask[None, :], qk, float("-inf"))
 
             # MLA exposes its latent V through V_Buffer; ordinary shared-KV
             # attention has an independent V cache. Both use this same load.
-            v = tl.load(
-                V_Buffer
-                + kv_loc[:, None] * stride_buf_vbs
-                + kv_head_off_v
-                + offs_dv[None, :],
-                mask=n_mask[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
-                other=0.0,
-            )
+            if PAGED_V2:
+                page_offsets = tl.arange(0, BLOCK_N // 64) * 64
+                page_first = tl.load(
+                    kv_indices + cur_batch_kv_start_idx + start_n + page_offsets,
+                    mask=start_n + page_offsets < split_end,
+                    other=0,
+                )
+                expected = tl.reshape(
+                    page_first[:, None] + tl.arange(0, 64)[None, :], (BLOCK_N,)
+                )
+                regular = tl.sum(((kv_loc != expected) & n_mask).to(tl.int32), 0) == 0
+                aligned = tl.sum((page_first % 64).to(tl.int32), 0) == 0
+                if regular & aligned:
+                    # Runtime-verified page-contiguous IDs, including partial last page.
+                    vb = (page_first // 64) * tl.multiple_of(stride_buf_vpage, 64)
+                    vb += tl.multiple_of(kv_head_off_v, 64)
+                    vb = tl.reshape(vb[:, None] + tl.arange(0, 64)[None, :], (BLOCK_N,))
+                    vb = tl.max_contiguous(vb, 64)
+                    v = tl.load(
+                        V_Buffer
+                        + vb[:, None]
+                        + offs_dv[None, :] * tl.multiple_of(stride_buf_vd, 64),
+                        mask=n_mask[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
+                        other=0.0,
+                    )
+                else:
+                    v = tl.load(
+                        V_Buffer + v_base + offs_dv[None, :] * stride_buf_vd,
+                        mask=n_mask[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
+                        other=0.0,
+                    )
+            else:
+                v = tl.load(
+                    V_Buffer
+                    # Legacy HCU V is [page, head, dim, token].
+                    + v_base
+                    + offs_dv[None, :] * stride_buf_vd,
+                    mask=n_mask[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
+                    other=0.0,
+                )
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max[:, None])
             acc *= re_scale[:, None]
+            if PRESERVE_Q_PRECISION:
+                v = v.to(COMPUTE_DTYPE)
             acc += tl.dot(p.to(v.dtype), v)
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
@@ -220,7 +306,10 @@ def _verify_mla_prefix_stage1(
         )
         tl.store(
             Att_Out + o_row[:, None] + offs_dv[None, :],
-            (acc / e_sum[:, None]).to(Att_Out.dtype.element_ty),
+            # Empty prefix is an identity contribution, not 0/0.
+            (acc / tl.where(e_sum > 0, e_sum, 1.0)[:, None]).to(
+                Att_Out.dtype.element_ty
+            ),
             mask=row_mask[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
         )
         lse_row = tl.reshape(
@@ -294,7 +383,8 @@ def _verify_mla_combine_stage2(
     m = tl.zeros([L_EXT], dtype=tl.float32) - float("inf")
     l_acc = tl.zeros([L_EXT], dtype=tl.float32)
     acc = tl.zeros([L_EXT, BLOCK_DV], dtype=tl.float32)
-    for s in range(active):
+    # Empty/padded prefixes must not merge (-inf)-(-inf).
+    for s in range(tl.where(seqlen > 0, active, 0)):
         lse_s = tl.load(
             Att_Lse
             + cur_batch * stride_lb
@@ -320,7 +410,7 @@ def _verify_mla_combine_stage2(
         acc = acc * alpha[:, None] + o_s * beta[:, None]
         l_acc = l_acc * alpha + beta
         m = new_m
-    o_prefix = acc / l_acc[:, None]
+    o_prefix = acc / tl.where(l_acc > 0, l_acc, 1.0)[:, None]
     lse_prefix = m + tl.log(l_acc)
 
     # ---- (b) draft-draft causal attention (L_EXT x L_EXT) -----------------
@@ -468,8 +558,54 @@ class VerifyMLA:
         sm_scale,
         k_scale,
         v_scale,
+        page_size=1,
     ):
         grid = (bs, self.n_head_blocks, num_splits)
+        # Same physical-layout contract as the existing extend reference.
+        ks, kh, kp, kt, _ = _extract_kv_strides(k_buffer, page_size, is_value=False)
+        vs, vh, vp, vt, vd = _extract_kv_strides(v_buffer, page_size, is_value=True)
+        # V2 requires the physical page/layout contract, not a BS/head whitelist.
+        # No device tensor values are read by Python: safe during graph replay.
+        paged_v2 = (
+            _is_hcu
+            and _DSPARK_SPLITKV_V2
+            and bool(_AMD_LAUNCH_KWARGS)
+            and _kv_layout_hcu_fa
+            and self.block_n % 64 == 0
+            and page_size == 64
+            and k_buffer.dim() == v_buffer.dim() == 4
+            and k_buffer.dtype == v_buffer.dtype == torch.float8_e4m3fn
+            and q_extend.dtype == torch.bfloat16
+            and vt == 1
+            and vd % 64 == 0
+            and vp % 64 == 0
+            and vh % 64 == 0
+        )
+        launch_kwargs = _AMD_LAUNCH_KWARGS
+        if (
+            _is_hcu
+            and self.head_dim == self.v_head_dim == 64
+            and self.h_q == 8
+            and self.kv_group_num == 4
+            and self.l_ext == 7
+            and page_size == 64
+            and k_buffer.dim() == 4
+            and _kv_layout_hcu_fa
+        ):
+            launch_kwargs = _DSPARK_PAGED_LAUNCH_KWARGS
+        # Only the measured c0 geometry gets its V2 launch tuning.
+        # Other supported shapes still use V2 loads with their original hints.
+        if (
+            paged_v2
+            and 1 <= bs <= 16
+            and self.h_q == 32
+            and self.kv_group_num == 4
+            and self.head_dim == self.v_head_dim == 64
+            and self.l_ext == 7
+            and self.block_h == 4
+            and self.block_n == 256
+        ):
+            launch_kwargs = _DSPARK_PAGED_LAUNCH_KWARGS
         _verify_mla_prefix_stage1[grid](
             q_extend,
             k_buffer,
@@ -485,10 +621,15 @@ class VerifyMLA:
             num_splits,
             q_extend.stride(0),
             q_extend.stride(1),
-            k_buffer.stride(0),
-            v_buffer.stride(0),
-            k_buffer.stride(1),
-            v_buffer.stride(1),
+            ks,
+            vs,
+            kh,
+            vh,
+            kp,
+            kt,
+            vp,
+            vt,
+            vd,
             self.att_out.stride(0),
             self.att_out.stride(1),
             self.att_out.stride(2),
@@ -508,9 +649,17 @@ class VerifyMLA:
             BLOCK_DPE=max(1, triton.next_power_of_2(self.pe_dim)),
             BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
             BLOCK_N=self.block_n,
+            PAGE_SIZE=page_size,
+            PAGED_V2=paged_v2,
+            PRESERVE_Q_PRECISION=(
+                _is_hcu
+                and q_extend.dtype in (torch.bfloat16, torch.float16)
+                and k_buffer.dtype
+                in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2)
+            ),
             num_warps=self.num_warps,
             num_stages=1,
-            **_AMD_LAUNCH_KWARGS,
+            **launch_kwargs,
         )
 
     def _run_combine_kernel(
@@ -581,6 +730,7 @@ class VerifyMLA:
         k_scale=1.0,
         v_scale=1.0,
         is_causal=True,
+        page_size=1,
     ):
         if o_out is None:
             o_out = torch.empty(
@@ -603,6 +753,7 @@ class VerifyMLA:
             sm_scale,
             k_scale,
             v_scale,
+            page_size=page_size,
         )
         self._run_combine_kernel(
             bs,
@@ -671,6 +822,7 @@ def can_handle(
     sinks=None,
     logit_cap=0.0,
     xai_temperature_len=-1,
+    page_size=1,
 ):
     """Return True iff the grouped-head split-KV verify path can serve this
     exact problem with the same result as extend_attention_fwd. Conservative:
@@ -698,10 +850,21 @@ def can_handle(
     # q layout must be [tokens, H_Q, D]; head dims handled by power-of-2 pad.
     if q_extend.dim() != 3 or k_extend.dim() != 3 or v_extend.dim() != 3:
         return False
-    # The prefix kernel addresses KV buffers as [tokens, H_KV, D].
-    # Paged 4-D buffers use stride(0) per page, not per token; reject them
-    # even when page_size happens to match head_dim.
-    if k_buffer.dim() != 3 or v_buffer.dim() != 3:
+    # Require an explicit page size for paged buffers; reject unsupported layouts.
+    if not isinstance(page_size, int) or page_size < 1:
+        return False
+    if k_buffer.dim() != v_buffer.dim() or k_buffer.dim() not in (3, 4):
+        return False
+    if k_buffer.dtype != v_buffer.dtype or k_buffer.shape[0] != v_buffer.shape[0]:
+        return False
+    if any(t.stride(-1) != 1 for t in (q_extend, k_extend, v_extend)):
+        return False
+    if k_buffer.stride(-1) != 1:
+        return False
+    if (
+        k_extend.shape[0] != q_extend.shape[0]
+        or v_extend.shape[:2] != k_extend.shape[:2]
+    ):
         return False
     # GQA group must divide evenly.
     h_q = q_extend.shape[1]
@@ -711,14 +874,28 @@ def can_handle(
     kv_group_num = h_q // h_kv
     if h_kv > 1 and (kv_group_num & (kv_group_num - 1)) != 0:
         return False
-    # head dims must match buffers.
-    if k_buffer.shape[1] != h_kv or v_buffer.shape[1] != h_kv:
+    # Physical axes come from the same layout selector as extend_attention.
+    # Never infer layout from shape: page_size and head_dim can both be 64.
+    if k_buffer.dim() == 3:
+        k_heads, k_dim = k_buffer.shape[1:]
+        v_heads, v_dim = v_buffer.shape[1:]
+    elif _kv_layout_hcu_fa:
+        if k_buffer.shape[2] != page_size or v_buffer.shape[3] != page_size:
+            return False
+        k_heads, k_dim = k_buffer.shape[1], k_buffer.shape[3]
+        v_heads, v_dim = v_buffer.shape[1], v_buffer.shape[2]
+    else:
+        if k_buffer.shape[1] != page_size or v_buffer.shape[1] != page_size:
+            return False
+        k_heads, k_dim = k_buffer.shape[2:]
+        v_heads, v_dim = v_buffer.shape[2:]
+    if k_heads != h_kv or v_heads != h_kv:
         return False
     if q_extend.shape[2] != k_extend.shape[2]:
         return False
-    if q_extend.shape[2] != k_buffer.shape[2]:
+    if q_extend.shape[2] != k_dim:
         return False
-    if v_extend.shape[2] != v_buffer.shape[2]:
+    if v_extend.shape[2] != v_dim:
         return False
     # NOTE: must NOT read any tensor *values* here (no .item()/.cpu()): the
     # target-verify step runs inside a captured CUDA/HIP graph, where a
@@ -771,6 +948,7 @@ def verify_shared_kv_fwd(
     window_kv_offsets=None,
     xai_temperature_len=-1,
     max_bs=None,
+    page_size=1,
 ):
     """
     Grouped-head drop-in for extend_attention_fwd on a topk==1 target-verify
@@ -795,6 +973,7 @@ def verify_shared_kv_fwd(
         sinks=sinks,
         logit_cap=logit_cap,
         xai_temperature_len=xai_temperature_len,
+        page_size=page_size,
     ):
         return False
     if q_extend.shape[2] < v_extend.shape[2]:
@@ -840,5 +1019,6 @@ def verify_shared_kv_fwd(
         k_scale=k_scale,
         v_scale=v_scale,
         is_causal=is_causal,
+        page_size=page_size,
     )
     return True

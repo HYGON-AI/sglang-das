@@ -2000,6 +2000,8 @@ class TritonAttnBackend(AttentionBackend):
                 window_kv_offsets=window_kv_offsets,
                 xai_temperature_len=layer.xai_temperature_len,
                 max_bs=self.req_to_token_pool.size,
+                # Grouped verify addresses the physical paged KV layout.
+                **({"page_size": self.page_size} if self.use_verify_shared_kv else {}),
             )
         ):
             return o
