@@ -36,7 +36,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tupl
 
 import numpy as np
 import torch
-
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
@@ -75,6 +74,7 @@ from sglang.srt.disaggregation.utils import (
     get_qsa_pending_state_indices,
     is_mla_backend,
     is_unadmitted_reject,
+    normalize_plain_mha_draft_args,
     poll_and_all_reduce,
     poll_and_all_reduce_pp,
     poll_and_all_reduce_with_staging,
@@ -764,6 +764,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
+        normalize_plain_mha_draft_args(
+            kv_args,
+            is_mla_backend=self.is_mla_backend,
+            num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
+        )
         kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (

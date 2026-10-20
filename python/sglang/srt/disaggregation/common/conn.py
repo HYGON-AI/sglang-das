@@ -31,7 +31,6 @@ import requests
 import torch.distributed as dist
 import zmq
 from aiohttp import web
-
 from sglang.srt.configs.model_config import (
     ModelConfig,
     get_dsa_full_indexer_layer_ids,
@@ -1708,6 +1707,10 @@ class CommonKVManager(BaseKVManager):
             src_v_ptrs = list(src_kv_ptrs[src_num_layers:])
             dst_k_all = list(dst_kv_ptrs[:dst_num_layers])
             dst_v_all = list(dst_kv_ptrs[dst_num_layers:])
+
+            # Equal PP partitions register the same local main/draft layers.
+            if src_num_layers == dst_num_layers:
+                return src_k_ptrs, src_v_ptrs, dst_k_all, dst_v_all, src_num_layers
 
             main_start = getattr(self.kv_args, "prefill_main_start_layer", None)
             main_end = getattr(self.kv_args, "prefill_main_end_layer", None)

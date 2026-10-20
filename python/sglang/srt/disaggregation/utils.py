@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import random
 import logging
+import random
 import threading
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
-    Iterable,
     Any,
     Dict,
+    Iterable,
     List,
     Literal,
     Optional,
@@ -20,11 +20,10 @@ from typing import (
     overload,
 )
 
-import numpy as np
 import msgspec
+import numpy as np
 import torch
 import torch.distributed as dist
-
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.distributed.communication_tags import P2PTag
@@ -1470,6 +1469,38 @@ def normalize_mha_mtp_kv_infos(
     main_k, main_v = split_kv_infos(main_values)
     draft_k, draft_v = split_kv_infos(draft_values)
     return main_k + draft_k + main_v + draft_v
+
+
+def normalize_plain_mha_draft_args(kv_args, *, is_mla_backend, num_hidden_layers):
+    """Normalize plain MHA only; mapped hybrid/MLA keep appended draft entries."""
+    draft_entries = getattr(kv_args, "num_draft_entries", 0)
+    if not draft_entries or is_mla_backend or getattr(kv_args, "kv_layer_ids", None):
+        return False
+    main_entries = len(kv_args.kv_data_ptrs) - draft_entries
+    if main_entries <= 0 or main_entries % 2 or draft_entries % 2:
+        raise ValueError("Plain MHA target/draft entries must each contain K/V halves")
+    for name in ("kv_data_ptrs", "kv_data_lens", "kv_item_lens", "kv_data_mem_kinds"):
+        values = getattr(kv_args, name, None)
+        if values is None or len(values) == 0:
+            continue
+        if len(values) != main_entries + draft_entries:
+            raise ValueError(f"MHA pointer-parallel metadata length mismatch: {name}")
+        setattr(
+            kv_args,
+            name,
+            normalize_mha_mtp_kv_infos(values[:main_entries], values[main_entries:]),
+        )
+    kv_args.total_main_kv_layers = num_hidden_layers
+    kv_args.total_draft_kv_layers = draft_entries // 2
+    kv_args.prefill_main_start_layer = (
+        getattr(kv_args, "prefill_start_layer", None) or 0
+    )
+    kv_args.prefill_main_end_layer = (
+        kv_args.prefill_main_start_layer + main_entries // 2
+    )
+    kv_args.prefill_draft_start_layer = 0
+    kv_args.prefill_draft_end_layer = draft_entries // 2
+    return True
 
 
 def build_kv_layer_ids(

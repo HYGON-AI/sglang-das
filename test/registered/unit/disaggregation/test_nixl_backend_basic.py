@@ -10,7 +10,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
-
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
@@ -1445,6 +1444,7 @@ class TestNixlHeteroTpReplicatedKV(CustomTestCase):
         mgr.prep_handle_slice_src = None
         mgr.prep_handles_slice_dst = {}
         mgr.kv_args = SimpleNamespace(
+            kv_layer_ids=[],
             gpu_id=0,
             engine_rank=0,
             page_size=self.PAGE_SIZE,
@@ -1460,6 +1460,7 @@ class TestNixlHeteroTpReplicatedKV(CustomTestCase):
     def _decode_args(self, decode_tp_rank):
         return SimpleNamespace(
             agent_name=f"decode_{decode_tp_rank}",
+            dst_kv_layer_ids=[],
             decode_tp_size=self.DECODE_TP,
             decode_tp_rank=decode_tp_rank,
             dst_kv_item_len=self.DST_KV_ITEM_LEN,

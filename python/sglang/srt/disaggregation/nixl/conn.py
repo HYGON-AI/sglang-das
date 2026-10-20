@@ -48,11 +48,11 @@ from sglang.srt.disaggregation.utils import (
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
-    pack_state_types,
     is_elided_entry,
+    pack_state_types,
     resolve_dcp_dst_entry_indices,
-    slice_dsa_tail_dst_ptrs_for_pp,
     resolve_state_component_dst_index,
+    slice_dsa_tail_dst_ptrs_for_pp,
     unpack_state_types,
 )
 from sglang.srt.environ import envs
@@ -1314,13 +1314,25 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         assert page_size * num_groups * bytes_per_token_to_send == src_kv_item_len
         assert page_size * bytes_per_token_dst == dst_kv_item_len
 
-        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_pp = (
-            self.get_mha_kv_ptrs_with_pp(
-                self.kv_args.kv_data_ptrs, decode_kv_args.dst_kv_ptrs
+        if self.kv_args.kv_layer_ids or decode_kv_args.dst_kv_layer_ids:
+            # Mapped hybrid pools retain [K main, V main, K draft, V draft].
+            pairs = build_transfer_entry_pairs(
+                self.kv_args.kv_layer_ids,
+                decode_kv_args.dst_kv_layer_ids,
+                len(self.kv_args.kv_data_ptrs),
+                len(decode_kv_args.dst_kv_ptrs),
+                allow_positional_fallback=self.pp_size == 1,
             )
-        )
-        src_ptrs = list(src_k_ptrs[:layers_pp]) + list(src_v_ptrs[:layers_pp])
-        dst_ptrs = list(dst_k_ptrs[:layers_pp]) + list(dst_v_ptrs[:layers_pp])
+            src_ptrs = [self.kv_args.kv_data_ptrs[i] for i, _ in pairs]
+            dst_ptrs = [decode_kv_args.dst_kv_ptrs[j] for _, j in pairs]
+        else:
+            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_pp = (
+                self.get_mha_kv_ptrs_with_pp(
+                    self.kv_args.kv_data_ptrs, decode_kv_args.dst_kv_ptrs
+                )
+            )
+            src_ptrs = list(src_k_ptrs[:layers_pp]) + list(src_v_ptrs[:layers_pp])
+            dst_ptrs = list(dst_k_ptrs[:layers_pp]) + list(dst_v_ptrs[:layers_pp])
         num_ptr_pairs = len(src_ptrs)
 
         num_slots = self.kv_args.kv_data_lens[0] // src_kv_item_len
@@ -1437,6 +1449,23 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         Heterogeneous PP over a plain MLA pool uses the source stage's layer span.
         All other layouts use explicit layer IDs, or positional pairing for non-PP.
         """
+        if (
+            (n_src != n_dst or self.pp_size > 1)
+            and not self.is_mla_backend
+            and not self.is_hybrid_mla_backend
+            and not self.kv_args.kv_layer_ids
+            and not peer_info.dst_kv_layer_ids
+        ):
+            # Plain MHA can have draft entries only on decode, so positional
+            # pairing would move the V boundary even when PP is disabled.
+            sk, sv, dk, dv, _ = self.get_mha_kv_ptrs_with_pp(
+                list(range(n_src)), list(range(n_dst))
+            )
+            mapping = dict(zip(sk + sv, dk + dv))
+            if len(mapping) != n_src:
+                raise ValueError("Incomplete MHA target/draft transfer mapping")
+            return [mapping[i] for i in range(n_src)]
+
         use_pp_mla_offsets = (
             self.pp_size > 1
             and n_src != n_dst

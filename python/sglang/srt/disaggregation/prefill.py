@@ -68,6 +68,7 @@ from sglang.srt.disaggregation.utils import (
     is_external_kv_load_failure,
     is_mla_backend,
     is_unadmitted_reject,
+    normalize_plain_mha_draft_args,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_pp,
     poll_and_all_reduce_prefill_pp,
@@ -509,6 +510,11 @@ class PrefillBootstrapQueue:
             token_to_kv_pool=self.token_to_kv_pool,
             draft_token_to_kv_pool=draft_kv_pool,
             num_draft_entries=num_draft_entries,
+            num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
+        )
+        normalize_plain_mha_draft_args(
+            kv_args,
+            is_mla_backend=self.is_mla_backend,
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
         )
         if not self.is_mla_backend:
