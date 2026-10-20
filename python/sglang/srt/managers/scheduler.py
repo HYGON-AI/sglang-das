@@ -4783,10 +4783,15 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
-        # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
+        # A cache load can publish shared radix entries before the bytes are
+        # ready. Forward waits for that load; early PD reads must defer until
+        # the regular post-forward send, including for another request that
+        # matched the newly published entries as a device hit.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in batch.reqs:
-                self.maybe_send_cached_prefix_chunk(req)
+                self.maybe_send_cached_prefix_chunk(
+                    req, cache_load_pending=batch.hicache_consumer_index >= 0
+                )
 
         # Run forward
         if self.is_generation:
