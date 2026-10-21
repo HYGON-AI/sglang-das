@@ -6,12 +6,15 @@ the ordinary prefill/PP tests and real-device transport stress tests on Linux.
 
 import ast
 import concurrent.futures
+import datetime
 import importlib.util
 import pathlib
 import sys
+import tempfile
 import threading
+import time
 import unittest
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -56,9 +59,13 @@ class Request(SimpleNamespace):
     __hash__ = object.__hash__
 
 
-def load_methods(path, names, env):
+def load_methods(path, names, env, owner=None, base=None):
     tree = ast.parse(path.read_text(encoding="utf-8"))
     methods = []
+    if owner is not None:
+        tree = next(
+            n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == owner
+        )
     for name in names:
         matches = [
             n
@@ -71,7 +78,11 @@ def load_methods(path, names, env):
         node.decorator_list = []
         methods.append(node)
     cls = ast.ClassDef(
-        name="UnderTest", bases=[], keywords=[], body=methods, decorator_list=[]
+        name="UnderTest",
+        bases=[ast.Name(id="_TestBase", ctx=ast.Load())] if base else [],
+        keywords=[],
+        body=methods,
+        decorator_list=[],
     )
     module = ast.Module(
         body=[
@@ -83,8 +94,75 @@ def load_methods(path, names, env):
         type_ignores=[],
     )
     ast.fix_missing_locations(module)
+    if base is not None:
+        env["_TestBase"] = base
     exec(compile(module, str(path), "exec"), env)
     return env["UnderTest"]
+
+
+def _last_chunk_rank(rank, init_file):
+    import torch
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo",
+        init_method="file://" + init_file,
+        rank=rank,
+        world_size=2,
+        timeout=datetime.timedelta(seconds=15),
+    )
+    try:
+        case = TestAbortDrain()
+        case.setUp()
+        case.setup_client_abort("inflight")
+        s, req = case.s, case.req
+        req.external_kv_abort_requested = True
+        s._external_kv_abort_rids.add(req.rid)
+        req.disagg_kv_sender.is_transfer_drained.return_value = rank == 0
+        s.disagg_prefill_inflight_queue = []
+        s._pending_chunked_abort_req = None
+        s.metrics_reporter = Mock()
+        s.batch_result_processor = Mock()
+        s._write_pd_hidden_rows_for_batch = Mock()
+        result_cls = load_methods(
+            PREFILL, ["process_batch_result_disagg_prefill"], case.env
+        )
+        batch = SimpleNamespace(
+            reqs=[req], spec_info=None, prefill_stats=None, dp_cooperation_info=None
+        )
+        result = SimpleNamespace(
+            logits_output=None,
+            next_token_ids=torch.tensor([1]),
+            extend_input_len_per_req=None,
+            extend_logprob_start_len_per_req=None,
+            copy_done=None,
+            auxiliary_host_output=None,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+            next_draft_input=None,
+            can_run_cuda_graph=False,
+        )
+        result_cls.process_batch_result_disagg_prefill(s, batch, result)
+        assert s.disagg_prefill_inflight_queue == [req]
+
+        def reduce_min(flags, *groups):
+            flags = torch.tensor(flags, dtype=torch.int)
+            dist.all_reduce(flags, op=dist.ReduceOp.MIN)
+            return flags.tolist()
+
+        def poll(senders, *groups):
+            reduce_min([sender.poll() for sender in senders])
+            return [KVPoll.Failed] * len(senders)
+
+        case.env["poll_and_all_reduce_attn_cp_tp_group"] = poll
+        case.env["all_reduce_min_attn_cp_tp_group"] = reduce_min
+        assert s.process_disagg_prefill_inflight_queue() == []
+        assert s.disagg_prefill_inflight_queue == [req]
+        req.disagg_kv_sender.is_transfer_drained.return_value = True
+        assert s.process_disagg_prefill_inflight_queue() == [req]
+        assert not s.disagg_prefill_inflight_queue
+    finally:
+        dist.destroy_process_group()
 
 
 class TestAbortDrain(unittest.TestCase):
@@ -312,43 +390,101 @@ class TestAbortDrain(unittest.TestCase):
         self.s.abort_request(SimpleNamespace(rid=self.req.rid, abort_all=False))
         self.assertEqual(self.s.waiting_queue, [other])
 
+    def test_last_chunk_different_rank_drain_uses_gloo_consensus(self):
+        import torch.multiprocessing as mp
+
+        with tempfile.TemporaryDirectory() as directory:
+            mp.spawn(
+                _last_chunk_rank,
+                args=(str(pathlib.Path(directory) / "gloo"),),
+                nprocs=2,
+                join=True,
+            )
+
     def test_bootstrap_cancel_preserves_failure_for_late_decode_handshake(self):
         self.setup_client_abort("bootstrap")
         sender = self.req.disagg_kv_sender
         room = self.req.bootstrap_room
-        statuses = {}
-
-        def abort():
-            statuses[room] = KVPoll.Failed
-            sender.poll.return_value = KVPoll.Failed
-
-        def failure_exception():
-            # Mooncake's failure_exception clears manager state, while the
-            # sender's cached conclude_state remains Failed.
-            statuses.pop(room, None)
-            raise RuntimeError("Aborted by AbortReq.")
-
-        sender.abort.side_effect = abort
-        sender.failure_exception.side_effect = failure_exception
-        sender.is_transfer_drained.return_value = True
-        self.s.abort_request(SimpleNamespace(rid=self.req.rid, abort_all=False))
-        self.s.handle_bootstrap_failure(self.req)
-
-        cls = load_methods(
-            CONN,
-            ["_notify_drained_abort_target_if_needed"],
-            dict(KVPoll=KVPoll, logger=Mock()),
+        common = ROOT / "python/sglang/srt/disaggregation/common/conn.py"
+        common_mgr = load_methods(
+            common,
+            ["update_status", "record_failure"],
+            dict(KVPoll=KVPoll),
+            owner="CommonKVManager",
         )
-        manager = cls()
-        manager.request_status = statuses
+        env = dict(KVPoll=KVPoll, logger=Mock(), time=time)
+        mgr_cls = load_methods(
+            CONN,
+            [
+                "_prune_drained_abort_rooms",
+                "finish_drained_abort",
+                "_notify_drained_abort_target_if_needed",
+            ],
+            env,
+            base=common_mgr,
+        )
+        manager = mgr_cls()
+        manager.request_status = {room: KVPoll.Transferring}
+        manager.failure_lock = threading.Lock()
+        manager.failure_records = {}
+        manager.transfer_infos = {}
+        manager.req_to_decode_prefix_len = {}
+        manager.req_to_pd_hidden_meta = {}
+        manager._drained_abort_lock = threading.Lock()
+        manager._drained_abort_rooms = OrderedDict()
+        manager.bootstrap_timeout = manager.waiting_timeout = 10
         manager.source_transfers_drained = Mock(return_value=True)
         manager.sync_status_to_decode_endpoint = Mock()
         manager._prefill_unique_rank = lambda: 0
+        common_sender = load_methods(
+            common, ["abort", "clear"], dict(KVPoll=KVPoll), owner="CommonKVSender"
+        )
+        sender_cls = load_methods(
+            CONN,
+            [
+                "abort",
+                "notify_drained_abort",
+                "_current_drained_abort_targets",
+                "is_transfer_drained",
+            ],
+            dict(KVPoll=KVPoll),
+            owner="MooncakeKVSender",
+            base=common_sender,
+        )
+        mixin = load_methods(
+            CONN,
+            ["failure_exception"],
+            dict(KVPoll=KVPoll, KVTransferError=lambda *a, **k: RuntimeError(*a)),
+        )
+        sender_cls.failure_exception = mixin.failure_exception
+        sender = sender_cls()
+        sender.kv_mgr = manager
+        sender.bootstrap_room = room
+        sender.conclude_state = None
+        sender._drained_abort_targets = set()
+        sender._drained_abort_notified_targets = set()
+        sender.trace_ctx = Mock()
+        sender.poll = lambda: sender.conclude_state
+        manager._source_drain = SimpleNamespace(lock=threading.Lock())
+        manager._wake_pd_hidden_ack_waiters = Mock()
+        self.req.disagg_kv_sender = sender
+        self.s.abort_request(SimpleNamespace(rid=self.req.rid, abort_all=False))
+        self.s.handle_bootstrap_failure(self.req)
+        self.assertNotIn(room, manager.request_status)
+        self.assertNotIn(room, manager.failure_records)
+        self.assertNotIn(room, manager.transfer_infos)
+        manager.update_status(room, KVPoll.Failed)
+        self.assertNotIn(room, manager.request_status)  # Real no-resurrection rule.
         target = SimpleNamespace(endpoint="decode-late", dst_port=456, is_dummy=False)
-        manager._notify_drained_abort_target_if_needed(room, target)
+        self.assertTrue(manager._notify_drained_abort_target_if_needed(room, target))
         manager.sync_status_to_decode_endpoint.assert_called_once_with(
             "decode-late", 456, room, KVPoll.Failed, 0, is_drained_abort=True
         )
+        manager._drained_abort_rooms[room] = time.monotonic() - 1
+        self.assertFalse(manager._notify_drained_abort_target_if_needed(room, target))
+        for value in range(5000):
+            manager.finish_drained_abort(value)
+        self.assertEqual(len(manager._drained_abort_rooms), 4096)
 
     def test_chunked_result_queue_blocks_release_even_with_zero_counter(self):
         self.s.result_queue = [(SimpleNamespace(reqs=[self.req]), object())]

@@ -1,7 +1,7 @@
 import threading
 import time
 import unittest
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -108,6 +108,12 @@ class TestMooncakeDrainedAbortStatus(CustomTestCase):
         manager.prefill_response_tracker = defaultdict(set)
         manager.required_prefill_response_num_table = {7: expected}
         manager.prefill_drained_abort_rooms = set()
+        manager._drained_abort_rooms = OrderedDict()
+        manager._drained_abort_lock = threading.Lock()
+        manager.req_to_decode_prefix_len = {}
+        manager.req_to_pd_hidden_meta = {}
+        manager.bootstrap_timeout = manager.waiting_timeout = 300
+        manager.source_transfers_drained = Mock(return_value=True)
         manager.failure_records = {}
         manager.failure_lock = threading.Lock()
         manager._final_poll_enabled = False
@@ -248,12 +254,12 @@ class TestMooncakeDrainedAbortStatus(CustomTestCase):
             self.assertEqual(call.args[2:5], (7, KVPoll.Failed, 4))
             self.assertTrue(call.kwargs["is_drained_abort"])
 
-        # Bootstrap metadata arriving after the sender's first notification is
-        # included in a later retry without resending existing targets.
-        manager.transfer_infos[7]["session-4"] = SimpleNamespace(
-            endpoint="decode-c", dst_port=300, is_dummy=False
-        )
-        sender.notify_drained_abort()
+        # After live state was cleared, late bootstrap metadata is handled
+        # by the terminal marker rather than resurrecting transfer state.
+        self.assertNotIn(7, manager.request_status)
+        self.assertNotIn(7, manager.transfer_infos)
+        target = SimpleNamespace(endpoint="decode-c", dst_port=300, is_dummy=False)
+        self.assertTrue(manager._notify_drained_abort_target_if_needed(7, target))
         self.assertEqual(manager.sync_status_to_decode_endpoint.call_count, 3)
         self.assertEqual(
             manager.sync_status_to_decode_endpoint.call_args.args[:2],

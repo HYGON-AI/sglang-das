@@ -1954,7 +1954,9 @@ class SchedulerDisaggregationPrefillMixin:
                     req.pending_bootstrap = False
                     if cleanup_done:
                         req.time_stats.set_completion_time()
-                    elif req not in self.disagg_prefill_inflight_queue:
+                    # Every rank must enter the inflight collective, including
+                    # ranks whose local sender has already drained.
+                    if req not in self.disagg_prefill_inflight_queue:
                         self.disagg_prefill_inflight_queue.append(req)
                     advance_logprob_pt(i, req)
                     continue

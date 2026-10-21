@@ -12,7 +12,7 @@ import os
 import struct
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from typing import List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -256,6 +256,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # zero so a deferred chunk is not dropped by an early conclude.
             self._staging_outstanding = defaultdict(int)
             self._source_drain = SourceDrainTracker()
+            self._drained_abort_lock = threading.Lock()
+            self._drained_abort_rooms = OrderedDict()
             self.session_lock = threading.Lock()
             self._final_poll_enabled = (
                 envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get() > 0
@@ -550,11 +552,36 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if self._final_poll_enabled and status in (KVPoll.Success, KVPoll.Failed):
             self._notify_transfer_waiters()
 
+    def _prune_drained_abort_rooms(self) -> None:
+        now = time.monotonic()
+        while self._drained_abort_rooms:
+            _, deadline = next(iter(self._drained_abort_rooms.items()))
+            if deadline > now and len(self._drained_abort_rooms) <= 4096:
+                break
+            self._drained_abort_rooms.popitem(last=False)
+
+    def finish_drained_abort(self, room: int) -> None:
+        # Keep only a bounded terminal marker for late bootstrap messages.
+        # Serialize publication/cleanup against bootstrap registration.
+        with self._drained_abort_lock:
+            ttl = max(300, self.bootstrap_timeout, self.waiting_timeout)
+            self._drained_abort_rooms.pop(room, None)
+            self._drained_abort_rooms[room] = time.monotonic() + ttl
+            self._prune_drained_abort_rooms()
+            self.request_status.pop(room, None)
+            self.transfer_infos.pop(room, None)
+            self.req_to_decode_prefix_len.pop(room, None)
+            self.req_to_pd_hidden_meta.pop(room, None)
+            with self.failure_lock:
+                self.failure_records.pop(room, None)
+
     def _notify_drained_abort_target_if_needed(
         self, room: int, transfer_info: TransferInfo
-    ) -> None:
+    ) -> bool:
+        self._prune_drained_abort_rooms()
+        terminal = room in self._drained_abort_rooms
         if (
-            self.request_status.get(room) == KVPoll.Failed
+            (terminal or self.request_status.get(room) == KVPoll.Failed)
             and not transfer_info.is_dummy
             and self.source_transfers_drained(room)
         ):
@@ -575,6 +602,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     transfer_info.dst_port,
                     room,
                 )
+        return terminal
 
     def wait_for_transfer_rooms(
         self, bootstrap_rooms: Set[int], timeout_s: float
@@ -3033,35 +3061,40 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         continue
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
-                    if room not in self.transfer_infos:
-                        self.transfer_infos[room] = {}
-
                     transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
-                    self.transfer_infos[room][mooncake_session_id] = transfer_info
-                    # NOTE: after bootstrapping we can mark the req as waiting for input
-                    if len(self.transfer_infos[room]) == required_dst_info_num:
-                        self.resolve_kv_replica_factor(self.transfer_infos[room])
-                        self.req_to_decode_prefix_len[room] = next(
-                            (
-                                info.decode_prefix_len
-                                for info in self.transfer_infos[room].values()
-                                if info.decode_prefix_len is not None
-                            ),
-                            0,
-                        )
-                        pd_hidden_meta = next(
-                            (
-                                info.spec_metadata
-                                for info in self.transfer_infos[room].values()
-                                if info.spec_metadata
-                                and info.spec_metadata.get("pd_hidden")
-                            ),
-                            None,
-                        )
-                        if pd_hidden_meta:
-                            self.req_to_pd_hidden_meta[room] = pd_hidden_meta
-                        self.update_status(room, KVPoll.WaitingForInput)
-                    self._notify_drained_abort_target_if_needed(room, transfer_info)
+                    with self._drained_abort_lock:
+                        self._prune_drained_abort_rooms()
+                        if room in self._drained_abort_rooms:
+                            self._notify_drained_abort_target_if_needed(room, transfer_info)
+                            continue
+                        if room not in self.transfer_infos:
+                            self.transfer_infos[room] = {}
+
+                        self.transfer_infos[room][mooncake_session_id] = transfer_info
+                        # NOTE: after bootstrapping we can mark the req as waiting for input
+                        if len(self.transfer_infos[room]) == required_dst_info_num:
+                            self.resolve_kv_replica_factor(self.transfer_infos[room])
+                            self.req_to_decode_prefix_len[room] = next(
+                                (
+                                    info.decode_prefix_len
+                                    for info in self.transfer_infos[room].values()
+                                    if info.decode_prefix_len is not None
+                                ),
+                                0,
+                            )
+                            pd_hidden_meta = next(
+                                (
+                                    info.spec_metadata
+                                    for info in self.transfer_infos[room].values()
+                                    if info.spec_metadata
+                                    and info.spec_metadata.get("pd_hidden")
+                                ),
+                                None,
+                            )
+                            if pd_hidden_meta:
+                                self.req_to_pd_hidden_meta[room] = pd_hidden_meta
+                            self.update_status(room, KVPoll.WaitingForInput)
+                        self._notify_drained_abort_target_if_needed(room, transfer_info)
 
         threading.Thread(target=bootstrap_thread).start()
 
@@ -3482,6 +3515,8 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 is_drained_abort=True,
             )
             self._drained_abort_notified_targets.add((remote, dst_port))
+        self.clear()
+        self.kv_mgr.finish_drained_abort(self.bootstrap_room)
 
     def abort(self):
         # Serialize Failed publication against the final enqueue.
