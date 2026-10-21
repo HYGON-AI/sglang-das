@@ -152,6 +152,7 @@ from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_parallel,
     get_platform,
@@ -434,6 +435,21 @@ def _hcu_candidate_logits_available() -> bool:
     except ImportError:
         return False
     return getattr(fp8_fp4_mqa_logits, "supports_candidate_blocks", False)
+
+
+def _prefill_candidate_mask(candidate, request, rows, width, block_size):
+    if candidate.request_masks is not None:
+        return candidate.request_masks[request][rows, :width]
+    # Chunked sources retain compact IDs, not a full [Q, history-K] bool mask.
+    blocks = candidate.request_block_ids[request][rows].to(torch.int64)
+    nblocks = (width + block_size - 1) // block_size
+    keep = torch.zeros(
+        (blocks.shape[0], nblocks + 1), dtype=torch.bool, device=blocks.device
+    )
+    keep.scatter_(
+        1, torch.where((blocks >= 0) & (blocks < nblocks), blocks, nblocks), True
+    )
+    return keep[:, :nblocks].repeat_interleave(block_size, dim=1)[:, :width]
 
 
 def _hcu_mqa_prep_available() -> bool:
@@ -2092,16 +2108,25 @@ class DeepseekV4AttnBackend(
         # TODO(candidate): goes away once the source publishes its tail rows straight
         # onto the tail metadata (publish_prefill); until then cut the full masks.
         full_masks = self.forward_metadata.candidate_metadata
-        if isinstance(full_masks, CandidateMasks) and full_masks.request_masks:
+        if isinstance(full_masks, CandidateMasks) and (
+            full_masks.request_masks is not None
+            or full_masks.request_block_ids is not None
+        ):
             tail_metadata.candidate_metadata = CandidateMasks(
-                request_masks=[
-                    mask[mask.shape[0] - t :]
-                    for mask, t in zip(full_masks.request_masks, tail_lens_cpu)
-                ],
+                request_masks=(
+                    [
+                        mask[mask.shape[0] - t :]
+                        for mask, t in zip(full_masks.request_masks, tail_lens_cpu)
+                    ]
+                    if full_masks.request_masks is not None
+                    else None
+                ),
                 request_block_ids=(
                     [
                         blocks[blocks.shape[0] - t :]
-                        for blocks, t in zip(full_masks.request_block_ids, tail_lens_cpu)
+                        for blocks, t in zip(
+                            full_masks.request_block_ids, tail_lens_cpu
+                        )
                     ]
                     if full_masks.request_block_ids is not None
                     else None
@@ -4160,6 +4185,37 @@ class DeepseekV4AttnBackend(
             candidate_blocks = self._hcu_prefill_candidate_blocks(
                 indexer, lc_per_req, q_lens_cpu
             )
+            if (
+                forward_batch.forward_mode == ForwardMode.EXTEND
+                and get_disagg().disaggregation_mode != "decode"
+            ):
+                from sglang.srt.layers.attention.mqa_logits_utils import (
+                    dsv41_mqa_logits_rows_per_chunk,
+                )
+
+                rows_per_chunk = dsv41_mqa_logits_rows_per_chunk(
+                    num_rows=num_tokens,
+                    num_cols=ceil_align(max(lc_per_req), 4),
+                    device_index=device.index,
+                )
+                if rows_per_chunk is not None:
+                    self._low_ratio_index_topk_chunked(
+                        indexer,
+                        q,
+                        (k_fp4.contiguous(), k_sf.contiguous()),
+                        weights,
+                        ks,
+                        ke,
+                        compress_lens,
+                        k_slots,
+                        lc_per_req,
+                        q_lens_cpu,
+                        page_indices,
+                        raw_indices,
+                        candidate_blocks,
+                        rows_per_chunk,
+                    )
+                    return
             logits = _hcu_dense_fp4_mqa_logits(
                 (q.contiguous(), None),
                 (k_fp4.contiguous(), k_sf.contiguous()),
@@ -4228,6 +4284,126 @@ class DeepseekV4AttnBackend(
                 chosen, selected - ks[:, None], -1
             )
 
+    def _low_ratio_index_topk_chunked(
+        self,
+        indexer,
+        q,
+        kv,
+        weights,
+        ks,
+        ke,
+        compress_lens,
+        k_slots,
+        lc_per_req,
+        q_lens_cpu,
+        page_indices,
+        raw_indices,
+        candidate_blocks,
+        rows_per_chunk,
+    ) -> None:
+        from lightop.attention import dsv41_ragged_topk_postprocess
+
+        topk = indexer.index_topk
+        width = ceil_align(max(lc_per_req), 4)
+        publish = [] if indexer.is_candidate_source else None
+        consume = (
+            published_masks(self.forward_metadata.candidate_metadata)
+            if publish is None and indexer.uses_candidates
+            else None
+        )
+        # Keep request boundaries intact. ks/ke still address the full gathered K,
+        # including CP-global history; only real (non-padded) Q rows are sliced.
+        offset = 0
+        for request, (lc, count) in enumerate(zip(lc_per_req, q_lens_cpu)):
+            blocks_out = torch.empty((count, 0), dtype=torch.int32, device=q.device)
+            if lc and count:
+                step = (
+                    min(rows_per_chunk, 65535)
+                    if candidate_blocks is not None
+                    else rows_per_chunk
+                )
+                for start in range(0, count, step):
+                    end = min(start + step, count)
+                    rows = slice(offset + start, offset + end)
+                    blocks = (
+                        [candidate_blocks[request][start:end]]
+                        if candidate_blocks is not None
+                        else None
+                    )
+                    logits = _hcu_dense_fp4_mqa_logits(
+                        (q[rows].contiguous(), None),
+                        kv,
+                        weights[rows].contiguous(),
+                        ks[rows].contiguous(),
+                        ke[rows].contiguous(),
+                        width,
+                        candidate_blocks=blocks,
+                        candidate_query_lens=[end - start]
+                        if blocks is not None
+                        else None,
+                    )
+                    if publish is not None:
+                        scores = logits[:, :lc]
+                        lens = compress_lens[rows, None]
+                        scores.masked_fill_(
+                            torch.arange(lc, device=q.device)[None, :] >= lens,
+                            -torch.inf,
+                        )
+                        mask, ids = select_candidate_blocks(
+                            scores,
+                            lens,
+                            indexer.candidate_topk_blocks,
+                            indexer.candidate_block_size,
+                            return_block_ids=True,
+                        )
+                        if start == 0:
+                            blocks_out = torch.empty(
+                                (count, ids.shape[1]),
+                                dtype=torch.int32,
+                                device=q.device,
+                            )
+                        blocks_out[start:end].copy_(ids)
+                        del scores, mask, ids
+                    elif consume is not None and blocks is None:
+                        logits[:, :lc].masked_fill_(
+                            ~_prefill_candidate_mask(
+                                consume,
+                                request,
+                                slice(start, end),
+                                lc,
+                                indexer.candidate_block_size,
+                            ),
+                            -torch.inf,
+                        )
+                    selected = torch.empty(
+                        (end - start, topk), dtype=torch.int32, device=q.device
+                    )
+                    topk_transform_ragged_v2(
+                        logits,
+                        compress_lens[rows],
+                        out_offsets=ks[rows],
+                        out_indices=selected,
+                    )
+                    dsv41_ragged_topk_postprocess(
+                        logits,
+                        selected,
+                        ks[rows],
+                        k_slots,
+                        page_indices[rows, :topk],
+                        raw_indices[rows, :topk] if raw_indices is not None else None,
+                        indexer.uses_candidates and not indexer.is_candidate_source,
+                    )
+                    # No concatenation of logits; release all views before the
+                    # next RHS allocation (Python assignment alone retains them).
+                    del selected, logits
+            if publish is not None:
+                publish.append(blocks_out)
+            offset += count
+        if publish is not None:
+            self.forward_metadata.candidate_metadata = CandidateMasks(
+                request_block_ids=publish
+            )
+
     # TODO(candidate): dense-prefill level one / level two inline with masks; move
     # into the candidate indexer as publish_prefill / select_prefill.
     def _publish_or_consume_candidates(
@@ -4284,7 +4460,12 @@ class DeepseekV4AttnBackend(
                 continue
             scores = logits[rows, :lc]
             if publish is None:
-                scores.masked_fill_(~consume.request_masks[b], -torch.inf)
+                scores.masked_fill_(
+                    ~_prefill_candidate_mask(
+                        consume, b, slice(None), lc, indexer.candidate_block_size
+                    ),
+                    -torch.inf,
+                )
                 continue
             lens = compress_lens[rows, None]
             # the block selection tells unreachable positions apart by -inf
@@ -4578,7 +4759,7 @@ class DeepseekV4AttnBackend(
         topk = indexer.index_topk
         publish = [] if indexer.is_candidate_source else None
         consume = (
-            published_masks(self.forward_metadata.candidate_metadata).request_masks
+            published_masks(self.forward_metadata.candidate_metadata)
             if indexer.uses_candidates
             else None
         )
@@ -4628,7 +4809,12 @@ class DeepseekV4AttnBackend(
                         )
                     )
                 elif consume is not None:
-                    s = s.masked_fill(~consume[b][rows], -torch.inf)
+                    s = s.masked_fill(
+                        ~_prefill_candidate_mask(
+                            consume, b, rows, lc, indexer.candidate_block_size
+                        ),
+                        -torch.inf,
+                    )
                 idx = s.topk(k, dim=-1, sorted=False).indices
                 if consume is not None and masks is None:
                     idx = mask_topk_scores(s, idx)
