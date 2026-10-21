@@ -324,6 +324,45 @@ class TestMooncakeServiceMetrics(unittest.TestCase):
         self.assertEqual(calls, ["10.0.0.20:30000", "warmup"])
         self.assertNotIn("enable_client_http_server", store.store.setup_calls[0][1])
 
+    def test_shared_daemon_endpoint_conflict_warns_and_finishes_setup(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        shared = FakeMooncakeDistributedStore()
+        registered = []
+
+        def set_endpoint(endpoint):
+            if registered and registered[0] != endpoint:
+                return -1
+            registered[:] = [endpoint]
+            return 0
+
+        with (
+            patch.dict("sys.modules", _fake_mooncake_modules(lambda: shared)),
+            patch.object(shared, "set_service_endpoint", set_endpoint, create=True),
+            patch.object(MooncakeStore, "warmup") as warmup,
+            patch(
+                "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.get_server_args",
+                side_effect=[
+                    SimpleNamespace(host="10.0.0.20", port=30000, nnodes=1),
+                    SimpleNamespace(host="10.0.0.20", port=30001, nnodes=1),
+                ],
+            ),
+        ):
+            first = MooncakeStore(_make_storage_config())
+            with self.assertLogs(
+                "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store",
+                level="WARNING",
+            ) as logs:
+                second = MooncakeStore(_make_storage_config())
+
+        self.assertIs(first.store, second.store)
+        self.assertEqual(warmup.call_count, 2)
+        self.assertEqual(registered, ["10.0.0.20:30000"])
+        self.assertTrue(any("30001" in message for message in logs.output))
+        self.assertTrue(any("original endpoint" in message for message in logs.output))
+
 
 class TestMooncakePrefetchSetup(unittest.TestCase):
     def test_hicache_factory_disables_unused_waiting_queue_arena(self):

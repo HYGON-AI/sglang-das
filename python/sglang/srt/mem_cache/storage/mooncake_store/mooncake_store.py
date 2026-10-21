@@ -657,9 +657,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         "Mooncake with set_service_endpoint support."
                     )
                 elif set_service_endpoint(service_endpoint) != 0:
-                    raise RuntimeError(
-                        "Failed to enable Mooncake Master service metrics for "
-                        f"{service_endpoint}. Check Mooncake client support."
+                    logger.warning(
+                        "Failed to register Mooncake Master service metrics for %s; "
+                        "continuing cache initialization. A shared client daemon "
+                        "retains its original endpoint; use separate daemons per "
+                        "service for correct metric attribution.",
+                        service_endpoint,
                     )
                 else:
                     logger.info(
