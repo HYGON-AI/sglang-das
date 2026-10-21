@@ -14,7 +14,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx938_supported, is_hip
 
 _IS_HIP = is_hip()
 
@@ -238,7 +238,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         # that is also CUDA-graph capture safe.
         self.qsa_compressed_fp8_k_buffer_pool = []
         if (
-            _IS_HIP
+            is_gfx938_supported()
             and self.qsa_index_kv_heads == 1
             and self.qsa_compressed_capacity % self.qsa_compressed_page_size == 0
             and os.environ.get(
@@ -308,8 +308,8 @@ class QSATokenToKVPool(HybridLinearKVPool):
         """Return the fp8 shadow cache view ``[pages, page_size, 1, D+4]``.
 
         The trailing scratch page is excluded. ``None`` when the fp8 decode
-        shadow pool is unavailable (NVIDIA, kv_heads != 1, or disabled via
-        SGLANG_QSA_INDEXER_FP8_DECODE).
+        shadow pool is unavailable (non-gfx938 device, kv_heads != 1, or
+        disabled via SGLANG_QSA_INDEXER_FP8_DECODE).
         """
         if not self.qsa_compressed_fp8_k_buffer_pool:
             return None

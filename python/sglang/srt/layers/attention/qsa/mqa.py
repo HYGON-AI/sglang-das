@@ -11,9 +11,19 @@ from typing import Optional, Tuple
 
 import torch
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx938_supported, is_hip
 
 logger = logging.getLogger(__name__)
+
+
+def _fp8_decode_device_ok() -> bool:
+    """The vendor fp8 decode kernel is only validated on gfx938.
+
+    Every other device keeps the bf16 path (the fp8 gate checks this so an
+    unsupported arch degrades to bf16 instead of failing or wasting memory
+    on the fp8 shadow pool).
+    """
+    return is_hip() and is_gfx938_supported()
 
 
 @lru_cache(maxsize=8)
@@ -470,9 +480,10 @@ def _maybe_pack_fp8_decode(
     Returns ``(q_fp8, k_cache_packed)`` with the cache shaped
     ``[pages, page_size, 1, D+4]`` (per-token fp32 scale in the trailing 4
     bytes of every row), or ``None`` when the inputs do not match the FP8
-    kernel contract or packing is disabled.
+    kernel contract, packing is disabled, or the device is not gfx938
+    (non-gfx938 devices keep the bf16 path).
     """
-    if not _fp8_decode_enabled() or not is_hip():
+    if not _fp8_decode_enabled() or not _fp8_decode_device_ok():
         return None
     if k_cache.dtype is not torch.bfloat16 or k_cache.dtype is not q.dtype:
         return None
@@ -557,7 +568,7 @@ def _use_fp8_shadow(
     Returns ``(q_fp8, k_cache_fp8)`` or ``None`` when the inputs do not match
     the FP8 kernel contract.
     """
-    if not _fp8_decode_enabled() or not is_hip():
+    if not _fp8_decode_enabled() or not _fp8_decode_device_ok():
         return None
     if (
         k_cache_fp8.dtype is not torch.uint8
