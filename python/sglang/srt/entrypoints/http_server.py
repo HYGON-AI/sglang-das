@@ -770,7 +770,7 @@ async def health_generate(request: Request) -> Response:
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     health_dp_size = (
         tokenizer_manager.elastic_worker_count
-        if tokenizer_manager.get_parallel().attn_dp_enabled
+        if get_parallel().attn_dp_enabled
         else 1
     )
     health_requests = []
