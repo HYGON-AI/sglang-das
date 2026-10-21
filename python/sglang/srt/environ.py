@@ -1125,6 +1125,10 @@ class Envs:
     SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
     SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC = EnvBool(False)
     SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA = EnvBool(False)
+    # With --enable-decoder-swa-bounded-replay: a chunked-prefill step in which every
+    # request still has at least SWA_WINDOW prompt tokens after this chunk stops at
+    # the last kv_source layer. Nothing reads the later layers' rows of such a chunk.
+    SGLANG_DSV41_SKIP_MID_CHUNK_DECODER = EnvBool(True)
     # Gather the packed FP8 DSV4 KV cache into a temporary BF16 workspace before
     # invoking the existing HCU FlashMLA sparse-decode kernel. With the unified
     # MLA path this covers ordinary prefill as well as decode-family forwards.
