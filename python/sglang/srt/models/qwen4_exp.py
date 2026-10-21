@@ -29,6 +29,7 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     attn_tp_all_reduce,
     dp_gather_replicate,
+    dp_reduce_scatter_etp,
     dp_scatter,
     get_attention_dp_size,
     get_dp_global_num_tokens,
@@ -383,6 +384,32 @@ def _use_attn_tp_ngram() -> bool:
     return is_dp_attention_enabled() and envs.SGLANG_USE_ATTN_TP_NGRAM.get()
 
 
+def _ple_etp_reduce_scatter_enabled(gather_dp_tokens: bool, tp_size: int) -> bool:
+    """ETP-across-DP combine via reduce-scatter for the sharded PLE table.
+
+    Under DP attention with attn_tp_size == 1 the PLE table's TP shard group
+    IS the DP group, so the per-rank gathers are unreduced partial sums and
+    the combine can reduce-scatter directly (half the wire traffic of
+    all_reduce + dp_scatter, and no extra full-buffer copy). vLLM reference:
+    b681808/#199 (engram_config.embedding_across_dp), which uses all_reduce +
+    narrow; this is strictly cheaper.
+    """
+    if not gather_dp_tokens or tp_size < 2:
+        return False
+    try:
+        from sglang.srt.layers.dp_attention import (
+            configured_attn_cp_size,
+            get_attention_dp_size,
+        )
+    except ImportError:
+        return False
+    return (
+        envs.SGLANG_PLE_ETP_REDUCE_SCATTER.get()
+        and configured_attn_cp_size() == 1
+        and tp_size == get_attention_dp_size()
+    )
+
+
 class Qwen4ExpPLEGroupedNorm(nn.Module):
     def __init__(
         self,
@@ -498,6 +525,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             is_dp_attention_enabled()
             and get_attention_dp_size() > 1
             and not self.use_attn_tp_ngram
+        )
+        # Set on the embedding wrapper too; see _ple_etp_reduce_scatter_enabled.
+        self.etp_reduce_scatter = _ple_etp_reduce_scatter_enabled(
+            self.gather_dp_tokens, self.ngram_embedding.tp_size
         )
         ple_int8 = False
         ple_fp8_channelwise = False
@@ -680,7 +711,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 ngram_embedding.tp_size > 1
                 and not get_attn_tp_context().input_scattered
             ):
-                if ngram_embedding.use_attn_tp_group:
+                if getattr(self, "etp_reduce_scatter", False):
+                    # Unreduced ETP partials: _finish_embedding_lookup
+                    # combines them with dp_reduce_scatter_etp instead.
+                    pass
+                elif ngram_embedding.use_attn_tp_group:
                     embeddings = attn_tp_all_reduce(embeddings)
                 else:
                     embeddings = tensor_model_parallel_all_reduce(embeddings)
@@ -740,7 +775,14 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         local_embeddings = embeddings.new_empty(
             (physical_tokens, *embeddings.shape[1:])
         )
-        dp_scatter(local_embeddings, embeddings.contiguous(), forward_batch)
+        if self.etp_reduce_scatter:
+            # Sharded-table partials: sum across the DP group and keep this
+            # rank's rows in one collective (replaces all_reduce + dp_scatter).
+            dp_reduce_scatter_etp(
+                local_embeddings, embeddings.contiguous(), forward_batch
+            )
+        else:
+            dp_scatter(local_embeddings, embeddings.contiguous(), forward_batch)
         return local_embeddings[:semantic_tokens]
 
     def _hash_contexts(
@@ -1165,7 +1207,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         "num_added_embeddings_per_partition",
     )
 
-    def __init__(self, embedding: VocabParallelEmbedding) -> None:
+    def __init__(self, embedding: VocabParallelEmbedding, gather_dp_tokens: bool = False) -> None:
         nn.Module.__init__(self)
         if not isinstance(embedding.quant_method, UnquantizedEmbeddingMethod):
             raise NotImplementedError(
@@ -1189,6 +1231,11 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         # The unquantized CUDA post-load hook is a no-op. Exclude this CPU-only
         # table so the generic loader does not stage it back to GPU unnecessarily.
         self.quant_method = None
+        # Mirror the ETP reduce-scatter combine decision of the source
+        # embedding (dp shard group == table TP shard group).
+        self.etp_reduce_scatter = _ple_etp_reduce_scatter_enabled(
+            gather_dp_tokens, self.tp_size
+        )
 
         source_weight = embedding.weight
         released_source_weight = False
@@ -1532,6 +1579,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
+            if self.etp_reduce_scatter:
+                # Unreduced ETP partials: _finish_embedding_lookup combines
+                # them with dp_reduce_scatter_etp instead.
+                return output
             if self.use_attn_tp_group:
                 return attn_tp_all_reduce(output)
             return tensor_model_parallel_all_reduce(output)
@@ -1566,7 +1617,8 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         if config.ple_offload_embedding:
             self.ple_embedding.ngram_embedding = Qwen4ExpPinnedHostEmbedding(
-                self.ple_embedding.ngram_embedding
+                self.ple_embedding.ngram_embedding,
+                gather_dp_tokens=self.ple_embedding.gather_dp_tokens,
             )
         self.short_conv_dilation = self.ple_embedding.ngram_size
         self.short_conv_state_len = (

@@ -299,6 +299,9 @@ class Envs:
     # views and replay safely inside FULL decode graphs; opt out if the
     # mapped-view path misbehaves on a given DTK/GTT combination.
     SGLANG_PLE_DECODE_GRAPH_BREAKABLE = EnvBool(False)
+    # Combine ETP-across-DP sharded PLE lookups with reduce-scatter instead
+    # of all_reduce + dp_scatter (half the wire traffic, no extra copy).
+    SGLANG_PLE_ETP_REDUCE_SCATTER = EnvBool(True)
     # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
     # path is ported, so setting this fails loudly instead of degrading.
     SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)

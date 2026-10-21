@@ -938,6 +938,63 @@ def dp_scatter(
         memcpy(local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True)
 
 
+def dp_reduce_scatter_etp(
+    local_tokens: torch.Tensor,  # output
+    global_tokens: torch.Tensor,  # input (unreduced ETP partials)
+    forward_batch: ForwardBatch,
+):
+    """Combine ETP-across-DP partial embeddings (PLE-style sharded lookups).
+
+    Every DP rank gathers its vocab shard for ALL global tokens, producing
+    partial sums; the combine must SUM them and keep this rank's token rows.
+    The legacy pair (``tensor_model_parallel_all_reduce`` + ``dp_scatter``)
+    moves the full buffer twice per rank; a reduce-scatter halves the wire
+    traffic and skips the extra full-buffer copy. Layout must mirror
+    dp_scatter exactly, so fall back to the legacy pair whenever the
+    per-rank sizes are not available or do not match the buffers.
+    """
+    if configured_attn_cp_size() == 1 and _is_etp_reduce_scatter_shape_ok(
+        local_tokens, global_tokens
+    ):
+        if _aiter_reduce_scatter_tensor(local_tokens, global_tokens):
+            return
+        get_tp_group().reduce_scatter_tensor(local_tokens, global_tokens)
+        return
+    # The reduce_scatterv sizes contract (get_dp_global_num_tokens) is only
+    # authoritative under the SUM_LEN/gatherv regime the MoE combine already
+    # uses; everywhere else fall back to the legacy all_reduce + dp_scatter.
+    sizes = get_dp_global_num_tokens() if is_dp_gatherv_active() else None
+    if (
+        sizes is not None
+        and sum(sizes) == global_tokens.shape[0]
+        and local_tokens.is_contiguous()
+        and global_tokens.is_contiguous()
+    ):
+        n = sizes[get_attention_dp_rank()]
+        if 0 < n <= local_tokens.shape[0]:
+            local_tokens.fill_(0)
+            get_tp_group().reduce_scatterv(
+                global_tokens, output=local_tokens[:n], sizes=sizes
+            )
+            return
+    tensor_model_parallel_all_reduce(global_tokens)
+    dp_scatter(local_tokens, global_tokens, forward_batch)
+
+
+def _is_etp_reduce_scatter_shape_ok(
+    local_tokens: torch.Tensor, global_tokens: torch.Tensor
+) -> bool:
+    """Equal-chunk (MAX_LEN) layout check: each DP rank owns one equal slot."""
+    dp_size = get_attention_dp_size()
+    return (
+        get_tensor_model_parallel_world_size() == dp_size
+        and dp_size > 1
+        and global_tokens.shape[0] == local_tokens.shape[0] * dp_size
+        and local_tokens.is_contiguous()
+        and global_tokens.is_contiguous()
+    )
+
+
 def _aiter_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor) -> bool:
     """HCU-only: run the DP-attention MAX_LEN combine over aiter's custom (IPC)
     reduce_scatter. Returns True if it handled the op, False to let the caller
