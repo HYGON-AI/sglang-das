@@ -427,6 +427,9 @@ class EagerRunner(BaseRunner):
             aux_hidden_states is not None
             and getattr(model.model, "late_layer_start", None) is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
+            # A mid-chunk prefill skipped the tail: its captures are full rows.
+            and getattr(self.model_runner.attn_backend, "tail_forward_metadata", None)
+            is not None
         ):
             # The body restored the full batch, but DSpark captures are still
             # compact tail rows. Gather with their own physical CP layout.
