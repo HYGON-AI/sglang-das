@@ -447,7 +447,9 @@ def consume_prefill_candidate_sparse(
     if width <= 0 or width % 4 or width > 4096:
         return False
     masks = getattr(candidate_metadata, "request_masks", None)
-    if masks is None or len(masks) != len(rows_per_request):
+    retained = getattr(candidate_metadata, "request_block_ids", None)
+    candidates = retained if retained is not None else masks
+    if candidates is None or len(candidates) != len(rows_per_request):
         return False
     functions = _lightop_functions()
     if functions is None:

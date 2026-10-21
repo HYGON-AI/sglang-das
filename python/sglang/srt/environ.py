@@ -1744,6 +1744,8 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # Opt-in query-row budget for HCU V4.1 eager Prefill FP4 MQA logits.
+    SGLANG_DSV41_PAGED_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(None)
     # HCU RLC (Repartition-Local Compression); off by default.
     SGLANG_DSV4_COMPRESS_RLC = EnvBool(False)
     # Deprecated: DSV4 compressor V2 is always used.
