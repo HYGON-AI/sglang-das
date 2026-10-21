@@ -610,6 +610,12 @@ class Scheduler(
                 ),
                 tree_cache=self.tree_cache,
                 server_args=self.server_args,
+                attn_cp_group=self.attn_cp_cpu_group,
+                pp_group=(
+                    self.pp_group.cpu_group
+                    if self.pp_group is not None
+                    else None
+                ),
             )
         else:
             self.decode_offload_manager = None

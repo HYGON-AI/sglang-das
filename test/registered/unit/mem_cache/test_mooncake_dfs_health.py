@@ -17,6 +17,7 @@ _SPEC.loader.exec_module(_MODULE)
 AVAILABLE = _MODULE.AVAILABLE
 UNAVAILABLE = _MODULE.UNAVAILABLE
 MooncakeDfsHealthManager = _MODULE.MooncakeDfsHealthManager
+inject_dfs_health_config = _MODULE.inject_dfs_health_config
 resolve_dfs_health_config = _MODULE.resolve_dfs_health_config
 
 _CI_MODULE_PATH = (
@@ -96,6 +97,53 @@ class MooncakeDfsHealthManagerTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "probe_timeout_s must be positive"):
                 resolve_dfs_health_config()
+
+    def test_injector_preserves_extra_config_and_uses_cli_values(self):
+        server_args = type(
+            "ServerArgs",
+            (),
+            {
+                "mooncake_dfs_health_probe_interval_s": 11,
+                "mooncake_dfs_health_failure_threshold": 3,
+                "mooncake_dfs_health_success_threshold": 4,
+                "mooncake_dfs_health_probe_timeout_s": 9,
+            },
+        )()
+        original = {"master_server_address": "127.0.0.1:50051"}
+
+        resolved = inject_dfs_health_config(original, server_args=server_args)
+
+        self.assertEqual(original, {"master_server_address": "127.0.0.1:50051"})
+        self.assertEqual(resolved["master_server_address"], "127.0.0.1:50051")
+        self.assertEqual(
+            resolved["_mooncake_dfs_health_config"],
+            {
+                "probe_interval_s": 11,
+                "failure_threshold": 3,
+                "success_threshold": 4,
+                "probe_timeout_s": 9,
+            },
+        )
+
+    def test_injector_keeps_explicit_health_values_over_cli(self):
+        server_args = type(
+            "ServerArgs",
+            (),
+            {
+                "mooncake_dfs_health_probe_interval_s": 11,
+                "mooncake_dfs_health_failure_threshold": 3,
+                "mooncake_dfs_health_success_threshold": 4,
+                "mooncake_dfs_health_probe_timeout_s": 9,
+            },
+        )()
+        resolved = inject_dfs_health_config(
+            {"_mooncake_dfs_health_config": {"probe_interval_s": 17}},
+            server_args=server_args,
+        )
+
+        health_config = resolved["_mooncake_dfs_health_config"]
+        self.assertEqual(health_config["probe_interval_s"], 17)
+        self.assertEqual(health_config["failure_threshold"], 3)
 
     def _manager(self, read_probes, write_probes):
         env = {

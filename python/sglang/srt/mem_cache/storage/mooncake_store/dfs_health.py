@@ -36,6 +36,8 @@ _HEALTH_CONFIG_SOURCES = {
     ),
 }
 
+DFS_HEALTH_CONFIG_KEY = "_mooncake_dfs_health_config"
+
 
 def resolve_dfs_health_config(
     config: dict[str, int | None] | None = None, server_args: Any = None
@@ -59,6 +61,23 @@ def resolve_dfs_health_config(
             raise ValueError(f"Mooncake DFS health {key} must be positive, got {value}")
         resolved[key] = value
     return resolved
+
+
+def inject_dfs_health_config(
+    extra_config: dict[str, Any] | None = None, server_args: Any = None
+) -> dict[str, Any]:
+    """Copy an extra config and attach the resolved Mooncake DFS settings.
+
+    An explicitly supplied nested health config keeps the highest precedence;
+    missing values are filled from ServerArgs, the environment, and defaults.
+    Keeping this in one place prevents startup, runtime attach, and decode-side
+    offload from resolving the same command-line settings differently.
+    """
+    resolved_extra_config = dict(extra_config or {})
+    resolved_extra_config[DFS_HEALTH_CONFIG_KEY] = resolve_dfs_health_config(
+        resolved_extra_config.get(DFS_HEALTH_CONFIG_KEY), server_args=server_args
+    )
+    return resolved_extra_config
 
 
 @dataclass(frozen=True)

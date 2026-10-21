@@ -437,14 +437,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
             if storage_backend == "mooncake":
                 from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
-                    resolve_dfs_health_config,
+                    inject_dfs_health_config,
                 )
 
                 # Carry the same resolved CLI/env/default values through the
                 # HiCache backend factory to MooncakeStore.
-                storage_extra_config = dict(storage_extra_config or {})
-                storage_extra_config["_mooncake_dfs_health_config"] = (
-                    resolve_dfs_health_config(server_args=server_args)
+                storage_extra_config = inject_dfs_health_config(
+                    storage_extra_config, server_args=server_args
                 )
 
         attach_hybrid_pool_to_unified_cache(
@@ -2897,6 +2896,14 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         effective = torch.tensor(local_policy, dtype=torch.int, device="cpu")
         self._all_reduce_attn_groups(effective, torch.distributed.ReduceOp.MIN)
+        # Attention groups are local to one PP stage. Reduce their already
+        # conservative result once more across corresponding PP ranks so every
+        # stage enables DFS only when every stage can use it.
+        pp_group = getattr(self, "pp_group", None)
+        if getattr(self, "pp_size", 1) > 1 and pp_group is not None:
+            torch.distributed.all_reduce(
+                effective, op=torch.distributed.ReduceOp.MIN, group=pp_group
+            )
         effective_values = effective.tolist()
         target = (bool(effective_values[0]), bool(effective_values[1]))
 

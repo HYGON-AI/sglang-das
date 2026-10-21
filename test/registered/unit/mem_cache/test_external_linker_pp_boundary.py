@@ -95,6 +95,29 @@ def test_sync_dfs_health_policy_applies_attention_group_minimum():
     assert applied == [(False, True)]
 
 
+def test_sync_dfs_health_policy_applies_pp_group_minimum(monkeypatch):
+    applied = []
+    pp_group = object()
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.linker = SimpleNamespace(
+        get_local_dfs_health_policy=lambda: (True, True),
+        apply_dfs_health_policy=lambda read, write: applied.append((read, write)),
+    )
+    cache._all_reduce_attn_groups = lambda policy, op: None
+    cache.pp_size = 2
+    cache.pp_group = pp_group
+
+    def reduce_pp_policy(policy, op, group):
+        assert op == torch.distributed.ReduceOp.MIN
+        assert group is pp_group
+        policy.copy_(torch.tensor([1, 0], dtype=torch.int))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce_pp_policy)
+    cache._sync_dfs_health_policy()
+
+    assert applied == [(True, False)]
+
+
 def test_sync_dfs_health_policy_failure_is_nonfatal_and_throttled(monkeypatch):
     now = [100.0]
     calls = []

@@ -73,6 +73,38 @@ def _make_manager(pool_size: int, page_size: int = 1):
     return manager, freed_indices
 
 
+def _init_dfs_policy_state(manager):
+    manager._dfs_policy_failed_target = None
+    manager._dfs_policy_consecutive_failures = 0
+    manager._dfs_policy_next_retry_at = 0.0
+    manager._dfs_policy_last_warning_at = float("-inf")
+    manager._dfs_policy_suppressed_warnings = 0
+
+
+def test_decode_dfs_policy_uses_tp_minimum(monkeypatch):
+    manager = object.__new__(DecodeKVCacheOffloadManager)
+    applied = []
+    manager.cache_controller = SimpleNamespace(
+        storage_backend=SimpleNamespace(
+            get_local_dfs_health_policy=lambda: (True, True),
+            apply_dfs_health_policy=lambda read, write: applied.append((read, write)),
+        )
+    )
+    manager.tp_world_size = 2
+    manager.tp_group = object()
+    _init_dfs_policy_state(manager)
+
+    def reduce_policy(policy, op, group):
+        assert op == torch.distributed.ReduceOp.MIN
+        assert group is manager.tp_group
+        policy.copy_(torch.tensor([0, 1], dtype=torch.int))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce_policy)
+    manager._sync_dfs_health_policy()
+
+    assert applied == [(False, True)]
+
+
 class _FinishedEvent:
     def synchronize(self):
         pass
