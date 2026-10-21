@@ -667,6 +667,113 @@ def _get_dp_gather_fp8_bufs(rows: int, hidden: int, device: torch.device):
         _dp_gather_fp8_bufs[key] = bufs
     return bufs[0][:rows], bufs[1][:rows]
 
+# int8-per-token wire variant buffers, keyed by device.
+_dp_gather_int8_bufs: dict = {}
+# Consume-once stash of the wire (codes, scales) pair from the last int8
+# gatherv DP gather, keyed by (device, data_ptr) of the dequantized bf16
+# buffer. The MoE caller (model MLP) picks it up with
+# take_dp_gather_int8_prequant so the expert GEMMs skip their re-quant.
+_dp_gather_int8_stash: dict = {}
+
+
+@functools.lru_cache(maxsize=1)
+def _use_dp_gather_int8() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_ENABLE_DP_GATHER_INT8.get()
+
+
+def _get_dp_gather_int8_bufs(rows: int, hidden: int, scale_tail, device):
+    key = str(device)
+    bufs = _dp_gather_int8_bufs.get(key)
+    if bufs is None or bufs[0].shape[0] < rows:
+        bufs = (
+            torch.empty((rows, hidden), dtype=torch.int8, device=device),
+            torch.empty(
+                (rows,) + tuple(scale_tail), dtype=torch.float32, device=device
+            ),
+        )
+        _dp_gather_int8_bufs[key] = bufs
+    return bufs[0][:rows], bufs[1][:rows]
+
+
+def take_dp_gather_int8_prequant(hidden_states: torch.Tensor):
+    """Return and consume the (codes, scales) wire pair stashed by the last
+    int8 gatherv DP gather that wrote `hidden_states`, or None.
+
+    The stash is keyed by the dequantized buffer's (device, data_ptr), so a
+    mismatched consumer (e.g. the logits gather buffer) simply misses. Under
+    CUDA-graph replay the captured tensor objects are reused, so the stashed
+    views stay valid; the stash only feeds eager/prefill paths (the gatherv
+    gather never runs under MAX_LEN decode padding)."""
+    if not _dp_gather_int8_stash:
+        return None
+    key = (str(hidden_states.device), hidden_states.data_ptr())
+    prequant = _dp_gather_int8_stash.pop(key, None)
+    if prequant is None:
+        return None
+    gq, gs = prequant
+    if (
+        hidden_states.dtype != torch.bfloat16
+        or gq.shape != hidden_states.shape
+        or gs.shape[0] != hidden_states.shape[0]
+    ):
+        return None
+    return gq, gs
+
+
+@triton.jit
+def _dequant_per_token_int8_kernel(
+    q_ptr,
+    s_ptr,
+    out_ptr,
+    HIDDEN: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    s = tl.load(s_ptr + row).to(tl.float32)
+    for start in tl.static_range(0, HIDDEN, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        mask = offs < HIDDEN
+        qv = tl.load(q_ptr + row * HIDDEN + offs, mask=mask, other=0.0).to(tl.float32)
+        tl.store(out_ptr + row * HIDDEN + offs, (qv * s).to(tl.bfloat16), mask=mask)
+
+
+def _dp_gather_via_all_gatherv_int8(
+    global_tokens: torch.Tensor,
+    local_real: torch.Tensor,
+    sizes: List[int],
+):
+    """int8-per-token wire format for the variable-length DP gather: quantize
+    the local rows with the SAME lightop per_token_quant_int8 the w4a8 expert
+    GEMMs apply to their input downstream, gather codes and per-token scales
+    in two output-buffered gatherv calls, then dequantize into the bf16 global
+    buffer (router/shared-expert still read bf16). The gathered (codes,
+    scales) are stashed for take_dp_gather_int8_prequant so the experts skip
+    their own re-quant (vLLM PR 247 INT8 AllGatherv pattern). Zero pad rows
+    quantize to (q=0, s=eps) and dequantize back to exact zeros."""
+    from lightop.quant import per_token_quant_int8
+
+    rows = global_tokens.shape[0]
+    hidden = global_tokens.shape[-1]
+    q, s = per_token_quant_int8(local_real.contiguous())
+    gq, gs = _get_dp_gather_int8_bufs(rows, hidden, s.shape[1:], global_tokens.device)
+    tp_group = get_tp_group()
+    tp_group.all_gatherv(q, sizes=sizes, output=gq)
+    tp_group.all_gatherv(s, sizes=sizes, output=gs)
+    _dp_gather_int8_stash.clear()
+    _dp_gather_int8_stash[(str(global_tokens.device), global_tokens.data_ptr())] = (
+        gq,
+        gs,
+    )
+    _dequant_per_token_int8_kernel[(rows,)](
+        gq,
+        gs,
+        global_tokens,
+        HIDDEN=hidden,
+        BLOCK=2048,
+    )
+
 
 @triton.jit
 def _dequant_per_token_group_fp8_kernel(
@@ -845,6 +952,12 @@ def _dp_gather_via_all_gatherv(
     # be extend/idle-mixed within one global forward).  Prefill-only is
     # already structural: the gatherv path runs only under SUM_LEN padding,
     # which decode-only steps and CUDA-graph capture never select.
+    if (
+        _use_dp_gather_int8()
+        and global_tokens.dtype == torch.bfloat16
+    ):
+        _dp_gather_via_all_gatherv_int8(global_tokens, local_real, sizes)
+        return
     if (
         _use_dp_gather_fp8()
         and global_tokens.dtype == torch.bfloat16

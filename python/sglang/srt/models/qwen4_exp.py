@@ -2136,12 +2136,20 @@ class Qwen4ExpLayerExtensionMixin:
                 flush=True,
             )
 
+        pre_quant_input = None
         if use_dp_moe_gather:
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(get_tp_group()),
                 hidden_states,
             )
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
+            # SGLANG_ENABLE_DP_GATHER_INT8: if the gather above ran in int8
+            # per-token wire format, pick up its (codes, scales) so the w4a8
+            # experts below skip their own re-quant (vLLM PR 247 pattern).
+            # Returns None whenever the wire stayed bf16 (decode/MAX_LEN).
+            from sglang.srt.layers.dp_attention import take_dp_gather_int8_prequant
+
+            pre_quant_input = take_dp_gather_int8_prequant(hidden_states)
         elif hidden_states.shape[0] == 0 and get_moe_a2a_backend().is_none():
             # Only safe to short-circuit an empty batch when the MoE holds no collective;
             # under deepep an idle DP rank must still join dispatch/combine or peers hang.
@@ -2153,7 +2161,7 @@ class Qwen4ExpLayerExtensionMixin:
             attn_tp_chunks = list(hidden_states.tensor_split(attn_tp_size))
             hidden_states = attn_tp_chunks[get_parallel().attn_tp_rank].contiguous()
 
-        hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = self.mlp(hidden_states, forward_batch, pre_quant_input=pre_quant_input)
 
         if use_dp_moe_gather:
             hidden_states, global_hidden_states = (

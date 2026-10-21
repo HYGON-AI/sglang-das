@@ -836,6 +836,12 @@ class Envs:
     # input anyway, but router/shared-expert reads see rounded values, so this
     # stays accuracy-gated and default OFF.
     SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
+    # int8-per-token variant of the fp8 wire compression above: local rows are
+    # quantized with the SAME lightop per_token_quant_int8 the w4a8 expert
+    # GEMMs use, so the gathered (codes, scales) can be handed straight to the
+    # experts (vLLM PR 247 "INT8 AllGatherv": gather quantized, dequantize
+    # once for the router, reuse the codes/scales instead of re-quantizing).
+    SGLANG_ENABLE_DP_GATHER_INT8 = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
