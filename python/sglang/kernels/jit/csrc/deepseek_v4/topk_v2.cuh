@@ -863,9 +863,9 @@ struct TopKSplit : impl::TopKRadixBase<12> {
     // The full row's histogram and the full row's seq_len, so every rank picks
     // the same bin and the appends below agree on what "above" means.
     find_threshold(problem.topk, problem.seq_len, smem, [&](uint32_t threshold_bin) {
-      const auto [v_lo, v_hi] = impl::coarse_bin_bounds<kHistBits>(threshold_bin);
-      smem->v_hi = v_hi;
-      smem->v_lo = v_lo;
+      const auto bounds = impl::coarse_bin_bounds<kHistBits>(threshold_bin);
+      smem->v_hi = bounds.y;
+      smem->v_lo = bounds.x;
     });
 
     const auto topk = problem.topk;

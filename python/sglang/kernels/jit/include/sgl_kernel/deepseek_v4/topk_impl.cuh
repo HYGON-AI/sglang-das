@@ -107,8 +107,10 @@ SGL_DEVICE float2 coarse_bin_bounds(uint32_t bin) {
     const uint32_t bits = k ^ 0x80008000u ^ ((~k >> 15) & 0x00010001u) * 0x7FFFu;
     return cast<fp32x2_t>(*reinterpret_cast<const fp16x2_t*>(&bits));
   };
-  const auto [v_lo, v_hi] = to_fp32(keys);
-  const auto [u_lo, u_hi] = to_fp32(keys - 0x00010001u);
+  const auto v = to_fp32(keys);
+  const auto v_lo = v.x, v_hi = v.y;
+  const auto u = to_fp32(keys - 0x00010001u);
+  const auto u_lo = u.x, u_hi = u.y;
   // Exact midpoints of adjacent fp16 values; the clamp puts one against inf on the
   // +/-65520 overflow point.
   const auto midpoint = [](float a, float b) { return fminf(fmaxf(0.5f * (a + b), -65520.0f), 65520.0f); };
@@ -721,9 +723,9 @@ struct TopKRegister : TopKRadixBase<12> {
 
     // Phase 2: Find the threshold bin
     find_threshold(problem.topk, num_full * kVecSize, smem, [&](uint32_t threshold_bin) {
-      const auto [v_lo, v_hi] = coarse_bin_bounds<kHistBits>(threshold_bin);
-      smem->v_hi = v_hi;
-      smem->v_lo = v_lo;
+      const auto bounds = coarse_bin_bounds<kHistBits>(threshold_bin);
+      smem->v_hi = bounds.y;
+      smem->v_lo = bounds.x;
     });
 
     // Phase 3: collect by two fp32 boundaries
@@ -810,9 +812,9 @@ struct TopKStreaming : TopKRadixBase<12> {
 
     // Phase 2: Find the threshold bin
     find_threshold(problem.topk, problem.seq_len, smem, [&](uint32_t threshold_bin) {
-      const auto [v_lo, v_hi] = coarse_bin_bounds<kHistBits>(threshold_bin);
-      smem->v_hi = v_hi;
-      smem->v_lo = v_lo;
+      const auto bounds = coarse_bin_bounds<kHistBits>(threshold_bin);
+      smem->v_hi = bounds.y;
+      smem->v_lo = bounds.x;
     });
 
     // Phase 3: Collect candidates and sort. Classify by two fp32 boundaries derived
@@ -1010,9 +1012,9 @@ struct TopKCluster : TopKRadixBase<10> {
 
       // Phase 3. rank-0 find threshold and write to local smem for other ranks to read
       find_threshold(problem.topk, problem.seq_len, smem, [&](uint32_t threshold_bin) {
-        const auto [v_lo, v_hi] = coarse_bin_bounds<kHistBits>(threshold_bin);
-        smem->v_hi = v_hi;
-        smem->v_lo = v_lo;
+        const auto bounds = coarse_bin_bounds<kHistBits>(threshold_bin);
+        smem->v_hi = bounds.y;
+        smem->v_lo = bounds.x;
       });
 
       barrier_cluster_arrive_release();  // bar-2 arrive: publishes v_hi / v_lo
