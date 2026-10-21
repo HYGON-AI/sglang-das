@@ -93,3 +93,74 @@ def test_sync_dfs_health_policy_applies_attention_group_minimum():
     cache._sync_dfs_health_policy()
 
     assert applied == [(False, True)]
+
+
+def test_sync_dfs_health_policy_failure_is_nonfatal_and_throttled(monkeypatch):
+    now = [100.0]
+    calls = []
+    reductions = []
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+
+    def fail_policy(read, write):
+        calls.append((read, write))
+        raise RuntimeError("standalone RPC unavailable")
+
+    cache.linker = SimpleNamespace(
+        get_local_dfs_health_policy=lambda: (True, True),
+        apply_dfs_health_policy=fail_policy,
+    )
+    cache._all_reduce_attn_groups = lambda policy, op: reductions.append(op)
+    monkeypatch.setattr(
+        "sglang.srt.mem_cache.unified_radix_cache.time.monotonic", lambda: now[0]
+    )
+
+    cache._sync_dfs_health_policy()
+    now[0] += 0.5
+    cache._sync_dfs_health_policy()
+
+    assert calls == [(True, True)]
+    assert reductions == [
+        torch.distributed.ReduceOp.MIN,
+        torch.distributed.ReduceOp.MIN,
+    ]
+    assert cache._dfs_policy_failed_target == (True, True)
+    assert cache._dfs_policy_consecutive_failures == 1
+
+    now[0] += 0.5
+    cache._sync_dfs_health_policy()
+    assert calls == [(True, True), (True, True)]
+    assert cache._dfs_policy_consecutive_failures == 2
+
+
+def test_sync_dfs_health_policy_recovers_and_applies_latest_target(monkeypatch):
+    now = [200.0]
+    target = [(True, True)]
+    calls = []
+    fail = [True]
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+
+    def apply_policy(read, write):
+        calls.append((read, write))
+        if fail[0]:
+            raise RuntimeError("standalone RPC unavailable")
+
+    cache.linker = SimpleNamespace(
+        get_local_dfs_health_policy=lambda: target[0],
+        apply_dfs_health_policy=apply_policy,
+    )
+    cache._all_reduce_attn_groups = lambda policy, op: None
+    monkeypatch.setattr(
+        "sglang.srt.mem_cache.unified_radix_cache.time.monotonic", lambda: now[0]
+    )
+
+    cache._sync_dfs_health_policy()
+    target[0] = (False, True)
+    fail[0] = False
+    # A changed (and more restrictive) target bypasses the stale target's
+    # retry delay, so failure recovery does not postpone DFS disablement.
+    cache._sync_dfs_health_policy()
+
+    assert calls == [(True, True), (False, True)]
+    assert cache._dfs_policy_failed_target is None
+    assert cache._dfs_policy_consecutive_failures == 0
+    assert cache._dfs_policy_next_retry_at == 0.0

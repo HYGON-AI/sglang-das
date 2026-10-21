@@ -121,6 +121,10 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 logger = logging.getLogger(__name__)
 
+_DFS_POLICY_RETRY_INITIAL_S = 1.0
+_DFS_POLICY_RETRY_MAX_S = 30.0
+_DFS_POLICY_WARNING_INTERVAL_S = 30.0
+
 
 class _OngoingWriteThrough(NamedTuple):
     """Tracks an in-flight D→H write-through operation."""
@@ -252,6 +256,11 @@ class UnifiedRadixCache(BasePrefixCache):
         # one rid, but the owner that releases it last is the one that makes it
         # free-able, and that is not necessarily the same request.
         self._stranded_linker_nodes: list[NodeId] = []
+        self._dfs_policy_failed_target: tuple[bool, bool] | None = None
+        self._dfs_policy_consecutive_failures = 0
+        self._dfs_policy_next_retry_at = 0.0
+        self._dfs_policy_last_warning_at = float("-inf")
+        self._dfs_policy_suppressed_warnings = 0
         # Buffer-only host memory mode (host RAM as transient GPU↔storage
         # staging, not an L2 tier); resolved in init_hicache, which also
         # constructs the pipeline collaborator (None = cache mode).
@@ -2888,7 +2897,71 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         effective = torch.tensor(local_policy, dtype=torch.int, device="cpu")
         self._all_reduce_attn_groups(effective, torch.distributed.ReduceOp.MIN)
-        apply_policy(*(bool(value) for value in effective.tolist()))
+        effective_values = effective.tolist()
+        target = (bool(effective_values[0]), bool(effective_values[1]))
+
+        # Every rank must participate in the collective above on every step.
+        # Only the rank-local storage RPC is throttled after a failure.
+        now = time.monotonic()
+        failed_target = getattr(self, "_dfs_policy_failed_target", None)
+        next_retry_at = getattr(self, "_dfs_policy_next_retry_at", 0.0)
+        if failed_target == target and now < next_retry_at:
+            return
+
+        try:
+            apply_policy(*target)
+        except Exception as exc:
+            failures = (
+                getattr(self, "_dfs_policy_consecutive_failures", 0) + 1
+                if failed_target == target
+                else 1
+            )
+            retry_delay = min(
+                _DFS_POLICY_RETRY_INITIAL_S * (2 ** min(failures - 1, 30)),
+                _DFS_POLICY_RETRY_MAX_S,
+            )
+            self._dfs_policy_failed_target = target
+            self._dfs_policy_consecutive_failures = failures
+            self._dfs_policy_next_retry_at = now + retry_delay
+
+            last_warning_at = getattr(
+                self, "_dfs_policy_last_warning_at", float("-inf")
+            )
+            if now - last_warning_at >= _DFS_POLICY_WARNING_INTERVAL_S:
+                suppressed = getattr(self, "_dfs_policy_suppressed_warnings", 0)
+                logger.warning(
+                    "Mooncake DFS policy application failed; retaining the "
+                    "previous policy: target_read=%s target_write=%s "
+                    "failures=%d retry_in_s=%.1f suppressed=%d error=%r",
+                    target[0],
+                    target[1],
+                    failures,
+                    retry_delay,
+                    suppressed,
+                    exc,
+                )
+                self._dfs_policy_last_warning_at = now
+                self._dfs_policy_suppressed_warnings = 0
+            else:
+                self._dfs_policy_suppressed_warnings = (
+                    getattr(self, "_dfs_policy_suppressed_warnings", 0) + 1
+                )
+            return
+
+        failures = getattr(self, "_dfs_policy_consecutive_failures", 0)
+        if failures:
+            logger.info(
+                "Mooncake DFS policy application recovered: "
+                "target_read=%s target_write=%s failures=%d",
+                target[0],
+                target[1],
+                failures,
+            )
+        self._dfs_policy_failed_target = None
+        self._dfs_policy_consecutive_failures = 0
+        self._dfs_policy_next_retry_at = 0.0
+        self._dfs_policy_last_warning_at = float("-inf")
+        self._dfs_policy_suppressed_warnings = 0
 
     def drain_linker_loads(self, *, wait_for_completion: bool = False) -> list[str]:
         """Retire finished linker loads and return the rids that must abort.

@@ -19,6 +19,16 @@ UNAVAILABLE = _MODULE.UNAVAILABLE
 MooncakeDfsHealthManager = _MODULE.MooncakeDfsHealthManager
 resolve_dfs_health_config = _MODULE.resolve_dfs_health_config
 
+_CI_MODULE_PATH = (
+    Path(__file__).parents[4] / "python/sglang/test/ci/ci_register.py"
+)
+_CI_SPEC = importlib.util.spec_from_file_location("ci_register", _CI_MODULE_PATH)
+assert _CI_SPEC is not None and _CI_SPEC.loader is not None
+_CI_MODULE = importlib.util.module_from_spec(_CI_SPEC)
+_CI_SPEC.loader.exec_module(_CI_MODULE)
+register_cpu_ci = _CI_MODULE.register_cpu_ci
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
 
 class _FakeStore:
     def __init__(self, read_probes, write_probes):
@@ -184,6 +194,34 @@ class MooncakeDfsHealthManagerTest(unittest.TestCase):
         manager.apply_effective_policy(True, False)
         manager.apply_effective_policy(True, False)
         self.assertEqual(store.policies, [(False, False), (True, False)])
+
+    def test_failed_policy_application_preserves_previous_effective_policy(self):
+        class Store(_FakeStore):
+            result = 0
+
+            def set_dfs_access_policy(self, allow_read, allow_write):
+                self.policies.append((allow_read, allow_write))
+                return self.result
+
+        store = Store([0], [0])
+        manager = MooncakeDfsHealthManager(
+            store,
+            {
+                "probe_interval_s": 10,
+                "failure_threshold": 1,
+                "success_threshold": 1,
+                "probe_timeout_s": 1,
+            },
+            defer_policy_application=True,
+        )
+        manager.apply_effective_policy(True, False)
+        self.assertEqual(manager._effective_policy, (True, False))
+
+        store.result = -900
+        with self.assertRaisesRegex(RuntimeError, "error=-900"):
+            manager.apply_effective_policy(False, False)
+
+        self.assertEqual(manager._effective_policy, (True, False))
 
     def test_stuck_read_does_not_block_or_fail_write_probe(self):
         release_read = threading.Event()
