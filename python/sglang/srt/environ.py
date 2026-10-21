@@ -1139,6 +1139,13 @@ class Envs:
     # ===================================================================
     # HCU - platform-specific knobs
     # ===================================================================
+    # Retained for the fork's HCU CP path: enable_cp_v2() in layers/cp/utils.py
+    # and the launcher both read this switch. Official main deleted the name
+    # ("strategy-based prefill CP is now the only generic implementation") and
+    # has no reader left, but the fork still keeps an HCU legacy CP branch
+    # behind it (layers/layer_boundary/hcu_legacy.py). Default False matches
+    # the pre-removal default.
+    SGLANG_ENABLE_CP_V2 = EnvBool(False)
     SGLANG_DSV4_PD_PREFILL_USE_FULL_TOKEN_POOL = EnvBool(True)
     SGLANG_ENABLE_DP_ATTENTION_LOCAL_CONTROL_BROADCAST = EnvBool(False)
     SGLANG_KV_LAYOUT_HCU_FA = EnvBool(True)
