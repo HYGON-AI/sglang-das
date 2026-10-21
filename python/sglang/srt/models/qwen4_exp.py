@@ -526,10 +526,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             and get_attention_dp_size() > 1
             and not self.use_attn_tp_ngram
         )
-        # Set on the embedding wrapper too; see _ple_etp_reduce_scatter_enabled.
-        self.etp_reduce_scatter = _ple_etp_reduce_scatter_enabled(
-            self.gather_dp_tokens, self.ngram_embedding.tp_size
-        )
+        # etp_reduce_scatter is set below, once ngram_embedding exists (its
+        # tp_size feeds the gate); see _ple_etp_reduce_scatter_enabled.
         ple_int8 = False
         ple_fp8_channelwise = False
         ple_not_ignored = False
@@ -606,6 +604,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 output_dtype=torch.bfloat16,
                 use_attn_tp_group=self.use_attn_tp_ngram,
             )
+        self.etp_reduce_scatter = _ple_etp_reduce_scatter_enabled(
+            self.gather_dp_tokens, self.ngram_embedding.tp_size
+        )
         scale_shape = (
             (self.ngram_embedding.num_embeddings_per_partition, 1)
             if self.ple_per_row_scale
