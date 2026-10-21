@@ -1992,6 +1992,17 @@ class Qwen4ExpLayerExtensionMixin:
         use_dp_moe_gather = self._qwen4_exp_use_dp_moe_gather()
         use_attn_tp_a2a_scatter = self._qwen4_exp_use_attn_tp_a2a_scatter()
 
+        import os
+
+        if os.environ.get("SGLANG_HC_DEBUG"):
+            _gnt = getattr(forward_batch, "global_num_tokens_cpu", None)
+            print(
+                f"[HC_DEBUG mlp-in] hidden={tuple(hidden_states.shape)} "
+                f"dp_moe_gather={use_dp_moe_gather} gnt={_gnt} "
+                f"mode={forward_batch.forward_mode} dp_padding={getattr(forward_batch, 'dp_padding_mode', None)}",
+                flush=True,
+            )
+
         if use_dp_moe_gather:
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(get_tp_group()),
@@ -2016,6 +2027,13 @@ class Qwen4ExpLayerExtensionMixin:
                 get_local_dp_buffer(get_tp_group()),
                 hidden_states,
             )
+            if os.environ.get("SGLANG_HC_DEBUG"):
+                print(
+                    f"[HC_DEBUG mlp-out] local_buf={tuple(hidden_states.shape)} "
+                    f"global={tuple(global_hidden_states.shape)} "
+                    f"dp_local_num={getattr(forward_batch, 'dp_local_num_tokens', None)}",
+                    flush=True,
+                )
             if should_use_dp_reduce_scatterv():
                 get_tp_group().reduce_scatterv(
                     global_hidden_states,
