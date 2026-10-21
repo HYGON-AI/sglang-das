@@ -302,6 +302,12 @@ class Envs:
     # Combine ETP-across-DP sharded PLE lookups with reduce-scatter instead
     # of all_reduce + dp_scatter (half the wire traffic, no extra copy).
     SGLANG_PLE_ETP_REDUCE_SCATTER = EnvBool(True)
+    # Minimum gathered-row count for the PLE ETP reduce-scatter combine.
+    # Below this the combine falls back to all_reduce + dp_scatter:
+    # reduce-scatter on small messages (short decode batches) loses to the
+    # fused aiter all-reduce (measured TPOT +35% at 4k/1k c8 with the gate
+    # absent), while large prefill gathers still benefit.
+    SGLANG_PLE_ETP_REDUCE_SCATTER_MIN_TOKENS = EnvInt(2048)
     # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
     # path is ported, so setting this fails loudly instead of degrading.
     SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)

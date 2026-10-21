@@ -1051,6 +1051,13 @@ def dp_scatter(
         memcpy(local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True)
 
 
+@functools.lru_cache(maxsize=1)
+def _etp_rs_min_tokens() -> int:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_PLE_ETP_REDUCE_SCATTER_MIN_TOKENS.get()
+
+
 def dp_reduce_scatter_etp(
     local_tokens: torch.Tensor,  # output
     global_tokens: torch.Tensor,  # input (unreduced ETP partials)
@@ -1066,6 +1073,12 @@ def dp_reduce_scatter_etp(
     dp_scatter exactly, so fall back to the legacy pair whenever the
     per-rank sizes are not available or do not match the buffers.
     """
+    if global_tokens.shape[0] < _etp_rs_min_tokens():
+        # Small-message regime: reduce-scatter (and reduce_scatterv) lose to
+        # the fused all-reduce on tiny payloads; keep the legacy pair.
+        tensor_model_parallel_all_reduce(global_tokens)
+        dp_scatter(local_tokens, global_tokens, forward_batch)
+        return
     if configured_attn_cp_size() == 1 and _is_etp_reduce_scatter_shape_ok(
         local_tokens, global_tokens
     ):
