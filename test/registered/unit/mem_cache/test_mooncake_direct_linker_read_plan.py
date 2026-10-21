@@ -189,6 +189,23 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
 
         linker.storage._report_dfs_operation_timeout.assert_not_called()
 
+    def test_read_plan_admission_timeout_does_not_change_dfs_policy(self):
+        linker = self._read_plan_linker(prefetch=False)
+        linker.storage.store.create_read_plan.return_value.run.side_effect = (
+            RuntimeError(
+                "Mooncake read plan range get failed at group=-1 "
+                "key_index=0 rc=-1608 expected=4096"
+            )
+        )
+
+        with self.assertLogs(
+            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker",
+            level="ERROR",
+        ):
+            self.assertFalse(linker.load_layer_wise(0, []))
+
+        linker.storage._report_dfs_operation_timeout.assert_not_called()
+
     def test_borrowed_read_plan_reselects_memory_when_dfs_is_disabled(self):
         linker = self._read_plan_linker(prefetch=True)
         linker.storage.get_local_dfs_health_policy.return_value = (False, True)
@@ -205,16 +222,28 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
             [0],
             ["memory"],
         )
-        store.all_get_sessions_memory.return_value = True
 
         self.assertTrue(linker.load_layer_wise(0, [], request_ids=["rid"]))
 
         store.batch_get_session_start_with_sources.assert_called_once_with(
             ["tagged-page"]
         )
-        store.all_get_sessions_memory.assert_called_once_with(["tagged-page"])
         self.assertEqual(linker.session_sources["tagged-page"], "memory")
         store.create_read_plan.return_value.run.assert_called_once()
+
+    def test_borrowed_read_plan_rejects_dfs_source_when_dfs_is_disabled(self):
+        linker = self._read_plan_linker(prefetch=True)
+        linker.storage.get_local_dfs_health_policy.return_value = (False, True)
+        linker.storage.store.batch_get_session_start_with_sources.return_value = (
+            [0],
+            ["dfs"],
+        )
+        layouts = [(["tagged-page"], [0], True, [[]])]
+
+        with self.assertRaisesRegex(
+            RuntimeError, "no usable memory replica.*sources=\\['dfs'\\]"
+        ):
+            linker._reselect_read_plan_sessions_if_needed(layouts)
 
     def test_prefetch_off_legacy_load_batches_sessions_by_pool(self):
         for page_wise in (False, True):

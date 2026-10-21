@@ -115,7 +115,7 @@ def test_sync_dfs_health_policy_applies_pp_group_minimum(monkeypatch):
     monkeypatch.setattr(torch.distributed, "all_reduce", reduce_pp_policy)
     cache._sync_dfs_health_policy()
 
-    assert applied == [(True, False)]
+    assert applied == [(False, False)]
 
 
 def test_sync_dfs_health_policy_failure_is_nonfatal_and_throttled(monkeypatch):

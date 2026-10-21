@@ -2905,7 +2905,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 effective, op=torch.distributed.ReduceOp.MIN, group=pp_group
             )
         effective_values = effective.tolist()
-        target = (bool(effective_values[0]), bool(effective_values[1]))
+        allow_write = bool(effective_values[1])
+        target = (bool(effective_values[0]) and allow_write, allow_write)
 
         # Every rank must participate in the collective above on every step.
         # Only the rank-local storage RPC is throttled after a failure.

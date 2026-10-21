@@ -119,6 +119,19 @@ class TestSessionRefreshAge(CustomTestCase):
             ["k0", "k1"]
         )
 
+    def test_disabled_dfs_write_policy_also_forces_session_reselection(self):
+        clock = _Clock()
+        linker = _linker()
+        linker.storage.get_local_dfs_health_policy = lambda: (True, False)
+        _prefetched(linker, clock)
+        clock.now += 1.0
+
+        self.assertTrue(_revalidate(linker, clock))
+
+        linker.storage.store.batch_get_session_refresh.assert_called_once_with(
+            ["k0", "k1"]
+        )
+
     def test_old_session_refreshes_and_resets_its_base(self):
         clock = _Clock()
         linker = _linker()

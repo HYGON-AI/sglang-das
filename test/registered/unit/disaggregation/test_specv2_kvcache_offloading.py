@@ -105,6 +105,30 @@ def test_decode_dfs_policy_uses_tp_minimum(monkeypatch):
     assert applied == [(False, True)]
 
 
+def test_decode_dfs_policy_disables_read_when_write_is_unavailable(monkeypatch):
+    manager = object.__new__(DecodeKVCacheOffloadManager)
+    applied = []
+    manager.cache_controller = SimpleNamespace(
+        storage_backend=SimpleNamespace(
+            get_local_dfs_health_policy=lambda: (True, True),
+            apply_dfs_health_policy=lambda read, write: applied.append((read, write)),
+        )
+    )
+    manager.tp_world_size = 2
+    manager.tp_group = object()
+    _init_dfs_policy_state(manager)
+
+    def reduce_policy(policy, op, group):
+        assert op == torch.distributed.ReduceOp.MIN
+        assert group is manager.tp_group
+        policy.copy_(torch.tensor([1, 0], dtype=torch.int))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce_policy)
+    manager._sync_dfs_health_policy()
+
+    assert applied == [(False, False)]
+
+
 class _FinishedEvent:
     def synchronize(self):
         pass

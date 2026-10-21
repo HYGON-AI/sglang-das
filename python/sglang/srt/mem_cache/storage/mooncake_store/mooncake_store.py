@@ -41,6 +41,7 @@ DEFAULT_LOCAL_BUFFER_SIZE = int(
 SETUP_TIMEOUT = 600  # 10min
 DFS_BATCH_PUT_TIMEOUT = -1606
 DFS_BATCH_GET_TIMEOUT = -1607
+DFS_BATCH_GET_ADMISSION_TIMEOUT = -1608
 DEFAULT_TENANT_ID = "default"
 
 logger = logging.getLogger(__name__)
@@ -1644,6 +1645,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             results = self.store.batch_get_into(
                 key_strs, buffer_ptrs, buffer_sizes
             )
+        # -1608 is local BatchGet admission backpressure and must not disable
+        # DFS reads. Only -1607 means admitted DFS I/O exceeded its deadline.
         if any(int(result) == DFS_BATCH_GET_TIMEOUT for result in results):
             self._report_dfs_operation_timeout("read", DFS_BATCH_GET_TIMEOUT)
         return results

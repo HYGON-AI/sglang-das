@@ -157,7 +157,7 @@ class MooncakeDfsHealthManagerTest(unittest.TestCase):
         store = _FakeStore(read_probes, write_probes)
         return store, MooncakeDfsHealthManager(store)
 
-    def test_write_degrades_without_disabling_dfs_read(self):
+    def test_write_degradation_also_disables_dfs_read(self):
         store, manager = self._manager(
             [0, 0, 0, 0],
             [0, 0, -1, -1],
@@ -170,9 +170,10 @@ class MooncakeDfsHealthManagerTest(unittest.TestCase):
         snapshot = manager.probe_once()
         self.assertEqual(snapshot.read_state, AVAILABLE)
         self.assertEqual(snapshot.write_state, UNAVAILABLE)
-        self.assertEqual(store.policies[-1], (True, False))
+        self.assertEqual(manager.local_policy(), (False, False))
+        self.assertEqual(store.policies[-1], (False, False))
 
-    def test_real_io_timeout_trips_only_affected_capability_immediately(self):
+    def test_real_io_timeout_updates_state_and_dependent_policy_immediately(self):
         store, manager = self._manager([0, 0], [0, 0])
         manager.probe_once()
         manager.probe_once()
@@ -200,6 +201,20 @@ class MooncakeDfsHealthManagerTest(unittest.TestCase):
         manager.report_operation_timeout("read", -1607)
         self.assertEqual(store.policies[-1], (False, False))
 
+    def test_real_write_timeout_also_disables_dfs_read_immediately(self):
+        store, manager = self._manager([0, 0], [0, 0])
+        manager.probe_once()
+        manager.probe_once()
+        self.assertEqual(store.policies[-1], (True, True))
+
+        manager.report_operation_timeout("write", -1606)
+
+        snapshot = manager.snapshot()
+        self.assertEqual(snapshot.read_state, AVAILABLE)
+        self.assertEqual(snapshot.write_state, UNAVAILABLE)
+        self.assertEqual(manager.local_policy(), (False, False))
+        self.assertEqual(store.policies[-1], (False, False))
+
     def test_read_and_write_recover_independently(self):
         store, manager = self._manager(
             [-1, -1, 0, 0, 0, 0],
@@ -213,7 +228,8 @@ class MooncakeDfsHealthManagerTest(unittest.TestCase):
         snapshot = manager.probe_once()
         self.assertEqual(snapshot.read_state, AVAILABLE)
         self.assertEqual(snapshot.write_state, UNAVAILABLE)
-        self.assertEqual(store.policies[-1], (True, False))
+        self.assertEqual(manager.local_policy(), (False, False))
+        self.assertEqual(store.policies[-1], (False, False))
 
         manager.probe_once()
         snapshot = manager.probe_once()
@@ -241,7 +257,7 @@ class MooncakeDfsHealthManagerTest(unittest.TestCase):
 
         manager.apply_effective_policy(True, False)
         manager.apply_effective_policy(True, False)
-        self.assertEqual(store.policies, [(False, False), (True, False)])
+        self.assertEqual(store.policies, [(False, False)])
 
     def test_failed_policy_application_preserves_previous_effective_policy(self):
         class Store(_FakeStore):
@@ -262,14 +278,14 @@ class MooncakeDfsHealthManagerTest(unittest.TestCase):
             },
             defer_policy_application=True,
         )
-        manager.apply_effective_policy(True, False)
-        self.assertEqual(manager._effective_policy, (True, False))
+        manager.apply_effective_policy(False, True)
+        self.assertEqual(manager._effective_policy, (False, True))
 
         store.result = -900
         with self.assertRaisesRegex(RuntimeError, "error=-900"):
-            manager.apply_effective_policy(False, False)
+            manager.apply_effective_policy(True, True)
 
-        self.assertEqual(manager._effective_policy, (True, False))
+        self.assertEqual(manager._effective_policy, (False, True))
 
     def test_stuck_read_does_not_block_or_fail_write_probe(self):
         release_read = threading.Event()
@@ -338,7 +354,8 @@ class MooncakeDfsHealthManagerTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started_at, 1.5)
         self.assertEqual(snapshot.read_state, AVAILABLE)
         self.assertEqual(snapshot.write_state, UNAVAILABLE)
-        self.assertEqual(store.policies[-1], (True, False))
+        self.assertEqual(manager.local_policy(), (False, False))
+        self.assertEqual(store.policies[-1], (False, False))
         snapshot = manager.probe_once()
         self.assertEqual(store.write_calls, 1)
         self.assertEqual(snapshot.read_state, AVAILABLE)

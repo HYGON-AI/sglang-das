@@ -268,7 +268,8 @@ class DecodeKVCacheOffloadManager:
                     effective, op=torch.distributed.ReduceOp.MIN, group=group
                 )
         values = effective.tolist()
-        target = (bool(values[0]), bool(values[1]))
+        allow_write = bool(values[1])
+        target = (bool(values[0]) and allow_write, allow_write)
 
         # All ranks participate above on every scheduler step. A failed rank-local
         # policy RPC is retried with bounded backoff afterwards.

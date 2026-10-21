@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 DFS_BATCH_GET_TIMEOUT = -1607
+DFS_BATCH_GET_ADMISSION_TIMEOUT = -1608
 _READ_PLAN_RC_PATTERN = re.compile(r"(?:^|\s)rc=(-?\d+)(?=\s|$)")
 
 
@@ -582,7 +583,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not callable(getter):
             return True
         policy = getter()
-        return policy is None or bool(policy[0])
+        return policy is None or (bool(policy[0]) and bool(policy[1]))
 
     def disable_waiting_queue_prefetch(self) -> None:
         # Startup only, before any request or prefetch submission. Keep the
@@ -870,7 +871,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 "read policy was disabled"
             ) from error
 
-        all_memory = self.storage.store.all_get_sessions_memory(keys)
+        all_memory = len(sources) == len(keys) and all(
+            str(source).lower() == "memory" for source in sources
+        )
         if (
             len(results) != len(keys)
             or any(result != 0 for result in results)
@@ -878,7 +881,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         ):
             raise RuntimeError(
                 "Mooncake ReadPlan has no usable memory replica after DFS "
-                f"read policy was disabled: results={results}"
+                "read policy was disabled: "
+                f"results={results}, sources={sources}"
             )
 
         lease_base = time.monotonic()
@@ -1546,6 +1550,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             plan.run()
         except RuntimeError as error:
             match = _READ_PLAN_RC_PATTERN.search(str(error))
+            # Admission pressure (-1608) is local backpressure, not evidence
+            # that DFS itself is unhealthy. Only an admitted BatchGet that
+            # exceeded its I/O deadline may trip the DFS read policy.
             if match and int(match.group(1)) == DFS_BATCH_GET_TIMEOUT:
                 self._report_dfs_operation_timeout("read", DFS_BATCH_GET_TIMEOUT)
             raise
