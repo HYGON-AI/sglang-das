@@ -39,6 +39,8 @@ DEFAULT_LOCAL_BUFFER_SIZE = int(
     )
 )
 SETUP_TIMEOUT = 600  # 10min
+DFS_BATCH_PUT_TIMEOUT = -1606
+DFS_BATCH_GET_TIMEOUT = -1607
 DEFAULT_TENANT_ID = "default"
 
 logger = logging.getLogger(__name__)
@@ -1611,27 +1613,44 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         if self._uses_multi_buffer(buffer_ptrs):
             if config is not None:
-                return self.store.batch_put_from_multi_buffers(
+                results = self.store.batch_put_from_multi_buffers(
                     key_strs, buffer_ptrs, buffer_sizes, config
                 )
-            return self.store.batch_put_from_multi_buffers(
-                key_strs, buffer_ptrs, buffer_sizes
-            )
+            else:
+                results = self.store.batch_put_from_multi_buffers(
+                    key_strs, buffer_ptrs, buffer_sizes
+                )
         elif config is not None:
-            return self.store.batch_put_from(
+            results = self.store.batch_put_from(
                 key_strs, buffer_ptrs, buffer_sizes, config
             )
         else:
-            return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+            results = self.store.batch_put_from(
+                key_strs, buffer_ptrs, buffer_sizes
+            )
+        if any(int(result) == DFS_BATCH_PUT_TIMEOUT for result in results):
+            self._report_dfs_operation_timeout("write", DFS_BATCH_PUT_TIMEOUT)
+        return results
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
         if self._uses_multi_buffer(buffer_ptrs):
-            return self.store.batch_get_into_multi_buffers(
+            results = self.store.batch_get_into_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes
             )
-        return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        else:
+            results = self.store.batch_get_into(
+                key_strs, buffer_ptrs, buffer_sizes
+            )
+        if any(int(result) == DFS_BATCH_GET_TIMEOUT for result in results):
+            self._report_dfs_operation_timeout("read", DFS_BATCH_GET_TIMEOUT)
+        return results
+
+    def _report_dfs_operation_timeout(self, capability: str, error: int) -> None:
+        manager = self._dfs_health_manager
+        if manager is not None:
+            manager.report_operation_timeout(capability, error)
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)

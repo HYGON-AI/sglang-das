@@ -71,10 +71,10 @@ class MooncakeDfsHealthManagerTest(unittest.TestCase):
             self.assertEqual(
                 resolve_dfs_health_config(),
                 {
-                    "probe_interval_s": 10,
-                    "failure_threshold": 3,
-                    "success_threshold": 3,
-                    "probe_timeout_s": 2,
+                    "probe_interval_s": 5,
+                    "failure_threshold": 2,
+                    "success_threshold": 2,
+                    "probe_timeout_s": 5,
                 },
             )
 
@@ -113,6 +113,34 @@ class MooncakeDfsHealthManagerTest(unittest.TestCase):
         self.assertEqual(snapshot.read_state, AVAILABLE)
         self.assertEqual(snapshot.write_state, UNAVAILABLE)
         self.assertEqual(store.policies[-1], (True, False))
+
+    def test_real_io_timeout_trips_only_affected_capability_immediately(self):
+        store, manager = self._manager([0, 0], [0, 0])
+        manager.probe_once()
+        manager.probe_once()
+        self.assertEqual(store.policies[-1], (True, True))
+
+        manager.report_operation_timeout("read", -1607)
+        snapshot = manager.snapshot()
+        self.assertEqual(snapshot.read_state, UNAVAILABLE)
+        self.assertEqual(snapshot.write_state, AVAILABLE)
+        self.assertEqual(snapshot.read_error, -1607)
+        self.assertEqual(store.policies[-1], (False, True))
+
+        manager.report_operation_timeout("write", -1606)
+        snapshot = manager.snapshot()
+        self.assertEqual(snapshot.write_state, UNAVAILABLE)
+        self.assertEqual(snapshot.write_error, -1606)
+        self.assertEqual(store.policies[-1], (False, False))
+
+    def test_real_io_timeout_never_reopens_consensus_disabled_capability(self):
+        store, manager = self._manager([0, 0], [0, 0])
+        manager.probe_once()
+        manager.probe_once()
+        manager.apply_effective_policy(True, False)
+
+        manager.report_operation_timeout("read", -1607)
+        self.assertEqual(store.policies[-1], (False, False))
 
     def test_read_and_write_recover_independently(self):
         store, manager = self._manager(

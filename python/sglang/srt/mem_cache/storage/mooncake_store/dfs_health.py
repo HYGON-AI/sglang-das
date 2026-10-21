@@ -17,22 +17,22 @@ _HEALTH_CONFIG_SOURCES = {
     "probe_interval_s": (
         "mooncake_dfs_health_probe_interval_s",
         "SGLANG_MOONCAKE_DFS_HEALTH_PROBE_INTERVAL_S",
-        10,
+        5,
     ),
     "failure_threshold": (
         "mooncake_dfs_health_failure_threshold",
         "SGLANG_MOONCAKE_DFS_HEALTH_FAILURE_THRESHOLD",
-        3,
+        2,
     ),
     "success_threshold": (
         "mooncake_dfs_health_success_threshold",
         "SGLANG_MOONCAKE_DFS_HEALTH_SUCCESS_THRESHOLD",
-        3,
+        2,
     ),
     "probe_timeout_s": (
         "mooncake_dfs_health_probe_timeout_s",
         "SGLANG_MOONCAKE_DFS_HEALTH_PROBE_TIMEOUT_S",
-        2,
+        5,
     ),
 }
 
@@ -188,6 +188,59 @@ class MooncakeDfsHealthManager:
             old_policy[1],
             policy[0],
             policy[1],
+        )
+
+    def report_operation_timeout(self, capability: str, error: int) -> None:
+        """Trip one DFS capability immediately after a real data-I/O timeout."""
+        if capability not in ("read", "write"):
+            raise ValueError(f"Unknown DFS capability: {capability}")
+        with self._lock:
+            if capability == "read":
+                changed = self._read_state != UNAVAILABLE
+                self._read_state = UNAVAILABLE
+                self._read_successes = 0
+                self._read_failures = max(
+                    self._read_failures, self._failure_threshold
+                )
+                self._read_error = int(error)
+            else:
+                changed = self._write_state != UNAVAILABLE
+                self._write_state = UNAVAILABLE
+                self._write_successes = 0
+                self._write_failures = max(
+                    self._write_failures, self._failure_threshold
+                )
+                self._write_error = int(error)
+            if changed:
+                self._generation += 1
+            allow_read = self._read_state == AVAILABLE
+            allow_write = self._write_state == AVAILABLE
+        # A real business I/O timeout is stronger evidence than a probe
+        # failure. Only restrict the currently effective policy here: the
+        # unaffected capability may already be disabled by scheduler consensus
+        # because another rank is unhealthy, and must never be reopened by a
+        # local timeout report.
+        with self._policy_lock:
+            policy = (
+                self._effective_policy[0] and allow_read,
+                self._effective_policy[1] and allow_write,
+            )
+            if policy != self._effective_policy:
+                old_policy = self._effective_policy
+                self._apply_policy(*policy)
+                self._effective_policy = policy
+                logger.warning(
+                    "Mooncake DFS effective policy transition: "
+                    "old_read=%s old_write=%s new_read=%s new_write=%s",
+                    old_policy[0],
+                    old_policy[1],
+                    policy[0],
+                    policy[1],
+                )
+        logger.error(
+            "Mooncake DFS data operation timed out; capability=%s error=%s",
+            capability,
+            error,
         )
 
     def probe_once(self) -> DfsHealthSnapshot:
