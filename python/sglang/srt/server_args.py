@@ -4970,11 +4970,21 @@ class ServerArgs:
             )
 
     def _apply_qwen4_exp_hip_ple_decode_cuda_graph_default(self):
-        """HIP/HCU mapped-host PLE gathers collapse under full decode graphs.
+        """HIP/HCU Qwen4Exp PLE offload decode-graph default.
 
-        Force breakable decode graphs so PLE re-runs eagerly between MoE
-        segments. Must run before _handle_cuda_graph_config. Honors an
-        explicit --cuda-graph-backend-decode / --disable-decode-cuda-graph.
+        Triton ``tl.load`` from a mapped/pinned host pointer collapses to
+        token 0 under FULL decode graphs, which used to force BREAKABLE
+        graphs. INT8/FP8 PLE tables are always pinned and bind a mapped CUDA
+        view whose ATen ``F.embedding`` gather (weight + per-row scale)
+        replays graph-safely, so those tables can restore FULL decode graphs
+        and recover the host-gap spent on breakable replay. BF16 tables rely
+        on hostRegister of a pageable copy, which can fail on GTT exhaustion,
+        so they keep the BREAKABLE default.
+
+        Honors an explicit --cuda-graph-backend-decode /
+        --disable-decode-cuda-graph and the
+        SGLANG_PLE_DECODE_GRAPH_BREAKABLE=1 opt-out. Must run before
+        _handle_cuda_graph_config.
         """
         if (
             self.cuda_graph_backend_decode is not None
@@ -4992,13 +5002,46 @@ class ServerArgs:
             "Qwen4ExpForCausalLMMTP",
         ):
             return
+        if envs.SGLANG_PLE_DECODE_GRAPH_BREAKABLE.get():
+            logger.info(
+                "Using breakable decode CUDA graphs for Qwen4Exp PLE offload "
+                "on HIP/HCU (SGLANG_PLE_DECODE_GRAPH_BREAKABLE=1)."
+            )
+            self._declare(
+                "_apply_qwen4_exp_hip_ple_decode_cuda_graph_default",
+                cuda_graph_backend_decode=Backend.BREAKABLE,
+            )
+            return
+        if self._qwen4_exp_ple_table_is_int8_or_fp8():
+            logger.info(
+                "Using full decode CUDA graphs for Qwen4Exp int8/fp8 PLE "
+                "offload on HIP/HCU (mapped CUDA view gather is graph-safe)."
+            )
+            return
         logger.info(
-            "Using breakable decode CUDA graphs for Qwen4Exp PLE offload on HIP/HCU."
+            "Using breakable decode CUDA graphs for Qwen4Exp BF16 PLE offload "
+            "on HIP/HCU (hostRegister-mapped gather has no GTT-OOM fallback)."
         )
         self._declare(
             "_apply_qwen4_exp_hip_ple_decode_cuda_graph_default",
             cuda_graph_backend_decode=Backend.BREAKABLE,
         )
+
+    def _qwen4_exp_ple_table_is_int8_or_fp8(self) -> bool:
+        """Best-effort static check of the PLE n-gram table storage dtype."""
+        hf_config = self.get_model_config().hf_config
+        text_config = getattr(hf_config, "text_config", hf_config)
+        ple_dtype = getattr(text_config, "ple_embedding_dtype", None)
+        if ple_dtype in ("float8_e4m3fn", "fp8"):
+            return True
+        compression_config = getattr(text_config, "compression_config", None) or {}
+        if isinstance(compression_config, dict):
+            mixed = compression_config.get("mixed_precision") or {}
+            ngram = mixed.get("ngram_embedding") or {}
+            weight_bits = ngram.get("weight_bits")
+            if weight_bits in (8, "8"):
+                return True
+        return False
 
     def _apply_muse_glimmer_prefill_cuda_graph_max_bs_default(self):
         if (

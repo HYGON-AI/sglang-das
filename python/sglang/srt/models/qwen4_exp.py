@@ -1270,6 +1270,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self._kernel_scale_ptr = None
         self._device_weight_view = None
         self._device_weight_holder = None
+        self._device_scale_view = None
+        self._device_scale_holder = None
         self._uva_register_pending = False
         if cpu_weight.dtype == torch.bfloat16 and not cpu_weight.is_pinned():
             self._use_uva_gather = False
@@ -1312,7 +1314,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     def _bind_mapped_cuda_view(self) -> None:
         if torch.version.hip is None:
             return
-        if self.weight.dtype != torch.bfloat16:
+        if self.weight.dtype not in (torch.bfloat16, torch.int8, torch.float8_e4m3fn):
             return
         if not torch.cuda.is_available():
             return
@@ -1323,18 +1325,74 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 ptr, tuple(self.weight.shape), self.weight.dtype, device
             )
         except Exception as exc:
-            logger.warning("PLE BF16 mapped CUDA view wrap failed: %s", exc)
+            logger.warning("PLE mapped CUDA view wrap failed: %s", exc)
             self._device_weight_view = None
             self._device_weight_holder = None
+            self._device_scale_view = None
+            self._device_scale_holder = None
+            if self.weight.dtype in (torch.int8, torch.float8_e4m3fn):
+                # int8/fp8 tables may be served by FULL decode graphs by
+                # default; without a mapped view the gather would fall back
+                # to the pinned Triton kernel, which is NOT full-graph-safe
+                # on HIP (replay collapses to token 0).
+                logger.warning(
+                    "PLE %s table has no mapped CUDA view; if decode CUDA "
+                    "graphs are FULL, set SGLANG_PLE_DECODE_GRAPH_BREAKABLE=1 "
+                    "to avoid silent gather corruption.",
+                    self.weight.dtype,
+                )
             return
         self._device_weight_view = view
         self._device_weight_holder = holder
+        self._bind_mapped_scale_view(device)
         logger.info(
-            "PLE BF16 mapped CUDA view ok shape=%s ptr=%#x device=%s",
+            "PLE %s mapped CUDA view ok shape=%s ptr=%#x device=%s%s",
+            str(self.weight.dtype).replace("torch.", ""),
             tuple(view.shape),
             int(view.data_ptr()),
             view.device,
+            " (per-row scale view bound)" if self._device_scale_view is not None else "",
         )
+
+    def _bind_mapped_scale_view(self, device: torch.device) -> None:
+        """Bind a mapped CUDA view over the pinned per-row scale buffer.
+
+        Scalar scales stay on the existing device-copy path. The per-row
+        scale is pinned at PinnedHostEmbedding construction for int8/fp8
+        tables; loaders that expand a scalar scale later must keep it pinned
+        (see load_qwen4_exp_ple_shard), and this helper is also called
+        lazily from the gather when the expansion happened after init.
+        """
+        if self._device_weight_view is None:
+            return
+        if self._device_scale_view is not None or self.weight_scale.numel() <= 1:
+            return
+        if self.weight_scale.device.type != "cpu" or not self.weight_scale.is_pinned():
+            return
+        try:
+            scale_ptr = self._kernel_scale_ptr or _device_ptr_for_host_tensor(
+                self.weight_scale
+            )
+            scale_view, scale_holder = _wrap_mapped_host_as_cuda_tensor(
+                scale_ptr,
+                tuple(self.weight_scale.shape),
+                self.weight_scale.dtype,
+                device,
+            )
+        except Exception as exc:
+            logger.warning("PLE mapped scale view wrap failed: %s", exc)
+            self._device_scale_view = None
+            self._device_scale_holder = None
+            self._device_weight_view = None
+            self._device_weight_holder = None
+            logger.warning(
+                "PLE per-row scale gather has no mapped CUDA view; if decode "
+                "CUDA graphs are FULL, set SGLANG_PLE_DECODE_GRAPH_BREAKABLE=1 "
+                "to avoid silent gather corruption."
+            )
+            return
+        self._device_scale_view = scale_view
+        self._device_scale_holder = scale_holder
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         super().weight_loader(param, loaded_weight)
@@ -1393,6 +1451,17 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         weight = self._device_weight_view
         start = self.shard_indices.org_vocab_start_index
         end = self.shard_indices.org_vocab_end_index
+        if self._device_scale_view is None and self.weight_scale.numel() > 1:
+            # A scalar scale expanded to per-row after init (fp8 auto-switch):
+            # bind the mapped view lazily, host-side, before capture records.
+            self._bind_mapped_scale_view(
+                torch.device(f"cuda:{torch.cuda.current_device()}")
+            )
+            if self._device_weight_view is None:
+                # Scale bind failed: the weight view was dropped too, so let
+                # the caller take the pinned-Triton (breakable-only) path.
+                self._gather_from_pinned_triton(flat_ids, output)
+                return
         in_range = (flat_ids >= start) & (flat_ids < end)
         local = torch.where(in_range, flat_ids - start, torch.zeros_like(flat_ids))
         nrows = int(weight.shape[0])
@@ -1401,6 +1470,13 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         rows = F.embedding(local, weight)
         if rows.dtype != torch.bfloat16:
             rows = rows.to(torch.bfloat16)
+        scale_view = self._device_scale_view
+        if scale_view is not None:
+            # Per-row int8/fp8 tables: dequantize inside the gather exactly like
+            # the pinned Triton kernel (row scale of the OWNING shard). All-ATen,
+            # so the whole sequence replays inside full decode CUDA graphs.
+            scale = F.embedding(local, scale_view).to(torch.bfloat16)
+            rows = rows * scale
         rows = torch.where(in_range.unsqueeze(-1), rows, torch.zeros_like(rows))
         output.view(rows.shape).copy_(rows)
 
@@ -1430,24 +1506,29 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             elif self._device_weight_view is not None:
                 self._gather_from_mapped_cuda_view(flat_ids, output)
             else:
-                weight_ptr = self._kernel_weight_ptr or int(self.weight.data_ptr())
-                scale_ptr = self._kernel_scale_ptr or int(
-                    self.weight_scale.data_ptr()
-                )
-                _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                    weight_ptr,
-                    scale_ptr,
-                    flat_ids,
-                    output,
-                    embedding_dim=self.embedding_dim,
-                    tp_vocab_start=self.shard_indices.org_vocab_start_index,
-                    tp_vocab_end=self.shard_indices.org_vocab_end_index,
-                    is_fp8=self.weight.dtype == torch.float8_e4m3fn,
-                    is_int8=self.weight.dtype == torch.int8,
-                    is_per_row_scale=self.weight_scale.numel() > 1,
-                    BLOCK_D=self._block_d,
-                )
+                self._gather_from_pinned_triton(flat_ids, output)
         return output
+
+    def _gather_from_pinned_triton(
+        self, flat_ids: torch.Tensor, output: torch.Tensor
+    ) -> None:
+        weight_ptr = self._kernel_weight_ptr or int(self.weight.data_ptr())
+        scale_ptr = self._kernel_scale_ptr or int(
+            self.weight_scale.data_ptr()
+        )
+        _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
+            weight_ptr,
+            scale_ptr,
+            flat_ids,
+            output,
+            embedding_dim=self.embedding_dim,
+            tp_vocab_start=self.shard_indices.org_vocab_start_index,
+            tp_vocab_end=self.shard_indices.org_vocab_end_index,
+            is_fp8=self.weight.dtype == torch.float8_e4m3fn,
+            is_int8=self.weight.dtype == torch.int8,
+            is_per_row_scale=self.weight_scale.numel() > 1,
+            BLOCK_D=self._block_d,
+        )
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
@@ -2635,11 +2716,16 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         "storage"
                     )
                 if emb.weight_scale.numel() == 1:
-                    emb.weight_scale = torch.ones(
+                    scale = torch.ones(
                         (emb.num_embeddings_per_partition, 1),
                         dtype=torch.bfloat16,
                         device=emb.weight.device,
                     )
+                    if isinstance(emb, Qwen4ExpPinnedHostEmbedding):
+                        # UVA/mapped-view gathers read the scale from device;
+                        # a pageable buffer would be GTT-mapped page-by-page.
+                        scale = scale.pin_memory()
+                    emb.weight_scale = scale
                     ple_mod.ple_per_row_scale = True
                 target = emb.weight_scale
             else:
@@ -2676,11 +2762,16 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 )
                 del old_weight_data
                 if emb.weight_scale.numel() == 1:
-                    emb.weight_scale = torch.ones(
+                    scale = torch.ones(
                         (emb.num_embeddings_per_partition, 1),
                         dtype=torch.bfloat16,
                         device=emb.weight.device,
                     )
+                    if isinstance(emb, Qwen4ExpPinnedHostEmbedding):
+                        # UVA/mapped-view gathers read the scale from device;
+                        # a pageable buffer would be GTT-mapped page-by-page.
+                        scale = scale.pin_memory()
+                    emb.weight_scale = scale
                     ple_mod.ple_per_row_scale = True
                 # params_dict was snapshotted before the loop; drop the stale
                 # entry or it pins the old bf16 storage until load end.

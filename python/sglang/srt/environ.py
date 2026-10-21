@@ -294,6 +294,11 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # Restore the legacy BREAKABLE decode-graph default for Qwen4Exp PLE
+    # offload on HIP/HCU. By default, int8/fp8 PLE tables bind mapped CUDA
+    # views and replay safely inside FULL decode graphs; opt out if the
+    # mapped-view path misbehaves on a given DTK/GTT combination.
+    SGLANG_PLE_DECODE_GRAPH_BREAKABLE = EnvBool(False)
     # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
     # path is ported, so setting this fails loudly instead of degrading.
     SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
