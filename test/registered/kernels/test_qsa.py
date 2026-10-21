@@ -1298,7 +1298,7 @@ def test_qsa_indexer_decode_ignores_dp_attention_token_padding():
                 rope_rows=rope.numel(),
             )
         ),
-        select_decode_tokens=lambda q, cache, table, lengths, max_len, positions, seqlens: (
+        select_decode_tokens=lambda q, cache, table, lengths, max_len, positions, seqlens, k_cache_fp8=None: (
             calls.update(q_rows=q.shape[0], positions=positions.tolist())
             or q.squeeze(1)
         ),
