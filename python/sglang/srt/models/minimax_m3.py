@@ -55,7 +55,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
@@ -484,7 +484,11 @@ class MiniMaxM3MoE(nn.Module):
         else:
             self.e_score_correction_bias = None
 
-        self.experts = get_moe_impl_class(quant_config)(
+        moe_impl_class = get_moe_impl_class(quant_config)
+        # DeepEPMoE must know the model before choosing its MoE core.
+        # Other implementations do not consume this constructor argument.
+        moe_kwargs = {"is_minimax_m3": True} if moe_impl_class is DeepEPMoE else {}
+        self.experts = moe_impl_class(
             num_experts=num_physical_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=(
@@ -512,6 +516,7 @@ class MiniMaxM3MoE(nn.Module):
             gemm1_clamp_limit=config.swiglu_limit,
             prefix=add_prefix("experts", prefix),
             gate_up_interleaved=False,
+            **moe_kwargs,
         )
         self.experts.moe_runner_config.is_minimax_m3 = True
         self.topk = TopK(
