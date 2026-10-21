@@ -42,6 +42,7 @@ from sglang.kernels.ops.gemm.dsv4_wo_a import (
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
+from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -2908,6 +2909,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 alt_streams is not None
                 and (
                     _is_cuda
+                    or (_is_hcu and SboFlags.fuse_shared_experts_inside_sbo())
                     or envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
                     or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
                 )
