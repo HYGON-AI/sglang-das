@@ -240,6 +240,13 @@ class TestMooncakeDrainedAbortStatus(CustomTestCase):
             sender._drained_abort_targets,
             {("decode-a", 100), ("decode-b", 200)},
         )
+        manager.sync_status_to_decode_endpoint.side_effect = RuntimeError("send failed")
+        with self.assertRaisesRegex(RuntimeError, "send failed"):
+            sender.notify_drained_abort()
+        self.assertNotIn(7, manager.transfer_infos)
+        self.assertIn(7, manager._drained_abort_rooms)
+        self.assertEqual(sender._drained_abort_notified_targets, set())
+        manager.sync_status_to_decode_endpoint.reset_mock(side_effect=True)
         sender.notify_drained_abort()
         sender.notify_drained_abort()
         self.assertEqual(
@@ -265,6 +272,64 @@ class TestMooncakeDrainedAbortStatus(CustomTestCase):
             manager.sync_status_to_decode_endpoint.call_args.args[:2],
             ("decode-c", 300),
         )
+
+    def test_blocked_bootstrap_send_does_not_block_terminal_cleanup(self):
+        for terminal in (False, True):
+            with self.subTest(terminal=terminal):
+                manager = self.make_manager(status=KVPoll.Failed)
+                manager.transfer_infos = {}
+                manager.resolve_kv_replica_factor = Mock()
+                manager._prefill_unique_rank = lambda: 0
+                if terminal:
+                    manager.finish_drained_abort(7)
+                entered, release, cleaned = (threading.Event() for _ in range(3))
+                errors = []
+
+                def blocked_send(*args, **kwargs):
+                    entered.set()
+                    if not release.wait(5):
+                        raise TimeoutError("test did not release send")
+
+                def register():
+                    try:
+                        target = SimpleNamespace(
+                            endpoint="decode-blocked",
+                            dst_port=123,
+                            is_dummy=False,
+                            decode_prefix_len=0,
+                            spec_metadata=None,
+                        )
+                        manager._register_bootstrap_transfer(7, "session", target, 1)
+                    except BaseException as error:
+                        errors.append(error)
+
+                def cleanup():
+                    try:
+                        manager.finish_drained_abort(8)
+                        cleaned.set()
+                    except BaseException as error:
+                        errors.append(error)
+
+                manager.sync_status_to_decode_endpoint = Mock(side_effect=blocked_send)
+                notify = threading.Thread(target=register)
+                cleanup_thread = threading.Thread(target=cleanup)
+                notify.start()
+                started = entered.wait(1)
+                cleanup_thread.start()
+                responsive = cleaned.wait(0.5)
+                release.set()
+                notify.join(5)
+                cleanup_thread.join(5)
+                self.assertTrue(started)
+                self.assertTrue(
+                    responsive, "bootstrap send held the scheduler cleanup lock"
+                )
+                self.assertFalse(notify.is_alive())
+                self.assertFalse(cleanup_thread.is_alive())
+                self.assertEqual(errors, [])
+                manager.sync_status_to_decode_endpoint.assert_called_once()
+                if terminal:
+                    self.assertNotIn(7, manager.transfer_infos)
 
     def test_bootstrap_target_is_not_notified_until_source_drain(self):
         manager = self.make_manager(status=KVPoll.Failed)
