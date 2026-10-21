@@ -227,9 +227,27 @@ class DeepEPBuffer:
                 num_max_dispatch_tokens_per_rank=None,
                 num_experts=None,
                 num_topk=None,
+                low_latency_rdma_bytes=0,
+                low_latency_num_qps=0,
             )
             buffers["deepep_ep_state"] = state
         return state
+
+    @classmethod
+    def register_low_latency_layout(
+        cls, group, num_tokens, hidden_size, num_experts, num_topk
+    ):
+        state = cls._state()
+        args = (num_tokens, hidden_size, group.size(), num_experts)
+        state.low_latency_rdma_bytes = max(
+            state.low_latency_rdma_bytes,
+            Buffer.get_low_latency_rdma_size_hint(*args, num_topk=num_topk),
+            # Layout cleaning uses the native API's default top-k requirement.
+            Buffer.get_low_latency_rdma_size_hint(*args),
+        )
+        state.low_latency_num_qps = max(
+            state.low_latency_num_qps, num_experts // group.size()
+        )
 
     @classmethod
     def get_deepep_buffer(
@@ -330,6 +348,9 @@ class DeepEPBuffer:
                 num_rdma_bytes,
             )
 
+            if _is_hcu:
+                num_rdma_bytes = max(num_rdma_bytes, state.low_latency_rdma_bytes)
+
         # We should calculate num_qps_per_rank consistently with DeepEP's test script logic:
         if deepep_mode == DeepEPMode.NORMAL:
             # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
@@ -345,6 +366,9 @@ class DeepEPBuffer:
             )
         else:
             raise NotImplementedError
+
+        if _is_hcu and deepep_mode.enable_low_latency():
+            num_qps_per_rank = max(num_qps_per_rank, state.low_latency_num_qps)
 
         if not _is_npu:
             total_num_sms = torch.cuda.get_device_properties(
@@ -965,6 +989,16 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
     def __init__(self, return_recv_hook: bool, **kwargs):
         super().__init__(**kwargs)
+
+        if _is_hcu:
+            # Both target and draft dispatchers exist before the first forward.
+            DeepEPBuffer.register_low_latency_layout(
+                self.group,
+                self.num_max_dispatch_tokens_per_rank,
+                self.hidden_size,
+                self.num_experts,
+                self.router_topk,
+            )
 
         """
         num_max_dispatch_tokens_per_rank: the actual batch size in the decoding engine should be less than 256
