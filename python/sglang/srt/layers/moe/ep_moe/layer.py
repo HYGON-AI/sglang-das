@@ -635,8 +635,7 @@ class DeepEPMoE(FusedMoE):
             routed_scaling_factor=routed_scaling_factor,
             **kwargs,
         )
-        # Set the model marker before selecting the legacy/modern core.
-        # Setting it after DeepEPMoE construction is too late for this gate.
+        # The MiniMax HCU adapter needs the model marker during construction.
         self.moe_runner_config.is_minimax_m3 = is_minimax_m3
         is_humming = (
             get_moe_runner_backend().is_humming()
@@ -644,11 +643,7 @@ class DeepEPMoE(FusedMoE):
             and quant_config is not None
             and quant_config.get_name() == "humming"
         )
-        # The modern DeepEPMoE core is an explicit MiniMax-M3 opt-in.
-        # Keep all other models on the legacy path, including its weight setup.
-        if not self.moe_runner_config.is_minimax_m3:
-            self.deprecate_flag = False
-        elif is_humming:
+        if is_humming:
             self.deprecate_flag = True
         # Explicit --moe-runner-backend aiter must take the modern FusedMoE
         # dispatcher/runner path too.  Checking only SGLANG_USE_AITER misses
@@ -657,9 +652,9 @@ class DeepEPMoE(FusedMoE):
         # opt the MoE runner in explicitly.
         elif should_use_aiter_runner():
             self.deprecate_flag = True
-        elif _should_use_hcu_deepgemm_runner(quant_config):
-            # MiniMax-M3's channel-FP8 packing and DeepEP normal/LL adapters
-            # live in MoeRunner(DEEP_GEMM). Other models use the legacy core.
+        elif is_minimax_m3 and _should_use_hcu_deepgemm_runner(quant_config):
+            # Opt MiniMax-M3 into its HCU channel-FP8 runner adapter.
+            # Other models continue through their existing backend conditions.
             self.deprecate_flag = True
         elif _is_npu:
             self.deprecate_flag = True
@@ -923,11 +918,13 @@ class DeepEPMoE(FusedMoE):
     ):
         # DeepEP NORMAL mode is not capturable; run it as an eager node.
         if is_in_breakable_cuda_graph():
-            if self.deprecate_flag and _should_break_only_hcu_deepgemm_core(
-                self.quant_config
+            if (
+                self.moe_runner_config.is_minimax_m3
+                and self.deprecate_flag
+                and _should_break_only_hcu_deepgemm_core(self.quant_config)
             ):
                 # Low-latency DeepEP is graph-capturable on HCU.  Let the
-                # modern FusedMoE forward capture dispatch/combine and insert
+                # FusedMoE runner capture dispatch/combine and insert
                 # its eager break only around the vendor grouped GEMMs.
                 return self.forward_impl(hidden_states, topk_output)
             assert TopKOutputChecker.format_is_standard(
@@ -1169,7 +1166,11 @@ class DeepEPMoE(FusedMoE):
         i_s: Optional[torch.Tensor] = None,
     ):
         if self.deprecate_flag:
-            if is_in_breakable_cuda_graph() and _should_break_only_hcu_deepgemm_core(self.quant_config):
+            if (
+                self.moe_runner_config.is_minimax_m3
+                and is_in_breakable_cuda_graph()
+                and _should_break_only_hcu_deepgemm_core(self.quant_config)
+            ):
                 return self.hcu_ll_moe_core(dispatch_output)
             return super().run_moe_core(
                 dispatch_output,
