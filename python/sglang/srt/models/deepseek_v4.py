@@ -4047,6 +4047,19 @@ class DeepseekV4DecoderLayer(nn.Module):
         state.hidden_states_mlp_output = hidden
 
 
+_logged_mid_chunk_decoder_skip = False
+
+
+def _log_mid_chunk_decoder_skip_once(end_layer: int) -> None:
+    global _logged_mid_chunk_decoder_skip
+    if not _logged_mid_chunk_decoder_skip:
+        _logged_mid_chunk_decoder_skip = True
+        logger.info(
+            "Mid-chunk prefill stops after layer %d (SGLANG_DSV41_SKIP_MID_CHUNK_DECODER)",
+            end_layer - 1,
+        )
+
+
 def _scatter_tail_rows(
     tail: LateLayerTail, rows: torch.Tensor, num_tokens: int
 ) -> torch.Tensor:
@@ -4318,20 +4331,26 @@ class DeepseekV4Model(nn.Module):
             else:
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
         tail = None
+        end_layer = self.end_layer
         if (
             self.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             self._check_late_layer_tail_readers(forward_batch)
             attn_backend = get_attn_backend()
-            tail = attn_backend.tail_forward_metadata.late_layer_tail
+            if getattr(attn_backend, "skip_late_layers", False):
+                # A mid-chunk prefill: nothing reads the later layers' rows.
+                end_layer = self.late_layer_start
+                _log_mid_chunk_decoder_skip_once(end_layer)
+            else:
+                tail = attn_backend.tail_forward_metadata.late_layer_tail
         saved_full = None
         # A pending post never meets a residual reader: the HIP boundary's defer_post
         # gate excludes Engram/DSpark-capture layers and the model end.
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
         state = mhc.HcState(hidden_states)
-        for i in range(self.start_layer, self.end_layer):
+        for i in range(self.start_layer, end_layer):
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
@@ -4397,7 +4416,14 @@ class DeepseekV4Model(nn.Module):
                     input_ids_global=input_ids_global,
                     seam_open=tail is None,
                 )
-        state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
+        # The last run layer may have deferred its post to the next one.
+        state = state.materialized(self.layers[end_layer - 1].hc_cfg)
+        if end_layer < self.end_layer and capture_dspark:
+            # Keep the capture list whole; these rows precede every SWA window
+            # that later reads them, the DSpark draft's included.
+            for i in sorted(dspark_layers_to_capture):
+                if i >= end_layer:
+                    dspark_aux_hidden_states.append(state.residual.mean(dim=1))
         if saved_full is not None:
             attn_backend.exit_late_layer_tail(saved_full, forward_batch)
             return state.residual, state.pre, tail
@@ -5234,6 +5260,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.capture_aux_hidden_states
             and self.model.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
+            # A mid-chunk prefill skipped the tail and returned full rows.
+            and get_attn_backend().tail_forward_metadata is not None
         ):
             tail = get_attn_backend().tail_forward_metadata.late_layer_tail
             # an HCU CP tail was gathered to global tail order; index the global extend

@@ -528,6 +528,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # "Borrowed" into a dedicated "Forward-resolved snapshot" group.
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
+    # Host copy for plain extends (DSV4 mid-chunk decoder skip); None otherwise.
+    orig_seq_lens_cpu: Optional[List[int]] = None
 
     # This iteration's KV ids, translated once per sub-pool (`KVLocPlan`).
     # Every forward of the iteration holds the same plan; `out_cache_loc` is
@@ -1056,6 +1058,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 else None
             ),
             orig_seq_lens=batch.orig_seq_lens,
+            orig_seq_lens_cpu=(
+                getattr(batch, "orig_seq_lens_cpu", None)
+                if batch.forward_mode.is_extend_without_speculative()
+                else None
+            ),
             out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
             engram_history=batch.engram_history,
             mamba_track_indices=batch.mamba_track_indices,
@@ -1869,6 +1876,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.orig_seq_lens = torch.tensor(
                         [num_tokens], dtype=self.orig_seq_lens.dtype, device=dev
                     )
+                    self.orig_seq_lens_cpu = None
                     self.seq_lens_sum = int(num_tokens)
                     if self.seq_lens_cpu is not None:
                         self.seq_lens_cpu = torch.tensor(

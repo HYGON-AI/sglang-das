@@ -1427,6 +1427,13 @@ class DeepseekV4AttnBackend(
         )
         # The model switches onto this metadata in enter_late_layer_tail.
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
+        # Per forward: the model stops at the last kv_source layer (see
+        # _skips_late_layers), and no tail metadata is built.
+        self.skip_mid_chunk_decoder: bool = (
+            self.enable_decoder_swa_bounded_replay
+            and envs.SGLANG_DSV41_SKIP_MID_CHUNK_DECODER.get()
+        )
+        self.skip_late_layers: bool = False
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
@@ -1881,6 +1888,33 @@ class DeepseekV4AttnBackend(
             )
         self.tail_forward_metadata = self._build_late_layer_tail_metadata(
             forward_batch, legacy_cp=True
+        )
+
+    def _skips_late_layers(self, forward_batch: ForwardBatch) -> bool:
+        """Whether this extend stops at the last kv_source layer.
+
+        True when every request still has at least SWA_WINDOW prompt tokens after
+        this chunk. The layers past the last kv_source layer then produce nothing a
+        later step reads: their only state is SWA rows, the final chunk's tail floors
+        its window at its own start, decode and the DSpark draft (pure SWA of the
+        same width) reach back SWA_WINDOW positions, and the token sampled for an
+        unfinished chunk is dropped. Results match running the tail. The prefill
+        graph and DP attention, which would need every rank to run the same layers,
+        are already rejected with bounded replay (deepseek_v4_hook).
+        """
+        if not self.skip_mid_chunk_decoder:
+            return False
+        if forward_batch.forward_mode != ForwardMode.EXTEND:
+            return False
+        orig_lens = forward_batch.orig_seq_lens_cpu
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        seq_lens = forward_batch.seq_lens_cpu
+        if not orig_lens or extend_lens is None or seq_lens is None:
+            return False
+        if not len(orig_lens) == len(extend_lens) == seq_lens.shape[0]:
+            return False
+        return all(
+            orig - seq >= SWA_WINDOW for orig, seq in zip(orig_lens, seq_lens.tolist())
         )
 
     def _build_late_layer_tail_metadata(
@@ -2725,6 +2759,7 @@ class DeepseekV4AttnBackend(
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
+        self.skip_late_layers = False
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
         if self.mtp_enabled and logical_forward_mode.is_idle():
             self.online_c128_mtp.clear()
@@ -2734,10 +2769,12 @@ class DeepseekV4AttnBackend(
         maybe_prepare_cp_cache_layer_split_forward(self.token_to_kv_pool, forward_batch)
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
+        self.skip_late_layers = self._skips_late_layers(forward_batch)
         self.tail_forward_metadata = (
             self._build_late_layer_tail_metadata(forward_batch)
             if self.enable_decoder_swa_bounded_replay
             and forward_batch.forward_mode.is_extend_without_speculative()
+            and not self.skip_late_layers
             else None
         )
 
