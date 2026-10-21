@@ -106,6 +106,19 @@ class TestSessionRefreshAge(CustomTestCase):
         self.assertTrue(_revalidate(linker, clock))
         linker.storage.store.batch_get_session_refresh.assert_not_called()
 
+    def test_disabled_dfs_read_policy_forces_session_reselection(self):
+        clock = _Clock()
+        linker = _linker()
+        linker.storage.get_local_dfs_health_policy = lambda: (False, True)
+        _prefetched(linker, clock)
+        clock.now += 1.0
+
+        self.assertTrue(_revalidate(linker, clock))
+
+        linker.storage.store.batch_get_session_refresh.assert_called_once_with(
+            ["k0", "k1"]
+        )
+
     def test_old_session_refreshes_and_resets_its_base(self):
         clock = _Clock()
         linker = _linker()
@@ -394,9 +407,7 @@ class TestSharedSessionPreparation(CustomTestCase):
         linker.storage.store.batch_get_session_end.assert_not_called()
         self.assertTrue(_revalidate(linker, clock))
         linker._abort_prepared_load_now("s")
-        linker.storage.store.batch_get_session_end.assert_called_once_with(
-            ["k0", "k1"]
-        )
+        linker.storage.store.batch_get_session_end.assert_called_once_with(["k0", "k1"])
 
     def test_mixed_batch_refreshes_all_reused_keys_only(self):
         linker = _linker()
@@ -427,7 +438,9 @@ class TestSharedSessionPreparation(CustomTestCase):
                 self.assertEqual(linker.session_refcounts, {"k0": 1, "k1": 1})
                 self.assertEqual(linker.session_lease_base, {})
                 store.batch_get_session_end.assert_not_called()
-                self.assertEqual(store.batch_get_session_start_with_sources.call_count, 1)
+                self.assertEqual(
+                    store.batch_get_session_start_with_sources.call_count, 1
+                )
                 self.assertFalse(_revalidate(linker, _Clock()))
 
     def test_ordinary_revalidation_exception_fails_closed(self):
@@ -436,7 +449,9 @@ class TestSharedSessionPreparation(CustomTestCase):
         linker.pool_group = types.SimpleNamespace(
             resolve_transfers=lambda *a, **k: [transfer]
         )
-        linker.storage._batch_exist = MagicMock(side_effect=RuntimeError("master failed"))
+        linker.storage._batch_exist = MagicMock(
+            side_effect=RuntimeError("master failed")
+        )
         self.assertFalse(linker.revalidate_load([transfer]))
 
 

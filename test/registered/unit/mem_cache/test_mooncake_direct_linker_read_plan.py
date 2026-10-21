@@ -58,7 +58,11 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         linker.tp_rank = 0
         linker.num_layers = 1
         linker.pools = {}
-        linker.storage = types.SimpleNamespace(store=Mock())
+        linker.storage = types.SimpleNamespace(
+            store=Mock(),
+            get_local_dfs_health_policy=Mock(return_value=(True, True)),
+            _report_dfs_operation_timeout=Mock(),
+        )
         linker._prepare_read_plan_layouts = Mock(return_value=[])
         linker._prepare_expanded_load = Mock(
             side_effect=AssertionError("unexpected Python session preparation")
@@ -148,6 +152,69 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
 
         linker._prepare_expanded_load.assert_not_called()
         linker.abort_prepared_load.assert_not_called()
+
+    def test_read_plan_timeout_marks_dfs_read_unavailable(self):
+        linker = self._read_plan_linker(prefetch=False)
+        linker.storage.store.create_read_plan.return_value.run.side_effect = (
+            RuntimeError(
+                "Mooncake read plan range get failed at group=-1 "
+                "key_index=0 rc=-1607 expected=4096"
+            )
+        )
+
+        with self.assertLogs(
+            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker",
+            level="ERROR",
+        ):
+            self.assertFalse(linker.load_layer_wise(0, []))
+
+        linker.storage._report_dfs_operation_timeout.assert_called_once_with(
+            "read", -1607
+        )
+
+    def test_read_plan_non_timeout_error_does_not_change_dfs_policy(self):
+        linker = self._read_plan_linker(prefetch=False)
+        linker.storage.store.create_read_plan.return_value.run.side_effect = (
+            RuntimeError(
+                "Mooncake read plan range get failed at group=-1 "
+                "key_index=0 rc=-1601 expected=4096"
+            )
+        )
+
+        with self.assertLogs(
+            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker",
+            level="ERROR",
+        ):
+            self.assertFalse(linker.load_layer_wise(0, []))
+
+        linker.storage._report_dfs_operation_timeout.assert_not_called()
+
+    def test_borrowed_read_plan_reselects_memory_when_dfs_is_disabled(self):
+        linker = self._read_plan_linker(prefetch=True)
+        linker.storage.get_local_dfs_health_policy.return_value = (False, True)
+        linker.session_lock = threading.Lock()
+        linker.prepared_load_sessions = {"rid": ["tagged-page"]}
+        linker.session_refcounts = {"tagged-page": 1}
+        linker.session_sources = {"tagged-page": "dfs"}
+        linker.session_lease_base = {"tagged-page": 1.0}
+        linker._prepare_read_plan_layouts.return_value = [
+            (["tagged-page"], [0], True, [[]])
+        ]
+        store = linker.storage.store
+        store.batch_get_session_start_with_sources.return_value = (
+            [0],
+            ["memory"],
+        )
+        store.all_get_sessions_memory.return_value = True
+
+        self.assertTrue(linker.load_layer_wise(0, [], request_ids=["rid"]))
+
+        store.batch_get_session_start_with_sources.assert_called_once_with(
+            ["tagged-page"]
+        )
+        store.all_get_sessions_memory.assert_called_once_with(["tagged-page"])
+        self.assertEqual(linker.session_sources["tagged-page"], "memory")
+        store.create_read_plan.return_value.run.assert_called_once()
 
     def test_prefetch_off_legacy_load_batches_sessions_by_pool(self):
         for page_wise in (False, True):
@@ -404,6 +471,7 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         self.assertEqual(queued_rid, "rid")
         self.assertEqual(queued_transfers, [transfer])
         linker.host_prefetch_queue.task_done()
+
 
 if __name__ == "__main__":
     unittest.main()
