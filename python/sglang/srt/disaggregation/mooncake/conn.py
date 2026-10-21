@@ -250,6 +250,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.enable_trace = server_args.enable_trace
         self._final_poll_enabled = False
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # Abort terminal records must also cover decode's waiting timeout.
+            self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             # Per-room count of chunks not yet transferred; teardown waits for
