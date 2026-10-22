@@ -293,19 +293,6 @@ def set_dp_buffer_len(
 ):
     import os
 
-    if os.environ.get("SGLANG_HC_DEBUG"):
-        import traceback
-
-        frames = traceback.extract_stack()[-4:-1]
-        caller = " <- ".join(
-            f"{f.filename.split('/')[-1]}:{f.lineno}:{f.name}" for f in frames
-        )
-        print(
-            f"[HC_DEBUG set_dp_buffer_len] global={global_dp_buffer_len} "
-            f"local={local_dp_buffer_len} max_padding={dp_max_padding} "
-            f"gnt={global_num_tokens} caller={caller}",
-            flush=True,
-        )
     _DpGatheredBufferWrapper.set_dp_buffer_len(
         global_dp_buffer_len,
         local_dp_buffer_len,

@@ -1445,12 +1445,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             set_is_extend_in_batch(False)
             import os
 
-            if os.environ.get("SGLANG_HC_DEBUG"):
-                print(
-                    f"[HC_DEBUG load_batch-restore] key_size={self._replay_graph_key.size} "
-                    f"global={cap_dp[0]} local={cap_dp[1]} max_padding={cap_dp[2]} gnt={cap_dp[3]}",
-                    flush=True,
-                )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
         from sglang.srt.speculative.ragged_verify import round_up_grid
