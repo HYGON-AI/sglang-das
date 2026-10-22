@@ -20,6 +20,7 @@ from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
 
 import torch
+from sglang.srt.utils import get_bool_env_var
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -447,6 +448,16 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                         )
 
             loaded_params.add(name)
+
+        if get_bool_env_var("SGLANG_MTP_LOAD_DEBUG"):
+            import torch as _t
+
+            names = sorted(
+                pn for pn, _ in self.named_parameters() if "layers.0." in pn
+            )
+            for pn in names[:28]:
+                logger.info("[MTP_LOAD_DEBUG] param %s", pn)
+            logger.info("[MTP_LOAD_DEBUG] total layer0 params: %d", len(names))
         return loaded_params
 
 
