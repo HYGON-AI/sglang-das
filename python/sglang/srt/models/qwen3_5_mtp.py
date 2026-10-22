@@ -270,7 +270,24 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
         # fused experts: experts.w13_weight / experts.w2_weight
         is_fused_expert = False
+        # Scale keys must come before weight keys: ckpt names like
+        # ``experts.gate_up_proj.weight_scale`` contain ``experts.gate_up_proj``,
+        # and naive replace would yield the non-existent
+        # ``experts.w13_weight.weight_scale`` instead of ``w13_weight_scale``
+        # (SlimQuant registers the scales as w13_weight_scale / w2_weight_scale).
         fused_expert_params_mapping = [
+            (
+                "experts.w13_weight_scale",
+                "experts.gate_up_proj.weight_scale",
+                0,
+                "w1",
+            ),
+            (
+                "experts.w2_weight_scale",
+                "experts.down_proj.weight_scale",
+                0,
+                "w2",
+            ),
             ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
         ]
