@@ -223,9 +223,7 @@ class SchedulerBatchResultProcessor:
             # for (pool leak). Use the tracked window-aware helper, which stops
             # at max(window, page) and records swa_evicted_seqlen so the
             # end-of-request path releases the remainder.
-            window_size = int(
-                getattr(self.model_config, "sliding_window_size", 0) or 0
-            )
+            window_size = int(getattr(self.model_config, "sliding_window_size", 0) or 0)
             if window_size > 0 and prompt_len > 0:
                 free_swa_out_of_window_slots(
                     req,
@@ -1022,9 +1020,19 @@ class SchedulerBatchResultProcessor:
             req.output_ids.extend(next_token_id)
             new_accept_len = len(next_token_id)
 
-            self._maybe_update_reasoning_tokens(req, next_token_id)
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accept_len)
+
+            # A speculative block can cross EOS or the output budget. Count
+            # only its retained prefix, after the finish boundary is known;
+            # even the reasoning-end marker may lie in the discarded suffix.
+            reasoning_token_ids = next_token_id
+            if req.finished_len is not None:
+                output_start = len(req.output_ids) - new_accept_len
+                reasoning_token_ids = next_token_id[
+                    : max(0, req.finished_len - output_start)
+                ]
+            self._maybe_update_reasoning_tokens(req, reasoning_token_ids)
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
 
