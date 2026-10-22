@@ -3233,12 +3233,16 @@ class DeepseekV4AttnBackend(
             extend_seq_lens = tail.extend_seq_lens
             extend_seq_lens_cpu = tail.extend_seq_lens_cpu
         assert extend_seq_lens_cpu is not None
-        num_global_queries = sum(extend_seq_lens_cpu)
-        assert num_qo_tokens >= num_global_queries, (
-            "DSV4 sparse prefill requires global query rows: "
-            f"allocated {num_qo_tokens}, but request offsets cover {num_global_queries}. "
-            "CP-local queries must use paged attention."
+        cp_active = (
+            dsa_use_prefill_cp(forward_batch) if _is_hcu else is_cp_active(forward_batch)
         )
+        if not cp_active:
+            num_global_queries = sum(extend_seq_lens_cpu)
+            assert num_qo_tokens >= num_global_queries, (
+                "DSV4 sparse prefill requires global query rows: "
+                f"allocated {num_qo_tokens}, but request offsets cover {num_global_queries}. "
+                "CP-local queries must use paged attention."
+            )
         # Reject undersized query buffers before accessing attention metadata.
         request_layout = core_attn_metadata.request_window_layout
         assert tail is None or request_layout is not None
@@ -3255,9 +3259,6 @@ class DeepseekV4AttnBackend(
         # HCU CP needs physical/real lengths split so dummy rows cannot alias a
         # request's C4/C128 workspace. Keep the device-side metadata path HCU-only.
         query_pos = core_attn_metadata.seq_lens_casual[:num_qo_tokens] - 1
-        cp_active = (
-            dsa_use_prefill_cp(forward_batch) if _is_hcu else is_cp_active(forward_batch)
-        )
         if request_layout is not None:
             assert not cp_active
             query_pos = request_layout.pos.to(torch.int32)
@@ -3286,6 +3287,15 @@ class DeepseekV4AttnBackend(
                 )
         else:
             query_lens = extend_seq_lens.to(torch.int32)
+        if cp_active:
+            # CP shards the query layout: the rank-local lens, not the global
+            # extend lens, are the rows this cache indexes.
+            num_local_queries = int(query_lens.sum())
+            assert num_qo_tokens >= num_local_queries, (
+                "DSV4 sparse prefill requires the rank-local query rows: "
+                f"allocated {num_qo_tokens}, but CP-local offsets cover "
+                f"{num_local_queries}."
+            )
         return SparsePrefillChunkCache.build(
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             extend_seq_lens=extend_seq_lens.to(torch.int32),
