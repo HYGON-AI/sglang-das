@@ -99,11 +99,18 @@ class TestEquivalence(CustomTestCase):
     """Every decoder row a later step reads is written as without the skip."""
 
     gate = staticmethod(make_gate())
+    # main split the layout helpers; the tail-lens helper must be in scope.
+    _layout_ns = dict(torch=torch)
+    load(
+        SOURCE / "kernels/ops/attention/dsv4_attn_metadata_kernels.py",
+        "late_layer_tail_lens",
+        _layout_ns,
+    )
     layout = staticmethod(
         load(
             SOURCE / "kernels/ops/attention/dsv4_attn_metadata_kernels.py",
             "late_layer_tail_layout",
-            dict(torch=torch),
+            _layout_ns,
         )
     )
 

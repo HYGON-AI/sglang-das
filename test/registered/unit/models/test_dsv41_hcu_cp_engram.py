@@ -77,6 +77,7 @@ def test_engram_global_history_then_rank_local_hashes(hcu, cp):
             forward_hc_pre_from_prev=lambda **kwargs: kwargs["state"],
         )
         model = SimpleNamespace(
+            decoder_replay_tail=None,
             pp_group=SimpleNamespace(world_size=1), engram_hasher=hasher,
             late_layer_start=None, start_layer=0, end_layer=1, layers=[layer],
             config=SimpleNamespace(model_type="deepseek_v41", vision_n_layers=0),

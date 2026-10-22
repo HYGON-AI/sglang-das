@@ -23,6 +23,7 @@ class TestDsv41HcuPdTopology(unittest.TestCase):
             attn_cp_size=1,
             dcp_size=1,
             enable_prefill_cp=False,
+            cp_strategy="interleave",
             disaggregation_mode="decode",
             disaggregation_transfer_backend="mooncake",
             speculative_algorithm="DSPARK",
@@ -31,6 +32,7 @@ class TestDsv41HcuPdTopology(unittest.TestCase):
             enable_decoder_swa_bounded_replay=False,
             enable_hisparse=False,
             enable_two_batch_overlap=False,
+            moe_a2a_backend="none",
             pp_size=1,
             cuda_graph_config=SimpleNamespace(
                 prefill=SimpleNamespace(backend=Backend.DISABLED)
