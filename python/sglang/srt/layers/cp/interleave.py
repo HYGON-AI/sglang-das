@@ -48,6 +48,11 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_hcu
+
+_is_hcu = is_hcu()
+_HCU_GATHER_CHUNK_THRESHOLD_BYTES = 512 * 1024 * 1024
+_HCU_GATHER_CHUNK_BYTES = 64 * 1024 * 1024
 
 
 def attn_cp_interleave_gather(hidden_states: torch.Tensor):
@@ -277,14 +282,18 @@ class InterleaveCPStrategy(ContextParallelStrategy):
     def gather_hidden_states(
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
-        return self._gather_interleaved_tensor(x, forward_batch)
+        return self._gather_interleaved_tensor(
+            x, forward_batch, chunk_large_output=_is_hcu
+        )
 
     def gather_kv_cache(
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
         return self._gather_interleaved_tensor(x, forward_batch)
 
-    def _gather_interleaved_tensor(self, x: Any, forward_batch) -> Any:
+    def _gather_interleaved_tensor(
+        self, x: Any, forward_batch, *, chunk_large_output: bool = False
+    ) -> Any:
         metadata = getattr(forward_batch, "attn_cp_metadata", None)
         if metadata is None:
             raise RuntimeError("Interleave CP gather requires attn_cp_metadata.")
@@ -310,6 +319,42 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         physical_rank_len = max(metadata.per_rank_actual_token)
         if physical_rank_len == 0:
             return x.new_empty((0, *x.shape[1:]))
+
+        if (
+            chunk_large_output
+            and x.ndim == 2
+            and metadata.gather_index is None
+            and total_tokens * x.shape[1] * x.element_size()
+            >= _HCU_GATHER_CHUNK_THRESHOLD_BYTES
+        ):
+            # Write each bounded rank-major gather directly into final token order.
+            # Avoid keeping full raw and reordered DSPARK aux outputs simultaneously.
+            rows_per_chunk = max(
+                1,
+                _HCU_GATHER_CHUNK_BYTES
+                // (self.cp_size * x.shape[1] * x.element_size()),
+            )
+            rows_per_chunk = min(rows_per_chunk, physical_rank_len)
+            ordered = x.new_empty((physical_rank_len, self.cp_size, x.shape[1]))
+            with use_symmetric_memory(
+                get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
+            ):
+                scratch = x.new_empty((self.cp_size * rows_per_chunk, x.shape[1]))
+            for start in range(0, physical_rank_len, rows_per_chunk):
+                end = min(start + rows_per_chunk, physical_rank_len)
+                chunk = scratch[: self.cp_size * (end - start)]
+                local_end = min(end, local_logical_len)
+                if local_end == end:
+                    local_chunk = x[start:end].contiguous()
+                else:
+                    local_chunk = x.new_zeros((end - start, x.shape[1]))
+                    valid_rows = max(0, local_end - start)
+                    local_chunk[:valid_rows] = x[start:local_end]
+                attn_cp_all_gather_into_tensor(chunk, local_chunk)
+                ordered[start:end].copy_(
+                    chunk.view(self.cp_size, end - start, x.shape[1]).transpose(0, 1)
+                )
+            return ordered.view(-1, x.shape[1])[:total_tokens]
 
         padded_x = x.new_zeros((physical_rank_len, *x.shape[1:]))
         padded_x[:local_logical_len] = x[:local_logical_len]

@@ -220,8 +220,6 @@ def dsa_prefill_has_history(forward_batch: "ForwardBatch") -> bool:
 
 
 def is_dsa_enable_prefill_cp():
-    if is_hcu():
-        return get_parallel().enable_dsa_prefill_context_parallel
     if is_musa():
         return False
 

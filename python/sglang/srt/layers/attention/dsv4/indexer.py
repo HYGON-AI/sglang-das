@@ -699,17 +699,65 @@ def topk_transform_paged_bf16(
     )
 
 
+def deep_gemm_fp4_paged_mqa_logits(
+    q_fp4: Tuple[torch.Tensor, torch.Tensor],
+    k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata,
+    max_seq_len: int,
+    table_block_size: int = 64,
+    rows_per_request: int = 1,
+) -> torch.Tensor:
+    """DeepGEMM paged fp4 logits; no hadamard, the reference does not apply one.
+    On HCU the same contract runs on LightOp (``lightop_indexer``), where
+    ``rows_per_request`` pairs verify rows; DeepGEMM ignores it."""
+    if _is_hcu:
+        from sglang.kernels.ops.attention.dsv4 import lightop_indexer
+
+        return lightop_indexer.paged_mqa_logits_fp4(
+            q_fp4,
+            k_cache,
+            weights,
+            seq_lens,
+            page_table,
+            deep_gemm_metadata,
+            max_seq_len,
+            table_block_size=table_block_size,
+            rows_per_request=rows_per_request,
+        )
+    from deep_gemm import fp8_fp4_paged_mqa_logits
+
+    sl = seq_lens.to(torch.int32)
+    if sl.dim() == 1:
+        sl = sl.unsqueeze(-1)
+    return fp8_fp4_paged_mqa_logits(
+        q_fp4,
+        k_cache,
+        weights,
+        sl,
+        page_table,
+        deep_gemm_metadata,
+        max_seq_len,
+        False,
+    )
+
+
 def topk_transform_paged_from_metadata(
     logits: torch.Tensor,
     metadata,
     page_indices: torch.Tensor,
     raw_indices: Optional[torch.Tensor] = None,
+    candidate_mask: Optional[torch.Tensor] = None,
     *,
     rows: Optional[slice] = None,
     topk_metadata: Optional[torch.Tensor] = None,
 ) -> None:
     """Pool slots into ``page_indices`` (``-1`` past the valid count) and, when given,
     positions into ``raw_indices``; ``metadata`` is a ``PagedIndexerMetadata``."""
+    if candidate_mask is not None:
+        logits = logits.masked_fill(~candidate_mask, -torch.inf)
     if rows is None:
         seq_lens = metadata.compressed_seq_lens
         page_table = metadata.page_table

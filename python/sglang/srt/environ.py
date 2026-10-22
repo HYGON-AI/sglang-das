@@ -1150,6 +1150,7 @@ class Envs:
     SGLANG_ENABLE_DP_ATTENTION_LOCAL_CONTROL_BROADCAST = EnvBool(False)
     SGLANG_KV_LAYOUT_HCU_FA = EnvBool(True)
     SGLANG_USE_LIGHTOP = EnvBool(False)
+    SGLANG_HCU_HC_MIX_STATS_OPT = EnvBool(True)
     SGLANG_USE_LIGHTOP_MOE_SUM_MUL_ADD = EnvBool(False)
     SGLANG_USE_OPT_CAT = EnvBool(False)
     SGLANG_USE_FUSED_MLA_CAT = EnvBool(False)
@@ -1168,11 +1169,26 @@ class Envs:
     SGLANG_ROCM_USE_AITER_TILELANG_MHC = EnvBool(False)
     SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM = EnvBool(False)
     SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE = EnvBool(False)
+       # LightOp FP4 indexer logits on gfx928/936/938,Set to 0 to fall back to Triton.
+    SGLANG_USE_LIGHTOP_PAGED_MQA_LOGITS_FP4 = EnvBool(True)
+    # DSV4.1 low-ratio decode/verify indexer on HCU via the paged path on LightOp;
+    # falls back to the slot-based path when LightOp lacks the paged operators.
+    SGLANG_USE_LIGHTOP_DSV41_PAGED_INDEXER = EnvBool(True)
+    # HCU block selection on dense logits; 0 keeps the block-amax + top-k path.
+    SGLANG_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS = EnvBool(True)
+    # Consume Prefill candidates directly from the paged index-K cache on HCU.
+    SGLANG_HCU_PREFILL_PAGED_SPARSE = EnvBool(True)
+    # Use LightOp pointwise/geometry/output fusion; GEMMs and scorer stay unchanged.
+    SGLANG_HCU_PREFILL_SPARSE_FUSION = EnvBool(True)
     SGLANG_USE_FAST_HADAMARD_TRANSFORM = EnvBool(False)
     SGLANG_USE_FUSED_DPSKV4_QNORM_ROPE_KV_ROPE_QUANT = EnvBool(False)
     SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
     SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC = EnvBool(False)
     SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA = EnvBool(False)
+    # With --enable-decoder-swa-bounded-replay: a chunked-prefill step in which every
+    # request still has at least SWA_WINDOW prompt tokens after this chunk stops at
+    # the last kv_source layer. Nothing reads the later layers' rows of such a chunk.
+    SGLANG_DSV41_SKIP_MID_CHUNK_DECODER = EnvBool(True)
     # Gather the packed FP8 DSV4 KV cache into a temporary BF16 workspace before
     # invoking the existing HCU FlashMLA sparse-decode kernel. With the unified
     # MLA path this covers ordinary prefill as well as decode-family forwards.
@@ -1821,6 +1837,10 @@ class Envs:
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
+    # HCU-only loading optimizations for DeepSeek-V4.1 W4A8 EnGram tables.
+    # Keep disabled by default so the upstream loading and page-cache behavior
+    # remains unchanged unless the deployment explicitly opts in.
+    SGLANG_HCU_ENABLE_DSV41_W4A8_ENGRAM_LOAD_OPTIMIZATION = EnvBool(False)
     # "shared" is one buffer for the whole TP group, mapped by every rank, with no
     # lookup all-reduce (the ranks must share a PID namespace); "per_rank" is one
     # anonymous mapping per rank holding only its rows, gathered with the
@@ -1856,6 +1876,8 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # Opt-in query-row budget for HCU V4.1 eager Prefill FP4 MQA logits.
+    SGLANG_DSV41_PAGED_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(None)
     # HCU RLC (Repartition-Local Compression); off by default.
     SGLANG_DSV4_COMPRESS_RLC = EnvBool(False)
     # Deprecated: DSV4 compressor V2 is always used.

@@ -242,17 +242,173 @@ def _with_packed_draft_mapping(
     *,
     target_device_layer_num: int,
     draft_layer_num: int,
+    transfer_layer_num: int | None = None,
 ) -> dict[int, int | tuple[int, ...]]:
     """Attach draft depth N to the same transfer layer as target layer N."""
-    if draft_layer_num > len(layer_mapping):
+    if transfer_layer_num is None:
+        transfer_layer_num = len(layer_mapping)
+    if draft_layer_num > transfer_layer_num:
         raise ValueError(
             "Packed draft layers exceed the target transfer layer count: "
-            f"{draft_layer_num} > {len(layer_mapping)}."
+            f"{draft_layer_num} > {transfer_layer_num}."
         )
     result: dict[int, int | tuple[int, ...]] = dict(layer_mapping)
     for depth in range(draft_layer_num):
-        result[depth] = (layer_mapping[depth], target_device_layer_num + depth)
+        target = layer_mapping.get(depth)
+        draft = target_device_layer_num + depth
+        result[depth] = (target, draft) if target is not None else draft
     return result
+
+
+def _build_deepseek_v41_device_pool_group(
+    kvcache: Any,
+    page_size: int,
+    mtp_draft_device_pools: tuple[Any, ...],
+) -> DevicePoolGroup:
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _require_single_row_dsv4_swa_pages,
+    )
+
+    sources_by_ratio = kvcache.sources_by_ratio
+    if getattr(kvcache, "_unified_kv", False) or any(
+        ratio not in (1, 2) for ratio in sources_by_ratio
+    ):
+        raise ValueError("V4.1 direct linker requires paged C1/C2 and SWA pools.")
+    if page_size <= 0 or page_size != kvcache.page_size:
+        raise ValueError("V4.1 tree page size must match the FULL pool page size.")
+    if sources_by_ratio.get(2) and page_size % 2:
+        raise ValueError("V4.1 C2 direct linker requires an even tree page size.")
+
+    num_layers = kvcache._stage_end - kvcache._stage_start
+    owned_layers = getattr(kvcache, "_swa_global_to_local", None)
+    swa_mapping = (
+        {layer - kvcache.start_layer: local for layer, local in owned_layers.items()}
+        if owned_layers is not None
+        else {layer: layer for layer in range(num_layers)}
+    )
+    for pool in (kvcache, *mtp_draft_device_pools):
+        if pool.swa_kv_pool is None:
+            raise ValueError("V4.1 direct linker requires page-addressed SWA storage.")
+        _require_single_row_dsv4_swa_pages(
+            logical_page_size=pool.swa_page_size,
+            physical_page_size=pool.swa_kv_pool.page_size,
+            consumer="DeepSeek-V4.1 direct external linker",
+        )
+        if pool.swa_page_size != page_size:
+            raise ValueError("V4.1 SWA page size must match the tree page size.")
+    if any(getattr(pool, "sources_by_ratio", {}) for pool in mtp_draft_device_pools):
+        raise ValueError("V4.1 direct linker only supports SWA-only packed drafts.")
+    swa_buffers = kvcache.swa_kv_pool.kv_buffer
+    if set(swa_mapping.values()) != set(range(len(swa_buffers))):
+        raise ValueError("V4.1 SWA ownership does not match its physical buffers.")
+    draft_buffers = [
+        buffer
+        for pool in mtp_draft_device_pools
+        for buffer in pool.swa_kv_pool.kv_buffer
+    ]
+    swa_mapping = _with_packed_draft_mapping(
+        swa_mapping,
+        target_device_layer_num=len(swa_buffers),
+        draft_layer_num=len(draft_buffers),
+        transfer_layer_num=num_layers,
+    )
+    entries = []
+    if swa_mapping:
+        entries.append(
+            DevicePoolEntry(
+                name=PoolName.SWA,
+                indices_from_pool=PoolName.SWA,
+                device_pool=kvcache.swa_kv_pool,
+                components=[[*swa_buffers, *draft_buffers]],
+                layer_mapping=swa_mapping,
+                page_size=page_size,
+                rows_are_pages=True,
+            )
+        )
+
+    def add(name, pool, buffers, mapping):
+        if set(mapping.values()) != set(range(len(buffers))):
+            raise ValueError(f"V4.1 {name} layer mapping does not cover its buffers.")
+        if mapping:
+            entries.append(
+                DevicePoolEntry(
+                    name=name,
+                    indices_from_pool=PoolName.KV,
+                    device_pool=pool,
+                    components=[buffers],
+                    layer_mapping=mapping,
+                    page_size=page_size,
+                    rows_are_pages=True,
+                )
+            )
+
+    for ratio, names in (
+        (
+            1,
+            (
+                PoolName.DEEPSEEK_V4_C1,
+                PoolName.DEEPSEEK_V4_C1_INDEXER,
+                PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE,
+            ),
+        ),
+        (
+            2,
+            (
+                PoolName.DEEPSEEK_V4_C2,
+                PoolName.DEEPSEEK_V4_C2_INDEXER,
+                PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
+            ),
+        ),
+    ):
+        sources = sources_by_ratio.get(ratio, [])
+        if not sources:
+            continue
+        kv_pool = kvcache.kv_pools[ratio]
+        index_pool = kvcache.index_pools[ratio]
+        slots_per_page = page_size // ratio
+        if kv_pool.page_size != slots_per_page:
+            raise ValueError(f"V4.1 C{ratio} KV pages must align with FULL pages.")
+        if slots_per_page % index_pool.page_size:
+            raise ValueError(f"V4.1 C{ratio} indexer pages must divide FULL pages.")
+        index_pages_per_full_page = slots_per_page // index_pool.page_size
+        index_mapping = {
+            source - kvcache.start_layer: index for index, source in enumerate(sources)
+        }
+        # CP layer-split shards KV source layers, but keeps every indexer source.
+        kv_mapping = (
+            {
+                source - kvcache.start_layer: kvcache._low_owner_local_by_source[source]
+                for source in sources
+                if source in owned_layers
+            }
+            if owned_layers is not None
+            else index_mapping
+        )
+        add(names[0], kv_pool, kv_pool.kv_buffer, kv_mapping)
+        if index_pool.index_k_with_scale_buffer is not None:
+            regions = [(names[1], index_pool.index_k_with_scale_buffer)]
+        else:
+            regions = [
+                (names[1], index_pool.index_k_payload_buffer),
+                (names[2], index_pool.index_k_scale_buffer),
+            ]
+        for name, buffers in regions:
+            views = []
+            for buffer in buffers:
+                if not buffer.is_contiguous():
+                    raise ValueError(
+                        f"V4.1 {name} requires contiguous indexer buffers."
+                    )
+                full_pages = buffer.shape[0] // index_pages_per_full_page
+                views.append(
+                    buffer[: full_pages * index_pages_per_full_page]
+                    .view(torch.uint8)
+                    .view(full_pages, -1)
+                )
+            add(name, index_pool, views, index_mapping)
+    # C2's request-scoped pending pair is empty at even FULL-page boundaries.
+    # It must not be addressed or restored using token-page indices.
+    return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
 
 
 def _build_deepseek_v4_device_pool_group(
@@ -270,6 +426,13 @@ def _build_deepseek_v4_device_pool_group(
 
     if isinstance(kvcache.c4_kv_pool, HiSparseC4DevicePool):
         raise ValueError("The direct external linker does not support HiSparse.")
+
+    if any(
+        ratio in (1, 2) for ratio in getattr(kvcache, "sources_by_ratio", {})
+    ) or any(ratio in (1, 2) for ratio in getattr(kvcache, "compression_ratios", ())):
+        return _build_deepseek_v41_device_pool_group(
+            kvcache, page_size, mtp_draft_device_pools
+        )
 
     mappings = _resolve_deepseek_v4_layer_mappings(kvcache)
     is_unified_kv = getattr(kvcache, "_unified_kv", False)

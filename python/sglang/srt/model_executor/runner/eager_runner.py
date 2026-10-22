@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from copy import copy
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Tuple, Union
 
@@ -412,17 +413,39 @@ class EagerRunner(BaseRunner):
                 else hidden_states
             )
 
+        tail = None
+        gather_batch = forward_batch
+        if (
+            aux_hidden_states is not None
+            and getattr(model.model, "late_layer_start", None) is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            # A mid-chunk prefill skipped the tail: its captures are full rows.
+            and getattr(self.model_runner.attn_backend, "tail_forward_metadata", None)
+            is not None
+        ):
+            # The body restored the full batch, but DSpark captures are still
+            # compact tail rows. Gather with their own physical CP layout.
+            tail = self.model_runner.attn_backend.tail_forward_metadata.late_layer_tail
+            assert tail.cp_metadata is not None
+            assert tail.global_token_indices is not None
+            gather_batch = copy(forward_batch)
+            gather_batch.attn_cp_metadata = tail.cp_metadata
+
         stream = torch.cuda.current_stream()
-        hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
+        if aux_hidden_states is not None and isinstance(hidden_states, tuple):
+            # The logits path drops pre-HC states when aux capture is active;
+            # avoid gathering the unused tensor across CP ranks.
+            hidden_states = hidden_states[0]
+        hidden_states = cp_gather_after_forward(hidden_states, gather_batch, stream)
         # DSpark aux tensors ride the same CP token split; gather them the same way.
         if aux_hidden_states is not None:
             if isinstance(aux_hidden_states, torch.Tensor):
                 aux_hidden_states = cp_gather_after_forward(
-                    aux_hidden_states, forward_batch, stream
+                    aux_hidden_states, gather_batch, stream
                 )
             else:
                 aux_hidden_states = [
-                    cp_gather_after_forward(aux, forward_batch, stream)
+                    cp_gather_after_forward(aux, gather_batch, stream)
                     for aux in aux_hidden_states
                 ]
         # Models with a model-specific logits contract (DSV4: DSpark/PD aux
@@ -445,14 +468,27 @@ class EagerRunner(BaseRunner):
             # DSpark aux capture is on, else it overrides the packed aux.
             if aux_hidden_states is None:
                 logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
-        return model.logits_processor(
-            forward_batch.input_ids,
+        input_ids = forward_batch.input_ids
+        logits_metadata = forward_batch
+        if tail is not None:
+            from sglang.srt.layers.logits_processor import LogitsMetadata
+
+            input_ids = input_ids[tail.global_token_indices]
+            logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+            logits_metadata.extend_seq_lens = tail.extend_seq_lens
+            logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
+            logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
+        output = model.logits_processor(
+            input_ids,
             hidden_states,
             model.lm_head,
-            forward_batch,
+            logits_metadata,
             aux_hidden_states,
             **logits_kwargs,
         )
+        if tail is not None:
+            output.hidden_states_token_indices = tail.global_token_indices
+        return output
 
     def _execute_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None

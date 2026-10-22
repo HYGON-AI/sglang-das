@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from typing import Optional, Union
 
 import torch
@@ -22,8 +23,22 @@ from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import get_bool_env_var, is_hcu
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+_use_hcu_dequant_k_cache_paged = is_hcu() and get_bool_env_var(
+    "SGLANG_HCU_OPT_DEQUANT_K_CACHE_PAGED", "true"
+)
+_hcu_dequantize_k_cache_paged = None
+if _use_hcu_dequant_k_cache_paged:
+    try:
+        from lightop import (
+            dequantize_k_cache_paged_hcu as _hcu_dequantize_k_cache_paged,
+        )
+    except ImportError:
+        logging.getLogger(__name__).warning(
+            "LightOp dequantize_k_cache_paged_hcu is unavailable; using Triton."
+        )
 
 # v4 KV cache layout (see dsv4.index_buf_accessor._set_k_and_s_triton_kernel):
 #   per-token: 448 fp8 nope + 64 bf16 rope (= 576 contiguous bytes) +
@@ -89,6 +104,16 @@ def dequantize_k_cache_paged(
         assert out.shape == (num_tokens, 1, DIM_NOPE + DIM_ROPE)
         assert out.dtype == torch.bfloat16
 
+    if _hcu_dequantize_k_cache_paged is not None:
+        _hcu_dequantize_k_cache_paged(
+            quant_k_cache_u8,
+            page_table_1_flattened,
+            out,
+            page_size,
+            fp8_dtype == torch.float8_e4m3fnuz,
+        )
+        return out
+
     _dequantize_k_cache_paged_kernel[(num_tokens,)](
         out,
         buf_fp8,
@@ -137,9 +162,9 @@ def dequantize_k_cache_paged_v41(
     quant_k_cache_u8 = quant_k_cache.view(torch.uint8)
     num_tokens = page_table_1_flattened.shape[0]
     bytes_per_page = quant_k_cache_u8.shape[-1]
-    assert bytes_per_page >= page_size * layout.bytes_per_token, (
-        f"{bytes_per_page=} cannot hold {page_size} tokens of {layout}"
-    )
+    assert (
+        bytes_per_page >= page_size * layout.bytes_per_token
+    ), f"{bytes_per_page=} cannot hold {page_size} tokens of {layout}"
     buf_fp8 = quant_k_cache_u8.view(fp8_dtype).reshape(-1)
     buf_uint8 = quant_k_cache_u8.reshape(-1)
 

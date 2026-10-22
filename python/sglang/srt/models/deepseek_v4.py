@@ -42,6 +42,7 @@ from sglang.kernels.ops.gemm.dsv4_wo_a import (
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
+from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -132,6 +133,12 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE, MultimodalInputs
 from sglang.srt.mem_cache.memory_pool import RadixAttention
+from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers import (
+    is_cp_cache_layer_split_deepseek_v4_pool,
+    maybe_prefetch_cp_kv_extra,
+    maybe_prefetch_cp_kv_swa,
+    maybe_wait_cp_kv_swa_prefetch,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -210,6 +217,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
 )
 from sglang.srt.runtime_context import (
     get_device,
+    get_disagg,
     get_exec,
     get_forward,
     get_parallel,
@@ -2175,6 +2183,7 @@ class MQALayer(MqaAttentionBase):
         q_rope_out: Optional[torch.Tensor] = None,
         k_nope_out: Optional[torch.Tensor] = None,
         k_rope_out: Optional[torch.Tensor] = None,
+        overlap_layer_split_prefetch: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
@@ -2184,7 +2193,14 @@ class MQALayer(MqaAttentionBase):
             q_lora, _ = self.wq_a(x_linear)
             qkv_a = None
 
-        use_cp = is_cp_active(forward_batch)
+        # HCU shards inputs through legacy DSA CP, not the generic CP strategy.
+        use_cp = (
+            dsa_use_prefill_cp(forward_batch) if _is_hcu else is_cp_active(forward_batch)
+        )
+        layer_split_cp = (
+            is_cp_cache_layer_split_deepseek_v4_pool(get_token_to_kv_pool())
+            and forward_batch.forward_mode.is_context_parallel_extend()
+        )
         kv: Optional[torch.Tensor]
 
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
@@ -2230,9 +2246,10 @@ class MQALayer(MqaAttentionBase):
             and not is_decode
             and not forward_batch.forward_mode.is_target_verify()
         )
-        do_fused_qk_norm_rope = (
-            unified and (is_decode or fuse_verify or fuse_prefill)
-        ) or (not unified and self.use_fused_qk_norm_rope)
+        do_fused_qk_norm_rope = not layer_split_cp and (
+            (unified and (is_decode or fuse_verify or fuse_prefill))
+            or (not unified and self.use_fused_qk_norm_rope)
+        )
 
         # The indexer's wq_b reuses the fp8 quant of the normed q_lora made here.
         q_lora_quant = None
@@ -2312,7 +2329,7 @@ class MQALayer(MqaAttentionBase):
                     False,
                 )
                 if use_cp:
-                    # Store globally ordered KV after the CP gather.
+                    # Local fused KV must be gathered before writing global slots.
                     swa_cache, swa_loc = None, None
 
             from sglang.kernels.ops.attention.fused_qk_norm_rope_store import (
@@ -2406,11 +2423,11 @@ class MQALayer(MqaAttentionBase):
                 q_out.copy_(q)
         else:
             q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
-            if _is_hip:
+            if _is_hip and not _is_hcu:
                 q, q_lora, fuse_q_rope = _hip.compute_q_b(
                     self, q_lora, q_for_wqb, positions, q_out, unified, use_cp
                 )
-            else:
+            elif not overlap_layer_split_prefetch:
                 q = self._compute_q_b(q_for_wqb, positions, q_out)
                 fuse_q_rope = False
             if unified:
@@ -2543,6 +2560,14 @@ class MQALayer(MqaAttentionBase):
                         self.compressor,
                     )
 
+        if overlap_layer_split_prefetch:
+            # Keep collective order unchanged. KV and indexer sources are ready;
+            # Q projection only reads q_lora and can overlap the side-stream fetch.
+            pool = get_token_to_kv_pool()
+            maybe_prefetch_cp_kv_swa(pool, self.layer_id, forward_batch)
+            maybe_prefetch_cp_kv_extra(pool, self.layer_id, forward_batch)
+            q = self._compute_q_b(q_for_wqb, positions, q_out)
+
         return q, kv
 
     def forward(
@@ -2553,7 +2578,15 @@ class MQALayer(MqaAttentionBase):
         x_quant: Optional[torch.Tensor] = None,
         defer_all_reduce: bool = False,
     ) -> Union[torch.Tensor, mhc.AttnOutput]:
-        if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
+        layer_split_prefill = (
+            is_cp_cache_layer_split_deepseek_v4_pool(get_token_to_kv_pool())
+            and forward_batch.forward_mode.is_context_parallel_extend()
+        )
+        if (
+            not get_attn_tp_context().input_scattered
+            and x.shape[0] == 0
+            and not layer_split_prefill
+        ):
             return x
 
         attn_backend = get_attn_backend()
@@ -2710,6 +2743,17 @@ class MQALayer(MqaAttentionBase):
                 q_out = q_padded[:, tp_slice, :]
         attn_sink = self._local_attn_sink(kernel_num_heads)
 
+        overlap_layer_split_prefetch = (
+            _is_hcu
+            and self.is_dsv41
+            and layer_split_prefill
+            and self.compress_ratio in (1, 2)
+            and self.dsa_enable_prefill_cp
+            and dsa_use_prefill_cp(forward_batch)
+            and not unified
+            and not is_in_breakable_cuda_graph()
+        )
+
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
             # so the bf16 KV intermediate is gone.
@@ -2762,6 +2806,7 @@ class MQALayer(MqaAttentionBase):
                 q_rope_out=q_rope,
                 k_nope_out=k_nope,
                 k_rope_out=k_rope,
+                overlap_layer_split_prefetch=overlap_layer_split_prefetch,
             )
 
         if unified_fp8_prefill and is_cp_active(forward_batch):
@@ -2769,6 +2814,15 @@ class MQALayer(MqaAttentionBase):
             kv, k_rope = _materialize_cp_unified_fp8_kv(
                 kv, k_rope, forward_batch, torch.cuda.current_stream()
             )
+        if layer_split_prefill:
+            pool = get_token_to_kv_pool()
+            if not overlap_layer_split_prefetch:
+                maybe_prefetch_cp_kv_swa(pool, self.layer_id, forward_batch)
+                if self.compress_ratio in (1, 2):
+                    maybe_prefetch_cp_kv_extra(pool, self.layer_id, forward_batch)
+            maybe_wait_cp_kv_swa_prefetch(pool, self.layer_id, forward_batch)
+            if x.shape[0] == 0 and not get_attn_tp_context().input_scattered:
+                return x
 
         if self.use_mega_attention:
             o = self._forward_mega(
@@ -3100,6 +3154,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
                 alt_streams is not None
                 and (
                     _is_cuda
+                    or (_is_hcu and SboFlags.fuse_shared_experts_inside_sbo())
                     or envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
                     or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
                 )
@@ -3229,7 +3284,22 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         # The original FP32 parameters stay intact for small rows and invariant mode.
         self._hc_attn_tf32_parts = self._hc_ffn_tf32_parts = None
         self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
+        # Prepare HCU parts after each weight load/update, before graph capture.
+        # Original FP32 parameters remain the source of truth and fallback.
         if (
+            mhc._use_hcu_hc_mix_stats
+            and self.hc_pre_from_prev_sublayer
+            and self.hc_attn_fn.shape == (24, 20480)
+            and getattr(self.config, "model_type", None) == "deepseek_v41"
+            and not is_batch_invariant_mode_enabled()
+        ):
+            from lightop import split_bf16_hc_weight, split_tf32_hc_weight
+
+            self._hc_attn_tf32_parts = split_tf32_hc_weight(self.hc_attn_fn.data)
+            self._hc_ffn_tf32_parts = split_tf32_hc_weight(self.hc_ffn_fn.data)
+            self._hc_attn_bf16_parts = split_bf16_hc_weight(self.hc_attn_fn.data)
+            self._hc_ffn_bf16_parts = split_bf16_hc_weight(self.hc_ffn_fn.data)
+        elif (
             self.hc_pre_from_prev_sublayer
             and (get_platform().is_sm100 or get_platform().is_sm90)
             and self.hc_attn_fn.shape == (24, 20480)
@@ -3524,7 +3594,9 @@ def _scatter_tail_rows(
         return full[:num_tokens]
     full = rows.new_empty((num_tokens, rows.shape[1]))
     if tail.contiguous_start is not None:
-        full[tail.contiguous_start :].copy_(rows)
+        # Bounded: a CP-padded extend (HCU) carries padding rows past the tail.
+        end = tail.contiguous_start + rows.shape[0]
+        full[tail.contiguous_start : end].copy_(rows)
     else:
         full[tail.token_indices] = rows[: tail.token_indices.shape[0]]
     return full
@@ -3723,6 +3795,28 @@ class DeepseekV4PlatformDecoderLayer(NonCudaDecoderMixin, DeepseekV4DecoderLayer
 DeepseekV4DecoderLayer = (
     DeepseekV4CudaDecoderLayer if _is_cuda else DeepseekV4PlatformDecoderLayer
 )
+
+
+_logged_mid_chunk_decoder_skip = False
+
+
+def _log_mid_chunk_decoder_skip_once(end_layer: int) -> None:
+    global _logged_mid_chunk_decoder_skip
+    if not _logged_mid_chunk_decoder_skip:
+        _logged_mid_chunk_decoder_skip = True
+        logger.info(
+            "Mid-chunk prefill stops after layer %d (SGLANG_DSV41_SKIP_MID_CHUNK_DECODER)",
+            end_layer - 1,
+        )
+
+
+def _scatter_global_tail_rows(
+    tail: LateLayerTail, rows: torch.Tensor, num_tokens: int
+) -> torch.Tensor:
+    # CP-gathered tail rows are in global tail order; place them in the global extend.
+    full = rows.new_empty((num_tokens, *rows.shape[1:]))
+    full[tail.global_token_indices] = rows
+    return full
 
 
 class DeepseekV4Model(nn.Module):
@@ -3984,12 +4078,20 @@ class DeepseekV4Model(nn.Module):
         assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
         hash_ids = None
         cp_extend = (
-            is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
+            (dsa_use_prefill_cp(forward_batch) if _is_hcu else is_cp_active(forward_batch))
+            and forward_batch.forward_mode.is_extend()
         )
         if self.engram_hasher is not None:
             if cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
-                total = int(forward_batch.attn_cp_metadata.total_seq_lens)
+                # Legacy HCU round-robin metadata has total_seq_lens=0. Keep its
+                # global execution padding, matching forward_batch.positions;
+                # EngramHasher masks padding and commits only real requests.
+                total = (
+                    forward_batch.input_ids.shape[0]
+                    if _is_hcu
+                    else int(forward_batch.attn_cp_metadata.total_seq_lens)
+                )
                 hash_ids = self.engram_hasher(
                     forward_batch.input_ids[:total], forward_batch
                 )
@@ -4009,13 +4111,19 @@ class DeepseekV4Model(nn.Module):
             else:
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
         tail = None
+        end_layer = self.end_layer
         if (
             self.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             attn_backend = get_attn_backend()
-            tail = attn_backend.tail_forward_metadata.late_layer_tail
-            self._check_late_layer_tail_readers(forward_batch, tail)
+            if getattr(attn_backend, "skip_late_layers", False):
+                # A mid-chunk prefill: nothing reads the later layers' rows.
+                end_layer = self.late_layer_start
+                _log_mid_chunk_decoder_skip_once(end_layer)
+            else:
+                tail = attn_backend.tail_forward_metadata.late_layer_tail
+                self._check_late_layer_tail_readers(forward_batch, tail)
         tail_in_graph = (
             tail is not None
             and tail.scatter_indices is not None
@@ -4055,7 +4163,7 @@ class DeepseekV4Model(nn.Module):
         if _is_cuda:
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
-        for i in range(self.start_layer, self.end_layer):
+        for i in range(self.start_layer, end_layer):
             if _is_cuda:
                 layer = self.layers[i]
                 if (
@@ -4192,7 +4300,14 @@ class DeepseekV4Model(nn.Module):
                 hidden_states, forward_batch, hc_boundary.FinalRead(), None
             )
             residual_batch.clear(forward_batch)
-        state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
+        # The last run layer may have deferred its post to the next one.
+        state = state.materialized(self.layers[end_layer - 1].hc_cfg)
+        if end_layer < self.end_layer and capture_dspark:
+            # Keep the capture list whole; these rows precede every SWA window
+            # that later reads them, the DSpark draft's included.
+            for i in sorted(dspark_layers_to_capture):
+                if i >= end_layer:
+                    dspark_aux_hidden_states.append(state.residual.mean(dim=1))
         if saved_dp is not None:
             exit_late_layer_dp(forward_batch, saved_dp)
         if saved_full is not None:
@@ -4634,8 +4749,16 @@ class DeepseekV4Model(nn.Module):
                 hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
             )
         hidden_states = self.norm(hidden_states)
+        # HCU prefill CP left the decoder tail rank-local: gather it under its own
+        # layout, which yields the tail rows in global order.
+        hcu_cp_tail = (
+            cp_gather_output and tail is not None and tail.cp_metadata is not None
+        )
         if cp_gather_output:
             stream = torch.cuda.current_stream()
+            full_cp_metadata = forward_batch.attn_cp_metadata
+            if hcu_cp_tail:
+                forward_batch.attn_cp_metadata = tail.cp_metadata
             pre_hc_head = cp_all_gather_rerange_output(
                 pre_hc_head, self.cp_size, forward_batch, stream
             )
@@ -4655,16 +4778,26 @@ class DeepseekV4Model(nn.Module):
                         pd_aux_hidden, self.cp_size, forward_batch, stream
                     )
                 )
+            forward_batch.attn_cp_metadata = full_cp_metadata
 
         if tail is not None and not capture_dspark:
             # The logits processor indexes rows by the full extend layout.
-            num_tokens = input_ids.shape[0]
-            hidden_states = _scatter_tail_rows(
-                tail=tail, rows=hidden_states, num_tokens=num_tokens
-            )
-            pre_hc_head = _scatter_tail_rows(
-                tail=tail, rows=pre_hc_head, num_tokens=num_tokens
-            )
+            if hcu_cp_tail:
+                num_tokens = forward_batch.input_ids.shape[0]
+                hidden_states = _scatter_global_tail_rows(
+                    tail=tail, rows=hidden_states, num_tokens=num_tokens
+                )
+                pre_hc_head = _scatter_global_tail_rows(
+                    tail=tail, rows=pre_hc_head, num_tokens=num_tokens
+                )
+            else:
+                num_tokens = input_ids.shape[0]
+                hidden_states = _scatter_tail_rows(
+                    tail=tail, rows=hidden_states, num_tokens=num_tokens
+                )
+                pre_hc_head = _scatter_tail_rows(
+                    tail=tail, rows=pre_hc_head, num_tokens=num_tokens
+                )
 
         if capture_dspark:
             return (hidden_states, pre_hc_head), pd_aux_hidden
@@ -4684,6 +4817,29 @@ _QUARK_CKPT_TO_SGLANG_MAPPER = WeightsMapper(
 def _is_quark_checkpoint(config: DeepSeekV4Config) -> bool:
     quantization_config = getattr(config, "quantization_config", None) or {}
     return quantization_config.get("quant_method") == "quark"
+
+
+
+
+def _should_disable_v41_vision_for_hcu(config: DeepSeekV4Config) -> bool:
+    if not (
+        _is_hcu
+        and config.model_type == "deepseek_v41"
+        and config.vision_n_layers > 0
+    ):
+        return False
+
+    parallel = get_parallel()
+    return (
+        get_disagg().disaggregation_mode in ("prefill", "decode")
+        or parallel.attn_cp_size != 1
+        or parallel.pp_group.world_size != 1
+        or not (
+            get_moe_a2a_backend().is_none()
+            or get_moe_a2a_backend().is_deepep()
+        )
+    )
+
 
 
 class DeepseekV4ForCausalLM(nn.Module):
@@ -4724,6 +4880,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             install_aiter_intree_tune()
             if envs.SGLANG_DSV4_DENSE_MXSCALE.get():
                 set_dense_mxscale(True)
+        if _should_disable_v41_vision_for_hcu(config):
+            logger.info(
+                "Disabling the DeepSeek-V4.1 vision tower for this HCU text "
+                "serving topology; the V4.1 vision path does not support PD, "
+                "CP, PP or MoE A2A."
+            )
+            config.vision_n_layers = 0
+
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
@@ -4740,12 +4904,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                 or get_parallel().pp_group.world_size != 1
                 or not (
                     get_moe_a2a_backend().is_none()
+                    or get_moe_a2a_backend().is_deepep()
                     or (_is_cuda and get_moe_a2a_backend().is_megamoe())
                 )
             ):
                 raise ValueError(
                     "V4.1 vision supports TP/EP/DP without CP or PP; "
-                    "MoE A2A requires CUDA MegaMoE"
+                    "MoE A2A requires DeepEP or CUDA MegaMoE"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
@@ -5008,6 +5173,25 @@ class DeepseekV4ForCausalLM(nn.Module):
                         metadata.indexer_metadata = (
                             attn_backend.init_forward_metadata_indexer(core_meta)
                         )
+                    if getattr(attn_backend, "tail_forward_metadata", None) is not None:
+                        # decoder SWA bounded replay: the tail was built before the split
+                        convert = getattr(
+                            attn_backend, "convert_late_layer_tail_to_hcu_cp", None
+                        )
+                        if convert is None:
+                            raise NotImplementedError(
+                                "decoder SWA bounded replay under HCU prefill CP is "
+                                f"not wired for {type(attn_backend).__name__}"
+                            )
+                        convert(forward_batch)
+                elif (
+                    getattr(get_attn_backend(), "tail_forward_metadata", None)
+                    is not None
+                ):
+                    raise NotImplementedError(
+                        "decoder SWA bounded replay supports only the round-robin "
+                        "(interleave) HCU prefill CP split"
+                    )
 
         return input_ids, input_embeds
 
@@ -5070,9 +5254,15 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.capture_aux_hidden_states
             and self.model.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
+            # A mid-chunk prefill skipped the tail and returned full rows.
+            and get_attn_backend().tail_forward_metadata is not None
         ):
             tail = get_attn_backend().tail_forward_metadata.late_layer_tail
-            input_ids = tail.rows(input_ids)
+            input_ids = (
+                input_ids[tail.global_token_indices]
+                if tail.global_token_indices is not None
+                else tail.rows(input_ids)
+            )
             if tail.real_rows_count is not None:
                 # Fixed-capacity tail block from the prefill CUDA graph: drop padding.
                 n = tail.real_rows_count
@@ -5110,9 +5300,13 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
         if tail is not None:
             output.hidden_states_token_indices = (
-                tail.token_indices[: tail.real_rows_count]
-                if tail.real_rows_count is not None
-                else tail.token_indices
+                tail.global_token_indices
+                if tail.global_token_indices is not None
+                else (
+                    tail.token_indices[: tail.real_rows_count]
+                    if tail.real_rows_count is not None
+                    else tail.token_indices
+                )
             )
         if pd_aux_hidden_states is not None and (
             has_pd_hidden_capture or self.model.dspark_layers_to_capture is not None
@@ -5489,6 +5683,17 @@ class DeepseekV4ForCausalLM(nn.Module):
                     )
                 try:
                     use_async_loading = should_async_load(loaded_weight)
+                    # EnGram tables are much larger than ordinary model weights.
+                    # Loading them asynchronously keeps the full checkpoint tensors
+                    # alive in pending futures and can exhaust host memory before
+                    # their TP-local row shards are copied. Consume them inline so
+                    # each full tensor can be released before reading the next one.
+                    if (
+                        _is_hcu
+                        and envs.SGLANG_HCU_ENABLE_DSV41_W4A8_ENGRAM_LOAD_OPTIMIZATION.get()
+                        and ".engram." in name
+                    ):
+                        use_async_loading = False
 
                     name = self.remap_weight_name_to_dpsk_hf_format(
                         name,

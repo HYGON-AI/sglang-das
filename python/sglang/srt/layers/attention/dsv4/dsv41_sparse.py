@@ -6,11 +6,13 @@ share that storage.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional, Tuple
 
 import torch
 from torch import nn
 
+logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsv4.torch_quant import (
     fake_quant_compressed_kv,
     fake_quant_fp4,
@@ -20,8 +22,10 @@ from sglang.kernels.ops.gemm.router_gemv_hip import rocm_gemv_split_k_max_tokens
 from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import add_prefix, is_gfx95_supported
+from sglang.srt.utils import add_prefix, is_gfx95_supported, is_hcu
 
+
+_is_hcu = is_hcu()
 
 def _fused_dsv41_kernels(x: torch.Tensor) -> bool:
     # validated on CUDA and gfx950; other ROCm GPUs keep the torch forms
@@ -31,7 +35,7 @@ def _fused_dsv41_kernels(x: torch.Tensor) -> bool:
 def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False, positions=None):
     """RoPE plus fake FP4 quantization, fused for bf16 inputs on CUDA and ROCm. With
     positions, freqs is the whole table and the fused kernel gathers freqs[positions]."""
-    if _fused_dsv41_kernels(x) and x.dtype == torch.bfloat16:
+    if not _is_hcu and _fused_dsv41_kernels(x) and x.dtype == torch.bfloat16:
         from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
             rope_tail_fake_quant_fp4,
         )
@@ -41,6 +45,27 @@ def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False, positions=None):
         )
     if positions is not None:
         freqs = freqs[positions]
+    # HIP/DCU: fused sgl-kernel AOT path.
+    if _is_hcu and x.is_cuda and x.dtype == torch.bfloat16:
+        try:
+            from sgl_kernel import rope_fp4_fake_quant as _rope_fp4_hip
+
+            # Log once per process so the dispatch path is visible in service logs.
+            if not getattr(_rope_fq4, "_hip_logged", False):
+                logger.info(
+                    "[dsv41] _rope_fq4: using HIP fused kernel (rope_fp4_fake_quant)"
+                )
+                _rope_fq4._hip_logged = True
+            return _rope_fp4_hip(x, freqs, rope_dim, compressed_kv)
+        except (ImportError, RuntimeError) as e:
+            if not getattr(_rope_fq4, "_hip_warn_logged", False):
+                logger.warning(
+                    "[dsv41] _rope_fq4: HIP kernel unavailable (%s), falling back to Python", e
+                )
+                _rope_fq4._hip_warn_logged = True
+            pass  # fall through to Python fallback
+
+    # Pure-Python fallback (other platforms or unsupported configs).
     quant = fake_quant_compressed_kv if compressed_kv else fake_quant_fp4
     return quant(rope_tail(x, freqs, rope_dim))
 
@@ -54,9 +79,10 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # the Triton kernel is bitwise this fallback for bf16 rows on CUDA and ROCm (gfx950)
+        # rmsnorm_fp32 is a portable Triton kernel (fp32 stats + fp32 weight mul);
+        # it runs on ROCm/HIP too, so gate on is_cuda alone, not torch.version.cuda.
         if (
-            _fused_dsv41_kernels(x)
+            x.is_cuda
             and x.dtype in (torch.bfloat16, torch.float32)
             and self.weight.dtype in (torch.bfloat16, torch.float32)
             and x.shape[-1] in (128, 512)
@@ -81,6 +107,25 @@ def token_req_indices(forward_batch, *, num_tokens=None) -> torch.Tensor:
     assert forward_batch.forward_mode.is_extend(), (
         "the V4.1 torch attention path serves extend, target-verify and decode"
     )
+    if _is_hcu:
+        repeats = forward_batch.extend_seq_lens.to(torch.int64)
+        if num_tokens is not None:
+            # HCU EP may pad the token dimension without adding a request. Assign
+            # those masked tail rows to the last request so repeat_interleave's
+            # declared output size still matches the sum of repeats. A mismatch
+            # can make the HIP kernel access out of bounds instead of raising a
+            # Python exception.
+            num_extend_tokens = sum(forward_batch.extend_seq_lens_cpu)
+            num_padding_tokens = num_tokens - num_extend_tokens
+            assert num_padding_tokens >= 0, (
+                f"num_tokens={num_tokens} is smaller than the extend token count "
+                f"{num_extend_tokens}"
+            )
+            if num_padding_tokens:
+                assert repeats.numel(), "padded extend requires a request row"
+                repeats = repeats.clone()
+                repeats[-1] += num_padding_tokens
+        return torch.repeat_interleave(req, repeats, output_size=num_tokens)
     return torch.repeat_interleave(
         req, forward_batch.extend_seq_lens.to(torch.int64), output_size=num_tokens
     )
@@ -105,7 +150,7 @@ def fused_low_ratio_compress_supported() -> bool:
     if not torch.cuda.is_available():
         return False
     if torch.version.hip is not None:
-        return is_gfx95_supported()
+        return _is_hcu or is_gfx95_supported()
     return torch.cuda.get_device_capability()[0] >= 10
 
 

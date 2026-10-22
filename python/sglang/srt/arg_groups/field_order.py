@@ -94,6 +94,7 @@ POSITIONAL_FIELD_ORDER = (
     "dsa_prefill_cp_mode",
     "enable_prefill_context_parallel",
     "prefill_cp_mode",
+    "enable_cp_cache_layer_split",
     "enable_cp_decode_attn_tp",
     "enable_kv_cache_sharding",
     "enable_dp_attention",

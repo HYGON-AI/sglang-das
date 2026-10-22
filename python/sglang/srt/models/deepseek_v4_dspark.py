@@ -680,6 +680,8 @@ class DSparkV4StageMixin:
             hc_stats_stream=hc_stats_stream,
             moe_routed_quant_stream=moe_routed_quant_stream,
         )
+        # Draft stage IDs overlap target layers, but draft experts are not EPLB-reordered.
+        self.mlp.experts._skip_expert_location = True
         self.stage_id = stage_id
         self.dim = config.hidden_size
 
@@ -1225,7 +1227,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         # ``weight_scale_inv``.
         self._dspark_scale_suffix = (
             "weight_scale"
-            if any(key.endswith(".weight_scale") for key in params_dict)
+            if any(
+                key.endswith((".weight_scale", "_weight_scale"))
+                for key in params_dict
+            )
             else "weight_scale_inv"
         )
 
@@ -1356,10 +1361,21 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if mapped_rest.endswith(".gate.bias_vl"):
             return None
         mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
-        mapped_rest = mapped_rest.replace(
-            ".scale",
-            "." + getattr(self, "_dspark_scale_suffix", "weight_scale_inv"),
+        scale_suffix = getattr(
+            self, "_dspark_scale_suffix", "weight_scale_inv"
         )
+        # Some loaders normalize checkpoint scale names to weight_scale_inv
+        # before the model remapper runs. Per-channel FP8 parameters expose
+        # weight_scale, so normalize either input form to
+        # the suffix selected from the instantiated draft parameters.
+        if mapped_rest.endswith(".weight_scale_inv"):
+            mapped_rest = (
+                mapped_rest.removesuffix(".weight_scale_inv")
+                + "."
+                + scale_suffix
+            )
+        else:
+            mapped_rest = mapped_rest.replace(".scale", "." + scale_suffix)
         return f"stages.{stage_id}.{mapped_rest}"
 
     def _remap_dspark_weight_name_npu(self, name: str) -> Optional[str]:

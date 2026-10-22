@@ -168,7 +168,7 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             "DeepSeekV4 zigzag CP requires the NPU backend; CUDA/HIP backends "
             "reindex with interleave order."
         )
-    if get_platform().is_hip:
+    if get_platform().is_hip and not _is_hcu:
         prefill_backend, decode_backend = attention_backends_of(
             resolved_view(server_args)
         )
@@ -237,11 +237,6 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         )
     elif model_config_of(server_args).hf_config.model_type != "deepseek_v41":
         # The generic CP-aware sparse chunk cache is validated on V4.1 only.
-        logger.warning(
-            "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
-            "context parallelism is enabled."
-        )
-        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
         logger.warning(
             "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
             "context parallelism is enabled."
@@ -389,6 +384,34 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "DP attention is supported when "
                 "both servers use the same block size and target/draft KV layout."
             )
+
+        if _is_hcu:
+            # HCU PD additionally pins the replica/attention DP split per role.
+            if cfg.disaggregation_mode == "prefill":
+                topology_invalid = not (
+                    cfg.dp_size == 1
+                    and cfg.attn_dp_size == 1
+                    and cfg.enable_prefill_cp
+                    and cfg.attn_cp_size == cfg.tp_size
+                )
+                topology = "P requires replica DP=1, attention DP=1 and interleave prefill CP=TP"
+            else:
+                topology_invalid = not (
+                    cfg.disaggregation_mode == "decode"
+                    # The pipeline normalizes the legacy DP-attention flags
+                    # before this hook; dp_size now counts model replicas.
+                    and cfg.dp_size == 1
+                    and cfg.attn_dp_size == cfg.tp_size
+                    and attn_dp_enabled_of(cfg)
+                    and not cfg.enable_prefill_cp
+                    and cfg.attn_cp_size == 1
+                )
+                topology = "D requires replica DP=1, attention DP=TP and CP=1"
+            if topology_invalid:
+                raise ValueError(
+                    f"DeepSeek-V4.1 DSpark PD on HCU requires {topology}. "
+                    "Both servers must use the same DSpark block size and TP size."
+                )
 
     incompatible = (
         (

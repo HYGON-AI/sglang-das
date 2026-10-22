@@ -13,6 +13,9 @@ from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    MooncakeTransferEngine,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -540,6 +543,36 @@ class TestMooncakeEarlySend(unittest.TestCase):
         manager, queue = self._worker(None)
         MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
         manager.send_kvcache.assert_called_once()
+class TestMooncakeBatchRegistration(unittest.TestCase):
+    @staticmethod
+    def _make_engine(return_value=0, side_effect=None):
+        transfer_engine = MooncakeTransferEngine.__new__(MooncakeTransferEngine)
+        transfer_engine.engine = MagicMock()
+        transfer_engine.engine.batch_register_memory.return_value = return_value
+        transfer_engine.engine.batch_register_memory.side_effect = side_effect
+        return transfer_engine
+
+    def test_batch_register_returns_zero_on_success(self):
+        engine = self._make_engine()
+
+        self.assertEqual(engine.batch_register([1000], [4096]), 0)
+        engine.engine.batch_register_memory.assert_called_once_with([1000], [4096])
+
+    def test_batch_register_raises_on_nonzero_return(self):
+        engine = self._make_engine(return_value=-7)
+
+        with self.assertRaisesRegex(
+            RuntimeError, r"Mooncake batch memory registration failed \(ret=-7\)"
+        ):
+            engine.batch_register([1000], [4096])
+
+    def test_batch_register_raises_on_engine_exception(self):
+        engine = self._make_engine(side_effect=ValueError("registration rejected"))
+
+        with self.assertRaisesRegex(
+            RuntimeError, "Mooncake batch memory registration failed"
+        ):
+            engine.batch_register([1000], [4096])
 
 
 if __name__ == "__main__":

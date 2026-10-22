@@ -123,7 +123,7 @@ class TestPlatformPrefillCPPolicy(CustomTestCase):
 
     def test_non_cp_and_decode_cp_are_not_rejected(self):
         for platform in ("is_hip", "is_npu", "is_musa"):
-            facts = dict(is_hip=False, is_npu=False, is_musa=False)
+            facts = dict(is_hip=False, is_hcu=False, is_npu=False, is_musa=False)
             facts[platform] = True
             for dcp_size in (1, 2):
                 with self.subTest(platform=platform, dcp_size=dcp_size):
@@ -131,6 +131,14 @@ class TestPlatformPrefillCPPolicy(CustomTestCase):
                         args = ServerArgs(model_path="dummy", dcp_size=dcp_size)
                         validate_prefill_cp_platform(args)
 
+    @override_platform(is_hip=True, is_hcu=True, is_npu=False, is_musa=False)
+    def test_hcu_prefill_cp_is_not_rejected(self):
+        args = ServerArgs(
+            model_path="dummy", enable_prefill_cp=True, cp_strategy="interleave"
+        )
+        validate_prefill_cp_platform(args)
+
+    @override_platform(is_hip=False, is_hcu=False, is_npu=False, is_musa=False)
     def test_generic_cp_is_not_rejected_or_modified(self):
         for is_hip in (False, True):
             for strategy in ("zigzag", "interleave"):

@@ -176,7 +176,9 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
 #pragma unroll
   for (uint32_t i = 0; i < kVecSize / 2; ++i) {
     const auto packed = fp32x2_t{staged[i * 2 + 0], staged[i * 2 + 1]};
-    const auto [x, y] = cast<fp32x2_t>(cast<bf16x2_t>(packed));
+    const auto xy = cast<fp32x2_t>(cast<bf16x2_t>(packed));
+    const auto x = xy.x;
+    const auto y = xy.y;
     local_sqrsum += x * x;
     local_sqrsum += y * y;
     staged[i * 2 + 0] = x;
@@ -196,7 +198,9 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
 
 #pragma unroll
   for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-    const auto [wx, wy] = cast<fp32x2_t>(weight[i]);
+    const auto wxy = cast<fp32x2_t>(weight[i]);
+    const auto wx = wxy.x;
+    const auto wy = wxy.y;
     const auto x = staged[i * 2 + 0] * norm_factor * wx;
     const auto y = staged[i * 2 + 1] * norm_factor * wy;
     out[i] = cast<bf16x2_t>(fp32x2_t{x, y});
@@ -205,12 +209,17 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
   // before the trigger because that GEMM is the successor that reads it.
   out.store(params.kv_output, static_cast<int64_t>(row) * kCTASize + tx);
   PDLTriggerSecondary<kUsePDL>();
+  // Pair-state writes and the replicated index latent are needed on every CP
+  // rank; only the owner has a persistent main-KV destination.
+  if (params.kvcache == nullptr) return;
 
   // ---- main-KV branch: RoPE tail, fp4 fake-quant, cache store ----
   // Match finish()'s bf16 rounding before RoPE.
 #pragma unroll
   for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-    const auto [x, y] = cast<fp32x2_t>(out[i]);
+    const auto xy = cast<fp32x2_t>(out[i]);
+    const auto x = xy.x;
+    const auto y = xy.y;
     staged[i * 2 + 0] = x;
     staged[i * 2 + 1] = y;
   }
@@ -225,7 +234,9 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
       const auto f_real = x_real * freq[i * 2 + 0] - x_imag * freq[i * 2 + 1];
       const auto f_imag = x_real * freq[i * 2 + 1] + x_imag * freq[i * 2 + 0];
       const auto rotated = cast<bf16x2_t>(fp32x2_t{f_real, f_imag});
-      const auto [r0, r1] = cast<fp32x2_t>(rotated);
+      const auto r = cast<fp32x2_t>(rotated);
+      const auto r0 = r.x;
+      const auto r1 = r.y;
       staged[i * 2 + 0] = r0;
       staged[i * 2 + 1] = r1;
     }
@@ -249,9 +260,10 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
     const auto scale = deepseek_v4::fp4::compressed_kv_scale(amax);
 #pragma unroll
     for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-      const auto [x, y] = deepseek_v4::fp4::fake_quant_compressed_kv_x2({staged[i * 2 + 0], staged[i * 2 + 1]}, scale);
-      staged[i * 2 + 0] = x;
-      staged[i * 2 + 1] = y;
+      const auto q = deepseek_v4::fp4::fake_quant_compressed_kv_x2(
+          fp32x2_t{staged[i * 2 + 0], staged[i * 2 + 1]}, scale);
+      staged[i * 2 + 0] = q.x;
+      staged[i * 2 + 1] = q.y;
     }
   }
 
@@ -497,7 +509,7 @@ struct FlashCompress2Kernel {
         .positions = positions.data_ptr(),
         .req = static_cast<const int64_t*>(req.data_ptr()),
         .raw_out_loc = raw_out_loc.data_ptr(),
-        .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
+        .kvcache = kvcache.size(0) == 0 ? nullptr : static_cast<uint8_t*>(kvcache.data_ptr()),
         .ring_size = static_cast<fast_mod_div_u32_t>(ring_size),
         .eps = eps,
     };

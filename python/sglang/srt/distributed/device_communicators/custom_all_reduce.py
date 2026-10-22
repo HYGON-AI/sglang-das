@@ -357,7 +357,13 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self._all_reduce_impl(input, registered=not self.tms_cudagraph)
+                # HCU DP ranks can replay different attention graph variants.
+                # Their temporary input addresses need not match the graph slot
+                # used by peers. Stage through the same communicator-owned IPC
+                # buffer in every variant instead of registering graph temporaries.
+                return self._all_reduce_impl(
+                    input, registered=not (self.tms_cudagraph or _is_hcu)
+                )
             else:
                 # Could be warmup OR piecewise cuda graph split op execution.
                 # In piecewise cuda graph, split ops run eagerly outside the graph

@@ -48,6 +48,9 @@ from sglang.srt.utils import (
 )
 
 _is_hcu = is_hcu()
+_use_lightop = get_bool_env_var("SGLANG_USE_LIGHTOP")
+_hc_mix_stats_opt = envs.SGLANG_HCU_HC_MIX_STATS_OPT.get()
+_use_hcu_hc_mix_stats = _is_hcu and _use_lightop and _hc_mix_stats_opt
 _use_aiter_tilelang_mhc = get_bool_env_var(
     "SGLANG_ROCM_USE_AITER_TILELANG_MHC", default="false"
 )
@@ -352,6 +355,39 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
                 cfg.eps,
             )
         return pre, post, comb
+    if (
+        _use_hcu_hc_mix_stats
+        and x_flat.dtype == torch.bfloat16
+        and x_flat.is_contiguous()
+        and not is_batch_invariant_mode_enabled()
+    ):
+        parts, bf16_parts = hc.tf32_parts, hc.bf16_parts
+        use_bf16x3 = 4096 <= x_flat.shape[0] <= 65536
+        if parts is not None and (not use_bf16x3 or bf16_parts is not None):
+            from lightop import (
+                hc_mix_stats_sinkhorn_bf16x3,
+                hc_mix_stats_sinkhorn_deepgemm,
+            )
+
+            if use_bf16x3:
+                return hc_mix_stats_sinkhorn_bf16x3(
+                    x_flat,
+                    bf16_parts,
+                    hc.scale,
+                    hc.base,
+                    cfg.sinkhorn_iters,
+                    cfg.rms_eps,
+                    cfg.eps,
+                )
+            return hc_mix_stats_sinkhorn_deepgemm(
+                x_flat,
+                parts,
+                hc.scale,
+                hc.base,
+                cfg.sinkhorn_iters,
+                cfg.rms_eps,
+                cfg.eps,
+            )
     if x.is_cuda and torch.version.cuda is not None:
         # cuBLAS/torch reductions can change order with num_tokens; this kernel
         # keeps the mixing and RMS reductions batch-invariant.

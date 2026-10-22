@@ -35,6 +35,7 @@ from compressed_tensors.quantization import (
 from pydantic import BaseModel
 
 from sglang.srt.layers.moe import MoeRunnerConfig, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -50,6 +51,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A4Nvfp4MoE,
     CompressedTensorsW4A16Fp4,
     CompressedTensorsW4A16Nvfp4MoE,
+    HCUCompressedTensorsW4A8Int8DynamicMoE,
     CompressedTensorsW4AFP8MoE,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
@@ -82,6 +84,7 @@ from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_cuda, is_hcu, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
+_is_hcu = is_hcu()
 _is_npu = is_npu()
 _is_hip = is_hip()
 _is_hcu = is_hcu()
@@ -247,6 +250,33 @@ class CompressedTensorsConfig(QuantizationConfig):
                 )
                 return Mxfp4MoEMethod(prefix=prefix)
 
+            if (
+                _is_hcu
+                and get_moe_runner_backend().is_deep_gemm()
+                and get_moe_a2a_backend().is_deepep()
+                and self.quant_format == CompressionFormat.pack_quantized.value
+            ):
+                scheme = self._get_moe_projection_scheme(layer, prefix)
+                if scheme is not None:
+                    weight_quant = scheme.get("weights")
+                    input_quant = scheme.get("input_activations")
+                    if (
+                        weight_quant is not None
+                        and input_quant is not None
+                        and weight_quant.type == QuantizationType.INT
+                        and input_quant.type == QuantizationType.INT
+                        and self._is_dynamic_token_w4a8(weight_quant, input_quant)
+                        and weight_quant.strategy == QuantizationStrategy.CHANNEL
+                        and weight_quant.symmetric
+                        and input_quant.symmetric
+                        and weight_quant.actorder is None
+                    ):
+                        from sglang.srt.layers.quantization.slimquant_w4a8_marlin import (
+                            HCUW4A8Int8DeepEPMoEMethod,
+                        )
+
+                        return HCUW4A8Int8DeepEPMoEMethod(self)
+
             layer.scheme = self.get_moe_scheme(layer=layer, layer_name=prefix)
             if layer.scheme is None:  # ignored layer
                 use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
@@ -281,6 +311,23 @@ class CompressedTensorsConfig(QuantizationConfig):
             return
         self.target_scheme_map["FusedMoE"] = self.target_scheme_map["Linear"]
         self.target_scheme_map["DeepEPMoE"] = self.target_scheme_map["Linear"]
+
+    def _is_hcu_dsv41_w4a8_config(self) -> bool:
+        if not _is_hcu or not any("engram" in pattern for pattern in self.ignore):
+            return False
+
+        for target, scheme in self.target_scheme_map.items():
+            if "w[123]" not in target:
+                continue
+            weight_quant = scheme.get("weights")
+            input_quant = scheme.get("input_activations")
+            if (
+                weight_quant is not None
+                and input_quant is not None
+                and self._is_dynamic_token_w4a8(weight_quant, input_quant)
+            ):
+                return True
+        return False
 
     # @property
     # def weight_block_size(self) -> Optional[List[int]]:
@@ -886,6 +933,31 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         raise NotImplementedError("No compressed-tensors compatible scheme was found.")
 
+    def _get_moe_projection_scheme(self, layer, layer_name):
+        self._add_fused_moe_to_target_scheme_map()
+        unfused_names = [
+            layer_name + projection_name
+            for projection_name in [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
+        ]
+        # Keep DSV4.1 checkpoint aliases and projection consistency checks shared
+        # between the direct method and the original scheme-based path.
+        try:
+            schemes = [self.get_scheme_dict(layer, name) for name in unfused_names]
+        except ValueError:
+            if not self._is_hcu_dsv41_w4a8_config():
+                raise
+            schemes = [
+                self.get_scheme_dict(layer, layer_name + name)
+                for name in [".0.w1", ".0.w3", ".0.w2"]
+            ]
+        scheme = schemes[0]
+        if not all(d == scheme for d in schemes):
+            raise ValueError(
+                "All MoE projections need to have same "
+                "quantization scheme but found multiple"
+            )
+        return scheme
+
     def get_moe_scheme(
         self, layer: torch.nn.Module, layer_name: Optional[str] = None
     ) -> Optional[CompressedTensorsMoEScheme]:
@@ -905,7 +977,13 @@ class CompressedTensorsConfig(QuantizationConfig):
         # FusedMoE was made by combining multiple Linears so need to
         # make sure quantization config for Linear can target it
         self._add_fused_moe_to_target_scheme_map()
-        scheme_dict = self.get_scheme_dict(layer, layer_name)
+        is_hcu_dsv41_w4a8 = self._is_hcu_dsv41_w4a8_config()
+        if is_hcu_dsv41_w4a8:
+            scheme_dict = None
+            with suppress(ValueError):
+                scheme_dict = self.get_scheme_dict(layer, layer_name)
+        else:
+            scheme_dict = self.get_scheme_dict(layer, layer_name)
         if scheme_dict is not None:
             weight_quant = scheme_dict.get("weights")
             input_quant = scheme_dict.get("input_activations")
@@ -913,20 +991,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 logger.info_once("Using CompressedTensorsW8A8Fp8MoE")
                 return CompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
 
-        unfused_names = [
-            layer_name + proj_name
-            for proj_name in [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
-        ]
-        # TODO: refactor this to use expert_mapping and check all layer numbers
-        all_scheme_dicts = [self.get_scheme_dict(layer, name) for name in unfused_names]
-        scheme_dict = all_scheme_dicts[0] if all_scheme_dicts else None
-
-        # multiple schemes found
-        if not all(d == scheme_dict for d in all_scheme_dicts):
-            raise ValueError(
-                "All MoE projections need to have same "
-                "quantization scheme but found multiple"
-            )
+        scheme_dict = self._get_moe_projection_scheme(layer, layer_name)
 
         if scheme_dict is None:  # ignored layer
             return None
@@ -1021,23 +1086,10 @@ class CompressedTensorsConfig(QuantizationConfig):
             if _is_npu and self._is_dynamic_token_w4a8(weight_quant, input_quant):
                 logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoE")
                 return NPUCompressedTensorsW4A8Int8DynamicMoE(self)
-            # HCU packed INT4 + dynamic per-token INT8: this is W4A8 in
-            # compressed-tensors metadata, but the checkpoint is still
-            # pack-quantized (not ngram unpacked int8). NVIDIA CUTLASS
-            # W4AFP8 is unavailable; reuse Triton GPTQ MoE with
-            # use_int4_w4a8 so activations are quantized per token.
-            if (
-                _is_hcu
-                and self._is_dynamic_token_w4a8(weight_quant, input_quant)
-                and input_quant is not None
-                and input_quant.type == QuantizationType.INT
-            ):
-                logger.info_once(
-                    "Using CompressedTensorsWNA16TritonMoE use_int4_w4a8 "
-                    "(packed INT4 + dynamic per-token INT8 activations)"
-                )
-                return CompressedTensorsWNA16TritonMoE(
-                    self, weight_quant=weight_quant, use_int4_w4a8=True
+            if _is_hcu and self._is_dynamic_token_w4a8(weight_quant, input_quant):
+                logger.info_once("Using HCUCompressedTensorsW4A8Int8DynamicMoE")
+                return HCUCompressedTensorsW4A8Int8DynamicMoE(
+                    self, weight_quant=weight_quant
                 )
             logger.info_once("Using CompressedTensorsW4AFP8MoE")
             return CompressedTensorsW4AFP8MoE(self, weight_quant, input_quant)
@@ -1045,17 +1097,16 @@ class CompressedTensorsConfig(QuantizationConfig):
             if _is_npu:
                 logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoE")
                 return NPUCompressedTensorsW4A8Int8DynamicMoE(self)
-            if _is_hcu and self.quant_format == CompressionFormat.pack_quantized.value:
-                logger.info_once(
-                    "Using CompressedTensorsWNA16TritonMoE use_int4_w4a8 "
-                    "(packed INT4 + dynamic per-token INT8 activations)"
+            elif _is_hcu:
+                logger.info_once("Using HCUCompressedTensorsW4A8Int8DynamicMoE")
+                return HCUCompressedTensorsW4A8Int8DynamicMoE(
+                    self, weight_quant=weight_quant
                 )
-                return CompressedTensorsWNA16TritonMoE(
-                    self, weight_quant=weight_quant, use_int4_w4a8=True
+            else:
+                raise NotImplementedError(
+                    "The W4A8Int8 Fused MoE scheme is currently implemented "
+                    "only for NPU and HCU."
                 )
-            raise NotImplementedError(
-                "The W4A8Int8 Fused MoE scheme is implemented only for NPU for now."
-            )
         else:
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"

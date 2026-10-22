@@ -539,6 +539,12 @@ class PrefillBootstrapQueue:
             req_to_token_pool=req_to_token_pool,
             pd_hidden_pool=getattr(self.metadata_buffers, "pd_hidden_pool", None),
         )
+        if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            from sglang.srt.mem_cache.cp_cache_layer_split.transfer import (
+                configure_v4_transfer,
+            )
+
+            configure_v4_transfer(kv_args, self.token_to_kv_pool, draft_kv_pool)
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager_kwargs = (

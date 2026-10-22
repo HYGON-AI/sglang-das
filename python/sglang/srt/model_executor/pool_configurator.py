@@ -1243,11 +1243,62 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         }
 
         self.num_layers_total = len(self.stage_compress_ratios)
+        self.use_cp_cache_layer_split = bool(
+            getattr(get_parallel(), "enable_cp_cache_layer_split", False)
+            and not kvc.is_draft_worker
+        )
+        self.cp_draft_layers = 0
+        if self.use_cp_cache_layer_split and kvc.spec_algorithm.is_dspark():
+            # Draft KV remains replicated on every CP rank, as in the V4
+            # LayerSplit implementation; only target KV is layer-sharded.
+            self.cp_draft_layers = len(cfg.hf_text_config.dspark_target_layer_ids)
+            assert self.cp_draft_layers > 0, "DSPARK draft layer count is required"
+        self.swa_priced_layers = self.num_layers_total
         # The low-ratio indexer pools are built with force_fp4=True
         # (deepseek_v4_memory_pool), so they are fp4 whatever dtype c4 uses.
         self.low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
             self.indexer_head_dim, use_fp4_indexer=True
         )
+        if self.use_cp_cache_layer_split:
+            from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_layout import (
+                build_cp_cache_layer_split_deepseek_v4_pool_layout,
+            )
+
+            cp_size = get_parallel().attn_cp_size
+            layouts = [
+                build_cp_cache_layer_split_deepseek_v4_pool_layout(
+                    rank,
+                    cp_size,
+                    kvc.layer_info.start_layer,
+                    kvc.layer_info.end_layer,
+                    cfg.compress_ratios,
+                    cfg.hf_config.kv_source_layer_ids,
+                )
+                for rank in range(cp_size)
+            ]
+            self.swa_priced_layers = max(l.swa_layer_num for l in layouts) + 1
+            owner_kv_bytes = max(
+                (l.c1_layer_num + l.c2_layer_num / 2) * self.kv_bytes
+                for l in layouts
+            )
+            replicated_indexer_bytes = sum(
+                self.low_ratio_index_bytes / cfg.compress_ratios[l]
+                for l in cfg.hf_config.kv_source_layer_ids
+                if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
+                and cfg.compress_ratios[l] in (1, 2)
+            )
+            staging_kv_bytes = max(
+                (
+                    self.kv_bytes / cfg.compress_ratios[l]
+                    for l in cfg.hf_config.kv_source_layer_ids
+                    if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
+                    and cfg.compress_ratios[l] in (1, 2)
+                ),
+                default=0,
+            )
+            self.low_ratio_bytes_per_full_token = (
+                owner_kv_bytes + replicated_indexer_bytes + staging_kv_bytes
+            )
 
         # kvc.sliding_window_size is None on a runner without SWA layers.
         self._swa_ring_size = get_swa_ring_size(cfg.window_size, self.is_speculative)
@@ -1325,9 +1376,28 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
         self.bytes_per_swa_token = self._get_bytes_per_swa_token()
         self.bytes_per_full_token = self._get_bytes_per_full_token()
-        if self.is_speculative and not self.encoder_replay:
-            # Reserve the draft worker by inflating per-token bytes by
-            # (target+draft)/target, as scale_kv_cell_size_per_token_for_dflash does.
+        if self.use_cp_cache_layer_split:
+            logger.info(
+                "CP Cache LayerSplit KV pricing: cp_size=%d, target_layers=%d, "
+                "swa_layers=%d, draft_layers=%d, kv_bytes=%d, swa_cap=%s, "
+                "bytes_per_swa_token=%.2f",
+                get_parallel().attn_cp_size,
+                self.num_layers_total,
+                self.swa_priced_layers,
+                self.cp_draft_layers,
+                self.kv_bytes,
+                self.swa_cap_tokens,
+                self.bytes_per_swa_token,
+            )
+        if (
+            self.is_speculative
+            and not self.encoder_replay
+            and not self.use_cp_cache_layer_split
+        ):
+            # Reserve memory for the speculative draft worker by inflating
+            # per-token bytes by (target+draft)/target. Equivalent to dflash's
+            # scale_kv_cell_size_per_token_for_dflash but applied to
+            # bytes_per_full_token: tokens = avail / (bpft * (T+D)/T).
             draft_layers = 1
             target_layers = self.num_layers_total
             self._spec_infl = (target_layers + draft_layers) / target_layers
@@ -1459,8 +1529,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
         c4_state_ratio = self.ring_sizes.get(4, 0) / self.page_size
-        return self._get_paged_kv_bytes_per_token() * self.num_layers_total + (
-            c4_state_ratio
+        return (
+            self._get_paged_kv_bytes_per_token()
+            * (self.swa_priced_layers + self.cp_draft_layers)
+            + c4_state_ratio
             * (c4_state_bytes + c4_indexer_state_bytes)
             * self.num_layers(4)
         )
@@ -1485,10 +1557,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         swa_ratio = (
             0 if self._unified or self.swa_cap_tokens is not None else self.swa_ratio
         )
-        return swa_ratio * self.bytes_per_swa_token + sum(
+        compressed_bytes = sum(
             self._compressed_bytes_per_full_token(ratio) * len(layers)
             for ratio, layers in self.stage_owner_layers.items()
+            if not (self.use_cp_cache_layer_split and ratio in (1, 2))
         )
+        if self.use_cp_cache_layer_split:
+            compressed_bytes += self.low_ratio_bytes_per_full_token
+        return swa_ratio * self.bytes_per_swa_token + compressed_bytes
 
     def _get_swa_fixed_bytes(self) -> float:
         """Bias bytes of the encoder-replay request window plus the cap-mode pool."""

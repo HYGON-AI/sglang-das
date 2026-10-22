@@ -862,6 +862,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     kv_args.host_state_data_lens,
                     kv_args.host_state_item_lens,
                 ) = ([values] for values in host_state)
+        if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            from sglang.srt.mem_cache.cp_cache_layer_split.transfer import (
+                configure_v4_transfer,
+            )
+
+            configure_v4_transfer(
+                kv_args, self.token_to_kv_pool, self.draft_token_to_kv_pool
+            )
 
         kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = get_device().gpu_id

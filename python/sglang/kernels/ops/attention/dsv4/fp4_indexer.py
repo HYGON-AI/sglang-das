@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+from typing import Callable, Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -8,13 +11,63 @@ from triton.language.extra import libdevice
 from sglang.kernels.jit.utils import aligned_new_empty
 from sglang.kernels.ops.attention.deep_select import get_input_stride_alignment_bytes
 from sglang.kernels.ops.attention.dsv4.torch_quant import FP4_AMAX_FLOOR
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import is_hcu
+
+# Cached at import time: LightOp paged_mqa_logits_fp4 is HCU-only, so the check
+# guards every decode call without repeated platform probes.
+_is_hcu = is_hcu()
+
+logger = logging.getLogger(__name__)
 
 INDEX_HEAD_DIM = 128
 # One index-K slot: 64 packed e2m1 bytes and four ue8m0 block exponents.
 INDEX_K_PAYLOAD_BYTES = tl.constexpr(64)
 INDEX_K_SCALE_BYTES = tl.constexpr(4)
 INDEX_K_SLOT_BYTES = INDEX_K_PAYLOAD_BYTES.value + INDEX_K_SCALE_BYTES.value
+
+_lightop_fp4_op: Optional[Callable] = None
+_lightop_fp4_op_resolved = False
+
+
+def _get_lightop_fp4_op() -> Optional[Callable]:
+    global _lightop_fp4_op, _lightop_fp4_op_resolved
+    # Check the flag before the cache so disabling it never reuses a native op.
+    if not envs.SGLANG_USE_LIGHTOP_PAGED_MQA_LOGITS_FP4.get():
+        return None
+    if _lightop_fp4_op_resolved:
+        return _lightop_fp4_op
+    # Loading an extension inside capture is unsafe. Eager warmup resolves the
+    # optional operator; a first invocation in capture keeps the Triton path.
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    reason = "missing symbol"
+    try:
+        from lightop import attention as lightop_attention
+        from lightop import op
+
+        # ABI 2 takes (q_fp4, q_sf) + a block table and no longer accepts slots;
+        # it serves the paged indexer (lightop_indexer.py) instead.
+        if getattr(lightop_attention, "PAGED_MQA_LOGITS_FP4_ABI", 1) >= 2:
+            reason = "paged ABI, not slot based"
+        else:
+            _lightop_fp4_op = getattr(op, "paged_mqa_logits_fp4", None)
+    except (ImportError, OSError) as exc:
+        logger.warning("LightOp FP4 indexer unavailable; using Triton: %s", exc)
+    _lightop_fp4_op_resolved = True
+    if _lightop_fp4_op is None:
+        logger.warning(
+            "LightOp slot-based paged_mqa_logits_fp4 unavailable (%s); "
+            "the slot-based FP4 indexer uses Triton.",
+            reason,
+        )
+    else:
+        logger.info(
+            "Using LightOp paged_mqa_logits_fp4 for FP4 indexer inputs; "
+            "LightOp owns platform and shape dispatch."
+        )
+    return _lightop_fp4_op
 
 
 @triton.jit
@@ -579,13 +632,23 @@ def _index_k_rope_pack_kernel(
     byte_offsets = tl.arange(0, 64)
     if STORE_CACHE:
         location = tl.load(Loc + token)
+        # Slot 0 is the reserved dummy row. Prefill ratio-2 batches also use
+        # it for an incomplete final group, so the fused writer must preserve
+        # the same no-publish behavior as the reference cache writer.
+        valid = location > 0
+        location = tl.maximum(location, 0)
         page = location // PAGE_SIZE
         slot = location % PAGE_SIZE
-        tl.store(Cache + page * CACHE_STRIDE + slot * 64 + byte_offsets, payload)
+        tl.store(
+            Cache + page * CACHE_STRIDE + slot * 64 + byte_offsets,
+            payload,
+            mask=valid,
+        )
         scale_bytes = (sf >> (tl.arange(0, 4) * 8)) & 0xFF
         tl.store(
             Cache + page * CACHE_STRIDE + PAGE_SIZE * 64 + slot * 4 + tl.arange(0, 4),
             scale_bytes,
+            mask=valid,
         )
     else:
         tl.store(Payload + row * 64 + byte_offsets, payload)
@@ -603,7 +666,8 @@ def index_k_rope_pack(
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """RoPE, fake fp4 quantization and the indexer pack in one launch: packed
     ``[T*heads, 64]`` / ``[T*heads]`` when ``cache`` is None, else the paged index-K
-    cache write. Without positions, freqs is already gathered per token; otherwise
+    cache write. ``loc<=0`` is treated as the reserved dummy slot and is not written.
+    Without positions, freqs is already gathered per token; otherwise
     the kernel reads freqs[positions] directly, removing the gather launch.
 
     Both quantization stages stay: the indexer packer has a different scale floor
@@ -789,8 +853,11 @@ def fp4_index_logits_decode(
 ) -> torch.Tensor:
     """Decode index logits from the fp4 index-K pool. q [B, H, 128] bf16, weights
     [B, H], slots [B, L] int64, lens [B] int64, table = the layer's index-K page
-    buffer (uint8, 2D). Returns [B, L] fp32 logits, -inf at positions >= lens,
-    rounded as the torch reference does."""
+    buffer (uint8, 2D). Returns [B, L] fp32 logits, -inf at positions >= lens.
+    LightOp is enabled by default on HCU and can be disabled via
+    SGLANG_USE_LIGHTOP_PAGED_MQA_LOGITS_FP4=0; its native dispatcher chooses
+    BF16 or lossless FP8 MMAC without converting the public BF16 query input
+    to FP8 here."""
     assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
     B, H, _ = q.shape
     L = slots.shape[1]
@@ -799,8 +866,16 @@ def fp4_index_logits_decode(
     weights = weights.to(torch.bfloat16).contiguous()
     slots = slots.contiguous()
     out = torch.empty((B, L), dtype=torch.float32, device=q.device)
-    if L == 0:
+    if B == 0 or L == 0:
         return out
+    if _is_hcu:
+        if lens.dtype != torch.int64 or not lens.is_contiguous():
+            lens = lens.to(dtype=torch.int64).contiguous()
+        native = _get_lightop_fp4_op()
+        if native is not None:
+            # LightOp owns validation and its BF16/FP8 choice. Do not add a
+            # second SGLang allowlist or swallow native execution errors.
+            return native(q, weights, slots, lens, table, page_size, out)
     BLOCK_L = 64
     grid = (B, triton.cdiv(L, BLOCK_L))
     _fp4_index_logits_kernel[grid](

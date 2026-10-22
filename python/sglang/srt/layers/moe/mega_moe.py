@@ -137,7 +137,7 @@ def _get_hcu_normal_ll_token_threshold() -> int:
     return threshold
 
 
-def _select_hcu_megamoe_backend(selector_tokens: int) -> str:
+def _select_hcu_megamoe_backend_by_tokens(selector_tokens: int) -> str:
     if selector_tokens < 0:
         raise ValueError("MegaMoE backend selector token count must be non-negative")
     if is_dsa_enable_prefill_cp():
@@ -164,6 +164,30 @@ def _select_hcu_megamoe_backend(selector_tokens: int) -> str:
         f"{[_MEGA_MOE_HCU_BACKEND_AUTO, _MEGA_MOE_HCU_BACKEND_LL, _MEGA_MOE_HCU_BACKEND_NORMAL]}, "
         f"got {mode!r}"
     )
+
+
+def _select_hcu_megamoe_backend(selector_tokens: int, buf) -> str:
+    backend = _select_hcu_megamoe_backend_by_tokens(selector_tokens)
+    if backend == _MEGA_MOE_HCU_BACKEND_LL:
+        from megamoe.dcu_megamoe_opt.v3_config import staged_v3_capability_supported
+
+        if not staged_v3_capability_supported(
+            quant="fp8",
+            backend="ll",
+            num_ranks=buf.group.size(),
+            num_experts=buf.num_experts,
+            num_topk=buf.num_topk,
+            hidden=buf.hidden,
+            intermediate_hidden=buf.intermediate_hidden,
+        ):
+            # V4.1 target and DSpark shapes use the dynamic NORMAL kernel.
+            # An explicit unsupported LL request must not silently change mode.
+            if os.getenv(_MEGA_MOE_HCU_BACKEND_ENV, "auto").strip().lower() == "ll":
+                raise ValueError(
+                    "standalone MegaMoE LL does not support this model shape; use normal or auto"
+                )
+            return _MEGA_MOE_HCU_BACKEND_NORMAL
+    return backend
 
 
 def _get_hcu_cuda_graph_max_tokens_per_rank(
@@ -241,6 +265,7 @@ def _prepare_standalone_megamoe_inputs(
     buf.topk_weights[:num_tokens].copy_(topk_weights.to(buf.topk_weights.dtype))
 
 
+@torch.inference_mode()
 def set_mega_moe_cuda_graph_num_tokens(num_tokens: int) -> None:
     if not _is_standalone_megamoe_runtime():
         return
@@ -410,8 +435,13 @@ def _get_mega_moe_symm_buffer(
         buf = _MEGA_MOE_SYMM_BUFFER.get(key)
         if buf is None:
             kwargs = {}
-            if quant_mode != "fp8":
-                kwargs["quant_mode"] = quant_mode
+            if _is_hcu:
+                kwargs["use_fp8_dispatch"] = True
+                if quant_mode != "fp8":
+                    kwargs["quant_mode"] = quant_mode
+            else:
+                kwargs["mma_type"] = mma_type
+                kwargs["num_shared_experts"] = num_shared_experts
             if cuda_graph_max_tokens_per_rank is not None:
                 kwargs["cuda_graph_max_tokens_per_rank"] = (
                     cuda_graph_max_tokens_per_rank
@@ -423,12 +453,24 @@ def _get_mega_moe_symm_buffer(
                 num_topk,
                 hidden,
                 intermediate_hidden,
-                num_shared_experts=num_shared_experts,
-                mma_type=mma_type,
                 activation="swiglu",
                 **kwargs,
             )
             _MEGA_MOE_SYMM_BUFFER[key] = buf
+            if _is_hcu and group.rank() == 0:
+                logger.info(
+                    "HCU MegaMoE buffer: runtime=%s quant=%s experts=%d topk=%d "
+                    "hidden=%d intermediate=%d cap=%d graph_cap=%s factory=%s",
+                    runtime,
+                    quant_mode,
+                    num_experts,
+                    num_topk,
+                    hidden,
+                    intermediate_hidden,
+                    num_max_tokens_per_rank,
+                    cuda_graph_max_tokens_per_rank,
+                    factory.__module__,
+                )
     return buf
 
 
@@ -469,6 +511,8 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     if get_is_capture_mode():
         if getattr(moe.experts, "_mega_moe_hcu_int4_weights", False):
             raise RuntimeError("HCU INT4 MegaMoE requires --disable-cuda-graph")
+        if getattr(moe.experts, "_mega_moe_hcu_w4a8_weights", False):
+            raise RuntimeError("HCU W4A8 MegaMoE requires disabled CUDA graphs")
         # deepgemm.mega supports capture with the graph's static padded rows;
         # topk masks the non-token rows. Keep the same prepared weights/runtime
         # during capture rather than falling back to the generic MoE runner.
@@ -573,19 +617,6 @@ def forward_mega_moe(
         if eager_w4a8_overlap:
             y.record_stream(current_stream)
 
-    if is_w4a8:
-        topk_config = getattr(moe.topk, "topk_config", moe.topk)
-        scale = (
-            1.0
-            if topk_config.apply_routed_scaling_factor_on_output
-            else moe.routed_scaling_factor
-        )
-        if shared_output is not None:
-            # Match forward_deepep: scaling and shared addition must round once.
-            shared_output.add_(y, alpha=scale)
-            return shared_output
-        y.mul_(scale)
-        return y
     if shared_output is not None:
         y.add_(shared_output)
     return y
@@ -755,26 +786,26 @@ def run_mega_routed_experts(
                 buf,
                 activation_clamp=activation_clamp,
             )
-        else:
-            run_hcu = (
-                _run_standalone_hcu_w8a8_mega_moe
-                if runtime == _HCU_MEGA_MOE_RUNTIME_MEGAMOE
-                else _run_deep_gemm_hcu_w8a8_mega_moe
-            )
-            y = run_hcu(
-                hidden_states=hidden_states,
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
-                experts=experts,
-                buf=buf,
-                num_tokens=num_tokens,
-                hidden_size=hidden_size,
-                dispatch_num_tokens=dispatch_num_tokens,
-                activation_clamp=activation_clamp,
-            )
-        # W4A8 applies the routed scale together with the shared-expert add in
-        # forward_mega_moe, so both round once.
-        if not is_w4a8 and routed_scaling_factor != 1.0:
+            if routed_scaling_factor != 1.0:
+                y.mul_(routed_scaling_factor)
+            return y
+        run_hcu = (
+            _run_standalone_hcu_w8a8_mega_moe
+            if runtime == _HCU_MEGA_MOE_RUNTIME_MEGAMOE
+            else _run_deep_gemm_hcu_w8a8_mega_moe
+        )
+        y = run_hcu(
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            experts=experts,
+            buf=buf,
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            dispatch_num_tokens=dispatch_num_tokens,
+            activation_clamp=activation_clamp,
+        )
+        if routed_scaling_factor != 1.0:
             y.mul_(routed_scaling_factor)
         return y
 
@@ -977,7 +1008,9 @@ def _run_standalone_hcu_w8a8_mega_moe(
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    api_kwargs = {"megamoe_backend": _select_hcu_megamoe_backend(dispatch_num_tokens)}
+    api_kwargs = {
+        "megamoe_backend": _select_hcu_megamoe_backend(dispatch_num_tokens, buf)
+    }
     if is_graph_capture:
         api_kwargs["graph"] = True
     else:
@@ -999,7 +1032,7 @@ def _run_standalone_hcu_w8a8_mega_moe(
 
 
 def _run_standalone_hcu_w4a8_mega_moe(
-    hidden_states, topk_ids, topk_weights, experts, buf, activation_clamp=None
+    hidden_states, topk_ids, topk_weights, experts, buf, *, activation_clamp=None
 ):
     from lightop.quant import per_token_quant_int8
     from megamoe.w4a8 import w4a8_mega_moe
@@ -1027,6 +1060,7 @@ def _run_standalone_hcu_w4a8_mega_moe(
 def build_hcu_w4a8_mega_moe_experts_weights(experts) -> None:
     from deepgemm import pack_w4a8_moe_hipc_weight
     from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+    from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 
     if getattr(experts, "_mega_moe_weights_built", False):
         return
@@ -1038,7 +1072,7 @@ def build_hcu_w4a8_mega_moe_experts_weights(experts) -> None:
         raise ValueError(
             "W4A8 MegaMoE supports offline EPLB via --init-expert-location; online EPLB is unsupported"
         )
-    if not get_exec().graph.disable_cuda_graph:
+    if not cuda_graph_fully_disabled():
         raise ValueError("W4A8 MegaMoE prefill currently requires --disable-cuda-graph")
     # The loader has already placed logical experts into the static physical
     # slots. Repack each slot independently without changing expert order.
@@ -1283,10 +1317,15 @@ def build_hcu_w8a8_mega_moe_experts_weights(experts) -> None:
         )
         experts._mega_moe_hcu_weight_layout = "marlin_w6_interleaved"
     else:
-        if (num_experts, hidden, intermediate) != (32, 4096, 2048):
+        from megamoe.dcu_megamoe_opt.v3_config import staged_pack5_dims_supported
+
+        if not (0 < num_experts <= 64) or not staged_pack5_dims_supported(
+            hidden=hidden,
+            intermediate_hidden=intermediate,
+        ):
             raise ValueError(
-                "standalone megamoe currently supports only 32 local experts, "
-                "hidden=4096, intermediate=2048 (DSV4-Flash EP8)"
+                "standalone MegaMoE NORMAL requires 1..64 local experts, "
+                "hidden divisible by 256 and intermediate divisible by 128 (<=4096)"
             )
         for label, weight in (("w13", w13), ("w2", w2)):
             _, rows, cols = weight.shape
@@ -1298,7 +1337,8 @@ def build_hcu_w8a8_mega_moe_experts_weights(experts) -> None:
 
         import megamoe
 
-        if _is_pd_prefill_instance():
+        normal_only_shape = (hidden, intermediate) not in {(4096, 2048), (7168, 3072)}
+        if _is_pd_prefill_instance() or normal_only_shape:
             experts.mega_l1_weights = {
                 "normal": (
                     megamoe.flatten_pack5_weight_asm_normal(w13.contiguous()),
@@ -1326,6 +1366,19 @@ def build_hcu_w8a8_mega_moe_experts_weights(experts) -> None:
                 )
             }
             experts._mega_moe_hcu_weight_layout = "unified"
+
+    # Keep one GPU copy of each expert weight. V4.1's EP8 routed weights
+    # occupy about 63 GiB/rank before shared/draft experts and KV cache;
+    # retaining both checkpoint and Mega layouts exceeds device capacity.
+    # Preserve parameter shapes for accounting, while sharing packed storage.
+    for name, pair in (
+        ("w13_weight", experts.mega_l1_weights),
+        ("w2_weight", experts.mega_l2_weights),
+    ):
+        if isinstance(pair, dict):
+            pair = next(iter(pair.values()))
+        parameter = getattr(experts, name)
+        parameter.data = pair[0].view(parameter.shape)
 
     experts._mega_moe_hcu_runtime = runtime
     experts._mega_moe_hcu_w8a8_weights = True

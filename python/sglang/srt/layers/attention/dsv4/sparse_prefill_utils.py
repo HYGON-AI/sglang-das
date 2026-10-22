@@ -32,6 +32,7 @@ For SWA-only layers callers pass ``topk=0``, ``compressed_base = 0`` (the
 compressed branch becomes a no-op) and any ``compress_ratio >= 1``.
 """
 
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Dict, Optional
@@ -40,8 +41,22 @@ import torch
 import triton
 
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import DIM_NOPE, DIM_ROPE
-from sglang.srt.utils import ceil_align
+from sglang.srt.utils import ceil_align, get_bool_env_var, is_hcu
 from sglang.srt.utils.common import async_h2d
+
+_use_hcu_combine_topk_swa_indices = is_hcu() and get_bool_env_var(
+    "SGLANG_HCU_OPT_COMBINE_TOPK_SWA_INDICES", "true"
+)
+_hcu_combine_topk_swa_indices = None
+if _use_hcu_combine_topk_swa_indices:
+    try:
+        from lightop import (
+            combine_topk_swa_indices_hcu as _hcu_combine_topk_swa_indices,
+        )
+    except ImportError:
+        logging.getLogger(__name__).warning(
+            "LightOp combine_topk_swa_indices_hcu is unavailable; using Triton."
+        )
 
 # FlashMLA sparse prefill asserts ``params.topk % B_TOPK == 0``. B_TOPK is 64
 # for the h_q=64 kernel and 128 for h_q=128; pad to 128 to satisfy both.
@@ -202,9 +217,9 @@ def combine_topk_swa_indices(
     assert compressed_base.dtype == torch.int32
     assert swa_base.dtype == torch.int32
     assert compress_ratio >= 1, "compress_ratio must be >= 1 (use topk=0 for SWA-only)"
-    assert topk_indices.shape[-1] >= topk, (
-        f"topk_indices width {topk_indices.shape[-1]} must be >= topk {topk}"
-    )
+    assert (
+        topk_indices.shape[-1] >= topk
+    ), f"topk_indices width {topk_indices.shape[-1]} must be >= topk {topk}"
 
     num_tokens = topk_indices.shape[0]
     if swa_indices is not None:
@@ -235,6 +250,23 @@ def combine_topk_swa_indices(
 
     if num_tokens == 0:
         return combined_indices, combined_lens
+    if _hcu_combine_topk_swa_indices is not None:
+        _hcu_combine_topk_swa_indices(
+            topk_indices,
+            query_start_loc,
+            query_pos,
+            seq_lens,
+            gather_lens,
+            compressed_base,
+            swa_base,
+            combined_indices,
+            combined_lens,
+            window_size,
+            compress_ratio,
+            topk,
+        )
+        return combined_indices, combined_lens
+
     block_t = 2  # Measured on B200 with num_warps=2, 16384 tokens, bs 1 to 64.
     _combine_topk_swa_indices_kernel[(triton.cdiv(num_tokens, block_t),)](
         combined_indices,
@@ -303,6 +335,14 @@ def build_swa_token_ids(
         swa_gather_lens: (num_reqs,) int32, gather length per request.
         swa_offsets: (num_reqs+1,) int32, exclusive cumsum of swa_gather_lens.
     """
+    if is_hcu():
+        from lightop.attention import dsv41_build_swa_token_ids
+
+        return dsv41_build_swa_token_ids(
+            seq_lens, extend_seq_lens, req_pool_indices, req_to_token,
+            full_to_swa, swa_window, total_swa,
+        )
+
     assert seq_lens.dtype == torch.int32
     assert extend_seq_lens.dtype == torch.int32
     assert req_pool_indices.dtype == torch.int32

@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.moe.topk import (
     _RENORMALIZE_SUM_EPSILON,
+    _use_lightop_sqrtsoftplus_v41_gate,
     StandardTopKOutput,
     StandardTopKOutputPacked,
     _mask_topk_ids_padded_region,
@@ -14,7 +15,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
     has_per_rank_fused_shared_slots,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hcu
 
 
 def _scale_fused_shared_weights(weights, num_fused_shared_experts, scaling_factor):
@@ -40,6 +41,58 @@ def vision_topk(
         assert not has_per_rank_fused_shared_slots(num_fused_shared_experts), (
             "VL routing does not support per-rank fused shared slots"
         )
+
+    # HCU lightop fast path: fused sqrtsoftplus gate with per-token 2D bias.
+    # _use_lightop_sqrtsoftplus_v41_gate already implies HCU; is_hcu() is an
+    # explicit guard so this block never runs on non-HCU builds regardless of
+    # how the flag is set.
+    if (
+        is_hcu()
+        and _use_lightop_sqrtsoftplus_v41_gate
+        and logits.dtype == torch.float32
+        and logits.is_contiguous()
+        and logits.size(1) in (256, 384)  # kernel compiled only for these expert counts
+        and 0 <= num_fused_shared_experts < config.top_k <= 16
+        and config.routed_scaling_factor is not None
+        and config.routed_scaling_factor > 0.0
+        and moe.gate.e_score_correction_bias.dtype == torch.float32
+        and (
+            input_ids is None
+            or moe.gate.e_score_correction_bias_vl.dtype == torch.float32
+        )
+    ):
+        # input_ids is None only for idle DP padding-token forwards; pass 1D
+        # bias directly so the kernel uses bias_row_stride=0 (broadcast).
+        if input_ids is None:
+            bias = moe.gate.e_score_correction_bias
+        else:
+            # Expand to [num_tokens, num_experts]; image tokens take the VL
+            # bias, text tokens take the routed bias. .contiguous() is required
+            # by the kernel's vectorized aligned load.
+            bias = torch.where(
+                (input_ids == moe.config.image_token_id)[:, None],
+                moe.gate.e_score_correction_bias_vl,
+                moe.gate.e_score_correction_bias,
+            ).contiguous()
+        weights, indices = torch.ops.sglang.moe_fused_gate_sqrtsoftplus_v41_hcu(
+            logits,
+            bias,
+            config.top_k,
+            num_fused_shared_experts,
+            config.renormalize and config.top_k > 1,
+            config.routed_scaling_factor,
+            config.apply_routed_scaling_factor_on_output,
+        )
+        weights = _scale_fused_shared_weights(
+            weights,
+            num_fused_shared_experts,
+            config.fused_shared_experts_scaling_factor,
+        )
+        if num_token_non_padded is not None:
+            _mask_topk_ids_padded_region(indices, num_token_non_padded)
+            _zero_topk_weights_padded_region(weights, num_token_non_padded)
+        return StandardTopKOutput(weights, indices, logits)
+
     if is_cuda():
         from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
         from sglang.srt.layers.moe.utils import get_moe_runner_backend

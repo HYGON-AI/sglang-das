@@ -30,6 +30,16 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
+def _cache_store_view(k_cache, kv_input, layout, page_size):
+    # A zero-page buffer denotes a non-owner in CP LayerSplit. The JIT still
+    # publishes the latent and updates C2 pair state, but never stores main KV.
+    if k_cache is None:
+        return torch.empty(
+            (0, layout.page_bytes(page_size)), device=kv_input.device, dtype=torch.uint8
+        )
+    return k_cache.view(torch.uint8) if is_hip_runtime() else k_cache
+
+
 @cache_once
 def _jit_c1_module(head_dim: int, rope_dim: int, page_size: int, layout: KVLayout):
     args = make_cpp_args(
@@ -56,7 +66,7 @@ def c1_decode_norm_rope_store(
     out_loc: torch.Tensor,
     eps: float,
     freqs_cis: torch.Tensor,
-    k_cache: torch.Tensor,
+    k_cache: Optional[torch.Tensor],
     *,
     page_size: int,
     layout: Union[KVLayout, str] = KVLayout.V4,
@@ -77,7 +87,7 @@ def c1_decode_norm_rope_store(
     :param eps: RMSNorm epsilon.
     :param freqs_cis: ``[max_pos, rope_dim]`` fp32, real/imag interleaved --
                       ``torch.view_as_real(freqs).flatten(-2)``.
-    :param k_cache: the compressed KV pool buffer for this layer.
+    :param k_cache: the compressed KV pool buffer, or None on a non-owner CP rank.
     :param page_size: slots per page of that pool (``page_size // ratio``, i.e.
                       the FULL page size at ratio 1).
     :param layout: the pool's :class:`KVLayout`. The fp8 layouts (``V4``,
@@ -101,7 +111,7 @@ def c1_decode_norm_rope_store(
         positions,
         out_loc,
         # HIP's fp8_e4m3_t is uint8_t, so the kernel matches the fp8 pool as bytes
-        k_cache.view(torch.uint8) if is_hip_runtime() else k_cache,
+        _cache_store_view(k_cache, kv_input, layout, page_size),
         float(eps),
     )
     return out
@@ -141,7 +151,7 @@ def c2_decode_norm_rope_store(
     raw_out_loc: torch.Tensor,
     eps: float,
     freqs_cis: torch.Tensor,
-    k_cache: torch.Tensor,
+    k_cache: Optional[torch.Tensor],
     *,
     page_size: int,
     ring_size: int,
@@ -163,7 +173,7 @@ def c2_decode_norm_rope_store(
                       ``torch.view_as_real(freqs).flatten(-2)``. Indexed
                       in-kernel at ``positions - 1``, the position the latent
                       stands for.
-    :param k_cache: the compressed KV pool buffer for this layer.
+    :param k_cache: the compressed KV pool buffer, or None on a non-owner CP rank.
     :param page_size: slots per page of that pool (``page_size // ratio``).
     :param layout: the pool's :class:`KVLayout`. The fp8 layouts (``V4``,
                    ``V41``) store the fp4 fake-quantized value; ``V41_FP4``
@@ -187,7 +197,7 @@ def c2_decode_norm_rope_store(
         eps,
         freqs_cis,
         # HIP's fp8_e4m3_t is uint8_t, so the kernel matches the fp8 pool as bytes
-        k_cache.view(torch.uint8) if is_hip_runtime() else k_cache,
+        _cache_store_view(k_cache, kv_input, layout, page_size),
         ring_size,
         draft_len,
     )
@@ -203,7 +213,7 @@ def c2_prefill_norm_rope_store(
     raw_out_loc: torch.Tensor,
     eps: float,
     freqs_cis: torch.Tensor,
-    k_cache: torch.Tensor,
+    k_cache: Optional[torch.Tensor],
     extend_start_loc: torch.Tensor,
     extend_seq_lens: torch.Tensor,
     *,
@@ -243,7 +253,7 @@ def c2_prefill_norm_rope_store(
         eps,
         freqs_cis,
         # HIP's fp8_e4m3_t is uint8_t, so the kernel matches the fp8 pool as bytes
-        k_cache.view(torch.uint8) if is_hip_runtime() else k_cache,
+        _cache_store_view(k_cache, kv_input, layout, page_size),
         ring_size,
         extend_start_loc,
         extend_seq_lens,

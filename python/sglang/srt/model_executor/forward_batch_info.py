@@ -528,6 +528,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # "Borrowed" into a dedicated "Forward-resolved snapshot" group.
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
+    # Host copy for plain extends (DSV4 mid-chunk decoder skip); None otherwise.
+    orig_seq_lens_cpu: Optional[List[int]] = None
 
     # This iteration's KV ids, translated once per sub-pool (`KVLocPlan`).
     # Every forward of the iteration holds the same plan; `out_cache_loc` is
@@ -1134,6 +1136,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 else None
             ),
             orig_seq_lens=batch.orig_seq_lens,
+            orig_seq_lens_cpu=(
+                getattr(batch, "orig_seq_lens_cpu", None)
+                if batch.forward_mode.is_extend_without_speculative()
+                else None
+            ),
             out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
             engram_history=batch.engram_history,
             mamba_track_indices=batch.mamba_track_indices,
@@ -1440,11 +1447,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         A replicated (``sharded=False``) forward keeps the full DP-group count.
         """
-        from sglang.srt.utils.common import require_mlp_tp_gather
-
         if self.global_num_tokens_cpu is not None:
             # DP / MLP-sync path: per-DP padded width.
-            if require_mlp_tp_gather():
+            if len(self.global_num_tokens_cpu) > 1:
                 num_tokens_per_dp = self.global_num_tokens_cpu[
                     dp_slot_in(self.global_num_tokens_cpu)
                 ]
@@ -1463,6 +1468,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def moe_num_token_non_padded(self) -> Optional[torch.Tensor]:
         """Bound for masking a sparse MoE's padded rows, or None when the MoE
         input is a gathered buffer whose real rows are not a prefix of it."""
+        from sglang.srt.layers.cp.utils import enable_cp_v2
         from sglang.srt.layers.layer_boundary import batch_gathers_over_moe_cp
         from sglang.srt.layers.moe.utils import is_moe_input_scattered_across_dp_ranks
 
@@ -1473,9 +1479,35 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ):
             from sglang.srt.layers.cp.base import get_cp_strategy
 
-            strategy = get_cp_strategy()
-            if strategy is not None:
-                return strategy.moe_num_token_non_padded(self)
+            if enable_cp_v2():
+                strategy = get_cp_strategy()
+                if strategy is not None:
+                    return strategy.moe_num_token_non_padded(self)
+            elif _is_hcu:
+                from sglang.srt.layers.attention.dsa.utils import (
+                    dsa_use_prefill_cp,
+                    is_dsa_prefill_cp_round_robin_split,
+                )
+
+                if dsa_use_prefill_cp(self) and is_dsa_prefill_cp_round_robin_split():
+                    # Legacy HCU metadata is not InterleaveCPStrategy metadata.
+                    # Its real rows still form a prefix of each strided shard.
+                    metadata = self.attn_cp_metadata
+                    if metadata.moe_local_token_count is None:
+                        total = self.global_num_token_non_padded_cpu
+                        if total is None:
+                            total = sum(self.extend_seq_lens_cpu)
+                        parallel = get_parallel()
+                        local = max(
+                            0,
+                            (total + parallel.attn_cp_size - 1 - parallel.attn_cp_rank)
+                            // parallel.attn_cp_size,
+                        )
+                        # Fill on device instead of synchronously uploading a CPU scalar.
+                        metadata.moe_local_token_count = torch.full(
+                            (), local, dtype=torch.int32, device=self.input_ids.device
+                        )
+                    return metadata.moe_local_token_count
 
         if self.num_token_non_padded is None:
             return None
@@ -1961,6 +1993,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.orig_seq_lens = torch.tensor(
                         [num_tokens], dtype=self.orig_seq_lens.dtype, device=dev
                     )
+                    self.orig_seq_lens_cpu = None
                     self.seq_lens_sum = int(num_tokens)
                     if self.seq_lens_cpu is not None:
                         self.seq_lens_cpu = torch.tensor(

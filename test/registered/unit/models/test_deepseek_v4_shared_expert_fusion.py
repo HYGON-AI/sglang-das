@@ -5,6 +5,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+import sglang.srt.models.deepseek_v4 as deepseek_v4
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.layers.moe import MoeA2ABackend
 from sglang.srt.layers.moe.utils import (
@@ -12,7 +13,10 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.models import deepseek_v4
-from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+from sglang.srt.models.deepseek_v4 import (
+    DeepseekV4DecoderLayer,
+    DeepseekV4ForCausalLM,
+)
 from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
 from sglang.srt.runtime_context import get_context, get_exec, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -265,6 +269,117 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
         self.assertIs(loaded[0][0], weight)
         self.assertEqual(loaded[0][1], "stages.0.mlp.experts.w13_weight")
         self.assertEqual(loaded[0][2:], ("w1", config.n_routed_experts))
+
+
+class TestDeepseekV4MoEAltStream(CustomTestCase):
+    def _moe_init_kwargs(self, streams):
+        config = SimpleNamespace(
+            hidden_size=16, model_type="deepseek_v41", vision_n_layers=0
+        )
+        with (
+            patch.object(
+                DeepseekV4DecoderLayer, "_build_self_attn", return_value=nn.Identity()
+            ),
+            patch.object(
+                deepseek_v4.deepseek_v2,
+                "DeepseekV2MoE",
+                side_effect=RuntimeError("stop_after_moe_init"),
+            ) as moe_init,
+            self.assertRaisesRegex(RuntimeError, "stop_after_moe_init"),
+        ):
+            DeepseekV4DecoderLayer(config, layer_id=0, alt_streams=streams)
+        return moe_init.call_args.kwargs
+
+    def test_hcu_sbo_reuses_stream_without_rocm_multistream_opt_in(self):
+        stream = object()
+        with (
+            patch.object(deepseek_v4, "_is_hcu", True),
+            patch.object(deepseek_v4, "_is_cuda", False),
+            patch.object(
+                deepseek_v4.SboFlags, "fuse_shared_experts_inside_sbo", return_value=True
+            ),
+            patch.object(
+                deepseek_v4.envs.SGLANG_ROCM_USE_MULTI_STREAM, "get", return_value=False
+            ),
+            patch.object(
+                deepseek_v4.envs.SGLANG_NPU_USE_MULTI_STREAM, "get", return_value=False
+            ),
+        ):
+            kwargs = self._moe_init_kwargs([stream])
+        self.assertIs(kwargs["alt_stream"], stream)
+        self.assertIsNone(kwargs["routed_quant_stream"])
+        self.assertTrue(kwargs["is_deepseek_v4"])
+
+    def test_hcu_without_sbo_keeps_explicit_multistream_policy(self):
+        stream = object()
+        for rocm, npu in ((False, False), (True, False), (False, True)):
+            with (
+                self.subTest(rocm=rocm, npu=npu),
+                patch.object(deepseek_v4, "_is_hcu", True),
+                patch.object(deepseek_v4, "_is_cuda", False),
+                patch.object(
+                    deepseek_v4.SboFlags,
+                    "fuse_shared_experts_inside_sbo",
+                    return_value=False,
+                ),
+                patch.object(
+                    deepseek_v4.envs.SGLANG_ROCM_USE_MULTI_STREAM,
+                    "get",
+                    return_value=rocm,
+                ),
+                patch.object(
+                    deepseek_v4.envs.SGLANG_NPU_USE_MULTI_STREAM,
+                    "get",
+                    return_value=npu,
+                ),
+            ):
+                self.assertIs(
+                    self._moe_init_kwargs([stream])["alt_stream"],
+                    stream if rocm or npu else None,
+                )
+
+    def test_non_hcu_sbo_keeps_original_stream_policy(self):
+        stream = object()
+        for cuda, rocm, npu in (
+            (True, False, False),
+            (False, False, False),
+            (False, True, False),
+            (False, False, True),
+        ):
+            with (
+                self.subTest(cuda=cuda, rocm=rocm, npu=npu),
+                patch.object(deepseek_v4, "_is_hcu", False),
+                patch.object(deepseek_v4, "_is_cuda", cuda),
+                patch.object(
+                    deepseek_v4.SboFlags,
+                    "fuse_shared_experts_inside_sbo",
+                    return_value=True,
+                ),
+                patch.object(
+                    deepseek_v4.envs.SGLANG_ROCM_USE_MULTI_STREAM,
+                    "get",
+                    return_value=rocm,
+                ),
+                patch.object(
+                    deepseek_v4.envs.SGLANG_NPU_USE_MULTI_STREAM,
+                    "get",
+                    return_value=npu,
+                ),
+            ):
+                self.assertIs(
+                    self._moe_init_kwargs([stream])["alt_stream"],
+                    stream if cuda or rocm or npu else None,
+                )
+
+    def test_hcu_sbo_without_stream_pool_does_not_create_stream(self):
+        with (
+            patch.object(deepseek_v4, "_is_hcu", True),
+            patch.object(deepseek_v4, "_is_cuda", False),
+            patch.object(
+                deepseek_v4.SboFlags, "fuse_shared_experts_inside_sbo", return_value=True
+            ),
+        ):
+            self.assertIsNone(self._moe_init_kwargs(None)["alt_stream"])
 
 
 if __name__ == "__main__":

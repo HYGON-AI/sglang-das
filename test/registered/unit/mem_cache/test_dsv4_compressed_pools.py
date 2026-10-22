@@ -104,6 +104,7 @@ class TestDSV4CompressedPools(CustomTestCase):
                 pool._unified_kv_fp8 = fp8
                 pool.uniform_fp8 = False
                 pool.kv_layout = KVLayout.V4
+                pool.cp_cache_layer_split_layout = None
                 pool.compressed_kv_layout_option = None
                 pool.compressed_pool_configs = {
                     4: _CompressedPoolConfig(
@@ -345,6 +346,8 @@ class TestV41KVPoolLayouts(CustomTestCase):
         for option, expect in ((None, KVLayout.V41_FP4), ("fp8", KVLayout.V41)):
             with self.subTest(compressed=option):
                 pool = self.make_pool([0, 0, 2, 1, 1], [2, 3], KVLayout.V41, option)
+                self.assertIsNone(pool.c4_indexer_kv_pool)
+                self.assertIs(pool.use_int8_index_k_cache, False)
                 self.assert_kernel_requirements(pool.swa_kv_pool, KVLayout.V41)
                 self.assertEqual(pool.get_swa_key_bytes_per_token(), 528)
                 for ratio in (1, 2):
@@ -374,6 +377,31 @@ class TestV41KVPoolLayouts(CustomTestCase):
             self.assertEqual(pool.kv_pools[ratio].page_size, PAGE_SIZE // ratio)
         # The 2-token c128 page is the only production page that pads.
         self.assertEqual(pool.kv_pools[128].bytes_per_page_padded, 1536)
+
+    def test_c4_int8_flag_is_preserved(self):
+        # Exercise the real constructor and pools on CPU, injecting only the
+        # feature flag; INT8 kernel/layout validation is tested separately.
+        make_indexer_pool = DeepSeekV4TokenToKVPool._make_indexer_pool
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                def make_with_flag(owner, *args, **kwargs):
+                    indexer = make_indexer_pool(owner, *args, **kwargs)
+                    indexer.use_int8_index_k_cache = enabled
+                    return indexer
+
+                with patch.object(
+                    DeepSeekV4TokenToKVPool, "_make_indexer_pool", make_with_flag
+                ):
+                    pool = self.make_pool(
+                        [0, 4, 128],
+                        [],
+                        KVLayout.V4,
+                        c4_size=PAGE_SIZE,
+                        c128_size=PAGE_SIZE,
+                        c4_state_pool_size=16,
+                        c128_state_pool_size=16,
+                    )
+                self.assertIs(pool.use_int8_index_k_cache, enabled)
 
     def test_pd_entries_cover_the_c4_kv_page_count(self):
         """The PD transfer walks every registered entry with the c4 KV pool's
@@ -449,6 +477,9 @@ class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):
     def test_pd_swa_state_pairs_with_a_paged_decode(self):
         target = self.make_pool(draft=False)
         draft = self.make_pool(draft=True)
+        for pool in (target, draft):
+            self.assertIsNone(pool.c4_indexer_kv_pool)
+            self.assertIs(pool.use_int8_index_k_cache, False)
         self.assertEqual(target.request_window.capacity, draft.swa_req_ring_size)
         override = get_context().override_server_args(
             enable_encoder_swa_bounded_replay=False

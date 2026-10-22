@@ -63,6 +63,7 @@ from sglang.srt.utils import (
 
 _is_hcu = is_hcu()
 _is_npu = is_npu()
+_is_hcu = is_hcu()
 _use_zbal = _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
 
 if TYPE_CHECKING:
@@ -388,9 +389,27 @@ class DeepEPBuffer:
                 num_max_dispatch_tokens_per_rank=None,
                 num_experts=None,
                 num_topk=None,
+                low_latency_rdma_bytes=0,
+                low_latency_num_qps=0,
             )
             buffers["deepep_ep_state"] = state
         return state
+
+    @classmethod
+    def register_low_latency_layout(
+        cls, group, num_tokens, hidden_size, num_experts, num_topk
+    ):
+        state = cls._state()
+        args = (num_tokens, hidden_size, group.size(), num_experts)
+        state.low_latency_rdma_bytes = max(
+            state.low_latency_rdma_bytes,
+            Buffer.get_low_latency_rdma_size_hint(*args, num_topk=num_topk),
+            # Layout cleaning uses the native API's default top-k requirement.
+            Buffer.get_low_latency_rdma_size_hint(*args),
+        )
+        state.low_latency_num_qps = max(
+            state.low_latency_num_qps, num_experts // group.size()
+        )
 
     @classmethod
     def get_deepep_buffer(
@@ -405,44 +424,49 @@ class DeepEPBuffer:
     ):
         state = cls._state()
         if state.buffer is not None:
-            incompatible = []
-            if state.group_size != group.size():
-                incompatible.append(
-                    f"EP size {state.group_size} != requested {group.size()}"
+            if _is_hcu and deepep_mode.enable_low_latency():
+                cls.set_low_latency_layout(
+                    num_max_dispatch_tokens_per_rank, hidden_size, num_experts
                 )
-            if state.hidden_size != hidden_size:
-                incompatible.append(
-                    f"hidden size {state.hidden_size} != requested {hidden_size}"
-                )
-            if deepep_mode.enable_normal() and not state.deepep_mode.enable_normal():
-                incompatible.append("existing buffer has no normal-mode allocation")
-            if deepep_mode.enable_low_latency():
-                if not state.deepep_mode.enable_low_latency():
-                    incompatible.append("existing buffer has no low-latency allocation")
-                if (
-                    state.num_max_dispatch_tokens_per_rank
-                    != num_max_dispatch_tokens_per_rank
-                ):
+            else:
+                incompatible = []
+                if state.group_size != group.size():
                     incompatible.append(
-                        "max dispatch tokens "
-                        f"{state.num_max_dispatch_tokens_per_rank} != requested "
-                        f"{num_max_dispatch_tokens_per_rank}"
+                        f"EP size {state.group_size} != requested {group.size()}"
                     )
-                if state.num_experts != num_experts:
+                if state.hidden_size != hidden_size:
                     incompatible.append(
-                        f"expert count {state.num_experts} != requested {num_experts}"
+                        f"hidden size {state.hidden_size} != requested {hidden_size}"
                     )
-                if state.num_topk != num_topk:
-                    incompatible.append(
-                        f"topk {state.num_topk} != requested {num_topk}"
+                if deepep_mode.enable_normal() and not state.deepep_mode.enable_normal():
+                    incompatible.append("existing buffer has no normal-mode allocation")
+                if deepep_mode.enable_low_latency():
+                    if not state.deepep_mode.enable_low_latency():
+                        incompatible.append("existing buffer has no low-latency allocation")
+                    if (
+                        state.num_max_dispatch_tokens_per_rank
+                        != num_max_dispatch_tokens_per_rank
+                    ):
+                        incompatible.append(
+                            "max dispatch tokens "
+                            f"{state.num_max_dispatch_tokens_per_rank} != requested "
+                            f"{num_max_dispatch_tokens_per_rank}"
+                        )
+                    if state.num_experts != num_experts:
+                        incompatible.append(
+                            f"expert count {state.num_experts} != requested {num_experts}"
+                        )
+                    if state.num_topk != num_topk:
+                        incompatible.append(
+                            f"topk {state.num_topk} != requested {num_topk}"
+                        )
+                if incompatible:
+                    raise RuntimeError(
+                        "Target and speculative DeepEP cannot create independent "
+                        "low-latency buffers in one process. Make their DeepEP "
+                        "layouts compatible or use a non-DeepEP speculative MoE "
+                        "backend. Incompatibilities: " + "; ".join(incompatible)
                     )
-            if incompatible:
-                raise RuntimeError(
-                    "Target and speculative DeepEP cannot create independent "
-                    "low-latency buffers in one process. Make their DeepEP "
-                    "layouts compatible or use a non-DeepEP speculative MoE "
-                    "backend. Incompatibilities: " + "; ".join(incompatible)
-                )
             return state.buffer
 
         state.deepep_mode = deepep_mode
@@ -486,6 +510,9 @@ class DeepEPBuffer:
                 num_rdma_bytes,
             )
 
+            if _is_hcu:
+                num_rdma_bytes = max(num_rdma_bytes, state.low_latency_rdma_bytes)
+
         # We should calculate num_qps_per_rank consistently with DeepEP's test script logic:
         if deepep_mode == DeepEPMode.NORMAL:
             # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
@@ -501,6 +528,9 @@ class DeepEPBuffer:
             )
         else:
             raise NotImplementedError
+
+        if _is_hcu and deepep_mode.enable_low_latency():
+            num_qps_per_rank = max(num_qps_per_rank, state.low_latency_num_qps)
 
         if not _is_npu:
             total_num_sms = torch.cuda.get_device_properties(
@@ -542,6 +572,47 @@ class DeepEPBuffer:
 
         state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
         return state.buffer
+
+    @classmethod
+    def get_low_latency_layout(cls):
+        state = cls._state()
+        if not _is_hcu or state.buffer is None or not state.buffer.low_latency_mode:
+            return None
+        return (
+            state.num_max_dispatch_tokens_per_rank,
+            state.hidden_size,
+            state.num_experts,
+        )
+
+    @classmethod
+    def set_low_latency_layout(
+        cls, num_max_dispatch_tokens_per_rank, hidden_size, num_experts
+    ):
+        layout = (num_max_dispatch_tokens_per_rank, hidden_size, num_experts)
+        if cls.get_low_latency_layout() == layout:
+            return
+        state = cls._state()
+        required_bytes = Buffer.get_low_latency_rdma_size_hint(
+            num_max_dispatch_tokens_per_rank,
+            hidden_size,
+            state.buffer.group_size,
+            num_experts,
+        )
+        if required_bytes > state.buffer.num_rdma_bytes:
+            raise RuntimeError(
+                f"DeepEP low-latency layout {layout} needs {required_bytes} bytes, "
+                f"but the shared buffer has {state.buffer.num_rdma_bytes}. "
+                "Initialize the largest communication layout first."
+            )
+        # HCU LL metadata offsets depend on the expert count. In DSpark the
+        # target and draft share this allocation but use different layouts;
+        # old payload bytes must not become counters/pointers in the new one.
+        state.buffer.clean_low_latency_buffer(*layout)
+        (
+            state.num_max_dispatch_tokens_per_rank,
+            state.hidden_size,
+            state.num_experts,
+        ) = layout
 
     @classmethod
     def clean_buffer(cls):
@@ -744,6 +815,12 @@ class _DeepEPDispatcherImplBase:
 
     def _validate_and_adjust_dtype(self) -> None:
         """Validate dtype against hardware and adjust if necessary."""
+        if (
+            _is_hcu
+            and self.deepep_output_dtype == DispatcherOutputDtype.INT8
+            and (self.quant_config or {}).get("hcu_w4a8_int8_dispatch", False)
+        ):
+            return  # The HCU DeepEP W4A8 kernels support INT8 communication.
         if _is_npu and self.deepep_output_dtype == DispatcherOutputDtype.FP8:
             from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
@@ -802,6 +879,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         if self.quant_config.get("preserve_input_dtype", False):
             # BF16 drafts must not inherit target activation quantization.
             pass
+        elif _is_hcu and self.quant_config.get("hcu_w4a8_int8_dispatch", False):
+            hidden_states = per_token_quant_int8(hidden_states)
         elif _deepgemm_is_selected() and self.use_fp8:
             quant_group_size = (
                 hidden_states.shape[-1] if _hcu_deepgemm_is_selected() else 128
@@ -813,7 +892,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
-        elif use_groupgemm:
+        elif use_groupgemm and not (
+            _is_hcu and self.deepep_output_dtype == DispatcherOutputDtype.BF16
+        ):
             if _use_fp8_w8a8_moe:
                 hidden_states = per_token_quant_fp8(hidden_states)
             elif _use_marlin_w16a16_moe:
@@ -1037,6 +1118,16 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     def __init__(self, return_recv_hook: bool, **kwargs):
         super().__init__(**kwargs)
 
+        if _is_hcu:
+            # Both target and draft dispatchers exist before the first forward.
+            DeepEPBuffer.register_low_latency_layout(
+                self.group,
+                self.num_max_dispatch_tokens_per_rank,
+                self.hidden_size,
+                self.num_experts,
+                self.router_topk,
+            )
+
         """
         num_max_dispatch_tokens_per_rank: the actual batch size in the decoding engine should be less than 256
         https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
@@ -1044,6 +1135,29 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.return_recv_hook = return_recv_hook
         self.device_module = torch.get_device_module()
         self.quant_config = {}
+        self._combine_input_ready_event = None
+        self._combine_input_ready_event_pending = False
+
+    def set_quant_config(self, quant_config: dict) -> None:
+        super().set_quant_config(quant_config)
+        if (
+            _is_hcu
+            and quant_config.get("hcu_w4a8_deepep_ll_producer_event", False)
+            and self._combine_input_ready_event is None
+        ):
+            self._combine_input_ready_event = self.device_module.Event()
+
+    def record_combine_input_ready_event(self) -> None:
+        if self._combine_input_ready_event is None:
+            raise RuntimeError(
+                "Combine-input ready events are only enabled for HCU DeepEP"
+            )
+        if self._combine_input_ready_event_pending:
+            raise RuntimeError(
+                "DeepEP combine-input ready event was recorded twice before combine"
+            )
+        self._combine_input_ready_event.record(self.device_module.current_stream())
+        self._combine_input_ready_event_pending = True
 
     def dispatch_a(
         self,
@@ -1133,7 +1247,21 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             and _DEEPEP_LL_DISPATCH_USES_QUANT_TYPE
             and not _hcu_deepgemm_is_selected()
         ):
-            if _use_fp8_w8a8_moe and not preserve_input_dtype:
+            if _is_hcu and self.quant_config.get("hcu_w4a8_int8_dispatch", False):
+                packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
+                    buffer.low_latency_dispatch(
+                        hidden_states,
+                        topk_ids,
+                        topk_weights,
+                        self.num_max_dispatch_tokens_per_rank,
+                        self.num_experts,
+                        quant_type=1,
+                        fp8_round_scale=False,
+                        async_finish=not self.return_recv_hook,
+                        return_recv_hook=self.return_recv_hook,
+                    )
+                )
+            elif _use_fp8_w8a8_moe and not preserve_input_dtype:
                 packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
                     buffer.low_latency_dispatch(
                         hidden_states,
@@ -1148,7 +1276,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                     )
                 )
             elif (
-                preserve_input_dtype or _use_marlin_w16a16_moe or _use_marlin_w4a16_moe
+                preserve_input_dtype
+                or self.deepep_output_dtype == DispatcherOutputDtype.BF16
+                or _use_marlin_w16a16_moe
+                or _use_marlin_w4a16_moe
             ):
                 packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
                     buffer.low_latency_dispatch(
@@ -1277,6 +1408,15 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 )
         else:
             overlap_args_dict = {}
+
+        combine_stream = (
+            overlap_args.stream
+            if overlap_args is not None
+            else self.device_module.current_stream()
+        )
+        if self._combine_input_ready_event_pending:
+            combine_stream.wait_event(self._combine_input_ready_event)
+            self._combine_input_ready_event_pending = False
 
         with ctx:
             _deepep_precompile_tp_barrier()
@@ -1469,6 +1609,14 @@ class DeepEPDispatcher(BaseDispatcher):
             self._low_latency_dispatcher.set_quant_config(quant_config)
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher.set_quant_config(quant_config)
+
+    def record_combine_input_ready_event(self) -> None:
+        impl = self._get_impl()
+        if not isinstance(impl, _DeepEPDispatcherImplLowLatency):
+            raise RuntimeError(
+                "Combine-input ready events require DeepEP low-latency mode"
+            )
+        impl.record_combine_input_ready_event()
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
