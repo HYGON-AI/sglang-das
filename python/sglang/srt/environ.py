@@ -294,6 +294,20 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # Restore the legacy BREAKABLE decode-graph default for Qwen4Exp PLE
+    # offload on HIP/HCU. By default, int8/fp8 PLE tables bind mapped CUDA
+    # views and replay safely inside FULL decode graphs; opt out if the
+    # mapped-view path misbehaves on a given DTK/GTT combination.
+    SGLANG_PLE_DECODE_GRAPH_BREAKABLE = EnvBool(False)
+    # Combine ETP-across-DP sharded PLE lookups with reduce-scatter instead
+    # of all_reduce + dp_scatter (half the wire traffic, no extra copy).
+    SGLANG_PLE_ETP_REDUCE_SCATTER = EnvBool(True)
+    # Minimum gathered-row count for the PLE ETP reduce-scatter combine.
+    # Below this the combine falls back to all_reduce + dp_scatter:
+    # reduce-scatter on small messages (short decode batches) loses to the
+    # fused aiter all-reduce (measured TPOT +35% at 4k/1k c8 with the gate
+    # absent), while large prefill gathers still benefit.
+    SGLANG_PLE_ETP_REDUCE_SCATTER_MIN_TOKENS = EnvInt(2048)
     # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
     # path is ported, so setting this fails loudly instead of degrading.
     SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
@@ -828,6 +842,12 @@ class Envs:
     # input anyway, but router/shared-expert reads see rounded values, so this
     # stays accuracy-gated and default OFF.
     SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
+    # int8-per-token variant of the fp8 wire compression above: local rows are
+    # quantized with the SAME lightop per_token_quant_int8 the w4a8 expert
+    # GEMMs use, so the gathered (codes, scales) can be handed straight to the
+    # experts (vLLM PR 247 "INT8 AllGatherv": gather quantized, dequantize
+    # once for the router, reuse the codes/scales instead of re-quantizing).
+    SGLANG_ENABLE_DP_GATHER_INT8 = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated

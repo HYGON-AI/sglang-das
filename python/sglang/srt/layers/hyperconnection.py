@@ -295,6 +295,8 @@ class GatedResidual(HyperConnectionBase):
         if block_output.shape[0] == 0:
             return hyper_input.to(self.params_dtype)
 
+        import os
+
         if (
             self._jit_combine_ok
             and block_output.is_cuda
