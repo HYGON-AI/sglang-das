@@ -524,17 +524,20 @@ class TestHCUW4A8Reference(CustomTestCase):
             hidden_states_scale=torch.ones((2, 1)),
             topk_ids=ids,
             topk_weights=weights,
-            num_recv_tokens_per_expert=[256, 512],
+            num_recv_tokens_per_expert=[256, 512, 0],
         )
         layer = self.make_reference_layer(
-            w13_weight_scale=torch.ones((2, 32, 1)),
-            w2_weight_scale=torch.ones((2, 16, 1)),
+            w13_weight_scale=torch.ones((3, 32, 1)),
+            w2_weight_scale=torch.ones((3, 16, 1)),
             w13_weight=object(),
             w2_weight=object(),
             w4a8_padded_intermediate_size=16,
         )
 
         def scatter(q, scale, topk, counts, output, out_scale, total, **kwargs):
+            torch.testing.assert_close(counts, counts_gpu, atol=0, rtol=0)
+            self.assertEqual(total, 768)
+            self.assertTrue(kwargs["counts_are_aligned"])
             self.assertEqual(output.shape, (768, 16))
             output.zero_()
             out_scale.fill_(1)
@@ -563,7 +566,30 @@ class TestHCUW4A8Reference(CustomTestCase):
                             input[indices[token, slot]] * topk_weights[token, slot]
                         )
 
+        make_tensor = torch.tensor
+        counts_gpu = make_tensor([256, 512, 0], dtype=torch.int32)
+        counts_host = Mock()
+        counts_host.to.return_value = counts_gpu
+
+        def tensor(*args, **kwargs):
+            if kwargs.get("pin_memory"):
+                self.assertEqual(args, ([256, 512, 0],))
+                self.assertEqual(
+                    kwargs,
+                    {"dtype": torch.int32, "pin_memory": True, "device": "cpu"},
+                )
+                return counts_host
+            return make_tensor(*args, **kwargs)
+
         with (
+            patch("torch.tensor", side_effect=tensor),
+            patch(
+                "sglang.srt.layers.moe.ep_moe.layer.get_offloader"
+            ) as offloader,
+            patch(
+                "sglang.srt.layers.moe.ep_moe.layer.copy_list_to_gpu_no_ce",
+                return_value=counts_gpu,
+            ) as copy_no_ce,
             patch(
                 "lightop.quant.per_token_quant_int8",
             ) as quantize,
@@ -580,13 +606,26 @@ class TestHCUW4A8Reference(CustomTestCase):
             ),
             patch("lightop.fuse_silu_mul_clamp_quant", new=activation),
         ):
-            result = layer.run_moe_core(dispatch)
+            for forbid_copy_engine in (False, True):
+                with self.subTest(forbid_copy_engine=forbid_copy_engine):
+                    offloader.return_value.forbid_copy_engine_usage = forbid_copy_engine
+                    counts_host.to.reset_mock()
+                    copy_no_ce.reset_mock()
+                    result = layer.run_moe_core(dispatch)
+                    if forbid_copy_engine:
+                        copy_no_ce.assert_called_once_with([256, 512, 0])
+                        counts_host.to.assert_not_called()
+                    else:
+                        copy_no_ce.assert_not_called()
+                        counts_host.to.assert_called_once_with(
+                            device=x.device, non_blocking=True
+                        )
+                    torch.testing.assert_close(
+                        result.hidden_states, x.to(torch.bfloat16), atol=0, rtol=0
+                    )
+                    self.assertIsInstance(result, DeepEPNormalCombineInput)
+                    self.assertIs(result.topk_ids, ids)
         quantize.assert_not_called()
-        torch.testing.assert_close(
-            result.hidden_states, x.to(torch.bfloat16), atol=0, rtol=0
-        )
-        self.assertIsInstance(result, DeepEPNormalCombineInput)
-        self.assertIs(result.topk_ids, ids)
         layer.quant_method.apply.assert_not_called()
 
     def test_reference_normal_rejects_unaligned_counts(self):
