@@ -51,6 +51,41 @@ cd ..
 pip install -e "python[srt]" --no-deps --no-build-isolation
 ```
 
+### 打包发布 wheel（带 git commit 后缀）
+
+`scripts/build_hcu_wheels.sh` 一键分别打包 `sglang`、`sgl-kernel`、`sglang-router` 三个 wheel，并按 CI 规则追加 DAS 本地版本号，形如 `0.5.18+das.dtk2604.torch2110.2609211530.g023409`（`das.dtk<DTK>.torch<torch>.<YYMMDDHHMM>.g<commit 前 6 位>`）。
+
+```shell
+# 三个包全打，产物落 output/
+scripts/build_hcu_wheels.sh
+
+# 只打其中一个或几个
+scripts/build_hcu_wheels.sh sglang
+scripts/build_hcu_wheels.sh kernel router
+
+# 清理历史构建产物
+scripts/build_hcu_wheels.sh clean        # 清中间产物，保留 output/ 和 cargo target
+scripts/build_hcu_wheels.sh clean_all    # 上面 + output/ + cargo target
+scripts/build_hcu_wheels.sh clean_all all  # 先全清再全打
+```
+
+脚本行为：
+
+- 自动 `source ${DTK_HOME}/env.sh` 和 `~/.cargo/env`；`TORCH_VERSION` 取自已安装的 torch，`DTK_VERSION` 取自 `/opt/dtk` 软链，`g<sha6>` 取自 `HEAD`。
+- 环境内有 Hygon 内部工具 `CIUpload` 时，走与 CI 相同的 `CIUpload REPAIR` 追加后缀；没有时直接把 `+das.*` 写入各包的版本来源（`SETUPTOOLS_SCM_PRETEND_VERSION` 与两个 `pyproject.toml` 的 `version` 行），构建结束自动还原被改动的文件。
+- 三个包的基础版本来源不同：`sglang` 走 setuptools-scm（默认 `SGLANG_VERSION=0.5.18`），`sgl-kernel` 读 `python/sglang/kernels/aot/pyproject.toml` 的 `version`，`sglang-router` 读 `sgl-model-gateway/bindings/python/pyproject.toml` 的 `version`。
+- `sglang` 构建前会换入 `python/pyproject_hcu.toml` 作为 HCU 依赖清单，构建后还原。
+
+常用环境变量：`SGLANG_VERSION`、`TORCH_VERSION`、`DTK_VERSION`、`DTK_HOME`、`GIT_COMMIT`、`BUILD_TIMESTAMP`、`LOCAL_VERSION`、`OUTPUT_DIR`、`USE_CIUPLOAD`、`SKIP_AUDITWHEEL`、`MATURIN_FEATURES`、`CLEAN_BEFORE_BUILD`；完整说明见 `scripts/build_hcu_wheels.sh --help`。
+
+打包前需装好构建依赖（脚本不代装）：
+
+```shell
+pip install build setuptools setuptools-scm setuptools-rust wheel ninja "maturin<1.8"
+```
+
+`sglang-router` 还需要 `cargo` 与 `protoc`。
+
 ### 运行基础环境准备
 1、使用上面所选的 Python 3.10、PyTorch 版本和 DTK 26.04 HCU 基础环境。
 

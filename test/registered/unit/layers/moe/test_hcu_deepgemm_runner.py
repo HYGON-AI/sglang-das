@@ -121,7 +121,7 @@ def test_hcu_deepgemm_problem_shape_uses_logical_packed_shapes():
         DeepGemmRunnerCore._hcu_problem_shape(_quant_info(logical_w13_shape=(2, 7, 4)))
 
 
-def test_hcu_deepgemm_uses_modern_deepep_runner_stack(monkeypatch):
+def test_hcu_deepgemm_runner_capability(monkeypatch):
     monkeypatch.setattr(ep_moe_layer.deep_gemm_wrapper, "ENABLE_HCU_DEEPGEMM", True)
     monkeypatch.setattr(
         ep_moe_layer,
@@ -130,6 +130,166 @@ def test_hcu_deepgemm_uses_modern_deepep_runner_stack(monkeypatch):
     )
 
     assert ep_moe_layer._should_use_hcu_deepgemm_runner()
+
+
+@pytest.mark.parametrize("is_minimax_m3", [False, True])
+@pytest.mark.parametrize(
+    "backend,quant_name,hcu,jit,aiter,npu,bf16_dispatch,expected_unmarked,expected_marked",
+    [
+        ("deep_gemm", "fp8", True, False, False, False, False, False, True),
+        ("humming", "fp8", False, False, False, False, False, True, True),
+        ("auto", "humming", False, False, False, False, False, True, True),
+        ("deep_gemm", "fp8", False, False, True, False, False, True, True),
+        ("deep_gemm", "fp8", False, False, False, True, False, True, True),
+        ("deep_gemm", "fp8", False, True, False, False, False, True, True),
+        ("deep_gemm", "generic", False, True, False, False, True, True, True),
+        (
+            "flashinfer_cutedsl",
+            "modelopt_fp4",
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+            True,
+        ),
+        (
+            "flashinfer_cutedsl",
+            "modelopt_mixed",
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+            True,
+        ),
+        ("deep_gemm", "mxfp4", False, True, False, False, False, True, True),
+        ("deep_gemm", None, False, True, False, False, False, True, True),
+        ("deep_gemm", "generic", False, False, False, False, False, False, False),
+        ("triton", "fp8", False, False, False, False, False, False, False),
+        ("triton", "fp8", True, False, False, False, False, False, False),
+        ("deep_gemm", "slim_w4a8", True, False, False, False, False, False, False),
+        ("deep_gemm", "slim_w8a8", True, False, False, False, False, False, False),
+    ],
+)
+def test_minimax_hcu_opt_in_preserves_backend_selection(
+    monkeypatch,
+    is_minimax_m3,
+    backend,
+    quant_name,
+    hcu,
+    jit,
+    aiter,
+    npu,
+    bf16_dispatch,
+    expected_unmarked,
+    expected_marked,
+):
+    class FakeFp8Config:
+        pass
+
+    def init_fused_moe(self, **kwargs):
+        torch.nn.Module.__init__(self)
+        self.moe_runner_config = SimpleNamespace(is_minimax_m3=False)
+        self.quant_method = SimpleNamespace(block_quant=False)
+        self.w13_weight = SimpleNamespace(dtype=torch.bfloat16)
+        self.dispatcher = SimpleNamespace()
+
+    runner = SimpleNamespace(
+        **{
+            "is_" + name: (lambda name=name: backend == name)
+            for name in ["humming", "auto", "deep_gemm", "flashinfer_cutedsl"]
+        }
+    )
+    mode = SimpleNamespace(enable_low_latency=lambda: True)
+    monkeypatch.setattr(ep_moe_layer.FusedMoE, "__init__", init_fused_moe)
+    monkeypatch.setattr(ep_moe_layer, "Fp8Config", FakeFp8Config)
+    monkeypatch.setattr(ep_moe_layer, "get_moe_runner_backend", lambda: runner)
+    monkeypatch.setattr(ep_moe_layer, "get_deepep_mode", lambda: mode)
+    monkeypatch.setattr(
+        ep_moe_layer,
+        "get_moe_a2a_backend",
+        lambda: SimpleNamespace(is_deepep=lambda: True, is_pplx=lambda: False),
+    )
+    monkeypatch.setattr(ep_moe_layer, "should_use_aiter_runner", lambda: aiter)
+    monkeypatch.setattr(ep_moe_layer, "_use_aiter", False)
+    monkeypatch.setattr(ep_moe_layer, "_is_npu", npu)
+    monkeypatch.setattr(ep_moe_layer, "_is_hip", hcu)
+    monkeypatch.setattr(ep_moe_layer, "_use_fp8_w8a8_moe", False)
+    monkeypatch.setattr(ep_moe_layer, "_use_marlin_w16a16_moe", False)
+    monkeypatch.setattr(ep_moe_layer, "_use_marlin_w4a16_moe", False)
+    monkeypatch.setattr(ep_moe_layer.deep_gemm_wrapper, "ENABLE_HCU_DEEPGEMM", hcu)
+    monkeypatch.setattr(ep_moe_layer.deep_gemm_wrapper, "ENABLE_JIT_DEEPGEMM", jit)
+    monkeypatch.setattr(
+        ep_moe_layer.envs.SGLANG_DEEPEP_BF16_DISPATCH, "get", lambda: bf16_dispatch
+    )
+    quant = (
+        FakeFp8Config()
+        if quant_name == "fp8"
+        else (
+            None if quant_name is None else SimpleNamespace(get_name=lambda: quant_name)
+        )
+    )
+    if quant_name == "slim_w4a8":
+        quant = object.__new__(ep_moe_layer.SlimQuantW4A8Int8MarlinConfig)
+    elif quant_name == "slim_w8a8":
+        quant = object.__new__(ep_moe_layer.SlimQuantCompressedTensorsMarlinConfig)
+    layer = ep_moe_layer.DeepEPMoE(
+        num_experts=128,
+        top_k=8,
+        hidden_size=4096,
+        intermediate_size=2048,
+        layer_id=3,
+        quant_config=quant,
+        is_minimax_m3=is_minimax_m3,
+    )
+    # Only the HCU-specific opt-in depends on the model marker. All other
+    # backend conditions must continue selecting FusedMoE for other models.
+    expected = expected_marked if is_minimax_m3 else expected_unmarked
+    assert layer.deprecate_flag is expected
+    if not expected:
+        assert not layer.use_w4a16_marlin
+        assert layer.deepep_mode is mode
+        if quant_name == "fp8":
+            assert layer.use_fp8_w8a8
+
+
+@pytest.mark.parametrize("is_minimax_m3", [False, True])
+def test_breakable_forward_limits_hcu_special_case_to_minimax(
+    monkeypatch, is_minimax_m3
+):
+    hidden = torch.ones((2, 4))
+    sentinel = object()
+    calls = []
+
+    def legacy_forward(hidden, weights, ids, logits, output):
+        calls.append("legacy")
+        output.copy_(hidden)
+
+    layer = SimpleNamespace(
+        deprecate_flag=True,
+        moe_runner_config=SimpleNamespace(is_minimax_m3=is_minimax_m3),
+        quant_config=None,
+        forward_impl=lambda *args: sentinel,
+        a2a_forward_with_output=legacy_forward,
+    )
+    topk = SimpleNamespace(topk_weights=None, topk_ids=None, router_logits=None)
+    monkeypatch.setattr(ep_moe_layer, "is_in_breakable_cuda_graph", lambda: True)
+    monkeypatch.setattr(
+        ep_moe_layer, "_should_break_only_hcu_deepgemm_core", lambda quant: True
+    )
+    monkeypatch.setattr(
+        ep_moe_layer.TopKOutputChecker, "format_is_standard", lambda value: True
+    )
+    output = ep_moe_layer.DeepEPMoE.forward(layer, hidden, topk)
+    if is_minimax_m3:
+        assert output is sentinel
+        assert not calls
+    else:
+        assert torch.equal(output, hidden)
+        assert calls == ["legacy"]
 
 
 def test_hcu_deepgemm_breakable_capture_stub_preserves_ll_layout():
@@ -157,19 +317,25 @@ def test_hcu_deepgemm_breakable_capture_stub_preserves_ll_layout():
     assert second.hidden_states is output.hidden_states
 
 
-def test_hcu_deepgemm_breakable_routes_only_moe_core(monkeypatch):
-    sentinel = object()
+@pytest.mark.parametrize("is_minimax_m3", [False, True])
+def test_hcu_core_break_preserves_other_model_delegation(monkeypatch, is_minimax_m3):
+    hcu_result, default_result = object(), object()
     dispatch_output = SimpleNamespace()
-    layer = SimpleNamespace(
-        deprecate_flag=True,
-        hcu_ll_moe_core=lambda value: sentinel if value is dispatch_output else None,
-    )
+    layer = object.__new__(ep_moe_layer.DeepEPMoE)
+    torch.nn.Module.__init__(layer)
+    layer.deprecate_flag = True
+    layer.quant_config = None
+    layer.moe_runner_config = SimpleNamespace(is_minimax_m3=is_minimax_m3)
+    layer.hcu_ll_moe_core = lambda value: hcu_result
     monkeypatch.setattr(ep_moe_layer, "is_in_breakable_cuda_graph", lambda: True)
     monkeypatch.setattr(
-        ep_moe_layer, "_should_break_only_hcu_deepgemm_core", lambda: True
+        ep_moe_layer, "_should_break_only_hcu_deepgemm_core", lambda quant: True
     )
-
-    assert ep_moe_layer.DeepEPMoE.run_moe_core(layer, dispatch_output) is sentinel
+    monkeypatch.setattr(
+        ep_moe_layer.FusedMoE, "run_moe_core", lambda *args, **kwargs: default_result
+    )
+    result = layer.run_moe_core(dispatch_output)
+    assert result is (hcu_result if is_minimax_m3 else default_result)
 
 
 def test_breakable_graph_helpers_preserve_namedtuple_protocol():

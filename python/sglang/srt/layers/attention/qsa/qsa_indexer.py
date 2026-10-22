@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -274,6 +274,11 @@ class QSAIndexer(MultiPlatformOp):
             self.k_layernorm.variance_epsilon,
             self.rotary_emb.is_neox_style,
         )
+        update_fp8 = getattr(
+            pool, "update_qsa_compressed_fp8_k_buffer", None
+        )
+        if update_fp8 is not None:
+            update_fp8(self.layer_id, write_locs)
 
     def _pending_ring_slots(
         self, metadata, logical_positions: torch.Tensor, is_extend: bool
@@ -549,6 +554,7 @@ class QSAIndexer(MultiPlatformOp):
         max_model_len: int,
         query_positions: torch.Tensor,
         sequence_lengths: torch.Tensor,
+        k_cache_fp8: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         logits = qsa_mqa_decode(
             q,
@@ -556,6 +562,7 @@ class QSAIndexer(MultiPlatformOp):
             compressed_page_table,
             compressed_lengths,
             max_model_len,
+            k_cache_fp8=k_cache_fp8,
         )
         if logits.is_cuda and self.block_topk == 512:
             # Decode rows start at zero, so lengths are the compressed lengths
@@ -673,6 +680,13 @@ class QSAIndexer(MultiPlatformOp):
             compressed_cache, page_table, compressed_lengths, max_model_len = (
                 indexer_metadata.get_decode_mqa_inputs(self.layer_id)
             )
+            pool = indexer_metadata.token_to_kv_pool
+            get_fp8_cache = getattr(
+                pool, "get_qsa_compressed_fp8_k_buffer", None
+            )
+            k_cache_fp8 = (
+                get_fp8_cache(self.layer_id) if get_fp8_cache is not None else None
+            )
             return self.select_decode_tokens(
                 q,
                 compressed_cache,
@@ -681,6 +695,7 @@ class QSAIndexer(MultiPlatformOp):
                 max_model_len,
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
+                k_cache_fp8,
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (

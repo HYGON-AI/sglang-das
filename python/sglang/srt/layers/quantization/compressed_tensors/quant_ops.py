@@ -67,6 +67,9 @@ def triton_scaled_mm(
     if (
         best_config is None
         and bias is None
+        # M=0 (e.g. idle DP batch) yields a zero grid dim in lightop's asm
+        # launch, which HIP rejects and lightop turns into exit(0).
+        and a.shape[0] > 0
         and a.dtype == torch.int8
         and b.dtype == torch.int8
         and b.dim() == 2
