@@ -1199,7 +1199,12 @@ class DeepEPMoE(FusedMoE):
             a1_scale = torch.empty(
                 (all_tokens, 1), dtype=torch.float32, device=x.device
             )
-            counts_gpu = torch.tensor(counts, dtype=torch.int32, device=x.device)
+            if get_offloader().forbid_copy_engine_usage:
+                counts_gpu = copy_list_to_gpu_no_ce(counts)
+            else:
+                counts_gpu = torch.tensor(
+                    counts, dtype=torch.int32, pin_memory=True, device="cpu"
+                ).to(device=x.device, non_blocking=True)
             m_indices, output_index = _ep_scatter_with_optional_lightop(
                 x,
                 x_scale,
