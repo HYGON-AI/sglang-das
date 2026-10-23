@@ -15,6 +15,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import logging
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -52,10 +53,16 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
 
 
 _A2A_STAGING_BUFFERS: dict[tuple, torch.Tensor] = {}
+_A2A_CAPACITY_STAGING_BUFFERS: dict[tuple, torch.Tensor] = {}
 
 
 def _a2a_staging_buffer(
-    role: str, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+    role: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    *,
+    reuse_staging_capacity: bool = False,
 ) -> torch.Tensor:
     """Reusable staging buffer for a Ulysses collective.
 
@@ -65,6 +72,9 @@ def _a2a_staging_buffer(
     Bypassed under autograd and CUDA graph capture: a buffer first allocated
     while capturing would live in the graph's private memory pool and must
     not be shared with eager replays.
+
+    Opt-in capacity reuse keeps one flat buffer per (role, dtype, device)
+    instead of retaining a separate buffer for every request shape.
     """
     if (
         torch.is_grad_enabled()
@@ -73,6 +83,16 @@ def _a2a_staging_buffer(
         or torch.cuda.is_current_stream_capturing()
     ):
         return torch.empty(shape, dtype=dtype, device=device)
+    if reuse_staging_capacity:
+        key = (role, dtype, device.index)
+        required = math.prod(shape)
+        buffer = _A2A_CAPACITY_STAGING_BUFFERS.get(key)
+        if buffer is None or buffer.numel() < required:
+            _A2A_CAPACITY_STAGING_BUFFERS.pop(key, None)
+            buffer = None
+            buffer = torch.empty(required, dtype=dtype, device=device)
+            _A2A_CAPACITY_STAGING_BUFFERS[key] = buffer
+        return buffer[:required].reshape(shape)
     key = (role, tuple(shape), dtype, device.index)
     buffer = _A2A_STAGING_BUFFERS.get(key)
     if buffer is None:
@@ -81,13 +101,22 @@ def _a2a_staging_buffer(
     return buffer
 
 
-def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Tensor:
+def _usp_all_to_all_single(
+    x: torch.Tensor,
+    role: str | None = None,
+    *,
+    reuse_staging_capacity: bool = False,
+) -> torch.Tensor:
     ulysses_pg = get_sp_group().ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x_shape = x.shape
     x = x.flatten().contiguous()
     if role is None:
         output = torch.empty_like(x)
+    elif reuse_staging_capacity:
+        output = _a2a_staging_buffer(
+            role, x.shape, x.dtype, x.device, reuse_staging_capacity=True
+        )
     else:
         output = _a2a_staging_buffer(role, x.shape, x.dtype, x.device)
     # USP calls this collective many times per denoising step and waits
@@ -338,6 +367,8 @@ def _usp_input_all_to_all_packed_qkv(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    *,
+    reuse_staging_capacity: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Exchange 3D Q/K/V with one destination-major Ulysses collective."""
     world_size = get_ulysses_parallel_world_size()
@@ -356,17 +387,25 @@ def _usp_input_all_to_all_packed_qkv(
         and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
         and not torch.compiler.is_compiling()
     ):
+        shape = (world_size, s_local, h_local, 3 * head_size)
+        if reuse_staging_capacity:
+            staging = _a2a_staging_buffer(
+                "usp_packed_qkv_src",
+                shape,
+                q.dtype,
+                q.device,
+                reuse_staging_capacity=True,
+            )
+        else:
+            staging = _a2a_staging_buffer(
+                "usp_packed_qkv_src", shape, q.dtype, q.device
+            )
         packed = pack_qkv_destination_major(
             q,
             k,
             v,
             world_size,
-            out=_a2a_staging_buffer(
-                "usp_packed_qkv_src",
-                (world_size, s_local, h_local, 3 * head_size),
-                q.dtype,
-                q.device,
-            ),
+            out=staging,
         )
     else:
         packed = torch.empty(
@@ -380,7 +419,12 @@ def _usp_input_all_to_all_packed_qkv(
             )
             packed[..., index * head_size : (index + 1) * head_size].copy_(head_shards)
 
-    packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
+    if reuse_staging_capacity:
+        packed = _usp_all_to_all_single(
+            packed, role="usp_packed_qkv_recv", reuse_staging_capacity=True
+        )
+    else:
+        packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
     packed = packed.reshape(s_local * world_size, h_local, 3 * head_size)
     q, k, v = packed.split(head_size, dim=-1)
     return q, k, v
@@ -538,7 +582,12 @@ def _usp_input_all_to_all_varlen(
     return x
 
 
-def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
+def _usp_output_all_to_all(
+    x: torch.Tensor,
+    head_dim: int = 1,
+    *,
+    reuse_staging_capacity: bool = False,
+) -> torch.Tensor:
     """
     Perform Ulysses-style output all-to-all over the head dimension (inverse of input).
 
@@ -586,7 +635,10 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     s_local, h_global = s_global // world_size, h_local * world_size
 
     x = x.permute(permute_order).contiguous()
-    x = _usp_all_to_all_single(x, role="usp_output")
+    if reuse_staging_capacity:
+        x = _usp_all_to_all_single(x, role="usp_output", reuse_staging_capacity=True)
+    else:
+        x = _usp_all_to_all_single(x, role="usp_output")
     x = x.reshape(world_size, s_local, b, h_local, d)
 
     # Reorder dims to place 'world_size' adjacent to 'h_local' to merge them into 'h_global'

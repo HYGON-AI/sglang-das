@@ -370,6 +370,8 @@ def _modulate_gate(
     if fused_fp32:
         from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant import (
             gate as fused_gate,
+        )
+        from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant import (
             supports_fp32_modulation,
         )
 
@@ -619,7 +621,7 @@ def _minimax_h3_attention_core_impl(
             _usp_output_all_to_all,
         )
 
-        q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+        q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v, reuse_staging_capacity=True)
 
     if attention._attention_impl is None:
         attention._set_attention_backend(
@@ -657,7 +659,9 @@ def _minimax_h3_attention_core_impl(
             cu_seqlens_host=cu_seqlens_host,
         )
     if ulysses_active:
-        out = _usp_output_all_to_all(out[None], head_dim=2)[0]
+        out = _usp_output_all_to_all(
+            out[None], head_dim=2, reuse_staging_capacity=True
+        )[0]
     return out
 
 
