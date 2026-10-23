@@ -1512,6 +1512,43 @@ def _fwd_kernel_ep_scatter_1_fused(
 
 
 @triton.jit
+def fused_build_m_indices_kernel(
+    topk_ids_ptr,
+    num_recv_tokens_ptr,
+    m_indices_ptr,
+    numel,
+    E: tl.constexpr,
+    BLOCK: tl.constexpr = 1024,
+    BLOCK_E: tl.constexpr = 256,
+):
+    pid = tl.program_id(0)
+
+    if pid < E:
+        count = 0
+        for offset in range(0, numel, BLOCK):
+            offs = offset + tl.arange(0, BLOCK)
+            mask = offs < numel
+            val = tl.load(
+                topk_ids_ptr + offs, mask=mask, other=-1, eviction_policy="evict_last"
+            )
+            count = count + tl.sum((val == pid).to(tl.int32) & mask)
+
+        rng = tl.arange(0, BLOCK_E)
+        vals = tl.load(num_recv_tokens_ptr + rng, mask=rng < E, other=0)
+        start_pos = tl.sum(tl.where(rng < pid, vals, 0))
+        my_padded = tl.load(num_recv_tokens_ptr + pid)
+        end_pos = start_pos + my_padded
+
+        for offset in range(start_pos, end_pos, BLOCK):
+            offs = offset + tl.arange(0, BLOCK)
+            mask = offs < end_pos
+            rel_pos = offs - start_pos
+            valid = rel_pos < count
+            result = tl.where(valid, pid, -1)
+            tl.store(m_indices_ptr + offs, result, mask=mask)
+
+
+@triton.jit
 def _fwd_kernel_ep_scatter_1(
     num_recv_tokens_per_expert,
     num_valid_tokens_per_expert,
