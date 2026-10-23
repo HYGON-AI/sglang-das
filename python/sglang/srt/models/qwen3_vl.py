@@ -1469,7 +1469,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 (Use input_metadata.mrope_positions to replace it)
         """
         if self.is_mrope_enabled:
-            positions = forward_batch.mrope_positions
+            mrope_positions = forward_batch.mrope_positions
+            if mrope_positions is not None:
+                positions = mrope_positions
+            # else: under dp-attention, text-only requests are scheduled
+            # without a mrope_positions tensor; keep the scheduler-provided
+            # 1D positions so the mrope kernel runs its 1D path instead of
+            # crashing on None (mrope.py asserts ndim in {1, 2}).
 
         if self.language_model_only:
             hidden_states = self.model(

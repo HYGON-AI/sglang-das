@@ -13,6 +13,9 @@ from typing import List, Optional
 
 import torch
 
+import triton
+import triton.language as tl
+
 from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
 from sglang.srt.utils import is_gfx938_supported, is_hip
 
@@ -58,8 +61,41 @@ def _scatter_rows(buffer: torch.Tensor, loc: torch.Tensor, values: torch.Tensor)
     if (not _IS_HIP) or capturing:
         buffer[loc] = values
         return
-    for i in range(loc.shape[0]):
-        buffer[loc[i]] = values[i]
+    # HIP eager: the per-row Python loop below (added to dodge the
+    # advanced-indexing duplicate-destination VMFault) was measured at ~45k
+    # select/copy_ ops + ~90k 8B D2H `.item()` host syncs per 4k prefill
+    # step (bw47 dp4ep4, WITH_STACK trace: qsa_kv_pool.py(25) via
+    # qsa_indexer.update_key_state_and_compress). Scatter with a tiny triton
+    # kernel instead: no host sync, no advanced indexing (so no VMFault).
+    # Duplicate destinations only occur on the reserved garbage slot 0
+    # (non-boundary rows), whose value is never read, so the kernel's
+    # unordered writes there are fine.
+    row_elems = values.numel() // values.shape[0]
+    _qsa_scatter_rows_kernel[(triton.cdiv(loc.shape[0], 128),)](
+        buffer.view(-1),
+        loc,
+        values.contiguous().view(-1),
+        loc.shape[0],
+        ROW_ELEMS=row_elems,
+        BLOCK_ROWS=128,
+    )
+
+
+@triton.jit
+def _qsa_scatter_rows_kernel(
+    buf_ptr,
+    loc_ptr,
+    val_ptr,
+    n_rows,
+    ROW_ELEMS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    rmask = rows < n_rows
+    dst = tl.load(loc_ptr + rows, mask=rmask, other=0).to(tl.int64)
+    for c in tl.static_range(ROW_ELEMS):
+        v = tl.load(val_ptr + rows * ROW_ELEMS + c, mask=rmask, other=0)
+        tl.store(buf_ptr + dst * ROW_ELEMS + c, v, mask=rmask)
 
 
 class QSATokenToKVPool(HybridLinearKVPool):
