@@ -128,5 +128,36 @@ def test_aiter_max_size_bytes_rejects_invalid(
         _aiter_max_size_bytes()
 
 
+@pytest.mark.parametrize("hcu", [True, False])
+def test_aiter_dispatch_uses_current_model_config_api(monkeypatch, hcu):
+    import sys
+    from types import ModuleType
+    from unittest.mock import Mock
+
+    from sglang.srt import runtime_context
+    from sglang.srt.arg_groups import model_override_base
+
+    fake = ModuleType("aiter.dist.device_communicators.custom_all_reduce")
+    fake.CustomAllreduce = type("FakeAiterCustomAllreduce", (), {})
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    monkeypatch.setattr(ca, "_is_hip", True)
+    monkeypatch.setattr(ca, "_is_hcu", hcu)
+    monkeypatch.setenv("AITER_AR_TRANSPORT", "ipc")
+    monkeypatch.setenv("SGLANG_MEMORY_SAVER_CUDA_GRAPH", "1")
+    monkeypatch.delenv("AITER_AR_MAX_SIZE_MB", raising=False)
+    # The current ServerArgs record deliberately has no get_model_config method.
+    args = SimpleNamespace()
+    config = SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v3"))
+    lookup = Mock(return_value=config)
+    monkeypatch.setattr(model_override_base, "model_config_of", lookup)
+    monkeypatch.setattr(runtime_context, "get_server_args", lambda: args)
+    factory = ca.dispatch_custom_allreduce(group=None, device=None, backend="aiter")
+    if hcu:
+        lookup.assert_called_once_with(args)
+    else:
+        lookup.assert_not_called()
+    assert factory.keywords["enable_register_for_capturing"] is (not hcu)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

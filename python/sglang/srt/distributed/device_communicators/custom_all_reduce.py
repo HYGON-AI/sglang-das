@@ -514,9 +514,10 @@ def dispatch_custom_allreduce(
         if transport == "ipc":
             hf_config = None
             if _is_hcu:
+                from sglang.srt.arg_groups.model_override_base import model_config_of
                 from sglang.srt.runtime_context import get_server_args
 
-                hf_config = get_server_args().get_model_config().hf_config
+                hf_config = model_config_of(get_server_args()).hf_config
             enable_reg = _aiter_enable_register_for_capturing(
                 envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get(), hf_config
             )
