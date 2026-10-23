@@ -186,6 +186,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.chain_mtp_hidden_states = draft_arch in [
             "Step3p5MTP",
             "InklingForConditionalGenerationMTP",
+            "WeLMV4MoeForCausalLMNextN",
+            "WeLMV4VLMForConditionalGeneration",
         ]
         self.draft_tp_context = (
             draft_tp_context if get_parallel().enable_dp_attention else empty_context
@@ -594,6 +596,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         batch: ScheduleBatch,
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
+        model_specific_states: Optional[dict] = None,
     ):
         """
         Run draft model extend to correctly fill the KV cache.
@@ -620,6 +623,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
+            model_specific_states=model_specific_states,
         )
         batch.spec_info = extend_input
 
@@ -671,6 +675,14 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             output: ModelRunnerOutput = self.draft_runner_list[step].forward(
                 step_forward_batch
             )
+            # ``replace(forward_batch)`` is intentionally used above to isolate
+            # padding/metadata mutations between de-tied draft runners.  It is
+            # shallow, however, so mirror state must be explicitly carried back
+            # after the forward: the last NextN physical layer consumes and
+            # clears the batch-owned mirror entries.  Without this writeback,
+            # every prefill draft step sees the original target mirror K/V and
+            # reuses it instead of following the ordinary chain semantics.
+            forward_batch.model_specific_states = step_forward_batch.model_specific_states
             maybe_detect_nan(
                 output.logits_output.next_token_logits,
                 f"draft_extend_for_prefill step {step}",
@@ -733,6 +745,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
+            model_specific_states=batch_result.logits_output.model_specific_states,
             # Actual width: the multi-layer chain fills num_steps + 1 rows/req,
             # plus the boundary-KV front rows when the widened window is active
             # (must match the capture width in the draft-extend graph runner).
@@ -1025,6 +1038,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 batch,
                 batch_output.logits_output.hidden_states,
                 batch_output.next_token_ids,
+                batch_output.logits_output.model_specific_states,
             )
             return batch_output
         else:

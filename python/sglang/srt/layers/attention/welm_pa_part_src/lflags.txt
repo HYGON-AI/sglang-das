@@ -1,0 +1,1 @@
+-fPIC -O3 -std=c++20 -ffast-math -fno-finite-math-only -fno-gpu-rdc --offload-arch=gfx938 -L/usr/local/lib/python3.10/dist-packages/torch/lib -L/usr/lib/x86_64-linux-gnu -Wl,--no-as-needed -ltorch_hip -ltorch_cpu -ltorch_python -lpython3.10 -lc10 -Wl,-Bsymbolic

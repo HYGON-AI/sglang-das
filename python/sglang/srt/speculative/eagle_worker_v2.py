@@ -14,6 +14,7 @@
 
 import contextlib
 import logging
+import os
 import time
 from dataclasses import replace
 from typing import List, Optional
@@ -640,6 +641,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
             graph_supported_backend_types.append(FlashMLABackend)
 
+        if os.environ.get("SGLANG_ENABLE_FA_DRAFT_EXTEND_CUDA_GRAPH", "0") == "1":
+            # FlashAttentionBackend implements DRAFT_EXTEND_V2 graph metadata
+            # (draft_extend_metadata); opt-in until validated per model
+            # (validated: WeLM v4.5 NextN on HCU).
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionBackend,
+            )
+
+            graph_supported_backend_types.append(FlashAttentionBackend)
         graph_supported_backend = isinstance(
             self.draft_extend_attn_backend,
             tuple(graph_supported_backend_types),
@@ -1036,6 +1046,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
         mm_input_embeds: Optional[torch.Tensor] = None,
+        model_specific_states: Optional[dict] = None,
     ):
         """
         Run draft model extend to correctly fill the KV cache.
@@ -1067,6 +1078,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
+            model_specific_states=model_specific_states,
         )
 
         # Run forward (LAST mode: only the final hidden state per request,
@@ -1084,6 +1096,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             return_hidden_states_before_norm=self.need_hidden_states_before_norm,
         )
         forward_batch.return_logprob = False
+        if (
+            forward_batch.enable_kv_mirror
+            and target_hidden_states is not None
+            and forward_batch.extend_num_tokens is not None
+            and target_hidden_states.shape[0] == forward_batch.extend_num_tokens
+            and forward_batch.extend_num_tokens != forward_batch.batch_size
+        ):
+            # The target prefill ran without KV-mirror row reduction (prefill
+            # CUDA graph), so it returned every token's hidden state.  The
+            # draft must then also keep all rows, or its mirror layer would
+            # reduce hidden states but not the residual.
+            forward_batch.enable_kv_mirror = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
 
@@ -1181,6 +1205,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             target_hidden = target_hidden.detach().contiguous().clone()
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=target_hidden,
+            model_specific_states=batch_result.logits_output.model_specific_states,
             # accept_lens includes the bonus token; correct drafts exclude it.
             num_correct_drafts=batch_result.accept_lens - 1,
             num_accept_tokens=batch_result.accept_lens,
@@ -1482,6 +1507,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         target_hidden,
                         batch_output.next_token_ids,
                         batch_output.logits_output.mm_input_embeds,
+                        batch_output.logits_output.model_specific_states,
                     )
                 )
                 return batch_output

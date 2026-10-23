@@ -702,8 +702,18 @@ class ServerArgs:
     ] = "{}"
 
     # -------------------------------------------------------------------------
-    # Quantization and data type
+    # WeLM v4 over-encoding
     # -------------------------------------------------------------------------
+    enable_over_encoding: A[
+        bool, "Enable WeLM v4 over-encoding embeddings.", NS("model")
+    ] = False
+    enable_kv_mirror: A[
+        bool, "Enable WeLM v4 KV-mirror attention layers.", NS("model")
+    ] = False
+    prepare_n_gram_inputs: A[
+        bool, "Prepare shifted n-gram IDs for over-encoding.", NS("model")
+    ] = False
+
     dtype: A[
         str,
         Arg(
@@ -1129,6 +1139,7 @@ class ServerArgs:
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "prefix_affinity",
             ],
         ),
         NS("parallel"),
@@ -5870,6 +5881,12 @@ class ServerArgs:
         model_config = self.get_model_config()
         hf_config = model_config.hf_config
         model_arch = hf_config.architectures[0]
+
+        if model_arch in [
+            "WeLMV4MoeForCausalLM",
+            "WeLMV4VLMForConditionalGeneration",
+        ]:
+            self.prepare_n_gram_inputs = True
 
         if model_arch == "InternS2MobiusForConditionalGeneration":
             unsupported = []

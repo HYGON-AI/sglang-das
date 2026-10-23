@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -441,6 +442,46 @@ def _finalize_accept_tree_path(
             bs,
             num_draft_tokens=num_draft_tokens,
         )
+    # WeLM's target verify publishes mirror K/V activations alongside the
+    # logits.  They are node-indexed just like hidden_states; compact them with
+    # the same accepted-tree mapping before draft-extend consumes the state.
+    # Without this, a branched tree leaves K/V in the old node order while
+    # predict/hidden_states have moved to the accepted path.
+    model_specific_states = getattr(logits_output, "model_specific_states", None)
+    mirror_states = (
+        model_specific_states.get("welm_kv_mirror_states")
+        if model_specific_states
+        else None
+    )
+    if mirror_states:
+        compacted_mirror_states = {}
+        for layer_idx, kv in mirror_states.items():
+            if not isinstance(kv, (tuple, list)) or len(kv) != 2:
+                compacted_mirror_states[layer_idx] = kv
+                continue
+            mirror_k, mirror_v = kv
+            if (
+                isinstance(mirror_k, torch.Tensor)
+                and isinstance(mirror_v, torch.Tensor)
+                and mirror_k.shape[0] >= bs * num_draft_tokens
+                and mirror_v.shape[0] >= bs * num_draft_tokens
+            ):
+                mirror_k = _compact_accept_to_front(
+                    mirror_k,
+                    accept_index,
+                    bs,
+                    num_draft_tokens=num_draft_tokens,
+                )
+                mirror_v = _compact_accept_to_front(
+                    mirror_v,
+                    accept_index,
+                    bs,
+                    num_draft_tokens=num_draft_tokens,
+                )
+            compacted_mirror_states[layer_idx] = (mirror_k, mirror_v)
+        model_specific_states = dict(model_specific_states)
+        model_specific_states["welm_kv_mirror_states"] = compacted_mirror_states
+        logits_output.model_specific_states = model_specific_states
     return predict
 
 
@@ -463,8 +504,107 @@ def _compact_accept_to_front(
     safe = accept_index.to(torch.int64).clamp(min=0).reshape(-1)
     gathered = x[safe]
     out = x.clone()
-    out.view(bs, nd, *x.shape[1:])[:, :s1] = gathered.view(bs, s1, *x.shape[1:])
+    # MLP/DP synchronization may append dummy token rows.  Compact only the
+    # real tree block and preserve any trailing padding for the caller's
+    # subsequent post-forward trim; reshaping the whole padded tensor would
+    # fail whenever its row count is not exactly bs * num_draft_tokens.
+    tree_rows = bs * nd
+    out[:tree_rows].view(bs, nd, *x.shape[1:])[:, :s1] = gathered.view(
+        bs, s1, *x.shape[1:]
+    )
     return out
+
+
+def _welm_trace_verify_state(
+    batch,
+    verify_input,
+    logits_output,
+    predict,
+    accept_lens,
+    accept_index,
+    *,
+    stage="post_eagle_sample",
+):
+    path = os.getenv("WELM_TRACE_VERIFY_STATE")
+    if not path:
+        return
+    try:
+        states = getattr(logits_output, "model_specific_states", None) or {}
+        mirror = states.get("welm_kv_mirror_states", {})
+        row = {
+            "pid": os.getpid(),
+            "stage": stage,
+            "batch_mode": str(batch.forward_mode),
+            "draft_token_num": int(verify_input.draft_token_num),
+            "draft_token_head": verify_input.draft_token[:16].detach().cpu().tolist(),
+            "predict_head": (
+                predict[:16].detach().cpu().tolist()
+                if isinstance(predict, torch.Tensor)
+                else None
+            ),
+            "accept_lens": (
+                accept_lens.detach().cpu().tolist()
+                if isinstance(accept_lens, torch.Tensor)
+                else None
+            ),
+            "accept_index": (
+                accept_index[:8].detach().cpu().tolist()
+                if isinstance(accept_index, torch.Tensor)
+                else None
+            ),
+            "state_shapes": {
+                str(k): (tuple(v[0].shape), tuple(v[1].shape))
+                for k, v in mirror.items()
+            },
+            "hidden_shape": (
+                tuple(logits_output.hidden_states.shape)
+                if logits_output.hidden_states is not None
+                else None
+            ),
+        }
+        sampling_info = getattr(batch, "sampling_info", None)
+        if sampling_info is not None:
+            row["sampling"] = {
+                "is_all_greedy": bool(getattr(sampling_info, "is_all_greedy", False)),
+                "top_ks": (
+                    sampling_info.top_ks.detach().cpu().tolist()
+                    if isinstance(getattr(sampling_info, "top_ks", None), torch.Tensor)
+                    else None
+                ),
+                "temperatures": (
+                    sampling_info.temperatures.detach().cpu().tolist()
+                    if isinstance(
+                        getattr(sampling_info, "temperatures", None), torch.Tensor
+                    )
+                    else None
+                ),
+            }
+        for name in (
+            "positions",
+            "retrieve_index",
+            "retrieve_next_token",
+            "retrieve_next_sibling",
+        ):
+            value = getattr(verify_input, name, None)
+            if isinstance(value, torch.Tensor):
+                row[name] = value.detach().cpu().tolist()
+        logits = getattr(logits_output, "next_token_logits", None)
+        if isinstance(logits, torch.Tensor) and logits.numel() > 0:
+            row_count = min(int(logits.shape[0]), 8)
+            values, ids = torch.topk(logits[:row_count].float(), k=5, dim=-1)
+            row["logit_rows"] = [
+                {
+                    "ids": ids[i].detach().cpu().tolist(),
+                    "values": values[i].detach().cpu().tolist(),
+                    "argmax": int(torch.argmax(logits[i]).item()),
+                }
+                for i in range(row_count)
+            ]
+        with open(path, "a", encoding="utf-8") as f:
+            import json
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+    except Exception:
+        pass
 
 
 def run_eagle_verify(
@@ -597,11 +737,29 @@ def run_eagle_verify(
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
+    _welm_trace_verify_state(
+        batch,
+        verify_input,
+        logits_output,
+        None,
+        None,
+        None,
+        stage="pre_eagle_sample",
+    )
     (
         predict,
         accept_lens,
         accept_index,
     ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+    _welm_trace_verify_state(
+        batch,
+        verify_input,
+        logits_output,
+        predict,
+        accept_lens,
+        accept_index,
+        stage="post_eagle_sample",
+    )
     new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),

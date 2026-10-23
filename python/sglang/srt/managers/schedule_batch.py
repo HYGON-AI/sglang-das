@@ -2058,6 +2058,54 @@ def _compute_chunked_req_next_prompt_token(
     return None
 
 
+def welm_prefill_ngram_ids(fill_ids_list, prefix_lens):
+    """(3, total_extend_tokens) int64: token 1/2/3 positions back, 0 if none."""
+    import numpy as np
+
+    total = sum(len(f) - p for f, p in zip(fill_ids_list, prefix_lens))
+    out = np.zeros((3, total), dtype=np.int64)
+    pos = 0
+    for fill, pre in zip(fill_ids_list, prefix_lens):
+        L = len(fill)
+        n = L - pre
+        if n <= 0:
+            continue
+        start = max(0, pre - 3)
+        window = np.asarray(fill[start:], dtype=np.int64)
+        for row, k in enumerate((1, 2, 3)):
+            lo = max(pre, k)
+            if lo < L:
+                out[row, pos + lo - pre : pos + n] = window[lo - k - start : L - k - start]
+        pos += n
+    return out
+
+
+@dataclasses.dataclass
+class NGramInputIds:
+    """Shifted token IDs used by WeLM over-encoding embeddings."""
+
+    input_ids_grams: List[torch.Tensor] = dataclasses.field(default_factory=list)
+    input_ids_buffer: Optional[torch.Tensor] = None
+    buffer_size: int = 4
+    filtered: bool = False
+
+    def get_gram(self, n: int) -> Optional[torch.Tensor]:
+        index = n - 2
+        if 0 <= index < len(self.input_ids_grams):
+            return self.input_ids_grams[index]
+        return None
+
+    @staticmethod
+    def get_token_ids_gram_n(req_input_ids: List[int], n: int):
+        result = [0] * len(req_input_ids)
+        if len(req_input_ids) > n:
+            result[n:] = req_input_ids[:-n]
+        return result
+
+    def __len__(self) -> int:
+        return len(self.input_ids_grams)
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -2132,6 +2180,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     replace_embeds: Optional[torch.Tensor] = None
     replace_positions: Optional[torch.Tensor] = None
 
+    # Read by ForwardBatch for WeLM over-encoding.
+    n_gram_input_ids: Optional[NGramInputIds] = None
     # Read by ForwardBatch ngram embedding init
     ne_token_table: torch.Tensor = None
     # Mask marking chunked (not-yet-finished) prefill requests whose sampled
@@ -2464,9 +2514,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             orig_seq_lens, dtype=torch.int32, pin_memory=_pin
         ).to(self.device, non_blocking=True)
 
-        # Set batch fields needed by alloc_for_extend
-        self.prefix_lens = prefix_lens
+        # The n-gram table for gram ``n`` consumes the token ``n - 1``
+        # positions back (matches the decode path). Built from a short numpy
+        # window per request and copied to the device once.
+        grams = welm_prefill_ngram_ids(
+            [req.get_fill_ids() for req in reqs],
+            [len(req.prefix_indices) for req in reqs],
+        )
+        grams = torch.from_numpy(grams)
+        if _pin:
+            grams = grams.pin_memory()
+        grams = grams.to(self.device, non_blocking=True)
+        self.n_gram_input_ids = NGramInputIds(
+            input_ids_grams=[grams[0], grams[1], grams[2]]
+        )
+
         self.extend_lens = extend_lens
+        self.prefix_lens = prefix_lens
         self.seq_lens = seq_lens_tensor
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
@@ -2828,8 +2892,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mix_running_indices = running_batch.req_pool_indices
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
 
+        prefill_grams = self.n_gram_input_ids
         self.merge_batch(running_batch)
         self.out_cache_loc = out_cache_loc
+        if prefill_grams is not None and len(prefill_grams) > 0:
+            # WeLM OE n-grams: the decode rows' predecessors live in the
+            # device ring (see welm_spec_n_gram_input_ids); -1 asks the model
+            # to read them there. Keeps the grams one row per token, so mixed
+            # batches also fit the static prefill-graph buffers.
+            pad = prefill_grams.input_ids_grams[0].new_full((running_bs,), -1)
+            self.n_gram_input_ids = NGramInputIds(
+                input_ids_grams=[
+                    torch.cat([g, pad]) for g in prefill_grams.input_ids_grams
+                ]
+            )
 
         # For overlap scheduler, the output_ids has one step delay
         delta = 0 if self.enable_overlap else -1
@@ -3141,6 +3217,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # input_ids is set at end of previous run_batch (placeholder for
         # overlap; next_token_ids cast for non-overlap).
+
+        # The decode input is the token immediately before the current input.
+        # Build the shifted history consumed by WeLM's OE embedding tables.
+        # Only the last 4 tokens of origin_input_ids + output_ids are needed;
+        # avoid materializing the whole history per request every step.
+        gram_lists = [[], [], []]
+        for req in self.reqs:
+            out = req.output_ids
+            n_out = len(out)
+            total = len(req.origin_input_ids) + n_out
+            if n_out >= 4:
+                tail = out[-4:]
+            else:
+                tail = list(req.origin_input_ids[n_out - 4 :]) + list(out)
+            for index, offset in enumerate((1, 2, 3)):
+                gram_lists[index].append(tail[-(1 + offset)] if total > offset else 0)
+        _pin = is_pin_memory_available(self.device)
+        grams = torch.tensor(gram_lists, dtype=torch.int64, pin_memory=_pin).to(
+            self.device, non_blocking=True
+        )
+        self.n_gram_input_ids = NGramInputIds(
+            input_ids_grams=[grams[0], grams[1], grams[2]]
+        )
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()

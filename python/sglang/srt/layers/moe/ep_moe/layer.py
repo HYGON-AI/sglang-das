@@ -1285,11 +1285,28 @@ class DeepEPMoE(FusedMoE):
         self,
         dispatch_output: DeepEPLLDispatchOutput,
     ):
-        hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
+        hidden_states, hidden_states_scale, _, _, masked_m, expected_m = dispatch_output
         assert hidden_states_scale is None
         assert self.moe_runner_config.activation == "silu"
         assert self.moe_runner_config.is_gated
         assert hidden_states.dim() == 3
+
+        if (
+            _is_hip
+            and getattr(self, "w13_weight_bias", None) is None
+            and getattr(self, "w2_weight_bias", None) is None
+            and hidden_states.dtype == torch.bfloat16
+            and not getattr(self.moe_runner_config, "swiglu_limit", None)
+        ):
+            # Masked grouped GEMM: skip experts / rows past masked_m instead of
+            # a dense bmm over num_local_experts * capacity rows.
+            from sglang.srt.layers.moe.ep_moe.welm_masked_moe import welm_masked_moe
+
+            return welm_masked_moe(
+                hidden_states, self.w13_weight, self.w2_weight,
+                masked_m[: hidden_states.shape[0]].to(torch.int32),
+                int(expected_m) if expected_m else 16,
+            )
 
         num_experts, max_tokens, _ = hidden_states.shape
         token_offsets = torch.arange(max_tokens, device=hidden_states.device)

@@ -762,6 +762,38 @@ def build_decode_registry(
                     bind=_backing,
                 )
 
+        # WeLM over-encoding n-gram ids: token-aligned like input_ids, sourced
+        # from the nested NGramInputIds on the FB. The padded tail is never
+        # used for real tokens (hash indices stay in range for any value).
+        n_gram = getattr(source, "n_gram_input_ids", None)
+        if n_gram is not None:
+
+            def _n_gram_source(order):
+                def _fn(fb, ctx):
+                    ids = getattr(fb, "n_gram_input_ids", None)
+                    gram = None if ids is None else ids.get_gram(order)
+                    # Under speculative decoding the model rebuilds n-grams
+                    # itself and the scheduler's ids may be stale (another
+                    # token count); copy only exact-length sources.
+                    if gram is None or gram.shape[0] != ctx.raw_num_tokens:
+                        return None
+                    return gram
+
+                return _fn
+
+            for _order, _backing in n_gram.items():
+                reg.register_slot(
+                    GraphSlot(
+                        name=f"n_gram_input_ids.{_order}",
+                        shape_fn=lambda _bs, _mt, _s=tuple(_backing.shape): _s,
+                        dtype=_backing.dtype,
+                        axis="none",
+                        padding_policy=PaddingPolicy.KEEP_PAD,
+                        source_fn=_n_gram_source(int(_order)),
+                    ),
+                    bind=_backing,
+                )
+
         # KV-canary id buffers (off by default): plain bs-axis FB copies,
         # adopt-only when the source carries them. Head [:raw_bs] is copied;
         # the tail keeps its init (rids_int 0, bootstrap_room_ids_int -1).

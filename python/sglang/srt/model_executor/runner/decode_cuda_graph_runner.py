@@ -434,6 +434,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_residual_num_blocks=(
                 self.model_runner.get_pp_proxy_residual_num_blocks()
             ),
+            prepare_n_gram_inputs=self.model_runner.server_args.prepare_n_gram_inputs,
         )
         self.buffers.share_buffers()
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
@@ -1008,6 +1009,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
 
+        if buffers.n_gram_input_ids is not None:
+            from sglang.srt.managers.schedule_batch import NGramInputIds
+
+            forward_batch.n_gram_input_ids = NGramInputIds(
+                input_ids_grams=[
+                    buffers.n_gram_input_ids[str(n)][:num_tokens] for n in (2, 3, 4)
+                ]
+            )
+
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:
@@ -1285,6 +1295,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            if (
+                self.buffers.n_gram_input_ids is not None
+                and forward_batch.n_gram_input_ids is not None
+            ):
+                for n in (2, 3, 4):
+                    gram = forward_batch.n_gram_input_ids.get_gram(n)
+                    # Under speculative decoding the model rebuilds n-grams
+                    # from its own ring buffer and the scheduler's ids can be
+                    # stale (different token count); only copy exact matches.
+                    if gram is not None and gram.shape[0] == self.raw_num_token:
+                        self.buffers.n_gram_input_ids[str(n)][
+                            : self.raw_num_token
+                        ].copy_(gram)
             if (
                 not is_ragged
                 and self.model_runner.spec_algorithm.is_dflash_family()

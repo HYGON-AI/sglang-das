@@ -67,6 +67,13 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 
+from sglang.srt.utils import get_bool_env_var as _get_bool_env_var
+from sglang.srt.utils import is_hcu as _is_hcu_fn
+
+_hcu_skinny_lm_head = _is_hcu_fn() and _get_bool_env_var(
+    "SGLANG_HCU_SKINNY_GEMM", "true"
+)
+
 _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedEmbeddingMethod",
     "UnquantizedLinearMethod",
@@ -105,6 +112,8 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    # Model-owned state handed from target forward to draft extend.
+    model_specific_states: Optional[Dict[str, Any]] = None
     # Draft decode VP returns a deterministic top-1 proposal without full logits.
     draft_top1_token_ids: Optional[torch.Tensor] = None
     draft_top1_probs: Optional[torch.Tensor] = None
@@ -194,6 +203,10 @@ class LogitsMetadata:
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
+    # WeLM KV-mirror extend batches already contain one hidden state per request.
+    enable_kv_mirror: bool = False
+    scale_seq_factor: int = 1
+
     mm_input_embeds: Optional[torch.Tensor] = None
 
     # DRAFT_EXTEND_V2: when set, lm_head runs only on these rows (see
@@ -259,6 +272,8 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
+            enable_kv_mirror=forward_batch.enable_kv_mirror,
+            scale_seq_factor=forward_batch.scale_seq_factor,
             draft_extend_select_index=draft_extend_select_index,
             spec_input_type=getattr(forward_batch.spec_info, "spec_input_type", None),
         )
@@ -414,7 +429,13 @@ class LogitsProcessor(nn.Module):
         )
         del hidden_states
 
-        if not logits_metadata.extend_return_logprob:
+        # KV-mirror extend batches already contain one hidden state per request;
+        # there are no intermediate-token logits to process as input logprobs.
+        kv_mirror_extend = logits_metadata.enable_kv_mirror and (
+            logits_metadata.forward_mode.is_extend_without_speculative()
+            or logits_metadata.scale_seq_factor > 1
+        )
+        if not logits_metadata.extend_return_logprob or kv_mirror_extend:
             if (
                 self.draft_lm_head_vp is not None
                 and logits_metadata.forward_mode.is_decode_or_idle()
@@ -593,6 +614,13 @@ class LogitsProcessor(nn.Module):
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
+            or (
+                logits_metadata.enable_kv_mirror
+                and (
+                    logits_metadata.forward_mode.is_extend_without_speculative()
+                    or logits_metadata.scale_seq_factor > 1
+                )
+            )
         ):
             if logits_metadata.draft_extend_select_index is not None:
                 # Only next_token_logits narrows to [bs, vocab]; the
@@ -898,9 +926,16 @@ class LogitsProcessor(nn.Module):
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
+                hs = hidden_states.to(lm_head.weight.dtype)
+                if _hcu_skinny_lm_head and hs.dim() == 2:
+                    from sglang.srt.layers.welmv4_fast_op import (
+                        skinny_gemm,
+                        skinny_gemm_supported,
+                    )
+
+                    if skinny_gemm_supported(hs, lm_head.weight):
+                        return skinny_gemm(hs, lm_head.weight)
+                logits = torch.matmul(hs, lm_head.weight.T)
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models

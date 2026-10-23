@@ -820,6 +820,11 @@ class Envs:
     # Opt HCU CUDA graph DP padding into MAX_LEN, enabling all-gather and
     # fused reduce-scatter for the pure TP-MoE DP-attention path.
     SGLANG_DP_USE_MAX_LEN = EnvBool(False)
+    # prefix_affinity DP dispatch: fall back to the least-loaded rank once the
+    # prefix owner holds this many more queued tokens than it.
+    SGLANG_DP_AFFINITY_SLACK_TOKENS = EnvInt(50000)
+    # prefix_affinity: prefixes shared by at least this many requests carry no affinity.
+    SGLANG_DP_AFFINITY_POPULAR = EnvInt(32)
     # Quantize the variable-length DP-MoE gather payload (SGLANG_DP_USE_GATHERV
     # path, prefill/extend only) to fp8-e4m3 with per-token-group-128 scales:
     # halves the gathered hidden-state bytes over NCCL; the combine

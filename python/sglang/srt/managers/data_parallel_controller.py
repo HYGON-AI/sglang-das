@@ -92,6 +92,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    PREFIX_AFFINITY = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -169,11 +170,15 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.PREFIX_AFFINITY: self.prefix_affinity_scheduler,
         }
+        # prefix_affinity: (depth, hash of input_ids[:depth]) -> dp rank, LRU-bounded
+        self._prefix_owner = {}
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
+            LoadBalanceMethod.PREFIX_AFFINITY,
         )
 
         self.launch_dp_size: int = get_parallel().dp_size
@@ -810,6 +815,44 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
         sock_send(self.workers[target_worker], req)
+
+    _AFFINITY_DEPTHS = (2048, 4096, 6144, 8192, 12288)
+    _AFFINITY_MAX_KEYS = 200_000
+
+    def prefix_affinity_scheduler(self, req: Req):
+        """Send a request to the DP rank that already holds its longest prompt
+        prefix (radix cache locality); balance by queued tokens otherwise.
+        Prefixes seen by many requests are cached on every rank, so they carry
+        no affinity: only the deepest matched prefix still below
+        SGLANG_DP_AFFINITY_POPULAR requests pins the rank."""
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        ids = req.input_ids
+        n = len(ids)
+        budget = self.dp_budget
+        keys = [(d, hash(tuple(ids[:d]))) for d in self._AFFINITY_DEPTHS if d <= n]
+        owner = self._prefix_owner
+        popular = envs.SGLANG_DP_AFFINITY_POPULAR.get()
+        target = None
+        for k in reversed(keys):
+            e = owner.get(k)
+            if e is not None:
+                if e[1] < popular:
+                    target = e[0]
+                break
+        least = min(range(budget.dp_size),
+                    key=lambda i: (budget.total_tokens[i], budget.total_requests[i]))
+        slack = envs.SGLANG_DP_AFFINITY_SLACK_TOKENS.get()
+        if target is None or budget.total_tokens[target] - budget.total_tokens[least] > slack:
+            target = least
+        budget.total_requests[target] += 1
+        budget.total_tokens[target] += n
+        if len(owner) > self._AFFINITY_MAX_KEYS:
+            owner.clear()
+        for k in keys:
+            e = owner.get(k)
+            owner[k] = (target, 1) if e is None else (e[0], e[1] + 1)
+        sock_send(self.workers[target], req)
 
     def event_loop(self):
         while True:

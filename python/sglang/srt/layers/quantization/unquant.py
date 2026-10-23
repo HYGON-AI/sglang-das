@@ -78,6 +78,8 @@ from sglang.srt.utils import is_hcu
 _is_hcu = is_hcu()
 
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
+# Triton skinny GEMM for decode-sized M on shapes where it beats hipBLASLt.
+_hcu_skinny_gemm = get_bool_env_var("SGLANG_HCU_SKINNY_GEMM", "true")
 _use_aiter_w16a16_moe = get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE")
 if _use_aiter_w16a16_moe:
     from aiter.moe import (
@@ -427,6 +429,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         if x.dtype != layer.weight.dtype:
             x = x.to(layer.weight.dtype)
+        if _is_hcu and bias is None and _hcu_skinny_gemm:
+            from sglang.srt.layers.welmv4_fast_op import (
+                skinny_gemm,
+                skinny_gemm_supported,
+            )
+
+            if x.dim() == 2 and skinny_gemm_supported(x, layer.weight):
+                return skinny_gemm(x, layer.weight)
         return F.linear(x, layer.weight, bias)
 
     def apply_into(
@@ -866,12 +876,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         buffer in halves layout is excluded here rather than trapped later
         (notably LoRA, whose gate_up delta targets the buffer this eliminates).
         """
-        if not envs.SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED.get():
+        # HCU: the epilogue has a HIP branch that reproduces sgl_hip's
+        # act_and_mul rounding exactly, so it is on by default there.
+        hcu_fuse = _is_hcu and get_bool_env_var(
+            "SGLANG_HCU_FUSE_SWIGLU_INTERLEAVED", "true"
+        )
+        if not (envs.SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED.get() or hcu_fuse):
             return
 
         moe_runner_config = layer.moe_runner_config
         if not (
-            _is_cuda
+            (_is_cuda or hcu_fuse)
             and self._aiter_runner is None
             and self.runner.runner_backend.is_triton()
             and get_moe_a2a_backend().is_none()

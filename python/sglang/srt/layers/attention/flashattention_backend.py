@@ -118,6 +118,10 @@ class FlashAttentionMetadata:
     max_seq_len_k: int = 0
     # Cumulative sequence lengths for query
     cu_seqlens_q: torch.Tensor = None
+    # Query metadata for WeLM KV-mirror layers. Mirror queries contain one
+    # token per request even when the surrounding extend batch is multi-token.
+    mirror_cu_seqlens_q: torch.Tensor = None
+    mirror_max_seq_len_q: int = 1
     # Cumulative sequence lengths for key
     cu_seqlens_k: torch.Tensor = None
     # Dummy-tail varlen metadata for the fa_skip_kv_cache path under a piecewise
@@ -164,6 +168,102 @@ class FlashAttentionMetadata:
 
     # For sliding window attention topk>1 spec decoding
     swa_spec_metadata: Optional[FlashAttentionMetadata] = None
+
+
+_WELM_PFX_ATTN_MAX_Q_BACKEND = int(__import__("os").environ.get("WELM_PFX_ATTN_MAX_Q", "256"))
+
+
+def _welm_host_seq_lens(forward_batch, cu_seqlens_q, metadata):
+    """Host (query, kv) lengths per request for the split-KV prefill.
+
+    Only for plain extend batches whose query layout is the regular
+    per-request one (not the mirror / SWA-spec / local-attention variants).
+    """
+    if (
+        forward_batch.forward_mode != ForwardMode.EXTEND
+        or cu_seqlens_q is not metadata.cu_seqlens_q
+        or forward_batch.extend_seq_lens_cpu is None
+        or forward_batch.seq_lens_cpu is None
+    ):
+        return None
+    lens = getattr(forward_batch, "_welm_host_seq_lens", None)
+    if lens is None:
+        lens = (
+            [int(x) for x in forward_batch.extend_seq_lens_cpu],
+            [int(x) for x in forward_batch.seq_lens_cpu.tolist()],
+        )
+        forward_batch._welm_host_seq_lens = lens
+    return lens
+
+
+_WELM_DEDUP_DECODE = __import__("os").environ.get("WELM_DEDUP_DECODE", "true").lower() in ("1", "true")
+_WELM_DEDUP_MIN_BS = int(__import__("os").environ.get("WELM_DEDUP_MIN_BS", "4"))
+_WELM_DEDUP_FIRST_LAYER = None
+_WELM_DEDUP_MIXED = __import__("os").environ.get("WELM_DEDUP_MIXED", "true").lower() in ("1", "true")
+
+
+def _welm_dedup_decode_state(
+    forward_batch, q, key_cache, page_table, cache_seqlens, layer, window_size, excluded,
+    mixed=False,
+):
+    """Shared-prefix grouping for full-attention decode rows (once per forward)."""
+    if not _WELM_DEDUP_DECODE or excluded:
+        return None
+    if not (forward_batch.forward_mode.is_decode() or mixed):
+        return None
+    if window_size is not None and tuple(window_size) != (-1, -1):
+        return None
+    from sglang.srt.layers.attention import flashattention_interface as _fi
+    from sglang.srt.layers.attention import welm_dedup_decode as _dd
+
+    B = q.shape[0]
+    if not (_WELM_DEDUP_MIN_BS <= B <= _dd.MAX_B) or B != page_table.shape[0]:
+        return None
+    if (
+        q.dtype != torch.bfloat16
+        or q.shape[1] != 6
+        or q.shape[2] != 256
+        or key_cache.dim() != 4
+        or key_cache.shape[1] != 1
+        or key_cache.shape[2] != 64
+        or key_cache.dtype != torch.bfloat16
+    ):
+        return None
+    if not (_fi.WELM_Q_PRESCALED or abs(layer.scaling - 256**-0.5) < 1e-7):
+        return None
+    if not _dd.available():
+        return None
+    # Group once per forward, at the first full-attention layer: layers run
+    # in order, so the grouping kernels are also captured into decode graphs
+    # (a cache keyed on Python objects would survive capture warmup).
+    global _WELM_DEDUP_FIRST_LAYER
+    lid = layer.layer_id
+    if _WELM_DEDUP_FIRST_LAYER is None or lid <= _WELM_DEDUP_FIRST_LAYER:
+        _WELM_DEDUP_FIRST_LAYER = lid
+        return _dd.prepare(
+            page_table, cache_seqlens, page_table.shape[1] * key_cache.shape[2],
+            key_cache.shape[2], B,
+        )
+    return _dd.get_prepared(page_table.shape[1] * key_cache.shape[2], key_cache.shape[2], B, q.device)
+
+
+def _hcu_mixed_decode_rows(forward_batch) -> int:
+    """Trailing one-token segments of a mixed batch (the decode rows).
+
+    A one-token prefill segment adjacent to them is counted too; attending a
+    single query to its full context is the same computation either way.
+    """
+    n = getattr(forward_batch, "_hcu_mixed_decode_rows", None)
+    if n is None:
+        n = 0
+        lens = forward_batch.extend_seq_lens_cpu
+        if lens is not None:
+            for length in reversed(list(lens)):
+                if int(length) != 1:
+                    break
+                n += 1
+        forward_batch._hcu_mixed_decode_rows = n
+    return n
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -706,6 +806,13 @@ class FlashAttentionBackend(AttentionBackend):
             # Baked into the captured kernel launches; upper bounds only.
             m.max_seq_len_q = forward_batch.positions.numel()
             m.max_seq_len_k = self.max_context_len
+            if forward_batch.enable_kv_mirror:
+                # KV-mirror layers attend with one query row per request
+                # (mirrors the eager extend branch).
+                m.mirror_cu_seqlens_q = torch.arange(
+                    0, bs + 1, dtype=torch.int32, device=m.cu_seqlens_q.device
+                )
+                m.mirror_max_seq_len_q = 1
         self.forward_metadata = m
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -1059,6 +1166,12 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
+            if forward_batch.enable_kv_mirror:
+                metadata.mirror_cu_seqlens_q = torch.arange(
+                    0, batch_size + 1, dtype=torch.int32, device=device
+                )
+                metadata.mirror_max_seq_len_q = 1
+
             # Setup local attention if enabled
             if forward_batch.forward_mode == ForwardMode.EXTEND:
                 self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
@@ -1197,6 +1310,99 @@ class FlashAttentionBackend(AttentionBackend):
                 self.forward_metadata_spec_decode_expand.page_table = expand_page_table
 
         self.forward_metadata = metadata
+
+    def _hcu_mixed_extend_attention(
+        self, q, key_cache, value_cache, page_table, cu_seqlens_q,
+        cache_seqlens, max_seqlen_q, metadata, layer, window_size, sinks,
+        forward_batch, out,
+    ):
+        """Mixed chunked prefill on the HCU legacy layout.
+
+        The varlen prefill path copies every row's paged KV into a contiguous
+        buffer, so the decode rows riding along (one query each, full context)
+        would cost a copy of their whole KV per layer. Run the prefill
+        segments through the varlen path and the trailing decode rows through
+        the paged decode kernel instead.
+        """
+        n_dec = _hcu_mixed_decode_rows(forward_batch)
+        bs = cache_seqlens.shape[0]
+        n_pre = bs - n_dec
+        H, D = layer.tp_q_head_num, layer.head_dim
+        q2 = q.contiguous().view(-1, H, D)
+        t_pre = q2.shape[0] - n_dec
+        if out is None:
+            out = torch.empty(
+                (q2.shape[0], H, layer.v_head_dim), dtype=q2.dtype, device=q2.device
+            )
+        if n_pre > 0:
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+            host = None
+            if seq_lens_cpu is not None and forward_batch.extend_seq_lens_cpu is not None:
+                host = (
+                    [int(x) for x in forward_batch.extend_seq_lens_cpu[:n_pre]],
+                    [int(x) for x in seq_lens_cpu[:n_pre].tolist()],
+                )
+            pre = vllm_flash_attn_varlen_func(
+                q=q2[:t_pre],
+                k=key_cache,
+                v=value_cache,
+                cu_seqlens_q=cu_seqlens_q[: n_pre + 1],
+                max_seqlen_q=max_seqlen_q,
+                seqused_k=cache_seqlens[:n_pre],
+                max_seqlen_k=(
+                    metadata.max_seq_len_k or page_table.shape[1] * self.page_size
+                ),
+                softmax_scale=layer.scaling,
+                causal=True,
+                window_size=window_size,
+                block_table=page_table[:n_pre],
+                fa_version=2,
+                q_descale=None,
+                k_descale=None,
+                v_descale=None,
+                layout="legacy_bhsd",
+                sinks=sinks,
+                out=out[:t_pre],
+                host_seq_lens=host,
+                total_k_hint=(
+                    int(seq_lens_cpu[:n_pre].sum()) if seq_lens_cpu is not None else None
+                ),
+            )
+            if pre.data_ptr() != out.data_ptr():
+                out[:t_pre].copy_(pre.view(t_pre, H, layer.v_head_dim))
+        dedup = None
+        if _WELM_DEDUP_MIXED:
+            from sglang.srt.layers.attention import flashattention_interface as _fi
+
+            # The paged kernel prescale (WELM_Q_PRESCALED) does not apply to
+            # extend batches; the dedup kernel needs the default scale.
+            if abs(layer.scaling - layer.head_dim**-0.5) < 1e-7:
+                dedup = _welm_dedup_decode_state(
+                    forward_batch, q2[t_pre:], key_cache, page_table[n_pre:],
+                    cache_seqlens[n_pre:], layer, window_size, False, mixed=True,
+                )
+        if dedup is not None:
+            from sglang.srt.layers.attention import welm_dedup_decode
+
+            welm_dedup_decode.attend(
+                q2[t_pre:], key_cache, value_cache, cache_seqlens[n_pre:], dedup,
+                sinks=sinks, out=out[t_pre:],
+            )
+            return out
+        dec = vllm_flash_attn_with_kvcache(
+            q=q2[t_pre:].unsqueeze(1),
+            k_cache=key_cache,
+            v_cache=value_cache,
+            page_table=page_table[n_pre:],
+            cache_seqlens=cache_seqlens[n_pre:],
+            softmax_scale=layer.scaling,
+            causal=True,
+            window_size=window_size,
+            softcap=layer.logit_cap,
+            sinks=sinks,
+        )
+        out[t_pre:].copy_(dec.view(n_dec, H, layer.v_head_dim))
+        return out
 
     def forward_extend(
         self,
@@ -1407,6 +1613,18 @@ class FlashAttentionBackend(AttentionBackend):
             cache_seqlens = swa_spec_metadata.cache_seqlens_int32
             max_seqlen_q = swa_spec_metadata.max_seq_len_q
             cu_seqlens_k = swa_spec_metadata.cu_seqlens_k
+        elif (
+            getattr(layer, "is_kv_mirror", False)
+            and forward_batch.custom_last_index is not None
+            and metadata.mirror_cu_seqlens_q is not None
+        ):
+            # WeLM mirror layers reduce the query to one row per request while
+            # continuing to read the ordinary per-request KV cache.
+            page_table = metadata.page_table
+            cu_seqlens_q = metadata.mirror_cu_seqlens_q
+            cache_seqlens = metadata.cache_seqlens_int32
+            max_seqlen_q = metadata.mirror_max_seq_len_q
+            cu_seqlens_k = metadata.cu_seqlens_k
         else:
             page_table = metadata.page_table
             if is_swa_layer and self.use_sliding_window_kv_pool:
@@ -1554,6 +1772,25 @@ class FlashAttentionBackend(AttentionBackend):
                     out=_fa_out,
                     **kwargs,
                 )
+            elif (
+                self._use_hcu_legacy_layout
+                and max_seqlen_q > 1
+                and (
+                    forward_batch.forward_mode.is_mixed()
+                    or forward_batch.forward_mode == ForwardMode.EXTEND
+                )
+                and cu_seqlens_q is metadata.cu_seqlens_q
+                and not use_cascade_attn
+                and not use_local_attn
+                and not layer.is_cross_attention
+                and self.kv_cache_dtype_str == "auto"
+                and _hcu_mixed_decode_rows(forward_batch) > 0
+            ):
+                result = self._hcu_mixed_extend_attention(
+                    q, key_cache, value_cache, page_table, cu_seqlens_q,
+                    cache_seqlens, max_seqlen_q, metadata, layer, window_size,
+                    kwargs.get("sinks"), forward_batch, _fa_out,
+                )
             elif self._use_hcu_legacy_layout and max_seqlen_q > 1:
                 result = vllm_flash_attn_varlen_func(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -1562,7 +1799,13 @@ class FlashAttentionBackend(AttentionBackend):
                     cu_seqlens_q=cu_seqlens_q,
                     max_seqlen_q=max_seqlen_q,
                     seqused_k=cache_seqlens,
-                    max_seqlen_k=metadata.max_seq_len_k,
+                    # CUDA-graph target-verify metadata leaves max_seq_len_k
+                    # unset (0); the HCU kernel sizes its paged->contiguous KV
+                    # copy from it, so fall back to the page-table bound.
+                    max_seqlen_k=(
+                        metadata.max_seq_len_k
+                        or page_table.shape[1] * self.page_size
+                    ),
                     softmax_scale=layer.scaling,
                     causal=False if use_cascade_attn else causal,
                     window_size=window_size,
@@ -1587,7 +1830,9 @@ class FlashAttentionBackend(AttentionBackend):
                         else None
                     ),
                     layout="legacy_bhsd",
+                    sinks=kwargs.get("sinks"),
                     out=_fa_out,
+                    host_seq_lens=_welm_host_seq_lens(forward_batch, cu_seqlens_q, metadata),
                     total_k_hint=(
                         forward_batch.seq_lens_sum
                         if _is_hcu
@@ -1596,7 +1841,6 @@ class FlashAttentionBackend(AttentionBackend):
                         and not layer.is_cross_attention
                         and not use_local_attn
                         and not use_cascade_attn
-                        and not is_swa_layer
                         else None
                     ),
                 )
@@ -1626,6 +1870,7 @@ class FlashAttentionBackend(AttentionBackend):
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
                     ver=self.fa_impl_ver,
+                    sinks=kwargs.get("sinks"),
                 )
                 result = _restore_padded_q_rows(result, _sp_padded_rows)
             elif not self._use_hcu_legacy_layout and _use_varlen_fwd_unified_fa:
@@ -2196,6 +2441,19 @@ class FlashAttentionBackend(AttentionBackend):
                     q_dec, _sp_padded_rows = _trim_padded_q_for_batch_api(
                         q_reshaped, page_table
                     )
+                    dedup = _welm_dedup_decode_state(
+                        forward_batch, q_dec, key_cache, page_table, cache_seqlens,
+                        layer, window_size, use_cascade_attn or pa_swa_active,
+                    )
+                if self._use_hcu_legacy_layout and dedup is not None:
+                    from sglang.srt.layers.attention import welm_dedup_decode
+
+                    result = welm_dedup_decode.attend(
+                        q_dec, key_cache, value_cache, cache_seqlens, dedup,
+                        sinks=kwargs.get("sinks"),
+                    ).unsqueeze(1)
+                    result = _restore_padded_q_rows(result, _sp_padded_rows)
+                elif self._use_hcu_legacy_layout:
                     result = vllm_flash_attn_with_kvcache(
                         q=q_dec.unsqueeze(1),
                         k_cache=key_cache,
@@ -2211,6 +2469,9 @@ class FlashAttentionBackend(AttentionBackend):
                         return_softmax_lse=use_cascade_attn,
                         num_splits=self.num_splits,
                         ver=self.fa_impl_ver,
+                        # Cascade merging would apply sinks twice; sinks are
+                        # only supported on the single-pass (topk=1) path.
+                        sinks=None if use_cascade_attn else kwargs.get("sinks"),
                     )
                     result = _restore_padded_q_rows(result, _sp_padded_rows)
                 elif not self._use_hcu_legacy_layout and _use_varlen_fwd_unified_fa:
