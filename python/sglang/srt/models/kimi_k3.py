@@ -157,6 +157,45 @@ def _lightop_int8_input_supported(x: torch.Tensor) -> bool:
     )
 
 
+def kimi_k3_latent_quant_config(
+    quant_config: Optional[QuantizationConfig], prefix: str
+) -> Optional[QuantizationConfig]:
+    """Preserve BF16 latent projections unless their W8A8 scheme is explicit."""
+    from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+
+    # ModelSlim already resolves each projection through quant_description.
+    if isinstance(quant_config, ModelSlimConfig):
+        return quant_config
+    if quant_config is None or quant_config.get_name() not in (
+        "slimquant_w4a8",
+        "slimquant_w4a8_marlin",
+    ):
+        return None
+
+    # Legacy experts-only SlimQuant checkpoints have BF16 latent weights and
+    # no mixed_precision.w8a8_include. Do not infer INT8 from the backend name.
+    include = getattr(quant_config, "w8a8_include", None)
+    if not include:
+        return None
+
+    from sglang.srt.layers.quantization.slimquant_w4a8_marlin import (
+        _layer_in_w8a8_include,
+    )
+
+    # Checkpoint names use block_sparse_moe and may start with language_model;
+    # K3 runtime module names use mlp. Keep this alias handling local to K3.
+    checkpoint_prefix = prefix.replace(".mlp.", ".block_sparse_moe.")
+    candidates = {
+        prefix,
+        checkpoint_prefix,
+        "language_model." + prefix,
+        "language_model." + checkpoint_prefix,
+    }
+    if any(_layer_in_w8a8_include(name, include) for name in candidates):
+        return quant_config
+    return None
+
+
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
@@ -800,33 +839,16 @@ class KimiK3MoE(nn.Module):
         # Default off: do not change the existing shared-expert paths.
         self._serial_sbo_enabled = self._init_serial_sbo()
 
-        # Latent MoE projections. Pass quant_config through so ModelSlim
-        # W8A8_DYNAMIC checkpoints (Huawei W4A8) load weight_scale/offset and
-        # run quant matmul. quant_config=None previously treated int8 weights
-        # as bf16 → latent GEMM explosion (~1e4). FLOAT shards still resolve
-        # to UnquantizedLinearMethod via is_layer_skipped. Fused-front /
-        # gemm_ag paths already require bf16 weights and self-disable here.
-        # ModelSlim W4A8: latent 投影是量化的，必须带 quant_config。
-        # MXFP4 / compressed-tensors: latent 投影是 bf16，必须 UnquantizedLinearMethod。
-        from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
-
-        latent_quant_config = (
-            quant_config
-            if isinstance(quant_config, ModelSlimConfig)
-            or (
-                quant_config is not None
-                and quant_config.get_name()
-                in ("slimquant_w4a8", "slimquant_w4a8_marlin")
-            )
-            else None
-        )
-
+        # Resolve the two latent projections separately: legacy SlimQuant
+        # keeps BF16; explicit mixed W8A8 and ModelSlim retain quantization.
         if self.use_latent_moe:
             self.routed_expert_down_proj = ReplicatedLinear(
                 hidden_size,
                 self.moe_hidden_size,
                 bias=False,
-                quant_config=latent_quant_config,
+                quant_config=kimi_k3_latent_quant_config(
+                    quant_config, f"{prefix}.routed_expert_down_proj"
+                ),
                 prefix=f"{prefix}.routed_expert_down_proj",
             )
             self.routed_expert_norm = (
@@ -838,7 +860,9 @@ class KimiK3MoE(nn.Module):
                 self.moe_hidden_size,
                 hidden_size,
                 bias=False,
-                quant_config=latent_quant_config,
+                quant_config=kimi_k3_latent_quant_config(
+                    quant_config, f"{prefix}.routed_expert_up_proj"
+                ),
                 prefix=f"{prefix}.routed_expert_up_proj",
             )
         else:
