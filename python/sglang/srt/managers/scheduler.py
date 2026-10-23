@@ -3586,6 +3586,19 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
+        if (
+            self.disaggregation_mode != DisaggregationMode.NULL
+            and not is_retracted
+        ):
+            # set_finish_with_abort stages the error in to_finish for a dummy
+            # forward. PD requests rejected before admission cannot reach that
+            # forward: they would wait for KV that their peer will never send.
+            if isinstance(req.to_finish, FINISH_ABORT):
+                req.finished_reason = req.to_finish
+                req.to_finish = None
+            if req.finished():
+                self.output_streamer.stream_output([req], req.return_logprob)
+                return
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
