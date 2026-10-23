@@ -82,6 +82,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
     ngram_embedding_info: Optional[NgramEmbeddingInfo]
     rids_int: Optional[torch.Tensor]
     bootstrap_room_ids_int: Optional[torch.Tensor]
+    # WeLM over-encoding shifted token ids, keyed by n-gram order ("2".."4").
+    n_gram_input_ids: Optional[Dict[str, torch.Tensor]] = None
 
     @classmethod
     def create(
@@ -106,6 +108,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         hc_hidden_size: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,
+        prepare_n_gram_inputs: bool = False,
     ) -> DecodeInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -182,6 +185,15 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 else None
             )
 
+            n_gram_input_ids = (
+                {
+                    str(n): torch.zeros((max_num_token,), dtype=torch.int64)
+                    for n in (2, 3, 4)
+                }
+                if prepare_n_gram_inputs
+                else None
+            )
+
             if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
                 rids_int = torch.zeros((max_bs,), dtype=torch.int64)
                 bootstrap_room_ids_int = torch.full((max_bs,), -1, dtype=torch.int64)
@@ -217,6 +229,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             ngram_embedding_info=ngram_embedding_info,
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
+            n_gram_input_ids=n_gram_input_ids,
         )
 
     def populate_from_forward_batch(

@@ -1076,14 +1076,18 @@ def _fused_moe_kernel_sequence(
             # Two paths gated by SGLANG_OPT_SWIGLU_CLAMP_FUSION:
             #   fusion=True: clamp fused into act_and_mul_triton or silu_and_mul_clamp
             #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
-            assert swiglu_limit == 10
+            # WeLM uses other limits (e.g. 30); clamp(silu(g)) == silu(clamp(g))
+            # to well below bf16 resolution for limits this large.
+            assert swiglu_limit == 10 or (_is_hip and swiglu_limit >= 10)
             assert intermediate_cache1.shape == (total_tokens, N)
             assert _is_cuda or _is_hip, "DeepSeek V4 only supports CUDA/HIP downstream"
 
             swiglu_limit_for_triton: Optional[float] = None
             swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
 
-            if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
+            if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get() and (
+                filter_expert or _is_cuda
+            ):
                 if filter_expert:
                     swiglu_limit_for_triton = swiglu_limit
                 else:

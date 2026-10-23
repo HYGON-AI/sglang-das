@@ -360,6 +360,10 @@ else:
 
 
 logger = logging.getLogger(__name__)
+_MIXED_CHUNK_MIN_TOKENS = int(os.environ.get("SGLANG_MIXED_CHUNK_MIN_TOKENS", "0"))
+# Token budget for admitting short waiting requests ahead of an in-progress
+# chunked prefill (0 disables).
+_SHORT_FIRST_TOKENS = int(os.environ.get("SGLANG_SHORT_FIRST_TOKENS", "0"))
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -4227,6 +4231,45 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
+        pre_admitted = ()
+        if (
+            self.chunked_req is not None
+            and _SHORT_FIRST_TOKENS > 0
+            and self.waiting_queue
+            and adder.rem_chunk_tokens is not None
+            and not self.enable_lora
+            and getattr(self.req_to_token_pool, "mamba_allocator", None) is None
+            and not self.enable_hicache_storage
+            and self.disaggregation_mode == DisaggregationMode.NULL
+        ):
+            # Admit short waiting requests (prefix-cache hits) ahead of the
+            # next chunk of a long prompt so they are not stuck behind all of
+            # its chunks; the chunk takes the remaining budget.
+            saved = adder.rem_chunk_tokens
+            budget = min(saved, _SHORT_FIRST_TOKENS)
+            adder.rem_chunk_tokens = budget
+            for req in self.waiting_queue:
+                if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                    len(running_batch.reqs)
+                ):
+                    break
+                req.init_next_round_input(self.tree_cache)
+                ext = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+                if ext <= 0 or ext + self.page_size > adder.rem_chunk_tokens:
+                    continue
+                res = adder.add_one_req(
+                    req, has_chunked_req=True,
+                    truncation_align_size=self.truncation_align_size,
+                )
+                if adder.new_chunked_req is not None:
+                    # cannot happen (ext fits); keep the invariant anyway
+                    adder.new_chunked_req = None
+                if res != AddReqResult.CONTINUE:
+                    break
+            used = budget - adder.rem_chunk_tokens
+            adder.rem_chunk_tokens = saved - used
+            pre_admitted = set(adder.can_run_list)
+
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
@@ -4249,6 +4292,8 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if req in pre_admitted:
+                continue
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -4423,6 +4468,9 @@ class Scheduler(
             and not (new_batch.return_logprob or running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
+            # Small prefills run as captured prefill graphs; mixing would push
+            # them (and the decode step) onto the eager path.
+            and (new_batch.extend_num_tokens or 0) >= _MIXED_CHUNK_MIN_TOKENS
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             running_batch.filter_batch()

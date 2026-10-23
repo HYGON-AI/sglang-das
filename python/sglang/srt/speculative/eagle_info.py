@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -174,6 +174,7 @@ class EagleDraftInput(SpecInput):
     # V2 overlap worker only: req_pool_indices used as buf slot keys.
     future_indices: Optional[torch.Tensor] = None
     future_dsa_topk_indices_available: bool = False
+    model_specific_states: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
@@ -326,6 +327,9 @@ class EagleDraftExtendInput(SpecInput):
     # None for draft-extend's idle batch; attention backends fall back to
     # rebuilding plain metadata from seq_lens when this is None.
     kv_indptr: torch.Tensor = None
+
+    # Target model state consumed by the draft model during this extend.
+    model_specific_states: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)

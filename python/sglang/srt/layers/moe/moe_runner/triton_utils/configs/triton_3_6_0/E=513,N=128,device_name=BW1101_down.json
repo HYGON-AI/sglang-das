@@ -1,0 +1,173 @@
+{
+    "1": {
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "BLOCK_SIZE_M": 16
+    },
+    "2": {
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "BLOCK_SIZE_M": 16
+    },
+    "3": {
+        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "BLOCK_SIZE_M": 16
+    },
+    "4": {
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "BLOCK_SIZE_M": 16
+    },
+    "8": {
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "BLOCK_SIZE_M": 16
+    },
+    "16": {
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "BLOCK_SIZE_M": 16
+    },
+    "24": {
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "BLOCK_SIZE_M": 16
+    },
+    "32": {
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "BLOCK_SIZE_M": 16
+    },
+    "48": {
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "BLOCK_SIZE_M": 16
+    },
+    "64": {
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "BLOCK_SIZE_M": 16
+    },
+    "96": {
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "BLOCK_SIZE_M": 32
+    },
+    "128": {
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 8,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "BLOCK_SIZE_M": 32
+    },
+    "192": {
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "BLOCK_SIZE_M": 32
+    },
+    "256": {
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "BLOCK_SIZE_M": 32
+    },
+    "512": {
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 8,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "BLOCK_SIZE_M": 32
+    },
+    "1024": {
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 8,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "BLOCK_SIZE_M": 32
+    },
+    "2048": {
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "BLOCK_SIZE_M": 64
+    },
+    "4096": {
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "BLOCK_SIZE_M": 128
+    },
+    "8192": {
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "BLOCK_SIZE_M": 128
+    }
+}

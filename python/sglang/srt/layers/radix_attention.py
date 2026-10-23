@@ -142,6 +142,8 @@ class RadixAttention(nn.Module):
         if self.quant_method is not None:
             self.quant_method.create_weights(self)
         self.attn_type = attn_type
+        # WeLM uses this marker to select KV-mirror query metadata.
+        self.is_kv_mirror = False
 
         self.pos_encoding_mode = pos_encoding_mode
         self.logit_capping_method = logit_capping_method

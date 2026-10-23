@@ -95,6 +95,82 @@ def _pin_host_metadata(device: Union[str, torch.device]) -> bool:
     return _is_hcu and is_pin_memory_available(device)
 
 
+_WELM_KV_MIRROR_STATES_KEY = "welm_kv_mirror_states"
+
+
+def _needs_extend_input_logprobs(forward_batch) -> bool:
+    """Whether an extend batch must return logprobs for prompt positions.
+
+    Mirrors ``LogitsMetadata.from_forward_batch``: a request needs input
+    logprobs when its logprob start lies before the end of its extend span.
+    """
+    mode = forward_batch.forward_mode
+    if (
+        mode is None
+        or not mode.is_extend()
+        or mode.is_target_verify()
+        or not forward_batch.return_logprob
+    ):
+        return False
+    starts = forward_batch.extend_logprob_start_lens_cpu
+    lens = forward_batch.extend_seq_lens_cpu
+    if not starts or not lens:
+        return False
+    return any(extend_len - start_len > 0 for extend_len, start_len in zip(lens, starts))
+
+
+def _resize_welm_mirror_states(
+    model_specific_states: Optional[Dict[str, any]], size: int, *, pad: bool
+):
+    """Resize token-aligned WeLM mirror activations around MLP-sync padding.
+
+    Mirror K/V activations are carried as model-specific state rather than as a
+    regular ForwardBatch tensor.  DP/TP padding still adds rows to the model
+    input, so leave those rows in place during the forward and remove them in
+    ``post_forward_mlp_sync_batch``.  Only the leading token dimension is
+    changed; all other model-specific state is passed through untouched.
+    """
+    if not model_specific_states:
+        return model_specific_states
+    mirror_states = model_specific_states.get(_WELM_KV_MIRROR_STATES_KEY)
+    if not mirror_states:
+        return model_specific_states
+
+    resized = {}
+    changed = False
+    for layer_idx, kv in mirror_states.items():
+        if not isinstance(kv, (tuple, list)) or len(kv) != 2:
+            resized[layer_idx] = kv
+            continue
+        resized_kv = []
+        for tensor in kv:
+            if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
+                resized_kv.append(tensor)
+                continue
+            if pad:
+                extra = size - tensor.shape[0]
+                if extra > 0:
+                    tensor = torch.cat(
+                        [
+                            tensor,
+                            tensor.new_zeros((extra, *tensor.shape[1:])),
+                        ],
+                        dim=0,
+                    )
+                    changed = True
+            elif tensor.shape[0] > size:
+                tensor = tensor[:size]
+                changed = True
+            resized_kv.append(tensor)
+        resized[layer_idx] = tuple(resized_kv)
+
+    if not changed:
+        return model_specific_states
+    result = dict(model_specific_states)
+    result[_WELM_KV_MIRROR_STATES_KEY] = resized
+    return result
+
+
 def _elastic_should_preserve_local_token_counts(
     *,
     model_runner: ModelRunner,
@@ -476,6 +552,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
+
+    # For WeLM over-encoding and KV mirror.
+    n_gram_input_ids: Optional["NGramInputIds"] = None
+    enable_kv_mirror: bool = False
+    custom_last_index: Optional[torch.Tensor] = None
+    scale_seq_factor: int = 1
 
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
@@ -922,7 +1004,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             pd_hidden_capture_layer_ids=pd_hidden_capture_layer_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
-            # Host-side metadata
+            n_gram_input_ids=batch.n_gram_input_ids,
+            scale_seq_factor=1,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             mm_inputs=batch.multimodal_inputs,
@@ -933,9 +1016,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
+            model_specific_states=getattr(
+                batch.spec_info, "model_specific_states", None
+            ),
         )
 
         ret._maybe_init_non_generation_fields(batch)
+        ret.enable_kv_mirror = model_runner.server_args.enable_kv_mirror
 
         device = model_runner.device
         pin_host_metadata = _pin_host_metadata(device)
@@ -1049,6 +1136,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if ret.positions is None:
                 ret.positions = positions
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
+
+        # KV-mirror prefill keeps only each request's last hidden state, so it
+        # cannot produce prompt-position logprobs.  Run such batches through
+        # the full (exact, slower) path instead of failing in the scheduler.
+        if ret.enable_kv_mirror and _needs_extend_input_logprobs(ret):
+            ret.enable_kv_mirror = False
 
         if model_runner.ngram_embedding_manager.enabled:
             ret._init_ngram_embedding_info(batch, device)
@@ -1657,6 +1750,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
         self._original_num_tokens = self.positions.shape[0]
+        self.model_specific_states = _resize_welm_mirror_states(
+            self.model_specific_states, num_tokens, pad=True
+        )
+        if self.spec_info is not None and hasattr(
+            self.spec_info, "model_specific_states"
+        ):
+            self.spec_info.model_specific_states = self.model_specific_states
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         if self.input_embeds is not None:
             # Keep token-aligned inputs consistent after padding.
@@ -1880,6 +1980,29 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+
+        # Mirror K/V activations are token-aligned but are not part of the
+        # regular logits/hidden-state tensors.  Apply the same post-padding
+        # row trim before the state is handed to draft-extend.
+        mirror_state_tokens = None
+        if logits_output.hidden_states is not None:
+            mirror_state_tokens = logits_output.hidden_states.shape[0]
+        elif logits_output.next_token_logits is not None:
+            mirror_state_tokens = logits_output.next_token_logits.shape[0]
+        elif self._original_num_tokens is not None:
+            mirror_state_tokens = self._original_num_tokens
+        if mirror_state_tokens is not None:
+            model_specific_states = getattr(
+                logits_output, "model_specific_states", None
+            )
+            if model_specific_states is None:
+                model_specific_states = self.model_specific_states
+            model_specific_states = _resize_welm_mirror_states(
+                model_specific_states, mirror_state_tokens, pad=False
+            )
+            self.model_specific_states = model_specific_states
+            if hasattr(logits_output, "model_specific_states"):
+                logits_output.model_specific_states = model_specific_states
 
     @property
     def can_run_tbo(self):

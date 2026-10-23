@@ -596,6 +596,11 @@ def _log_softmax_batch_invariant(input, dim, _half_to_float):
 
 def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = None):
     assert dtype is None or dtype == torch.float32, f"unsupported dtype: {dtype}"
+    if len(dim) == 0:
+        # ``x.mean()`` dispatches here with ``dim=[]`` meaning "all dims";
+        # without this the element count below stays 1 and the full sum is
+        # returned instead of the mean.
+        dim = list(range(input.dim()))
     if len(dim) == 1:
         return mean_dim(input, dim[0], keepdim=keepdim)
     else:

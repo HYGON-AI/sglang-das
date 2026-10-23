@@ -830,6 +830,32 @@ class ModelConfig:
             self.hf_config.architectures[0] = "HYV3ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
 
+        if is_draft_model and self.hf_config.architectures[0] == "WeLMV4VLMForConditionalGeneration":
+            # The VLM keeps its language configuration under text_config.  A
+            # draft worker must expose only the physical NextN layers while
+            # retaining the target depth for KV-mirror layer numbering and
+            # checkpoint remapping.
+            text_config = self.hf_text_config
+            if getattr(text_config, "architectures", [None])[0] == "WeLMV4MoeForCausalLM":
+                target_hidden_layers = text_config.num_hidden_layers
+                text_config.num_target_hidden_layers = target_hidden_layers
+                text_config.architectures[0] = "WeLMV4MoeForCausalLMNextN"
+                text_config.num_hidden_layers = (
+                    text_config.num_nextn_predict_layers
+                )
+
+        if is_draft_model and self.hf_config.architectures[0] == "WeLMV4MoeForCausalLM":
+            # The flattened WeLM checkpoint stores the target decoder and the
+            # NextN decoder in one config.  Keep the target depth available to
+            # KV-mirror attention/weight loading before exposing only the
+            # physical NextN layers to the draft model.
+            target_hidden_layers = self.hf_config.num_hidden_layers
+            self.hf_config.num_target_hidden_layers = target_hidden_layers
+            self.hf_config.architectures[0] = "WeLMV4MoeForCausalLMNextN"
+            self.hf_config.num_hidden_layers = (
+                self.hf_config.num_nextn_predict_layers
+            )
+
         if is_draft_model and self.hf_config.architectures[0] == "HYV4ForCausalLM":
             self.hf_config.architectures[0] = "HYV4ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
@@ -2079,6 +2105,7 @@ def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
         "MllamaForConditionalGeneration",
         "MossVLForConditionalGeneration",
         "CLIPModel",
+        "WeLMV4VLMForConditionalGeneration",
     ]
     if any(multi_model_arch in unsupported for multi_model_arch in model_architectures):
         return False
@@ -2182,6 +2209,12 @@ def is_hybrid_swa_model(
         "InklingForConditionalGenerationMTP",
         "UnlimitedOCRForCausalLM",
     }
+    if (
+        os.environ.get("WELM_HYBRID_SWA", "0") == "1"
+        and any(a in ("WeLMV4MoeForCausalLM", "WeLMV4VLMForConditionalGeneration") for a in model_architectures)
+        and getattr(hf_text_config, "sliding_window_size_layerwise", None)
+    ):
+        return True
     if any(arch in hybrid_swa_archs for arch in model_architectures):
         # Only treat Laguna as hybrid SWA when it actually has a sliding window.
         if (
@@ -2203,6 +2236,19 @@ def get_hybrid_layer_ids(
     hf_text_config: PretrainedConfig,
 ):
     num_hidden_layers = hf_text_config.num_hidden_layers
+    welm_windows = getattr(hf_text_config, "sliding_window_size_layerwise", None)
+    if welm_windows and any(
+        a in ("WeLMV4MoeForCausalLM", "WeLMV4VLMForConditionalGeneration") for a in model_architectures
+    ):
+        # WeLM: layers whose window is below the full context are sliding.
+        full_limit = int(getattr(hf_text_config, "sliding_window", 0) or 0) or 1 << 30
+        swa_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if 0 < int(welm_windows[i]) < full_limit
+        ]
+        full_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if i not in set(swa_attention_layer_ids)
+        ]
+        return swa_attention_layer_ids, full_attention_layer_ids
     if "Llama4ForConditionalGeneration" in model_architectures:
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 != 0

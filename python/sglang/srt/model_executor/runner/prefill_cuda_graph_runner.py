@@ -365,6 +365,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # TcPiecewise resolves by running a compile pass that calls back into
         # capture_prepare / _run_forward, so these fields must exist first.
         self._prefill_static_buffers: Optional[Dict[str, torch.Tensor]] = None
+        # WeLM over-encoding n-gram ids (gram n -> [max_num_tokens] int64).
+        self._prefill_ngram_buffers: Optional[Dict[int, torch.Tensor]] = None
+        self._captured_model_states: Dict[ShapeKey, Any] = {}
         self.static_draft_hidden_states: Optional[torch.Tensor] = None
         self.layer_model = None
         self._capture_req_slots = 1
@@ -473,6 +476,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     name: torch.zeros((self.max_bs,), dtype=torch.int64)
                     for name in _PREFILL_STATIC_FIELDS
                 }
+                if model_runner.server_args.prepare_n_gram_inputs:
+                    self._prefill_ngram_buffers = {
+                        n: torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+                        for n in (2, 3, 4)
+                    }
 
         server_args = model_runner.server_args
         self.enable_cp_v2_bcg_capture = isinstance(
@@ -1165,6 +1173,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
 
+        # Media batches compose embeddings in the outer model.forward from
+        # pad-hash ids the captured body never saw; run them eagerly.
+        if forward_batch.contains_mm_inputs():
+            return False
+
         # Non-DP local check (sole decision for tp-only).
         if not self.can_replay_locally(
             batch_size=forward_batch.batch_size,
@@ -1372,7 +1385,35 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 max_seq_len_override=getattr(self, "max_context_size", None),
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+            forward_batch.n_gram_input_ids = self._static_ngram_ids(num_tokens)
         return forward_batch, self.model_runner.attn_backend
+
+    def _static_ngram_ids(self, num_tokens: int):
+        if self._prefill_ngram_buffers is None:
+            return None
+        from sglang.srt.managers.schedule_batch import NGramInputIds
+
+        return NGramInputIds(
+            input_ids_grams=[
+                self._prefill_ngram_buffers[n][:num_tokens] for n in (2, 3, 4)
+            ]
+        )
+
+    def _load_ngram_ids(self, forward_batch: ForwardBatch, raw: int, padded: int):
+        """Copy the live n-gram ids into the captured buffers; zero the pad."""
+        if self._prefill_ngram_buffers is None:
+            return None
+        live = forward_batch.n_gram_input_ids
+        for n in (2, 3, 4):
+            buf = self._prefill_ngram_buffers[n]
+            gram = live.get_gram(n) if live is not None else None
+            if gram is not None and gram.shape[0] == raw:
+                buf[:raw].copy_(gram)
+            else:
+                buf[:raw].zero_()
+            if padded > raw:
+                buf[raw:padded].zero_()
+        return self._static_ngram_ids(padded)
 
     def capture(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
@@ -1459,7 +1500,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._init_forward_metadata_for_capture(forward_batch, num_tokens)
 
         def run_once():
-            return self._run_forward(forward_batch, num_tokens)
+            out = self._run_forward(forward_batch, num_tokens)
+            # Model-owned per-forward state (e.g. WeLM KV-mirror activations
+            # handed to the MTP draft) is published in Python inside the
+            # captured body, which replay does not re-run.  Keep the tensors
+            # from the last (captured) run: they are graph outputs refreshed
+            # on every replay of this shape.
+            self._captured_model_states[shape_key] = forward_batch.model_specific_states
+            return out
 
         # Main's monolithic BCG runner never invokes
         # on_after_cuda_graph_warmup between warmup iterations — the BCG
@@ -1633,6 +1681,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
             max_seq_len_override=getattr(self, "max_context_size", None),
         )
+        static_forward_batch.n_gram_input_ids = self._load_ngram_ids(
+            forward_batch, num_tokens, static_num_tokens
+        )
         if self._is_full_backend:
             forward_batch.next_token_logits_buffer = (
                 static_forward_batch.next_token_logits_buffer
@@ -1733,11 +1784,31 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 ie = layer_kwargs.get("input_embeds")
                 if ie is None and ie_idx is not None and len(args) > ie_idx:
                     ie = args[ie_idx]
+                if ie is None and args:
+                    # Text-only batch on a multimodal model: the outer forward
+                    # passes no embeddings, but the body reads the slot.
+                    ie = self.model_runner.model.get_input_embeddings()(args[0])
                 if ie is not None:
                     self.buffer_registry.get_slot("input_embeds").slice_for(
                         1, static_num_tokens
                     )[: ie.shape[0]].copy_(ie)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
+            captured_states = self._captured_model_states.get(shape_key)
+            if captured_states:
+                from sglang.srt.model_executor.forward_batch_info import (
+                    _resize_welm_mirror_states,
+                )
+
+                states = _resize_welm_mirror_states(
+                    captured_states, raw_num_tokens, pad=False
+                )
+                # Fresh containers: consumers pop entries in place.
+                fresh = {
+                    key: dict(val) if isinstance(val, dict) else val
+                    for key, val in states.items()
+                }
+                static_forward_batch.model_specific_states = fresh
+                forward_batch.model_specific_states = fresh
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
         # Same MegaMoE valid-token refresh the decode graph runner performs.
@@ -1800,7 +1871,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ):
             mm_input_embeds = output.mm_input_embeds[: self.raw_num_tokens]
         logits_rows = self.raw_bs if self._is_full_backend else self.raw_num_tokens
+        model_specific_states = getattr(output, "model_specific_states", None)
+        if model_specific_states:
+            from sglang.srt.model_executor.forward_batch_info import (
+                _resize_welm_mirror_states,
+            )
+
+            model_specific_states = _resize_welm_mirror_states(
+                model_specific_states, self.raw_num_tokens, pad=False
+            )
         return LogitsProcessorOutput(
+            # Model-owned state for the MTP draft (WeLM KV-mirror activations).
+            model_specific_states=model_specific_states,
             next_token_logits=(
                 output.next_token_logits[:logits_rows]
                 if output.next_token_logits is not None

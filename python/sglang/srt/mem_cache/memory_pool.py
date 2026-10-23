@@ -104,6 +104,7 @@ if TYPE_CHECKING:
 from sglang.srt.utils import get_bool_env_var
 
 _kv_layout_hcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="true")
+_welm_fast_kv_store = get_bool_env_var("SGLANG_HCU_FAST_KV_STORE", default="true")
 
 logger = logging.getLogger(__name__)
 
@@ -2710,6 +2711,21 @@ class MHATokenToKVPool(KVCache):
         if _kv_layout_hcu_fa and not self.use_hnd:
             from sglang.srt.model_executor.runner import get_is_capture_mode
 
+            k_buf = self.k_buffer[layer_id - self.start_layer]
+            v_buf = self.v_buffer[layer_id - self.start_layer]
+            if (
+                _welm_fast_kv_store
+                and cache_k.dim() >= 2
+                and cache_k.dtype == k_buf.dtype
+                and cache_v.dtype == v_buf.dtype
+                and cache_k.stride(-1) == 1
+                and cache_v.stride(-1) == 1
+                and cache_k.shape[0] == loc.shape[0]
+            ):
+                from sglang.srt.layers.welmv4_fast_op import welm_hcu_store_kv
+
+                welm_hcu_store_kv(cache_k, cache_v, k_buf, v_buf, loc)
+                return
             page_idxs = loc // self.page_size
             offsets = loc % self.page_size
             self.k_buffer[layer_id - self.start_layer][

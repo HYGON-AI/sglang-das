@@ -53,6 +53,9 @@ if _is_cuda:
 # Where the CUDA kernel's own small-batch single-block path stops: its
 # per-thread histogram costs 4 * (buckets + 1) ** 2 bytes of shared memory.
 _CUDA_SMALL_BATCH_MAX_BUCKETS = 64
+_HCU_SMALL_ALIGN_MAX_NUMEL = int(
+    __import__("os").environ.get("SGLANG_HCU_SMALL_ALIGN_MAX_NUMEL", "2048")
+)
 
 
 @triton.jit
@@ -168,6 +171,127 @@ def _hcu_moe_align_block_size_triton(
     )
 
 
+@triton.jit
+def _hcu_moe_align_count(
+    topk_ids_ptr,
+    counts_ptr,
+    numel,
+    invalid_expert: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < numel
+    expert = tl.load(topk_ids_ptr + offs, mask=mask, other=0)
+    expert = tl.where(expert < 0, invalid_expert, expert)
+    tl.atomic_add(counts_ptr + expert, 1, mask=mask)
+
+
+@triton.jit
+def _hcu_moe_align_cumsum(
+    counts_ptr,
+    cumsum_ptr,
+    num_tokens_post_pad_ptr,
+    num_buckets: tl.constexpr,
+    block_size: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK_E)
+    mask = offs < num_buckets
+    counts = tl.load(counts_ptr + offs, mask=mask, other=0)
+    padded = tl.cdiv(counts, block_size) * block_size
+    inclusive = tl.cumsum(padded, axis=0)
+    tl.store(cumsum_ptr + offs, inclusive - padded, mask=mask)
+    tl.store(num_tokens_post_pad_ptr, tl.sum(padded, axis=0))
+
+
+@triton.jit
+def _hcu_moe_align_scatter(
+    topk_ids_ptr,
+    sorted_ids_ptr,
+    expert_ids_ptr,
+    counts_ptr,
+    cumsum_ptr,
+    fill_ptr,
+    numel,
+    num_buckets: tl.constexpr,
+    invalid_expert: tl.constexpr,
+    block_size: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    # Token scatter: within-expert order does not matter because the MoE GEMM
+    # addresses outputs by token id, so atomic slot claiming is sufficient.
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < numel
+    expert = tl.load(topk_ids_ptr + offs, mask=mask, other=0)
+    expert = tl.where(expert < 0, invalid_expert, expert)
+    slot = tl.atomic_add(fill_ptr + expert, 1, mask=mask)
+    base = tl.load(cumsum_ptr + expert, mask=mask, other=0)
+    tl.store(sorted_ids_ptr + base + slot, offs.to(tl.int32), mask=mask)
+    # Block -> expert map; the sentinel bucket is reported as -1.
+    if pid < num_buckets:
+        begin = tl.load(cumsum_ptr + pid)
+        num_blocks = tl.cdiv(tl.load(counts_ptr + pid), block_size)
+        expert_value = tl.where(pid == invalid_expert, -1, pid)
+        for i in range(num_blocks):
+            tl.store(expert_ids_ptr + begin // block_size + i, expert_value)
+
+
+def _hcu_moe_align_block_size_fast(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+) -> None:
+    """O(numel + E) HCU align with negative ids routed to a sentinel bucket.
+
+    The triton fallback above keeps an (E + 1) x E count table and a serial
+    E-step prefix scan, which costs ~300 us per call at E=512. This version
+    counts with atomics and prefix-sums all buckets in one program.
+    ``sorted_ids`` must be pre-filled with ``topk_ids.numel()``.
+    """
+    numel = topk_ids.numel()
+    num_buckets = num_experts + 1
+    invalid_expert = num_experts
+    # [counts | per-bucket fill offsets]
+    scratch = torch.zeros(
+        (2 * num_buckets,), dtype=torch.int32, device=topk_ids.device
+    )
+    counts = scratch[:num_buckets]
+    fill = scratch[num_buckets:]
+    cumsum = torch.empty(
+        (num_buckets,), dtype=torch.int32, device=topk_ids.device
+    )
+    BLOCK = 256
+    token_programs = triton.cdiv(numel, BLOCK)
+    _hcu_moe_align_count[(token_programs,)](
+        topk_ids, counts, numel, invalid_expert, BLOCK=BLOCK
+    )
+    _hcu_moe_align_cumsum[(1,)](
+        counts,
+        cumsum,
+        num_tokens_post_pad,
+        num_buckets,
+        block_size,
+        BLOCK_E=triton.next_power_of_2(num_buckets),
+    )
+    _hcu_moe_align_scatter[(max(token_programs, num_buckets),)](
+        topk_ids,
+        sorted_ids,
+        expert_ids,
+        counts,
+        cumsum,
+        fill,
+        numel,
+        num_buckets,
+        invalid_expert,
+        block_size,
+        BLOCK=BLOCK,
+    )
+
+
 def moe_align_block_size(
     topk_ids: torch.Tensor,
     block_size: int,
@@ -277,29 +401,36 @@ def moe_align_block_size(
         # launch bound and eventually causing a VMFault.
         #
         # StandardDispatcher represents experts owned by other EP ranks as
-        # -1.  LightOp expects non-negative ids, so route them through one
-        # extra sentinel expert and map the aligned sentinel blocks back to
-        # -1 for the Triton MoE kernel's filter_expert path.
-        invalid_expert = num_experts
-        # LightOp preserves the caller-provided padding value.  Triton masks a
-        # row only when its sorted token id is >= topk_ids.numel(); leaving the
-        # torch.empty buffer uninitialized can turn padding into real tokens.
+        # -1.  The HCU align routes them through one extra sentinel expert and
+        # reports the aligned sentinel blocks as -1 for the Triton MoE
+        # kernel's filter_expert path.
+        #
+        # Triton masks a row only when its sorted token id is
+        # >= topk_ids.numel(); leaving the torch.empty buffer uninitialized
+        # can turn padding into real tokens.
+        if topk_ids.numel() <= _HCU_SMALL_ALIGN_MAX_NUMEL:
+            # One launch (fill + count + cumsum + scatter) for decode sizes.
+            from sglang.srt.layers.welmv4_fast_op import moe_align_small
+
+            moe_align_small(
+                topk_ids,
+                num_experts,
+                block_size,
+                sorted_ids,
+                expert_ids,
+                num_tokens_post_pad,
+            )
+            return sorted_ids, expert_ids, num_tokens_post_pad
         sorted_ids.fill_(topk_ids.numel())
-        hcu_topk_ids = torch.where(
-            topk_ids < 0,
-            torch.full_like(topk_ids, invalid_expert),
-            topk_ids,
-        )
         # LightOp's count/sort scratch overflows for batched decode shapes.
-        _hcu_moe_align_block_size_triton(
-            hcu_topk_ids,
-            num_experts + 1,
+        _hcu_moe_align_block_size_fast(
+            topk_ids,
+            num_experts,
             block_size,
             sorted_ids,
             expert_ids,
             num_tokens_post_pad,
         )
-        expert_ids.masked_fill_(expert_ids == invalid_expert, -1)
     elif use_jit_align:
         from sglang.kernels.ops.moe.moe_align import (
             moe_align_block_size as jit_moe_align_block_size,
