@@ -1246,9 +1246,7 @@ class GroupCoordinator:
     ) -> torch.Tensor:
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
-            with pynccl_comm.change_state(
-                enable=True, stream=get_current_device_stream_fast()
-            ):
+            with pynccl_comm.change_state(enable=True):
                 pynccl_comm.all_to_all_single(output, input)
         else:
             torch.distributed.all_to_all_single(output, input, group=self.device_group)

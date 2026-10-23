@@ -499,3 +499,32 @@ if __name__ == "__main__":
 
         traceback.print_exc()
         sys.exit(1)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_all_to_all_uses_current_pynccl_state_api(monkeypatch, enabled):
+    from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
+
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    communicator = PyNcclCommunicator.__new__(PyNcclCommunicator)
+    communicator.available = True
+    communicator.disabled = not enabled
+    communicator.all_to_all_single = Mock()
+    coordinator.pynccl_comm = communicator
+    coordinator.device_group = object()
+    fallback = Mock()
+    monkeypatch.setattr(torch.distributed, "all_to_all_single", fallback)
+    input_ = torch.arange(8, dtype=torch.float32)
+    output = torch.empty_like(input_)
+
+    assert coordinator._all_to_all_single(output, input_) is output
+
+    if enabled:
+        communicator.all_to_all_single.assert_called_once_with(output, input_)
+        fallback.assert_not_called()
+    else:
+        fallback.assert_called_once_with(output, input_, group=coordinator.device_group)
+        communicator.all_to_all_single.assert_not_called()
+    assert communicator.disabled is (not enabled)
