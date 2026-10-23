@@ -2484,6 +2484,28 @@ class DeepseekV4AttnBackend(
         # buffers; carry the tail rows into the tail metadata's (padding stays -1).
         full_core = saved[0].core_attn_metadata
         tail_core = tail_metadata.core_attn_metadata
+        if _is_hcu:
+            # HCU starts the tail after the KV source layer; consumers must
+            # retain the source top-k rows selected before the metadata switch.
+            for ratio in tail_core.low_ratios:
+                for full_buf, tail_buf in (
+                    (
+                        full_core.sparse_page_indices(ratio),
+                        tail_core.sparse_page_indices(ratio),
+                    ),
+                    (
+                        full_core.sparse_topk_lengths(ratio),
+                        tail_core.sparse_topk_lengths(ratio),
+                    ),
+                    (
+                        full_core.sparse_raw_indices(ratio),
+                        tail_core.sparse_raw_indices(ratio),
+                    ),
+                ):
+                    if full_buf is None or tail_buf is None:
+                        continue
+                    rows = tail.real_rows(full_buf)
+                    tail_buf[: rows.shape[0]].copy_(rows)
         self.forward_metadata = tail_metadata
         if self.token_to_kv_pool.request_window is not None:
             self.token_to_kv_pool.request_window.activate(

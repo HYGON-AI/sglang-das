@@ -334,3 +334,69 @@ class TestPrefillGraphReplayContext(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHcuTailSparseIndexHandoff(CustomTestCase):
+    def _run(self, hcu):
+        rows = torch.tensor([2, 5, 7])
+        full = {}
+        target = {}
+        for ratio in (1, 2):
+            full[ratio] = (
+                torch.arange(24).reshape(8, 3) + 100 * ratio,
+                torch.arange(8) + 1,
+                torch.arange(24).reshape(8, 3) + 200 * ratio,
+            )
+            target[ratio] = (
+                torch.full((4, 3), -1),
+                torch.zeros(4, dtype=torch.int64),
+                torch.full((4, 3), -1),
+            )
+        def core(buffers):
+            return SimpleNamespace(
+                low_ratios=(1, 2),
+                sparse_page_indices=lambda ratio: buffers[ratio][0],
+                sparse_topk_lengths=lambda ratio: buffers[ratio][1],
+                sparse_raw_indices=lambda ratio: buffers[ratio][2],
+            )
+        tail = SimpleNamespace(
+            real_rows_count=None,
+            cp_metadata=SimpleNamespace(per_rank_actual_token=[3]),
+            local_lens_cpu=[3],
+            real_rows=lambda tensor: tensor[rows],
+        )
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.forward_metadata = SimpleNamespace(
+            core_attn_metadata=core(full), candidate_metadata=None
+        )
+        backend.tail_forward_metadata = SimpleNamespace(
+            core_attn_metadata=core(target), late_layer_tail=tail
+        )
+        backend.token_to_kv_pool = SimpleNamespace(request_window=None)
+        batch = SimpleNamespace(
+            attn_cp_metadata=None, global_num_token_non_padded_cpu=None,
+            global_num_token_non_padded=None, num_token_non_padded=None,
+        )
+        with (
+            patch.object(deepseek_v4_backend, "_is_hcu", hcu),
+            patch.object(deepseek_v4_backend, "get_local_dp_buffer_len", return_value=8),
+            patch.object(deepseek_v4_backend, "set_local_dp_buffer_len"),
+            patch.object(deepseek_v4_backend, "is_cp_cache_layer_split_deepseek_v4_pool", return_value=False),
+        ):
+            saved = backend.enter_late_layer_tail(batch)
+            self.assertIs(backend.forward_metadata, backend.tail_forward_metadata)
+            backend.exit_late_layer_tail(saved, batch)
+        return full, target, rows
+
+    def test_hcu_preserves_source_topk_at_cp_tail_boundary(self):
+        full, target, rows = self._run(True)
+        for ratio in (1, 2):
+            for source, dest in zip(full[ratio], target[ratio]):
+                torch.testing.assert_close(dest[:3], source[rows])
+                torch.testing.assert_close(dest[3], torch.full_like(dest[3], 0 if dest.ndim == 1 else -1))
+
+    def test_non_hcu_keeps_tail_generated_indices(self):
+        _, target, _ = self._run(False)
+        for buffers in target.values():
+            for dest in buffers:
+                torch.testing.assert_close(dest, torch.full_like(dest, 0 if dest.ndim == 1 else -1))
