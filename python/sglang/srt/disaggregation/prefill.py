@@ -2406,7 +2406,7 @@ class SchedulerDisaggregationPrefillMixin:
             req.to_finish = FINISH_ABORT(
                 error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
-        cleanup_done = self.abort_external_kv_request(
+        self.abort_external_kv_request(
             req,
             forward_drained=self.prefill_abort_forward_drained(req),
             sender_terminal=self.prefill_abort_sender_terminal(req),
@@ -2414,9 +2414,9 @@ class SchedulerDisaggregationPrefillMixin:
             is_insert=False,
             emit_response=True,
         )
-        if not cleanup_done and req not in self.disagg_prefill_inflight_queue:
-            # The bootstrap/waiting queue removes this request after the call.
-            # Keep a strong reference, not just a RID, for the next cleanup pass.
+        if req not in self.disagg_prefill_inflight_queue:
+            # Local cleanup can finish before its TP/CP peers. Enqueue on every
+            # rank and let the existing inflight removal consensus retire it.
             self.disagg_prefill_inflight_queue.append(req)
 
         if self.metrics_reporter.enable_metrics:
