@@ -56,6 +56,15 @@ _A2A_STAGING_BUFFERS: dict[tuple, torch.Tensor] = {}
 _A2A_CAPACITY_STAGING_BUFFERS: dict[tuple, torch.Tensor] = {}
 
 
+def release_a2a_staging_capacity(device: torch.device) -> None:
+    """Release eager capacity buffers before another memory-intensive stage."""
+    if device.type != "cuda":
+        return
+    for key in tuple(_A2A_CAPACITY_STAGING_BUFFERS):
+        if key[2] == device.index:
+            del _A2A_CAPACITY_STAGING_BUFFERS[key]
+
+
 def _a2a_staging_buffer(
     role: str,
     shape: tuple[int, ...],
