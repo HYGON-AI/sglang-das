@@ -3262,6 +3262,7 @@ class DeepseekV4AttnBackend(
                     pos,
                     projected=(bufs["kv"], bufs.get("score")),
                     fuse_index_store=(x.is_cuda and _supports_index_k_rope_pack()),
+                    fuse_rope_fq_store=True,
                 )
             if run_indexer and layer.indexer is not None:
                 self._low_ratio_index_topk_captured(layer, bufs["q"], bufs["w"])
@@ -3308,6 +3309,7 @@ class DeepseekV4AttnBackend(
                 fuse_index_store=(
                     x_global.is_cuda and _supports_index_k_rope_pack()
                 ),
+                fuse_rope_fq_store=True,
             )
         if run_indexer and layer.indexer is not None:
             if not _is_hcu:
@@ -3504,6 +3506,7 @@ class DeepseekV4AttnBackend(
                         )
                     )
                 ),
+                fuse_rope_fq_store=forward_batch.forward_mode.is_extend(),
             )
 
     def _low_ratio_in_prefill_graph(self) -> bool:
@@ -3667,7 +3670,8 @@ class DeepseekV4AttnBackend(
             )
 
     def _low_ratio_compress_torch(
-        self, layer, x, req, pos, projected=None, *, fuse_index_store=False
+        self, layer, x, req, pos, projected=None, *, fuse_index_store=False,
+        fuse_rope_fq_store=False,
     ) -> None:
         core = self.forward_metadata.core_metadata
         num_tokens = pos.shape[0]
@@ -3681,6 +3685,7 @@ class DeepseekV4AttnBackend(
                 core.c1_out_loc[:num_tokens],
                 pos,
                 fuse_index_store=fuse_index_store,
+                fuse_rope_fq_store=fuse_rope_fq_store,
             )
             return
 
@@ -3700,7 +3705,8 @@ class DeepseekV4AttnBackend(
         out_loc = core.c2_out_loc[:num_tokens]
         slots = torch.where(out_loc >= 0, out_loc, torch.zeros_like(out_loc))
         self._low_ratio_write_group(
-            layer, pooled, slots, group_pos, fuse_index_store=fuse_index_store
+            layer, pooled, slots, group_pos, fuse_index_store=fuse_index_store,
+            fuse_rope_fq_store=fuse_rope_fq_store,
         )
 
     def _low_ratio_pair_partners(
@@ -3753,6 +3759,7 @@ class DeepseekV4AttnBackend(
         group_pos,
         *,
         fuse_index_store=False,
+        fuse_rope_fq_store=False,
     ) -> None:
         pool = self.token_to_kv_pool
         latent = layer.compressor.finish(pooled)
@@ -3794,6 +3801,26 @@ class DeepseekV4AttnBackend(
             )
             return
         # The fp8 FlashMLA caches requantize the FP4/E4M3 latent into their layout.
+        if (
+            fuse_rope_fq_store
+            and _is_hcu
+            and os.environ.get("SGLANG_HCU_OPT_DSV41_ROPE_FQ_STORE", "1") == "1"
+            and latent.is_cuda
+            and latent.dtype == torch.bfloat16
+            and latent.is_contiguous()
+            and latent.shape[-1] == 512
+            and layer.rope_head_dim == 64
+            and not pool.uniform_fp8
+            and not pool._unified_kv
+            and pool.dtype != torch.bfloat16
+            and pool.get_extra_key_layout(layer.layer_id) is KVLayout.V4
+        ):
+            # Preserve LayerSplit ownership and payload invalidation. Nonowners
+            # skip the fused work as well as the store; latent stays pre-RoPE.
+            pool.set_extra_key_buffer_fused(
+                layer_id=layer.layer_id, loc=slots, cache_k=latent, freqs_cis=freqs
+            )
+            return
         latent = _rope_fq4(latent, freqs, layer.rope_head_dim, compressed_kv=True)
         pool.set_extra_key_buffer_fused(
             layer_id=layer.layer_id, loc=slots, cache_k=latent

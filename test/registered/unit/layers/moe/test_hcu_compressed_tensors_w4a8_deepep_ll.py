@@ -428,6 +428,34 @@ class TestHCUCompressedTensorsW4A8DeepEPLL(CustomTestCase):
 
 
 class TestHCUW4A8Reference(CustomTestCase):
+    def test_hipc_masked_wrapper_returns_output_not_launch_metadata(self):
+        from sglang.srt.layers.moe.ep_moe.layer import (
+            m_grouped_w4a8_gemm_nt_masked_hipc_wrapper,
+        )
+
+        output = torch.zeros((2, 8, 16), dtype=torch.bfloat16)
+        mask = torch.tensor([3, 2], dtype=torch.int32)
+        activations = torch.ones((2, 8, 16), dtype=torch.int8)
+        scales = torch.ones((2, 8, 1))
+
+        def gemm(a, b, d, masked_m, expected_m):
+            self.assertIs(d, output)
+            self.assertIs(masked_m, mask)
+            self.assertEqual(expected_m, 8)
+            d.fill_(7)
+            return (64, 144)
+
+        with patch(
+            "sglang.srt.layers.moe.ep_moe.layer.m_grouped_w4a8_gemm_nt_masked_hipc",
+            side_effect=gemm,
+        ):
+            actual = m_grouped_w4a8_gemm_nt_masked_hipc_wrapper(
+                activations, scales, activations, scales, output, mask, 8
+            )
+        self.assertIs(actual, output)
+        torch.testing.assert_close(output, torch.full_like(output, 7))
+
+
     def setUp(self):
         for target, value in (
             ("sglang.srt.layers.moe.ep_moe.layer._use_w4a8_contiguous_hipc", True),

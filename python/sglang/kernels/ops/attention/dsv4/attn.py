@@ -93,11 +93,20 @@ def fused_store_cache(
         (fp8 nope, bf16 rope); ``V41`` (528 B) and ``V41_FP4`` (288 B) are the
         V4.1 formats, fp8 with per-32 ue8m0 scales and e2m1 with per-16 e4m3
         scales over all 512 dims.
-    :param freqs_cis: V4.1 layouts only. ``[num_tokens, 32]`` complex or
+    :param freqs_cis: V4.1 layouts, or compressed-KV fusion on HCU/V4.
+        ``[num_tokens, 32]`` complex or
         ``[num_tokens, 64]`` fp32 (real / imag interleaved); rotates the 64-dim
         RoPE tail in-kernel, so ``input`` must then be the un-rotated latent.
+        HCU/V4 also applies the compressed-KV FP4 fake-quant round trip.
     """
     layout = KVLayout.parse(layout)
+    if _is_hcu and layout is KVLayout.V4 and freqs_cis is not None:
+        # HCU compressed KV keeps the RoPE -> BF16 -> fake FP4 -> BF16
+        # sequence before its physical V4 FP8/BF16 cache quantization.
+        assert type == "flashmla", "compressed-KV RoPE fusion is not an indexer store"
+        from lightop import dsv41_rope_fake_quant_store
+
+        return dsv41_rope_fake_quant_store(input, freqs_cis, cache, indices, page_size)
     if is_hip_runtime() and layout is KVLayout.V4:
         assert freqs_cis is None, "the V4 store receives already-rotated inputs"
 
