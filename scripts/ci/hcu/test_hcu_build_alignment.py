@@ -142,6 +142,38 @@ class TestBuildAlignment(unittest.TestCase):
             self.assertRegex(path, hcu)
             self.assertRegex(path, wheel)
 
+    def test_pr_validation_uses_hcu_container(self):
+        job = workflow("pr-test-hcu.yml")["jobs"]["validate-config"]
+        self.assertFalse(
+            any(
+                s.get("uses", "").startswith("actions/setup-python@")
+                for s in job["steps"]
+            )
+        )
+        setup = step(job, "Setup HCU validation container")
+        verify = step(job, "Verify HCU registration in container")
+        self.assertNotIn("if", setup)
+        self.assertNotIn("if", verify)
+        self.assertIn("hcu_ci_start_container.sh", setup["run"])
+        self.assertIn("hcu_ci_exec.sh", verify["run"])
+        self.assertIn("verify_hcu_registration.py", verify["run"])
+        self.assertEqual(
+            step(job, "Cleanup HCU validation container")["if"], "always()"
+        )
+
+    def test_pr_wheel_staging_matches_container_helpers(self):
+        build = workflow("release-pr-hcu.yml")["jobs"]["compile"]
+        staging = build["env"]["HCU_WHEEL_STAGING_ROOT"]
+        self.assertTrue(staging.startswith("/home/github/sgl_whl_temp/"))
+        self.assertIn(f"-v {staging}:{staging}", build["container"]["options"])
+        test_jobs = workflow("pr-test-hcu.yml")["jobs"]
+        for name in [
+            "wait-hcu-wheels",
+            "stage-a-test-1-hcu-small",
+            "stage-b-test-1-hcu-small",
+        ]:
+            self.assertEqual(test_jobs[name]["env"]["HCU_WHEEL_STAGING_ROOT"], staging)
+
     def test_build_contract(self):
         pr = workflow("release-pr-hcu.yml")["jobs"]["compile"]
         nightly = workflow("nightly-test-hcu.yml")["jobs"]["build-hcu-wheels"]

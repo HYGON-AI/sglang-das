@@ -31,6 +31,7 @@ ROPE_DIM = 64
 # Reference implementations (pure Python/PyTorch, match dsv41_sparse.py)
 # ---------------------------------------------------------------------------
 
+
 def _rope_tail(x: torch.Tensor, freqs: torch.Tensor, rope_dim: int) -> torch.Tensor:
     """Rotate the last rope_dim features of x with complex freqs [T, rope_dim//2]."""
     head, tail = x[..., :-rope_dim], x[..., -rope_dim:]
@@ -43,9 +44,11 @@ def _rope_tail(x: torch.Tensor, freqs: torch.Tensor, rope_dim: int) -> torch.Ten
 def _round_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:
     """Round to FP4 E2M1 grid: {0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}."""
     ax = x.abs()
-    step = torch.where(ax < 2.0, torch.full_like(ax, 0.5),
-           torch.where(ax < 4.0, torch.full_like(ax, 1.0),
-                                  torch.full_like(ax, 2.0)))
+    step = torch.where(
+        ax < 2.0,
+        torch.full_like(ax, 0.5),
+        torch.where(ax < 4.0, torch.full_like(ax, 1.0), torch.full_like(ax, 2.0)),
+    )
     return (ax / step).round() * step * x.sign()
 
 
@@ -57,14 +60,14 @@ def _fake_quant_fp4(x: torch.Tensor, block: int = 32) -> torch.Tensor:
     xr = x.reshape(B, -1, block)
     amax = xr.abs().amax(dim=-1, keepdim=True)
     # UE8M0: ceil to next power-of-2, floor = 6 * 2^-126
-    FLOOR = 6.0 * (2.0 ** -126)
+    FLOOR = 6.0 * (2.0**-126)
     a = torch.clamp(amax, min=FLOOR) / 6.0
     # Convert to power-of-2 by rounding the float exponent up.
-    exp = torch.frexp(a)[1].float() - 1          # floor(log2(a))
+    exp = torch.frexp(a)[1].float() - 1  # floor(log2(a))
     # If a is not exactly a power of 2, ceil to next.
-    is_exact = (a == 2.0 ** exp)
+    is_exact = a == 2.0**exp
     exp = torch.where(is_exact, exp, exp + 1)
-    scale = (2.0 ** exp).reshape(B, -1, 1)        # [B, nblocks, 1]
+    scale = (2.0**exp).reshape(B, -1, 1)  # [B, nblocks, 1]
     q = torch.clamp(xr / scale, -6.0, 6.0)
     q = _round_fp4_e2m1(q)
     return (q * scale).reshape_as(orig).to(orig.dtype)
@@ -95,6 +98,7 @@ def _ref(x, freqs, compressed_kv):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("B", [1, 4, 16, 128])
 @pytest.mark.parametrize("D", [512, 128])
@@ -133,6 +137,20 @@ def test_rope_fp4_3d(B, H):
     torch.testing.assert_close(out.reshape(-1, D), ref, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.parametrize("D", [128, 512])
+def test_rope_fp4_compressed_subnormal_scales(D):
+    """Exercise every subnormal scale interval and ties-to-even boundary."""
+    scales = torch.arange(16, 129, dtype=torch.float32, device=DEVICE) / 8192
+    x = (scales[:, None] * 6).expand(-1, D).to(torch.bfloat16).contiguous()
+    # Leave the last block at the requested scale; smaller values in the other
+    # blocks also cover the scale floor and the normal/subnormal transition.
+    x[:, :-16] *= 0.25
+    freqs = torch.ones(x.shape[0], ROPE_DIM // 2, dtype=torch.complex64, device=DEVICE)
+    expected = _ref(x, freqs, compressed_kv=True)
+    actual = rope_fp4_fake_quant(x, freqs, ROPE_DIM, True)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_rope_fp4_unsupported_D():
     """Kernel must reject D values other than 128 and 512."""
     x = torch.randn(4, 256, dtype=torch.bfloat16, device=DEVICE)
@@ -146,4 +164,5 @@ def test_rope_fp4_unsupported_D():
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(pytest.main([__file__, "-v"]))

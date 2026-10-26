@@ -54,6 +54,10 @@ __device__ __forceinline__ float ceil_pow2_ue8m0(float amax) {
 // E4M3FN has 3 mantissa bits; we keep bits [22:20] of the fp32 mantissa and
 // apply round-half-to-even on bit 19.  Precondition: x in [2^-9, 448].
 __device__ __forceinline__ float round_to_e4m3fn(float x) {
+  // E4M3FN subnormals have a fixed 2^-9 spacing, without a hidden leading 1.
+  if (x < 0x1p-6f) {
+    return rintf(x * 0x1p9f) * 0x1p-9f;
+  }
   uint32_t u       = __float_as_uint(x);
   uint32_t mant    = u & 0x7FFFFFu;
   const uint32_t SHIFT = 20u;
