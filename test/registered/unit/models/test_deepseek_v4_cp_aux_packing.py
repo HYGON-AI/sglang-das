@@ -1,5 +1,8 @@
 """CPU regression tests for rank-local DSV4 DSPARK auxiliary packing."""
 
+import ast
+import inspect
+import textwrap
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -23,13 +26,15 @@ class _Layer(nn.Module):
     def __init__(self, increment):
         super().__init__()
         self.engram = None
+        self.hc_boundary_fused = False
+        self.hc_cfg = None
         self.increment = increment
 
     def forward(self, *, hidden_states, **kwargs):
         return hidden_states + self.increment, None, None, None
 
-    def forward_hc_pre_from_prev(self, *, hidden_states, **kwargs):
-        return hidden_states + self.increment, None
+    def forward_hc_pre_from_prev(self, *, state, **kwargs):
+        return state.with_residual(state.residual + self.increment)
 
 
 class TestDeepseekV4CpAuxPacking(CustomTestCase):
@@ -83,6 +88,12 @@ class TestDeepseekV4CpAuxPacking(CustomTestCase):
                 mock.patch.object(deepseek_v4, "is_cp_active", return_value=cp)
             )
             stack.enter_context(
+                mock.patch.object(deepseek_v4, "dsa_use_prefill_cp", return_value=False)
+            )
+            stack.enter_context(
+                mock.patch.object(deepseek_v4, "is_cp_v2_active", return_value=False)
+            )
+            stack.enter_context(
                 mock.patch.object(
                     deepseek_v4,
                     "get_parallel",
@@ -123,9 +134,10 @@ class TestDeepseekV4CpAuxPacking(CustomTestCase):
                         self.assertIsInstance(aux, torch.Tensor)
                         self.assertEqual(aux.shape, (rows, 12))
                         self.assertTrue(aux.is_contiguous())
-                        torch.testing.assert_close(
-                            aux, torch.cat(original[1], dim=-1), rtol=0, atol=0
-                        )
+                        expected_aux = original[1]
+                        if isinstance(expected_aux, list):
+                            expected_aux = torch.cat(expected_aux, dim=-1)
+                        torch.testing.assert_close(aux, expected_aux, rtol=0, atol=0)
                         torch.testing.assert_close(
                             body[0], original[0][0], rtol=0, atol=0
                         )
@@ -141,21 +153,82 @@ class TestDeepseekV4CpAuxPacking(CustomTestCase):
                                 atol=0,
                             )
 
-    def test_non_cp_non_hcu_and_multi_pp_keep_list(self):
+    def test_single_pp_packing_and_multi_pp_list(self):
         for kwargs in (
             dict(cp=False),
-            dict(hcu=False),
+            dict(cp=False, hcu=False),
             dict(pp_size=2, pre_from_prev=False),
         ):
             with self.subTest(**kwargs):
                 (_, aux), _ = self._forward(**kwargs)
-                self.assertIsInstance(aux, list)
-                self.assertEqual(len(aux), 3)
+                if kwargs.get("pp_size", 1) > 1:
+                    self.assertIsInstance(aux, list)
+                    self.assertEqual(len(aux), 3)
+                else:
+                    self.assertIsInstance(aux, torch.Tensor)
+                    self.assertEqual(aux.shape, (5, 12))
 
     def test_without_capture_preserves_body_output(self):
         (hidden, pre_hc), input_embeds = self._forward(captures=False)
         torch.testing.assert_close(hidden, input_embeds + 6, rtol=0, atol=0)
         self.assertEqual(pre_hc.shape, (5, 8))
+
+    def test_model_owned_cp_output_skips_only_unused_pre_hc(self):
+        # Execute the production gather block, without loading layers or kernels.
+        tree = ast.parse(textwrap.dedent(inspect.getsource(
+            deepseek_v4.DeepseekV4Model.forward.__wrapped__
+        )))
+        block = next(node for node in ast.walk(tree) if (
+            isinstance(node, ast.If) and isinstance(node.test, ast.Name)
+            and node.test.id == "cp_gather_output"
+        ))
+        code = compile(ast.Module(body=[block], type_ignores=[]), "cp_output", "exec")
+        hidden = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        pre_hc = torch.arange(24, dtype=torch.float32).reshape(3, 8)
+        aux = torch.arange(36, dtype=torch.float32).reshape(3, 12)
+        for hcu, capture, model_capture in (
+            (True, True, [0, 1, 2]), (True, True, None),
+            (True, False, None), (False, True, [0, 1, 2]),
+        ):
+            for compact_tail in (False, True):
+                with self.subTest(hcu=hcu, capture=capture,
+                                  model_capture=model_capture, tail=compact_tail):
+                    full_meta, tail_meta = object(), object()
+                    batch = SimpleNamespace(attn_cp_metadata=full_meta)
+                    seen = []
+
+                    def gather(tensor, cp_size, forward_batch, stream, **kwargs):
+                        self.assertIs(
+                            forward_batch.attn_cp_metadata,
+                            tail_meta if compact_tail else full_meta,
+                        )
+                        seen.append(tensor.shape[1])
+                        if hcu:
+                            self.assertTrue(kwargs["chunk_large_output"])
+                        return torch.cat([tensor] * cp_size)
+
+                    scope = dict(vars(deepseek_v4))
+                    scope.update(
+                        _is_hcu=hcu, cp_all_gather_rerange_output=gather,
+                        self=SimpleNamespace(cp_size=2,
+                                             dspark_layers_to_capture=model_capture),
+                        cp_gather_output=True, capture_dspark=capture,
+                        forward_batch=batch, hcu_cp_tail=compact_tail,
+                        tail=SimpleNamespace(cp_metadata=tail_meta),
+                        pre_hc_head=pre_hc, hidden_states=hidden, pd_aux_hidden=aux,
+                    )
+                    with mock.patch.object(deepseek_v4.torch.cuda, "current_stream"):
+                        exec(code, scope)
+                    skip = hcu and capture and bool(model_capture)
+                    self.assertEqual(seen, ([] if skip else [8]) + [4] + ([12] if capture else []))
+                    self.assertIs(batch.attn_cp_metadata, full_meta)
+                    if skip:
+                        self.assertIsNone(scope["pre_hc_head"])
+                    else:
+                        torch.testing.assert_close(scope["pre_hc_head"], torch.cat([pre_hc]*2))
+                    torch.testing.assert_close(scope["hidden_states"], torch.cat([hidden]*2))
+                    if capture:
+                        torch.testing.assert_close(scope["pd_aux_hidden"], torch.cat([aux]*2))
 
 
 if __name__ == "__main__":
