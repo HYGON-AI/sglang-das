@@ -1505,7 +1505,7 @@ class Envs:
     SGLANG_DSV4_MHC_PREWARM = EnvBool(True)
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
-    # Sort Torch Top512 results by score; does not control LightOp/FlashInfer.
+    # Sort Torch Top512 results by score
     SGLANG_TOPK_TRANSFORM_512_TORCH_SORTED = EnvBool(False)
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
     SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
