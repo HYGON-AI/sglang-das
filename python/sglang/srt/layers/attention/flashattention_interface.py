@@ -15,6 +15,9 @@
 from typing import Optional, Union
 
 from flash_attn import flash_attn_varlen_func as flash_attn_varlen_func_interface
+from flash_attn.flash_attn_interface import (
+    flash_attn_varlen_func as flash_attn_varlen_func_direct_interface,
+)
 from flash_attn import flash_attn_with_kvcache as flash_attn_with_kvcache_interface
 from flash_attn import (
     vllm_flash_attn_varlen_func as vllm_flash_attn_varlen_func_interface,
@@ -478,6 +481,30 @@ def vllm_flash_attn_varlen_func(
     out=None,
     total_k_hint: Optional[int] = None,
 ):
+    # DFLASH uses the installed flash-attn varlen entrypoint directly.  This
+    # keeps dispatch in the vendor implementation and avoids the legacy
+    # flash_attn_cuda conversion/attention path below.
+    if get_spec().speculative_algorithm == "DFLASH":
+        return flash_attn_varlen_func_direct_interface(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            seqused_k=seqused_k,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            block_table=block_table,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            fa_version=fa_version,
+            out=out,
+            layout=layout or "bshd",
+        )
+
     # Prefill already has an exact host KV-length sum. The vendor paged
     # prefill wrapper recomputes seqused_k.sum() and branches on that device
     # scalar for every layer, serializing all preceding GPU work. For the
