@@ -214,7 +214,6 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
 )
 from sglang.srt.runtime_context import (
     get_device,
-    get_disagg,
     get_exec,
     get_forward,
     get_parallel,
@@ -4191,10 +4190,11 @@ class DeepseekV4Model(nn.Module):
             self.engram_hasher = EngramHasher.from_config(
                 config,
                 self.engram_layout,
+                # Keyed on the model type, not vision_n_layers: a role that
+                # drops the tower still sees image pad ids from the tokenizer.
                 image_token_id=(
                     config.image_token_id
                     if config.model_type == "deepseek_v41"
-                    and config.vision_n_layers > 0
                     else None
                 ),
             )
@@ -4314,9 +4314,15 @@ class DeepseekV4Model(nn.Module):
                     if _is_hcu
                     else int(forward_batch.attn_cp_metadata.total_seq_lens)
                 )
-                hash_ids = self.engram_hasher(
-                    forward_batch.input_ids[:total], forward_batch
-                )
+                global_ids = forward_batch.input_ids[:total]
+                if self.engram_hasher.image_token_id is not None:
+                    # forward_batch.input_ids misses the image-pad remap the
+                    # caller applied to input_ids; redo it on the global ids.
+                    global_ids = global_ids.masked_fill(
+                        global_ids >= MM_PAD_SHIFT_VALUE,
+                        self.engram_hasher.image_token_id,
+                    )
+                hash_ids = self.engram_hasher(global_ids, forward_batch)
                 parallel = get_parallel()
                 hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
                 pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
@@ -4878,11 +4884,14 @@ def _should_disable_v41_vision_for_hcu(config: DeepSeekV4Config) -> bool:
     ):
         return False
 
+    if envs.SGLANG_ENABLE_V41_VISION_PD.get():
+        return False
+
+    # PD and HCU prefill CP keep the tower: prefill CP embeds images on the
+    # full batch before its split.
     parallel = get_parallel()
     return (
-        get_disagg().disaggregation_mode in ("prefill", "decode")
-        or parallel.attn_cp_size != 1
-        or parallel.pp_group.world_size != 1
+        parallel.pp_group.world_size != 1
         or not (
             get_moe_a2a_backend().is_none()
             or get_moe_a2a_backend().is_deepep()
@@ -4912,8 +4921,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         if _should_disable_v41_vision_for_hcu(config):
             logger.info(
                 "Disabling the DeepSeek-V4.1 vision tower for this HCU text "
-                "serving topology; the V4.1 vision path does not support PD, "
-                "CP, PP or MoE A2A."
+                "serving topology; the V4.1 vision path does not support PP "
+                "or MoE A2A backends other than none/DeepEP."
             )
             config.vision_n_layers = 0
         self.config = config
@@ -4923,16 +4932,20 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.determine_num_fused_shared_experts()
         self.vision = None
         if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+            # HCU prefill CP embeds images on the full batch before its split;
+            # the generic CP-v2 runners embed text ids only.
             if (
-                get_parallel().attn_cp_size != 1
+                (get_parallel().attn_cp_size != 1 and not _is_hcu)
                 or get_parallel().pp_group.world_size != 1
                 or not (
                     get_moe_a2a_backend().is_none()
                     or get_moe_a2a_backend().is_deepep()
                 )
-            ):
+            ) and not envs.SGLANG_ENABLE_V41_VISION_PD.get():
                 raise ValueError(
-                    "V4.1 vision supports TP/EP/DP with none or DeepEP A2A, without CP or PP"
+                    "V4.1 vision supports TP/EP/DP with none or DeepEP A2A, "
+                    "without PP, and CP only on HCU; set "
+                    "SGLANG_ENABLE_V41_VISION_PD=1 to opt into the untested path"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)

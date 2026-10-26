@@ -1087,6 +1087,9 @@ class Envs:
     # HCU - platform-specific knobs
     # ===================================================================
     SGLANG_DSV4_PD_PREFILL_USE_FULL_TOKEN_POOL = EnvBool(True)
+    # Opt-in: keep the DeepSeek-V4.1 vision tower alive under PD disaggregation
+    # and/or prefill context parallelism (an untested serving path on HCU).
+    SGLANG_ENABLE_V41_VISION_PD = EnvBool(False)
     SGLANG_ENABLE_DP_ATTENTION_LOCAL_CONTROL_BROADCAST = EnvBool(False)
     SGLANG_KV_LAYOUT_HCU_FA = EnvBool(True)
     SGLANG_USE_LIGHTOP = EnvBool(False)
