@@ -318,16 +318,42 @@ def cp_all_gather_rerange_launch(input_tensor, cp_size, comm_stream, event_key):
     return (output_tensor, input_tensor, event, cp_size)
 
 
-def cp_all_gather_rerange_finish(handle):
-    """Wait for a launched gather on the current stream, then rerange."""
-    output_tensor, _keepalive, event, cp_size = handle
-    torch.cuda.current_stream().wait_event(event)
+def _use_inplace_cp_output(tensor):
+    from sglang.srt.environ import envs
+    from sglang.srt.utils import is_hcu
+
+    return (
+        envs.SGLANG_DSV4_CP_OUTPUT_INPLACE.get()
+        and is_hcu()
+        and not (tensor.is_cuda and torch.cuda.is_current_stream_capturing())
+    )
+
+
+def _interleave_cp_output(output_tensor, cp_size):
+    """Reorder an exclusively owned, completed gather without a second buffer.
+
+    The optional LightOp kernel rotates disjoint row cycles in place. The
+    communication must finish before mutation; no consumer may retain the
+    original rank-major layout. Only the ordinary equal-share interleave path
+    uses this helper. Bounded-replay gather_index retains its compact selection.
+    """
+    if _use_inplace_cp_output(output_tensor):
+        from lightop.attention.cp_output import interleave_cp_output_
+
+        return interleave_cp_output_(output_tensor, cp_size)
     out_shape = output_tensor.shape
     return (
         output_tensor.view(cp_size, -1, *out_shape[1:])
         .transpose(0, 1)
         .reshape(out_shape)
     )
+
+
+def cp_all_gather_rerange_finish(handle):
+    """Wait for a launched gather on the current stream, then rerange."""
+    output_tensor, _keepalive, event, cp_size = handle
+    torch.cuda.current_stream().wait_event(event)
+    return _interleave_cp_output(output_tensor, cp_size)
 
 
 def cp_all_gather_rerange_output(
@@ -365,7 +391,12 @@ def cp_all_gather_rerange_output(
 
     if is_dsa_prefill_cp_round_robin_split():
         gather_index = getattr(forward_batch.attn_cp_metadata, "gather_index", None)
-        if chunk_large_output and input_tensor.ndim == 2 and gather_index is None:
+        if (
+            chunk_large_output
+            and input_tensor.ndim == 2
+            and gather_index is None
+            and not _use_inplace_cp_output(input_tensor)
+        ):
             from sglang.srt.layers.cp.interleave import (
                 _gather_interleaved_tensor_chunked,
                 _HCU_GATHER_CHUNK_THRESHOLD_BYTES,
@@ -393,13 +424,7 @@ def cp_all_gather_rerange_output(
             # Decoder SWA bounded replay tail (interleave layout): ranks hold uneven,
             # padded shares, so map the rank-major rows straight to global tail order.
             return output_tensor[gather_index]
-        out_shape = output_tensor.shape
-        output_tensor = (
-            output_tensor.view(cp_size, -1, *out_shape[1:])
-            .transpose(0, 1)
-            .reshape(out_shape)
-        )
-        return output_tensor
+        return _interleave_cp_output(output_tensor, cp_size)
 
     # TODO: Do we need to remove the padding here?
     bs_seq_len, hidden_size = input_tensor.shape
