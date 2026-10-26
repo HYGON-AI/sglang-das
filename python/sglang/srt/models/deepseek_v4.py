@@ -4884,9 +4884,6 @@ def _should_disable_v41_vision_for_hcu(config: DeepSeekV4Config) -> bool:
     ):
         return False
 
-    if envs.SGLANG_ENABLE_V41_VISION_PD.get():
-        return False
-
     # PD and HCU prefill CP keep the tower: prefill CP embeds images on the
     # full batch before its split.
     parallel = get_parallel()
@@ -4941,11 +4938,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                     get_moe_a2a_backend().is_none()
                     or get_moe_a2a_backend().is_deepep()
                 )
-            ) and not envs.SGLANG_ENABLE_V41_VISION_PD.get():
+            ):
                 raise ValueError(
                     "V4.1 vision supports TP/EP/DP with none or DeepEP A2A, "
-                    "without PP, and CP only on HCU; set "
-                    "SGLANG_ENABLE_V41_VISION_PD=1 to opt into the untested path"
+                    "without PP, and CP only on HCU"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
