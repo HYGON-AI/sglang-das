@@ -15,7 +15,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: guochenyang99/ci-model-test
-          ref: a0cfac4a736ae70dfc31e6cd8bddeaf87c5a7d78
+          ref: 575d1befbf78ba2cc07282c67f10e7436db4d836
           token: ${{ secrets.MODEL_SMOKE_REPO_TOKEN }}
           persist-credentials: false
           path: model-ci-tools
