@@ -5567,6 +5567,12 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
+        # An unquantized LM head has no scale parameter. Apply checkpoint scales
+        # before its loader casts serialized channelwise FP8 weights to BF16.
+        lm_head_weight = params_dict.get("lm_head.weight")
+        if lm_head_weight is not None and lm_head_weight.dtype == torch.bfloat16:
+            weights = _dequant_fp8_lm_head_streaming(weights)
+
         # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
         # while the layer allocated an FP8 parameter (or vice versa) fails the
         # weight loader's dtype check.
@@ -6085,9 +6091,9 @@ def _dequant_fp8_wo_a_streaming(
                 bucket["weight"] = _clone_if_runai_streamed_tensor(tensor)
             continue
 
-        if name.endswith(".wo_a.scale"):
+        if name.endswith((".wo_a.scale", ".wo_a.weight_scale_inv")):
             saw_wo_a_scale = True
-            prefix = name[: -len(".scale")]
+            prefix = name[: name.rindex(".wo_a.") + len(".wo_a")]
             bucket = pending.setdefault(prefix, {})
             weight = bucket.pop("weight", None)
             if weight is not None:
@@ -6108,6 +6114,47 @@ def _dequant_fp8_wo_a_streaming(
             yield prefix + ".weight", bucket["weight"]
         if "scale" in bucket:
             yield prefix + ".scale", bucket["scale"]
+
+
+def _dequant_fp8_lm_head_streaming(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Dequantize a serialized channelwise FP8 head for a BF16 destination.
+
+    Only the top-level head is handled; draft heads and non-FP8 weights retain
+    their existing loading path. Pending RunAI buffers must survive reuse.
+    """
+    weight_name, scale_name = "head.weight", "head.weight_scale_inv"
+    pending: dict[str, torch.Tensor] = {}
+    passthrough = False
+    for name, tensor in weights:
+        if name not in (weight_name, scale_name) or passthrough:
+            yield name, tensor
+            continue
+        if name == weight_name and tensor.dtype != torch.float8_e4m3fn:
+            passthrough = True
+            if "scale" in pending:
+                yield scale_name, pending.pop("scale")
+            yield name, tensor
+            continue
+        key = "weight" if name == weight_name else "scale"
+        pending[key] = _clone_if_runai_streamed_tensor(tensor)
+        if len(pending) == 2:
+            weight, scale = pending.pop("weight"), pending.pop("scale")
+            if scale.ndim == 1:
+                scale = scale.unsqueeze(-1)
+            if scale.shape != (weight.shape[0], 1):
+                raise ValueError(
+                    f"{scale_name}: expected channelwise scale "
+                    f"{(weight.shape[0], 1)}, got {tuple(scale.shape)}"
+                )
+            yield weight_name, (weight.float() * scale.float()).to(torch.bfloat16)
+            logger.info("Finished streaming dequant fp8 lm_head")
+    if pending:
+        raise ValueError(
+            "FP8 head.weight and head.weight_scale_inv must both be present; "
+            f"got {sorted(pending)}"
+        )
 
 
 def _dequant_fp8_wo_a(
