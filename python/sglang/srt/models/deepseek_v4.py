@@ -304,31 +304,22 @@ def _can_defer_mhc_repeat_cp_split(
     cp_size: int,
     cp_rank: int,
 ) -> bool:
-    """Require an unpadded, equal-sized legacy RR split without device reads."""
+    """Check physical RR row consistency, including padded and ragged batches.
+
+    Hidden width, HC/CP sizes and equal per-rank lengths do not constrain the
+    fused copy. Layout/mode selection stays at the caller; other layouts must
+    retain their own sharding implementation.
+    """
     if (
         hidden_states.ndim != 2
-        or hidden_states.shape[1] == 0
         or hc_mult <= 0
-        or cp_size <= 1
+        or cp_size <= 0
         or not 0 <= cp_rank < cp_size
     ):
         return False
     num_tokens = hidden_states.shape[0]
-    if num_tokens == 0 or num_tokens % cp_size != 0:
-        return False
-    # Existing CPU batch metadata proves logical rows; no device-value reads.
-    extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-    if not isinstance(extend_lens, (list, tuple)) or not all(
-        isinstance(length, int) and not isinstance(length, bool) and length >= 0
-        for length in extend_lens
-    ):
-        return False
-    if sum(extend_lens) != num_tokens:
-        return False
-    # None is the real ForwardBatch default, set only when padding is applied.
-    original_num_tokens = getattr(forward_batch, "_original_num_tokens", None)
-    if original_num_tokens is not None and original_num_tokens != num_tokens:
-        return False
+    # Shard the same physical rows as repeat-then-split. Logical request lengths
+    # and _original_num_tokens need not equal this padded physical row count.
     return all(
         tensor is not None and tensor.ndim > 0 and tensor.shape[0] == num_tokens
         for tensor in (
@@ -342,7 +333,7 @@ def _can_defer_mhc_repeat_cp_split(
 def _repeat_mhc_input_on_cp_rank(
     hidden_states: torch.Tensor, hc_mult: int, cp_size: int, cp_rank: int
 ) -> torch.Tensor:
-    """Copy directly to local [tokens / CP, hc_mult, hidden] mHC storage."""
+    """Copy selected RR rows directly to local [rows, hc_mult, hidden] storage."""
     repeat_ops = _get_mhc_repeat_cp_ops()
     if repeat_ops is not None and repeat_ops[0](
         hidden_states, hc_mult, cp_size, cp_rank
