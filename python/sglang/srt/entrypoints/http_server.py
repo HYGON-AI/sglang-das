@@ -831,22 +831,54 @@ async def health_generate(request: Request) -> Response:
     # same forward.  Wait for the complete fan-out instead of returning after
     # the first detokenizer heartbeat and cancelling a peer mid-collective.
     if health_dp_size > 1:
-        try:
-            await asyncio.wait_for(asyncio.gather(*tasks), timeout=HEALTH_CHECK_TIMEOUT)
-        except Exception:
+
+        def drop_health_requests():
             for task in tasks:
                 task.cancel()
             for gri in health_requests:
                 rids = gri.rid if isinstance(gri.rid, list) else [gri.rid]
                 for rid in rids:
                     tokenizer_manager.rid_to_state.pop(rid, None)
-            tokenizer_manager.server_status = ServerStatus.UnHealthy
-            logger.exception(
-                "DP-attention health check failed for %s ranks", health_dp_size
+
+        def serving_user_requests():
+            return any(
+                not rid.startswith(HEALTH_CHECK_RID_PREFIX)
+                for rid in tokenizer_manager.rid_to_state
             )
-            return Response(status_code=503)
-        tokenizer_manager.server_status = ServerStatus.Up
-        return Response(status_code=200)
+
+        fan_out = asyncio.gather(*tasks)
+        tic = time.time()
+        while True:
+            done, _ = await asyncio.wait({fan_out}, timeout=1)
+            if done:
+                try:
+                    fan_out.result()
+                except Exception:
+                    break
+                tokenizer_manager.server_status = ServerStatus.Up
+                return Response(status_code=200)
+            # A loaded server may hold every DP rank at max_running_requests for
+            # longer than the timeout (long reasoning outputs), so the probes
+            # cannot be admitted.  As in the single-rank check below, output for
+            # user requests since the probe started proves the scheduler is
+            # stepping; only an idle server needs the full fan-out.
+            if (
+                serving_user_requests()
+                and tokenizer_manager.last_receive_tstamp > tic
+            ):
+                drop_health_requests()
+                tokenizer_manager.server_status = ServerStatus.Up
+                return Response(status_code=200)
+            if time.time() >= tic + HEALTH_CHECK_TIMEOUT:
+                break
+        drop_health_requests()
+        tokenizer_manager.server_status = ServerStatus.UnHealthy
+        logger.error(
+            "DP-attention health check failed for %s ranks: no response within %ss",
+            health_dp_size,
+            HEALTH_CHECK_TIMEOUT,
+        )
+        return Response(status_code=503)
 
     # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
     tic = time.time()
