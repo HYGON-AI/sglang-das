@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 import torch.nn.functional as F
+from compressed_tensors.quantization import QuantizationStrategy
 
 from sglang.kernels.ops.moe.ep_moe_kernels import (
     build_m_indices_triton,
@@ -196,6 +197,31 @@ def _should_use_hcu_deepgemm_runner(
             quant_config,
             (SlimQuantW4A8Int8MarlinConfig, SlimQuantCompressedTensorsMarlinConfig),
         )
+    )
+
+
+def _use_hcu_legacy_channel_fp8_deepep(layer) -> bool:
+    """Keep DSV4-style channel-FP8 experts on the DeepEPMoE HCU kernels.
+
+    That path (LightOp ep_scatter/ep_gather, deepgemm grouped FP8 GEMMs and the
+    fused SiLU(+swiglu_limit)/FP8 quant) is the validated DSV4.1 MoE path.
+    MoeRunner(DEEP_GEMM) stays for what only it implements: the swiglu_oai
+    activation (gemm1_alpha / gemm1_clamp_limit) and the local shared group.
+    """
+    scheme = getattr(layer, "scheme", None)
+    config = getattr(layer, "moe_runner_config", None)
+    return (
+        _is_hcu
+        and _use_deepgemm_moe
+        and _use_fp8_w8a8_moe
+        and type(scheme).__name__ == "CompressedTensorsW8A8Fp8MoE"
+        and getattr(getattr(scheme, "weight_quant", None), "strategy", None)
+        == QuantizationStrategy.CHANNEL
+        and config is not None
+        and config.activation == "silu"
+        and config.gemm1_alpha is None
+        and config.gemm1_clamp_limit is None
+        and not config.local_shared_experts_without_dispatch
     )
 
 
@@ -744,7 +770,9 @@ class DeepEPMoE(FusedMoE):
         # opt the MoE runner in explicitly.
         elif should_use_aiter_runner():
             self.deprecate_flag = True
-        elif _should_use_hcu_deepgemm_runner(quant_config):
+        elif _should_use_hcu_deepgemm_runner(
+            quant_config
+        ) and not _use_hcu_legacy_channel_fp8_deepep(self):
             # The legacy DeepEPMoE core contains only old CUTLASS branches and
             # deliberately rejects DeepGEMM normal/LL outputs.  The HCU
             # channel-FP8 adapter lives in MoeRunner(DEEP_GEMM), so select the
@@ -897,6 +925,15 @@ class DeepEPMoE(FusedMoE):
             quant_config,
             self.quant_method,
         )
+        if _use_hcu_legacy_channel_fp8_deepep(self):
+            # The groupgemm kernels consume the vendor per-token FP8 dispatch
+            # (LightOp normal quant, DeepEP LL quant_type), not the DeepGEMM one.
+            self.dispatcher.set_quant_config(
+                {
+                    **(getattr(self.dispatcher, "quant_config", None) or {}),
+                    "hcu_legacy_groupgemm": True,
+                }
+            )
         if (
             self.deepep_mode.enable_low_latency()
             and not _is_npu
@@ -1013,7 +1050,9 @@ class DeepEPMoE(FusedMoE):
     ):
         # DeepEP NORMAL mode is not capturable; run it as an eager node.
         if is_in_breakable_cuda_graph():
-            if _should_break_only_hcu_deepgemm_core(self.quant_config):
+            if self.deprecate_flag and _should_break_only_hcu_deepgemm_core(
+                self.quant_config
+            ):
                 # Low-latency DeepEP is graph-capturable on HCU.  Let the
                 # modern FusedMoE forward capture dispatch/combine and insert
                 # its eager break only around the vendor grouped GEMMs.

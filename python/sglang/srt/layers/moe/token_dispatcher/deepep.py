@@ -881,7 +881,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             pass
         elif _is_hcu and self.quant_config.get("hcu_w4a8_int8_dispatch", False):
             hidden_states = per_token_quant_int8(hidden_states)
-        elif _deepgemm_is_selected() and self.use_fp8:
+        elif (
+            _deepgemm_is_selected()
+            and self.use_fp8
+            and not self.quant_config.get("hcu_legacy_groupgemm", False)
+        ):
             quant_group_size = (
                 hidden_states.shape[-1] if _hcu_deepgemm_is_selected() else 128
             )
@@ -1245,7 +1249,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         if (
             use_groupgemm
             and _DEEPEP_LL_DISPATCH_USES_QUANT_TYPE
-            and not _hcu_deepgemm_is_selected()
+            and (
+                not _hcu_deepgemm_is_selected()
+                # DeepEPMoE kept the HCU groupgemm kernels: vendor quant_type.
+                or self.quant_config.get("hcu_legacy_groupgemm", False)
+            )
         ):
             if _is_hcu and self.quant_config.get("hcu_w4a8_int8_dispatch", False):
                 packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (

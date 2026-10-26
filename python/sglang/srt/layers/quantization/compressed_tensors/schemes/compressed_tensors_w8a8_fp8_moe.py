@@ -553,7 +553,12 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             and _use_deepgemm_moe
             and _is_hcu
             and self.use_deepep
-            and not get_moe_runner_backend().is_deep_gemm()
+            and (
+                not get_moe_runner_backend().is_deep_gemm()
+                # DeepEPMoE kept its own HCU kernels (deprecate_flag False), which
+                # read the packed aliases next to the canonical weights.
+                or getattr(layer, "deprecate_flag", True) is False
+            )
         ):
             # SGLANG_USE_DEEPGEMM_MOE is process-wide, but DSpark may use a
             # standalone draft MoE alongside a DeepEP target MoE.  Repacking
@@ -661,6 +666,8 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         if (
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL
             and get_moe_runner_backend().is_deep_gemm()
+            # In-place packing is for MoeRunner(DEEP_GEMM) only.
+            and getattr(layer, "deprecate_flag", True) is not False
         ):
             from sglang.srt.layers import deep_gemm_wrapper
 
