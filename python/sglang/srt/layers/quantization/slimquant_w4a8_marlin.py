@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel
 import logging
 import os
 from typing import Dict, List, Optional
@@ -614,8 +614,11 @@ class HCUW4A8Int8DeepEPMoEMethod(FusedMoEMethodBase):
     # which still resolves mixed W8A8 Linear layers.
     hcu_w4a8_hipc = True
 
-    def __init__(self, quant_config):
+    def __init__(self, quant_config, *, use_mega_moe=False):
+        if use_mega_moe and get_disagg().disaggregation_mode != "prefill":
+            raise ValueError("HCU compressed-tensors W4A8 MegaMoE is prefill-only")
         self.quant_config = quant_config
+        self.use_mega_moe = use_mega_moe
 
     def create_weights(
         self,
@@ -686,6 +689,30 @@ class HCUW4A8Int8DeepEPMoEMethod(FusedMoEMethodBase):
         return storage[: scale.numel()].view_as(scale)
 
     def process_weights_after_loading(self, layer):
+        if self.use_mega_moe:
+            if getattr(layer, "_mega_moe_weights_built", False):
+                return
+            from sglang.srt.layers.moe.mega_moe import (
+                build_hcu_w4a8_mega_moe_experts_weights,
+            )
+
+            for prefix in ("w13", "w2"):
+                weight = self._convert_packed_weight(
+                    getattr(layer, prefix + "_weight_packed").data
+                )
+                layer.register_parameter(
+                    prefix + "_weight", Parameter(weight, requires_grad=False)
+                )
+                scale_name = prefix + "_weight_scale"
+                # Normalize CT true scales to the legacy scale/16 input;
+                # the MegaMoE builder restores true scales exactly once.
+                scale = self._channel_scale(getattr(layer, scale_name).data)
+                setattr(layer, scale_name, Parameter(scale, requires_grad=False))
+                delattr(layer, prefix + "_weight_packed")
+            # Pack only canonical INT4 bytes, never a prior DeepEP layout.
+            build_hcu_w4a8_mega_moe_experts_weights(layer)
+            return
+
         import deepgemm
         from sglang.srt.layers.moe.ep_moe.layer import (
             _use_w4a8_contiguous_hipc,

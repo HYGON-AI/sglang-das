@@ -250,8 +250,13 @@ class CompressedTensorsConfig(QuantizationConfig):
 
             if (
                 _is_hcu
-                and get_moe_runner_backend().is_deep_gemm()
-                and get_moe_a2a_backend().is_deepep()
+                and (
+                    (
+                        get_moe_runner_backend().is_deep_gemm()
+                        and get_moe_a2a_backend().is_deepep()
+                    )
+                    or get_moe_a2a_backend().is_megamoe()
+                )
                 and self.quant_format == CompressionFormat.pack_quantized.value
             ):
                 scheme = self._get_moe_projection_scheme(layer, prefix)
@@ -273,7 +278,9 @@ class CompressedTensorsConfig(QuantizationConfig):
                             HCUW4A8Int8DeepEPMoEMethod,
                         )
 
-                        return HCUW4A8Int8DeepEPMoEMethod(self)
+                        return HCUW4A8Int8DeepEPMoEMethod(
+                            self, use_mega_moe=get_moe_a2a_backend().is_megamoe()
+                        )
 
             layer.scheme = self.get_moe_scheme(layer=layer, layer_name=prefix)
             if layer.scheme is None:  # ignored layer

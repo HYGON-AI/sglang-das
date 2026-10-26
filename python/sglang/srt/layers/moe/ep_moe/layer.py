@@ -393,17 +393,10 @@ def m_grouped_w4a8_gemm_nt_masked_hipc_wrapper(
     masked_m: torch.Tensor,
     expected_m_per_group: int,
 ) -> torch.Tensor:
-    # NOTE(fix): the underlying deepgemm/dspark HIPC kernel writes its GEMM
-    # result in-place into d and RETURNS the signal-slot layout metadata
-    # tuple (block_m, ceil_div(N, block_n)) (e.g. (64, 144)), NOT a
-    # Tensor. This custom op is registered with a -> torch.Tensor schema,
-    # so returning that tuple makes PyTorch fail at the op boundary with
-    # "Unable to cast (64, 144) to Tensor" during CUDA graph capture.
-    # The real output is already in d (output = d, in-place), so we drop
-    # the metadata tuple and return the output buffer to honour the schema.
     m_grouped_w4a8_gemm_nt_masked_hipc(
         (a0, a1), (b0, b1), d, masked_m, expected_m_per_group
     )
+    # New DeepGEMM returns launch metadata; this custom op returns its output.
     return d
 
 

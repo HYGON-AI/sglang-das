@@ -330,7 +330,9 @@ def cp_all_gather_rerange_finish(handle):
     )
 
 
-def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
+def cp_all_gather_rerange_output(
+    input_tensor, cp_size, forward_batch, stream, *, chunk_large_output=False
+):
     """
     # for in-seq-split
     |   +-----------before allgather------------+|
@@ -362,6 +364,21 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     )
 
     if is_dsa_prefill_cp_round_robin_split():
+        gather_index = getattr(forward_batch.attn_cp_metadata, "gather_index", None)
+        if chunk_large_output and input_tensor.ndim == 2 and gather_index is None:
+            from sglang.srt.layers.cp.interleave import (
+                _gather_interleaved_tensor_chunked,
+                _HCU_GATHER_CHUNK_THRESHOLD_BYTES,
+            )
+
+            rows = input_tensor.shape[0]
+            if input_tensor.numel() * cp_size * input_tensor.element_size() >= (
+                _HCU_GATHER_CHUNK_THRESHOLD_BYTES
+            ):
+                # Legacy shards already include CP padding; preserve every row.
+                return _gather_interleaved_tensor_chunked(
+                    input_tensor, cp_size, rows, rows, rows * cp_size
+                )
         with use_symmetric_memory(
             get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
         ):
@@ -372,7 +389,6 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
             output_tensor,
             input_tensor,
         )
-        gather_index = getattr(forward_batch.attn_cp_metadata, "gather_index", None)
         if gather_index is not None:
             # Decoder SWA bounded replay tail (interleave layout): ranks hold uneven,
             # padded shares, so map the rank-major rows straight to global tail order.

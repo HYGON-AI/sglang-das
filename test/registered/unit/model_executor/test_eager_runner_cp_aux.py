@@ -33,6 +33,7 @@ class TestEagerRunnerCpAux(CustomTestCase):
             logits_processor=logits,
             lm_head=object(),
         )
+        model.model.late_layer_start = None
         runner = object.__new__(eager_runner.EagerRunner)
         runner.model_runner = SimpleNamespace(model=model)
         batch = SimpleNamespace(input_ids=torch.arange(2), positions=torch.arange(2))

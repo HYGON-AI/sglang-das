@@ -4821,25 +4821,33 @@ class DeepseekV4Model(nn.Module):
         )
         if cp_gather_output:
             stream = torch.cuda.current_stream()
+            gather_output = cp_all_gather_rerange_output
+            if _is_hcu:
+                gather_output = functools.partial(gather_output, chunk_large_output=True)
             full_cp_metadata = forward_batch.attn_cp_metadata
             if hcu_cp_tail:
                 forward_batch.attn_cp_metadata = tail.cp_metadata
-            pre_hc_head = cp_all_gather_rerange_output(
-                pre_hc_head, self.cp_size, forward_batch, stream
-            )
-            hidden_states = cp_all_gather_rerange_output(
+            if _is_hcu and capture_dspark and self.dspark_layers_to_capture:
+                # set_dspark_layers_to_capture also enables logits aux capture,
+                # which replaces pre-HC states in logits_from_body_output.
+                pre_hc_head = None
+            else:
+                pre_hc_head = gather_output(
+                    pre_hc_head, self.cp_size, forward_batch, stream
+                )
+            hidden_states = gather_output(
                 hidden_states, self.cp_size, forward_batch, stream
             )
             if capture_dspark:
                 pd_aux_hidden = (
                     [
-                        cp_all_gather_rerange_output(
+                        gather_output(
                             aux, self.cp_size, forward_batch, stream
                         )
                         for aux in pd_aux_hidden
                     ]
                     if isinstance(pd_aux_hidden, list)
-                    else cp_all_gather_rerange_output(
+                    else gather_output(
                         pd_aux_hidden, self.cp_size, forward_batch, stream
                     )
                 )
