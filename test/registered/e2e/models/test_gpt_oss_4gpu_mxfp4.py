@@ -26,7 +26,7 @@ register_hcu_ci(
 
 from sglang.test.gpt_oss_common import BaseTestGptOss
 
-register_cuda_ci(est_time=119, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=250, stage="base-c", runner_config="4-gpu-b200")
 
 
 class TestGptOss4GpuMxfp4(BaseTestGptOss):

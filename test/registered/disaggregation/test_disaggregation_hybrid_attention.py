@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
-register_cuda_ci(est_time=578, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=545, stage="extra-b", runner_config="8-gpu-h200")
 
 # HCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
 register_hcu_ci(
