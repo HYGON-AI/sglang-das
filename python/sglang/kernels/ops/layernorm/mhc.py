@@ -997,7 +997,30 @@ def mhc_pre(
         gemm_last_dim = hc_mult3
         big_fuse_n_splits = n_splits
     else:
-        if num_tokens <= 2048:
+        # Large-token (prefill) regime: the TileLang split-K kernel below only
+        # covers num_tokens <= 2048, so split over K in Triton instead of
+        # serialising the whole reduction in one CTA.
+        use_triton_splitk = False
+        if _is_hcu and num_tokens > 2048 and hc_mult3 <= 32:
+            from sglang.kernels.ops.layernorm.mhc_pre_splitk_triton import (
+                is_supported_mhc_pre_splitk,
+            )
+
+            use_triton_splitk = is_supported_mhc_pre_splitk(
+                residual_flat.view(num_tokens, hc_hidden_size), fn_flat
+            )
+
+        if use_triton_splitk:
+            from sglang.kernels.ops.layernorm.mhc_pre_splitk_triton import (
+                mhc_pre_partial_splitk,
+            )
+
+            gemm_out_mul, gemm_out_sqrsum = mhc_pre_partial_splitk(
+                residual_flat.view(num_tokens, hc_hidden_size), fn_flat
+            )
+            gemm_last_dim = hc_mult3
+            big_fuse_n_splits = gemm_out_mul.shape[0]
+        elif num_tokens <= 2048:
             assert n_splits == 1
             if hc_hidden_size == 16384:
                 hidden_block = 256
