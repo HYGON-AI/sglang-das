@@ -215,3 +215,48 @@ def _combine_topk_swa_indices_kernel(
     )
 
     tl.store(combined_lens_ptr + token, topk_len + swa_len, mask=valid)
+
+
+# From release PR #552 (d8a04fcc149d); shared page-table packing for C1/C2.
+@triton.jit
+def _pack_compact_sparse_token_ids_kernel(
+    output_ptr,
+    per_req_ids_ptr,
+    per_req_stride_0,
+    per_req_stride_1,
+    compressed_lens_ptr,
+    compressed_base_ptr,
+    PAGE_SIZE: tl.constexpr,
+    FROM_PAGE_TABLE: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+):
+    """Pack request-local extents into one ragged physical-token-ID array."""
+    request_idx = tl.program_id(0).to(tl.int64)
+    worker_idx = tl.program_id(1).to(tl.int64)
+    num_workers = tl.num_programs(1).to(tl.int64)
+    gather_len = tl.load(compressed_lens_ptr + request_idx).to(tl.int64)
+    output_base = tl.load(compressed_base_ptr + request_idx).to(tl.int64)
+    token_offsets = tl.arange(0, BLOCK_TOKENS).to(tl.int64)
+    request_base = request_idx * per_req_stride_0
+
+    for first_token in range(
+        worker_idx * BLOCK_TOKENS, gather_len, num_workers * BLOCK_TOKENS
+    ):
+        token_idx = first_token + token_offsets
+        valid = token_idx < gather_len
+        if FROM_PAGE_TABLE:
+            source_idx = token_idx // PAGE_SIZE
+        else:
+            source_idx = token_idx
+        source_id = tl.load(
+            per_req_ids_ptr + request_base + source_idx * per_req_stride_1,
+            mask=valid,
+            other=-1,
+        ).to(tl.int64)
+        if FROM_PAGE_TABLE:
+            token_id = source_id * PAGE_SIZE + token_idx % PAGE_SIZE
+        else:
+            token_id = source_id
+        # Match the dense path's safe landing slot for masked metadata.
+        token_id = tl.maximum(token_id, 0).to(tl.int32)
+        tl.store(output_ptr + output_base + token_idx, token_id, mask=valid)

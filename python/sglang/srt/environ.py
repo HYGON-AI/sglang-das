@@ -1118,6 +1118,8 @@ class Envs:
     SGLANG_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS = EnvBool(True)
     # Consume Prefill candidates directly from the paged index-K cache on HCU.
     SGLANG_HCU_PREFILL_PAGED_SPARSE = EnvBool(True)
+    # Eager HCU C1/C2 keeps a compact layout; opt in to TopK-union dequantization.
+    SGLANG_DSV41_PREFILL_TOPK_KV_WORKSPACE = EnvBool(True)
     # Use LightOp pointwise/geometry/output fusion; GEMMs and scorer stay unchanged.
     SGLANG_HCU_PREFILL_SPARSE_FUSION = EnvBool(True)
     SGLANG_USE_FAST_HADAMARD_TRANSFORM = EnvBool(False)

@@ -176,6 +176,9 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import is_sm120_supported
 
 _is_hcu = is_hcu()
+_hcu_selected_topk_supported = _is_hcu and getattr(
+    torch.cuda.get_device_properties(0), "gcnArchName", ""
+).startswith(("gfx936", "gfx938"))
 _is_sm120 = is_sm120_supported()
 _use_dpskv4_lightop_quant_k_cache = get_bool_env_var(
     "SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE"
@@ -208,6 +211,14 @@ def _is_sm100_or_newer() -> bool:
 def _supports_index_k_rope_pack() -> bool:
     """Enable the HCU packer without broadening main's other-platform gate."""
     return torch.cuda.is_available() and (_is_hcu or is_sm100_or_newer())
+
+
+@functools.lru_cache(maxsize=1)
+def _get_cp_pool_pairs_norm():
+    """Keep the unfused path usable with LightOp builds lacking this API."""
+    import lightop
+
+    return getattr(lightop, "dsv41_pool_pairs_norm", None)
 
 
 def _supports_index_q_rope_pack() -> bool:
@@ -258,6 +269,26 @@ def _get_target_verify_bs(forward_batch: ForwardBatch) -> int:
 
 
 T = TypeVar("T", bound=Optional[torch.Tensor])
+
+
+def _use_dsv41_compact_sparse_prefill_workspace(forward_batch: ForwardBatch) -> bool:
+    """Only HCU eager P-worker C1/C2; keep Decode, Graph and TBO unchanged."""
+    if not _is_hcu or forward_batch.forward_mode != ForwardMode.EXTEND:
+        return False
+    from sglang.srt.layers.attention.dsa.forward_batch_utils import (
+        effective_forward_mode,
+    )
+    from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+    from sglang.srt.runtime_context import get_disagg
+
+    return (
+        effective_forward_mode(forward_batch) == ForwardMode.EXTEND
+        and get_disagg().disaggregation_mode != "decode"
+        and not get_is_capture_mode()
+        and not torch.cuda.is_current_stream_capturing()
+        and getattr(forward_batch, "tbo_parent_token_range", None) is None
+        and not getattr(forward_batch, "tbo_children", None)
+    )
 
 
 def _should_use_sparse_prefill(q: torch.Tensor, forward_batch: ForwardBatch, *, allow_cp: bool = False) -> bool:
@@ -2877,7 +2908,9 @@ class DeepseekV4AttnBackend(
         # request's C4/C128 workspace. Keep the device-side metadata path HCU-only.
         query_pos = core_attn_metadata.seq_lens_casual[:num_qo_tokens] - 1
         cp_active = (
-            dsa_use_prefill_cp(forward_batch) if _is_hcu else is_cp_active(forward_batch)
+            dsa_use_prefill_cp(forward_batch)
+            if _is_hcu
+            else is_cp_active(forward_batch)
         )
         if request_layout is not None:
             assert not cp_active
@@ -2922,6 +2955,13 @@ class DeepseekV4AttnBackend(
             max_seq_len=max(seq_lens_cpu_list),
             total_swa=total_swa,
             request_window_layout=request_layout,
+            compact_seq_lens_cpu=(
+                tuple(seq_lens_cpu_list)
+                if self.is_dsv41
+                and request_layout is None
+                and _use_dsv41_compact_sparse_prefill_workspace(forward_batch)
+                else None
+            ),
         )
 
     def _build_forward_metadata(
@@ -3709,10 +3749,9 @@ class DeepseekV4AttnBackend(
             and kv.stride(-1) == 1
             and layer.compressor.norm.weight.dtype in (torch.float32, torch.bfloat16)
             and layer.compressor.norm.weight.is_contiguous()
+            and _get_cp_pool_pairs_norm() is not None
         ):
-            from lightop import dsv41_pool_pairs_norm
-
-            normalized_latent = dsv41_pool_pairs_norm(
+            normalized_latent = _get_cp_pool_pairs_norm()(
                 partner_kv, kv, partner_score, score,
                 layer.compressor.norm.weight, layer.compressor.norm.eps,
             )
@@ -3841,6 +3880,10 @@ class DeepseekV4AttnBackend(
             and not pool._unified_kv
             and pool.dtype != torch.bfloat16
             and pool.get_extra_key_layout(layer.layer_id) is KVLayout.V4
+            # The baseline pool only accepts freqs_cis for V41_FP4. A V4
+            # implementation must explicitly advertise the extended contract;
+            # otherwise use the single RoPE + store fallback below.
+            and getattr(pool, "supports_fp8_rope_fq_store", False) is True
         ):
             # Preserve LayerSplit ownership and payload invalidation. Nonowners
             # skip the fused work as well as the store; latent stays pre-RoPE.
@@ -5709,7 +5752,17 @@ class DeepseekV4AttnBackend(
         # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)
 
+        compact_workspace = (
+            self.is_dsv41
+            and core_attn_metadata.request_window_layout is None
+            and _use_dsv41_compact_sparse_prefill_workspace(forward_batch)
+        )
         cache = self.forward_metadata.sparse_prefill_cache
+        if cache is not None and (
+            (getattr(cache, "compact_seq_lens_cpu", None) is not None)
+            != compact_workspace
+        ):
+            cache = None
         if cache is None:
             cache = self._build_sparse_prefill_chunk_cache(
                 forward_batch, core_attn_metadata, num_qo_tokens=q_flat.shape[0]
@@ -5723,8 +5776,13 @@ class DeepseekV4AttnBackend(
         extra_k_layout = None
         extra_page_size = None
         flat_token_ids = None
+        compressed_valid_count = None
+        selected_topk = False
+        compressed_topk = None
         if compress_ratio == 0:
-            workspace = self.sparse_prefill_workspace.get(cache.swa_token_ids.shape[0])
+            workspace = self.sparse_prefill_workspace.get(
+                cache.swa_token_ids.shape[0], release_before_grow=compact_workspace
+            )
             combined_indices = cache.c0_combined_indices
             combined_lens = cache.c0_combined_lens
             swa_slice = workspace
@@ -5735,9 +5793,35 @@ class DeepseekV4AttnBackend(
             flat_token_ids, combined_indices, combined_lens = cache.layer_inputs(
                 compress_ratio, core_attn_metadata, extra_page_size
             )
+            if (
+                compact_workspace
+                and compress_ratio in (1, 2)
+                and q_flat.shape[0] > 0
+                and envs.SGLANG_DSV41_PREFILL_TOPK_KV_WORKSPACE.get()
+            ):
+                compressed_topk = core_attn_metadata.sparse_raw_indices(
+                    compress_ratio
+                ).shape[-1]
+                # With full capacity, logical positions already match Attention.
+                # Select and dequantize after the pool's physical-ID remapping.
+                selected_topk = (
+                    _hcu_selected_topk_supported
+                    and extra_k_layout is KVLayout.V4
+                    and flat_token_ids.numel() <= q_flat.shape[0] * compressed_topk
+                )
+                if not selected_topk:
+                    flat_token_ids, combined_indices, compressed_valid_count = (
+                        cache.pack_compressed_topk(
+                            flat_token_ids,
+                            combined_indices,
+                            combined_lens,
+                            topk=compressed_topk,
+                        )
+                    )
             n_compressed = flat_token_ids.shape[0]
             workspace = self.sparse_prefill_workspace.get(
-                n_compressed + cache.swa_token_ids.shape[0]
+                n_compressed + cache.swa_token_ids.shape[0],
+                release_before_grow=compact_workspace,
             )
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
@@ -5753,6 +5837,19 @@ class DeepseekV4AttnBackend(
                 )
 
         swa_k_layout = token_to_kv_pool.get_swa_key_layout()
+        if selected_topk:
+            from lightop.kvcache import dsv4_dequantize_sparse_topk_out
+
+            compressed_valid_count = dsv4_dequantize_sparse_topk_out(
+                extra_k_cache.view(torch.uint8),
+                flat_token_ids,
+                combined_indices,
+                combined_lens,
+                compressed_slice,
+                compressed_topk,
+                extra_page_size,
+                fp8_fnuz=fp8_dtype == torch.float8_e4m3fnuz,
+            )
         # HCU LightOp reads the packed V4 page bytes directly; the V4.1 layouts
         # keep the generic dequantizer.
         if (
@@ -5760,11 +5857,12 @@ class DeepseekV4AttnBackend(
             and envs.SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED.get()
             and (compressed_slice is None or extra_k_layout is KVLayout.V4)
             and swa_k_layout is KVLayout.V4
+            and (compressed_valid_count is None or selected_topk)
         ):
             from lightop.kvcache import dsv4_dequantize_k_cache_paged_out
 
             # Match the original wrapper's byte view; keep the caller's slices.
-            if compressed_slice is not None:
+            if compressed_slice is not None and not selected_topk:
                 dsv4_dequantize_k_cache_paged_out(
                     extra_k_cache.view(torch.uint8),
                     flat_token_ids,
@@ -5778,13 +5876,14 @@ class DeepseekV4AttnBackend(
                 cache.swa_page_size,
             )
         else:
-            if compressed_slice is not None:
+            if compressed_slice is not None and not selected_topk:
                 dequantize_k_cache_paged(
                     extra_k_cache,
                     flat_token_ids,
                     page_size=extra_page_size,
                     out=compressed_slice,
                     layout=extra_k_layout,
+                    valid_count=compressed_valid_count,
                 )
             dequantize_k_cache_paged(
                 token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
