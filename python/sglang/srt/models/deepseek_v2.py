@@ -1678,7 +1678,10 @@ class DeepseekV2MoE(nn.Module):
                 if getattr(self, "is_hash", False)
                 else {}
             )
-            if self.gate.e_score_correction_bias_vl is not None:
+            # Text batches need standard TopK's EPLB expert-ID postprocessing.
+            if self.gate.e_score_correction_bias_vl is not None and (
+                not _is_hip or _hip_moe.batch_has_images(forward_batch)
+            ):
                 topk_output = vision_topk(
                     self,
                     router_logits,
