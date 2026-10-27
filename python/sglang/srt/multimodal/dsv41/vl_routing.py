@@ -1,12 +1,17 @@
+from dataclasses import replace
+
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe.topk import (
     _RENORMALIZE_SUM_EPSILON,
     _use_lightop_sqrtsoftplus_v41_gate,
     StandardTopKOutput,
     StandardTopKOutputPacked,
     _mask_topk_ids_padded_region,
+    _post_process_topk_ids,
     _zero_topk_weights_padded_region,
 )
 from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
@@ -21,14 +26,71 @@ def _scale_fused_shared_weights(weights, num_fused_shared_experts, scaling_facto
     return weights
 
 
+def _postprocess_vision_topk(
+    moe,
+    logits,
+    weights,
+    indices,
+    num_token_non_padded,
+    expert_location_dispatch_info,
+    packed_topk=None,
+):
+    config = moe.topk.topk_config
+    num_shared = config.num_fused_shared_experts
+    # Gate kernels already append global shared slots. EPLB only maps routed
+    # experts; passing shared IDs to its table would index past the table.
+    routed_count = config.top_k - num_shared
+    routed_ids, routed_weights, recorder_ids = _post_process_topk_ids(
+        topk_ids=indices[:, :routed_count],
+        topk_weights=weights[:, :routed_count],
+        topk_config=(
+            replace(config, top_k=routed_count, num_fused_shared_experts=0)
+            if num_shared
+            else config
+        ),
+        router_logits=logits,
+        layer_id=moe.layer_id,
+        num_token_non_padded=num_token_non_padded,
+        expert_location_dispatch_info=expert_location_dispatch_info,
+    )
+    if recorder_ids is not None:
+        get_global_expert_distribution_recorder().on_select_experts(
+            topk_ids=recorder_ids
+        )
+    if num_shared:
+        # Redundant routed experts move the global shared-slot base as well.
+        shared_base = (
+            expert_location_dispatch_info.num_physical_experts
+            if expert_location_dispatch_info is not None
+            else logits.shape[-1]
+        )
+        shared_ids = indices[:, routed_count:].to(routed_ids.dtype)
+        shared_ids = shared_ids + (shared_base - logits.shape[-1])
+        indices = torch.cat((routed_ids, shared_ids), dim=-1)
+        weights = torch.cat((routed_weights, weights[:, routed_count:]), dim=-1)
+    else:
+        indices, weights = routed_ids, routed_weights
+    if num_token_non_padded is not None:
+        _mask_topk_ids_padded_region(indices, num_token_non_padded)
+        _zero_topk_weights_padded_region(weights, num_token_non_padded)
+    if packed_topk is not None:
+        return StandardTopKOutputPacked(weights, indices, logits, packed_topk)
+    return StandardTopKOutput(weights, indices, logits)
+
+
 def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
     config = moe.topk.topk_config
     num_fused_shared_experts = config.num_fused_shared_experts
     if num_fused_shared_experts:
-        # This path bypasses _post_process_topk_ids, which appends the per-rank slots.
+        # VL gate kernels emit global shared slots, not per-rank shared slots.
         assert not has_per_rank_fused_shared_slots(num_fused_shared_experts), (
             "VL routing does not support per-rank fused shared slots"
         )
+    expert_location_dispatch_info = (
+        ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
+        if not moe.is_nextn
+        else None
+    )
 
     # HCU lightop fast path: fused sqrtsoftplus gate with per-token 2D bias.
     # _use_lightop_sqrtsoftplus_v41_gate already implies HCU; is_hcu() is an
@@ -76,10 +138,14 @@ def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
             num_fused_shared_experts,
             config.fused_shared_experts_scaling_factor,
         )
-        if num_token_non_padded is not None:
-            _mask_topk_ids_padded_region(indices, num_token_non_padded)
-            _zero_topk_weights_padded_region(weights, num_token_non_padded)
-        return StandardTopKOutput(weights, indices, logits)
+        return _postprocess_vision_topk(
+            moe,
+            logits,
+            weights,
+            indices,
+            num_token_non_padded,
+            expert_location_dispatch_info,
+        )
 
     if is_cuda():
         from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
@@ -90,6 +156,7 @@ def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
         packed_topk = None
         if (
             num_fused_shared_experts == 0
+            and expert_location_dispatch_info is None
             and get_moe_runner_backend().is_flashinfer_mxfp4()
         ):
             packed_topk = torch.empty(
@@ -118,9 +185,15 @@ def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
             num_fused_shared_experts,
             config.fused_shared_experts_scaling_factor,
         )
-        if packed_topk is not None:
-            return StandardTopKOutputPacked(weights, indices, logits, packed_topk)
-        return StandardTopKOutput(weights, indices, logits)
+        return _postprocess_vision_topk(
+            moe,
+            logits,
+            weights,
+            indices,
+            num_token_non_padded,
+            expert_location_dispatch_info,
+            packed_topk,
+        )
     scores = F.softplus(logits.float()).sqrt()
     if input_ids is None:
         bias = moe.gate.e_score_correction_bias
@@ -153,7 +226,11 @@ def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
         weights, num_fused_shared_experts, config.fused_shared_experts_scaling_factor
     )
     weights, indices = weights.float(), indices.int()
-    if num_token_non_padded is not None:
-        _mask_topk_ids_padded_region(indices, num_token_non_padded)
-        _zero_topk_weights_padded_region(weights, num_token_non_padded)
-    return StandardTopKOutput(weights, indices, logits)
+    return _postprocess_vision_topk(
+        moe,
+        logits,
+        weights,
+        indices,
+        num_token_non_padded,
+        expert_location_dispatch_info,
+    )

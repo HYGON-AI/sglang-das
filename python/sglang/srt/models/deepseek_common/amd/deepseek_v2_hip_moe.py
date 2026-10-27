@@ -38,7 +38,8 @@ def batch_has_images(forward_batch) -> bool:
     if forward_batch is None:
         return True
     return (
-        forward_batch.forward_mode.is_extend() and forward_batch.contains_image_inputs()
+        forward_batch.forward_mode.is_extend_without_speculative()
+        and forward_batch.contains_image_inputs()
     )
 
 
