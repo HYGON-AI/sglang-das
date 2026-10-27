@@ -480,9 +480,21 @@ def sparse_gqa_fwd_interface_triton_ck(
     scale,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    max_seqlen_q: Optional[int] = None,
 ):
+    """Chunk-prefill sparse attention with an optional host-known max query len.
+
+    ``max_q`` only bounds the per-row query loop, so callers that already know
+    it from host metadata (``forward_batch.extend_seq_lens_cpu``) should pass
+    ``max_seqlen_q``.  Deriving it from ``cu_q`` needs a device ``.item()``,
+    which drains the whole HIP queue once per full-attention layer and turns
+    every launch afterwards into a bubble until the host catches up.
+    """
     k, v = k.contiguous(), v.contiguous()
-    max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
+    if max_seqlen_q is None:
+        max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
+    else:
+        max_q = max(int(max_seqlen_q), 1)
     return _launch_sparse_gqa_chunk_prefill(
         q, k, v, indices, cu_q, cu_k, kv_lens, scale, max_q, k_scale, v_scale
     )

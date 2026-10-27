@@ -4056,6 +4056,7 @@ class ServerArgs:
         # it). Inkling opts into full-graph prefill capture here.
         self._apply_inkling_prefill_cuda_graph_default()
         self._apply_qwen4_exp_hip_ple_decode_cuda_graph_default()
+        self._apply_qwen4_exp_hip_ple_prefill_cuda_graph_default()
         self._apply_muse_glimmer_prefill_cuda_graph_max_bs_default()
 
         # must run before _handle_cuda_graph_config and _handle_data_parallelism
@@ -4968,6 +4969,47 @@ class ServerArgs:
                 "_apply_inkling_prefill_cuda_graph_default",
                 cuda_graph_backend_prefill=Backend.FULL,
             )
+
+    def _apply_qwen4_exp_hip_ple_prefill_cuda_graph_default(self):
+        """HIP/HCU Qwen4Exp PLE offload prefill-graph default.
+
+        The PLE preamble builds a ``_PLEBatch`` metadata struct and walks
+        per-token token maps in Python.  torch.dynamo cannot trace that (it
+        cannot instantiate the struct, and marking it ``torch.compiler.disable``
+        is rejected inside a captured region), so capturing a *prefill* graph
+        fails the whole startup whenever EAGLE is off -- with EAGLE the prefill
+        graph is already disabled automatically, which is why this only shows up
+        on the multimodal / plain-generation paths.
+
+        Disable prefill graphs for these checkpoints.  Honors an explicit
+        --cuda-graph-backend-prefill / --disable-prefill-cuda-graph and the
+        SGLANG_PLE_PREFILL_GRAPH=1 opt-in.
+        """
+        if (
+            self.disable_prefill_cuda_graph
+            or self.disable_cuda_graph
+            or not self.ple_offload_embedding
+            or os.environ.get("SGLANG_PLE_PREFILL_GRAPH", "0") == "1"
+            or parse_connector_type(self.model_path) == ConnectorType.INSTANCE
+        ):
+            return
+        if not (is_hip() or is_hcu()):
+            return
+        arch = self.get_model_config().hf_config.architectures[0]
+        if arch not in (
+            "Qwen4ExpForConditionalGeneration",
+            "Qwen4ExpForCausalLMMTP",
+        ):
+            return
+        logger.info(
+            "Disabling prefill CUDA graphs for Qwen4Exp PLE offload on HIP/HCU "
+            "(the PLE preamble is not dynamo-traceable)."
+        )
+        # Assign directly: ``cuda_graph_backend_prefill`` is already populated
+        # by earlier defaults, so a declarative ``_declare`` would not reach the
+        # effective PhaseConfig built later in the pipeline.
+        self.disable_prefill_cuda_graph = True
+        self.cuda_graph_backend_prefill = None
 
     def _apply_qwen4_exp_hip_ple_decode_cuda_graph_default(self):
         """HIP/HCU Qwen4Exp PLE offload decode-graph default.

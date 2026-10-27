@@ -5,7 +5,7 @@ import fcntl
 import math
 import os
 from contextlib import nullcontext
-from typing import Any, Iterable, Optional, Set, Tuple
+from typing import NamedTuple, Any, Iterable, Optional, Set, Tuple
 
 import msgspec
 import sympy
@@ -101,7 +101,18 @@ def _get_processed_token_count(
     return processed_tokens
 
 
-class _PLEBatch(msgspec.Struct, frozen=True):
+class _PLEBatch(NamedTuple):
+    """Per-forward PLE token layout.
+
+    A plain ``NamedTuple`` on purpose: this container is built inside the
+    captured forward region, and dynamo cannot instantiate a frozen
+    ``msgspec.Struct`` (``object.__new__(_PLEBatch) is not safe``), which made
+    prefill CUDA-graph capture fail.  ``torch.compiler.disable`` is not an
+    option either -- a disabled call inside a captured region raises
+    ``Skip calling torch.compiler.disable()d function``.  Tuples are handled
+    natively by dynamo, so no graph break is needed.
+    """
+
     mode: ForwardMode
     use_decode_fast_path: bool
     physical_tokens: int

@@ -440,6 +440,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
+        lengths_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        query_start_loc = self.forward_metadata.query_start_loc
+        if (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            and lengths_cpu is not None
+            and query_start_loc is not None
+            and len(lengths_cpu) + 1 == query_start_loc.numel()
+        ):
+            # This tensor is allocated anew by _metadata_from_forward_batch;
+            # the hint therefore cannot outlive, or go stale across, forwards.
+            # Keep the fallback for speculative and graph-owned metadata.
+            query_start_loc._fla_lengths_cpu = tuple(int(n) for n in lengths_cpu)
         if self.forward_metadata.has_mamba_track_mask:
             self.forward_metadata.mamba_track_mask_indices = (
                 forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]

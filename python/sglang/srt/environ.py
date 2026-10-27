@@ -1283,6 +1283,10 @@ class Envs:
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
     # capacity).
     SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
+    # Opt the Qwen4Exp MTP drafter into draft decode / draft-extend CUDA graphs
+    # on HIP (skipped there by default). Without them every draft step runs
+    # eager and is CPU-launch bound.
+    SGLANG_QWEN4_EXP_HIP_DRAFT_GRAPHS = EnvBool(False)
     # Use the split-KV (flash-decode) kernel for EAGLE target-verify on the
     # Triton backend (ROCm). Only active at speculative topk == 1; falls back to
     # extend_attention_fwd for unsupported cases or when set false (e.g. for

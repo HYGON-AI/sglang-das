@@ -497,6 +497,7 @@ class QSAIndexer(MultiPlatformOp):
         row_ends: torch.Tensor,
         query_positions: torch.Tensor,
         sequence_lengths_for_rows: torch.Tensor,
+        max_span: Optional[int] = None,
     ) -> torch.Tensor:
         rows = q.shape[0]
         output = torch.empty(
@@ -527,6 +528,7 @@ class QSAIndexer(MultiPlatformOp):
                     compressed_keys,
                     row_starts[chunk_slice],
                     row_ends[chunk_slice],
+                    max_span=max_span,
                 )
                 block_indices = qsa_fast_topk(
                     logits,
@@ -698,14 +700,21 @@ class QSAIndexer(MultiPlatformOp):
                 k_cache_fp8,
             )
 
-        compressed_keys, row_starts, row_ends, sequence_lengths = (
-            indexer_metadata.get_prefill_mqa_inputs(
-                self.layer_id, logical_positions
-            )
+        (
+            compressed_keys,
+            row_starts,
+            row_ends,
+            sequence_lengths,
+            max_compressed_len,
+        ) = indexer_metadata.get_prefill_mqa_inputs(
+            self.layer_id, logical_positions
         )
         query_sequence_ids = indexer_metadata.get_token_to_batch_idx()
-        row_sequence_lengths = sequence_lengths.index_select(
-            0, query_sequence_ids.long()
+        prefill = getattr(indexer_metadata, "prefill", None)
+        row_sequence_lengths = (
+            prefill.row_sequence_lengths
+            if prefill is not None
+            else sequence_lengths.index_select(0, query_sequence_ids.long())
         )
         return self.select_prefill_tokens(
             q,
@@ -714,6 +723,7 @@ class QSAIndexer(MultiPlatformOp):
             row_ends,
             logical_positions,
             row_sequence_lengths,
+            max_span=max_compressed_len,
         )
 
 

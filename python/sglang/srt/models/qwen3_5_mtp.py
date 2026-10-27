@@ -79,6 +79,17 @@ def _mtp_quant_config(quant_config):
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
+    # (param_name, checkpoint_name, expert_id, shard_id) split for a single
+    # fused checkpoint expert tensor.  Subclasses whose experts also carry
+    # side scales must override this with the scale entries FIRST: otherwise
+    # the naive ``str.replace`` maps ``experts.gate_up_proj.weight_scale`` to
+    # the non-existent ``experts.w13_weight.weight_scale`` instead of
+    # ``experts.w13_weight_scale``.
+    fused_expert_params_mapping = [
+        ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
+        ("experts.w2_weight", "experts.down_proj", 0, "w2"),
+    ]
+
 
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
@@ -270,10 +281,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
         # fused experts: experts.w13_weight / experts.w2_weight
         is_fused_expert = False
-        fused_expert_params_mapping = [
-            ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
-            ("experts.w2_weight", "experts.down_proj", 0, "w2"),
-        ]
+        fused_expert_params_mapping = self.fused_expert_params_mapping
 
         def load_fused_expert_weights(
             name: str,
