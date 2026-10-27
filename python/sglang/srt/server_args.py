@@ -4986,7 +4986,8 @@ class ServerArgs:
         SGLANG_PLE_PREFILL_GRAPH=1 opt-in.
         """
         if (
-            self.disable_prefill_cuda_graph
+            self.cuda_graph_backend_prefill is not None
+            or self.disable_prefill_cuda_graph
             or self.disable_cuda_graph
             or not self.ple_offload_embedding
             or os.environ.get("SGLANG_PLE_PREFILL_GRAPH", "0") == "1"
