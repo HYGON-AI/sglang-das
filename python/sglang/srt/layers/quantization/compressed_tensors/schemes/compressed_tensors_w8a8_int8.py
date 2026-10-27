@@ -61,6 +61,11 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
         self.strategy = strategy
         self.is_static_input_scheme = is_static_input_scheme
         self.input_symmetric = input_symmetric
+        # The fused kernels emit a dynamic symmetric per-token scale; a static
+        # or zero-pointed input scale would be silently replaced.
+        self.prequantized_input_eligible = (
+            not is_static_input_scheme and input_symmetric
+        )
         self.w8a8_strategy = int(os.getenv("W8A8_SUPPORT_METHODS", "1"))  # TODO
 
     def create_weights(
@@ -310,7 +315,11 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
         silu_quant_args: Optional[list[torch.Tensor]] = None,
     ) -> torch.Tensor:
         # TODO: add cutlass_scaled_mm_azp support
-        if _use_fused_rms_quant and input_quant_args is not None:
+        # An opted-in layer must use the pair: the fused SwiGLU path passes the
+        # gate half as x.
+        if input_quant_args is not None and (
+            self.supports_prequantized_input or _use_fused_rms_quant
+        ):
             assert len(input_quant_args) == 2
             x_q, x_scale = input_quant_args
         elif _use_fused_silu_mul_quant and silu_quant_args is not None:
@@ -399,6 +408,8 @@ class NPUCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
         self, strategy: str, is_static_input_scheme: bool, input_symmetric: bool
     ):
         super().__init__(strategy, is_static_input_scheme, input_symmetric)
+        # apply_weights below delegates to the NPU kernel, which quantizes x itself.
+        self.prequantized_input_eligible = False
         # TODO: Currently, NPU kernel for static quant requires quant_bias field,
         # which can't be replicated in compressed-tensors.
         if self.is_static_input_scheme:

@@ -15,6 +15,7 @@ import msgspec
 import torch
 from torch import nn
 from torch.nn.parameter import Parameter, UninitializedParameter
+from torch.profiler import record_function
 
 from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.srt.distributed import (
@@ -33,6 +34,7 @@ from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
+from sglang.srt.layers.fused_rms_quant import Int8PerTokenInput
 from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
@@ -704,6 +706,9 @@ class ColumnParallelLinear(LinearBase):
 
     def forward(self, input_, rms_weight=None, residual=None, update_hd=True, input_quant_args=None):
         bias = self.bias if not self.skip_bias_add else None
+        if isinstance(input_, Int8PerTokenInput):
+            input_quant_args = (input_.q, input_.scale)
+            input_ = input_.x
 
         if input_quant_args is not None or (_is_hcu and _use_fused_rms_quant and rms_weight is not None):
             if input_quant_args is None:
@@ -1968,9 +1973,10 @@ class RowParallelLinear(LinearBase):
             else:
                 if not self.supports_fused_silu_mul_quant_input():
                     raise RuntimeError("LightOp clamp quantization is unavailable")
-                xq, xs = _lightop_fuse_silu_mul_clamp_quant(
-                    input_parallel, swiglu_limit
-                )
+                with record_function("dsv4_shared_expert_silu_mul_int8_fused"):
+                    xq, xs = _lightop_fuse_silu_mul_clamp_quant(
+                        input_parallel, swiglu_limit
+                    )
                 gemm_input = input_parallel[..., : input_parallel.shape[-1] // 2]
                 quant_kwargs = {"input_quant_args": (xq, xs)}
             with symm_ctx as sm:
@@ -2001,13 +2007,14 @@ class RowParallelLinear(LinearBase):
             x_scale = torch.empty(
                 (num_tokens, 1), device=input_parallel.device, dtype=torch.float32
             )
-            _lightop_fuse_silu_mul_fp8_quant(
-                input_parallel,
-                fp8type=0,
-                output=input_x,
-                scales=x_scale,
-                limit=swiglu_limit,
-            )
+            with record_function("dsv4_shared_expert_silu_mul_fp8_fused"):
+                _lightop_fuse_silu_mul_fp8_quant(
+                    input_parallel,
+                    fp8type=0,
+                    output=input_x,
+                    scales=x_scale,
+                    limit=swiglu_limit,
+                )
 
             with symm_ctx as sm:
                 output_parallel = self.quant_method.apply(

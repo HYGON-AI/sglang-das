@@ -84,6 +84,8 @@ _CONFIDENCE = Invariant(
 )
 _is_npu = is_npu()
 _is_hcu = is_hcu()
+if _is_hcu:
+    from sglang.srt.models.deepseek_common.amd import deepseek_v4_hip as _hip
 
 
 class _BlockFp8LinearSlice(nn.Module):
@@ -204,6 +206,11 @@ class DSparkAttention(MqaAttentionBase):
         self.window_size = int(
             getattr(config, "sliding_window", None) or config.window_size
         )
+        if _is_hcu:
+            # MQALayer sets these in init_mqa_layer; the draft skips that and has
+            # no gfx950 fake-quant route.
+            self.fused_rmsnorm_fake_quant = False
+            _hip.init_fused_rmsnorm_operand(self)
 
         self.attn = RadixAttention(
             self.n_local_heads,
@@ -269,7 +276,11 @@ class DSparkAttention(MqaAttentionBase):
         q_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         q, _ = self.wq_a(x)
-        q = self.q_norm(q)
+        if _is_hcu:
+            # Fused RMSNorm + per-token quant into wq_b's operand when eligible.
+            _, q = _hip.q_norm_for_wq_b(self, q)
+        else:
+            q = self.q_norm(q)
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if not self.q_head_norm:

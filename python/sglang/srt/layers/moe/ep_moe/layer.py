@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from torch.profiler import record_function
 from triton.language.extra import libdevice
 
 from sglang.kernels.ops.moe.ep_moe_kernels import (
@@ -1230,12 +1231,13 @@ class DeepEPMoE(FusedMoE):
                 m_indices,
             )
             del a1, a1_scale
-            if self.moe_runner_config.swiglu_limit is None:
-                a2, a2_scale = fuse_silu_mul_quant(gate_up)
-            else:
-                a2, a2_scale = fuse_silu_mul_clamp_quant(
-                    gate_up, float(self.moe_runner_config.swiglu_limit)
-                )
+            with record_function("dsv4_routed_expert_silu_mul_int8_fused_contig"):
+                if self.moe_runner_config.swiglu_limit is None:
+                    a2, a2_scale = fuse_silu_mul_quant(gate_up)
+                else:
+                    a2, a2_scale = fuse_silu_mul_clamp_quant(
+                        gate_up, float(self.moe_runner_config.swiglu_limit)
+                    )
             del gate_up
             if a2.shape[-1] != self.w4a8_padded_intermediate_size:
                 a2 = F.pad(a2, (0, self.w4a8_padded_intermediate_size - a2.shape[-1]))
@@ -1618,17 +1620,18 @@ class DeepEPMoE(FusedMoE):
         del input_tensor
 
         swiglu_limit = self.moe_runner_config.swiglu_limit
-        if swiglu_limit is None:
-            q_a2_all, q_a2_scale = fuse_silu_mul_fp8_quant(
-                gateup_output,
-                fp8type=0,
-            )
-        else:
-            q_a2_all, q_a2_scale = fuse_silu_mul_fp8_quant(
-                gateup_output,
-                fp8type=0,
-                limit=swiglu_limit,
-            )
+        with record_function("dsv4_routed_expert_silu_mul_fp8_fused_contig"):
+            if swiglu_limit is None:
+                q_a2_all, q_a2_scale = fuse_silu_mul_fp8_quant(
+                    gateup_output,
+                    fp8type=0,
+                )
+            else:
+                q_a2_all, q_a2_scale = fuse_silu_mul_fp8_quant(
+                    gateup_output,
+                    fp8type=0,
+                    limit=swiglu_limit,
+                )
         del gateup_output
 
         down_output = torch.empty(
@@ -2010,6 +2013,9 @@ class DeepEPMoE(FusedMoE):
             device=gateup_output.device,
             dtype=torch.bfloat16,
         )
+        # NOTE: forward_deepgemm_contiguous has no clamp kernel: a channelwise
+        # checkpoint landing here instead of forward_groupgemm_w8a8_fp8_contiguous
+        # would silently drop the DSV4 SwiGLU clamp.
         fuse_silu_and_mul(input=gateup_output.view(-1, N), output=down_input)
         del gateup_output
         down_output = torch.empty(
@@ -2134,17 +2140,18 @@ class DeepEPMoE(FusedMoE):
                 expected_m,
             )
             swiglu_limit = self.moe_runner_config.swiglu_limit
-            if swiglu_limit is None:
-                a2, a2_scale = fuse_silu_mul_quant_ep(
-                    gate_up, tokens_per_expert=masked_m, expect_m=expected_m
-                )
-            else:
-                a2, a2_scale = fuse_silu_mul_clamp_quant_ep(
-                    input=gate_up,
-                    limit=swiglu_limit,
-                    mask_m=masked_m,
-                    expect_m=expected_m,
-                )
+            with record_function("dsv4_routed_expert_silu_mul_int8_fused_masked"):
+                if swiglu_limit is None:
+                    a2, a2_scale = fuse_silu_mul_quant_ep(
+                        gate_up, tokens_per_expert=masked_m, expect_m=expected_m
+                    )
+                else:
+                    a2, a2_scale = fuse_silu_mul_clamp_quant_ep(
+                        input=gate_up,
+                        limit=swiglu_limit,
+                        mask_m=masked_m,
+                        expect_m=expected_m,
+                    )
             del gate_up
             padded_size = getattr(
                 self, "w4a8_ll_padded_intermediate_size", self.w4a8_padded_intermediate_size
@@ -2366,10 +2373,11 @@ class DeepEPMoE(FusedMoE):
             expected_m,
         )
 
-        q_a2_all, q_a2_scale = fuse_silu_mul_fp8_quant_ep(
-            input=gateup_output, fp8type=0, tokens_per_expert=masked_m,
-            limit=self.moe_runner_config.swiglu_limit,
-        )
+        with record_function("dsv4_routed_expert_silu_mul_fp8_fused_masked"):
+            q_a2_all, q_a2_scale = fuse_silu_mul_fp8_quant_ep(
+                input=gateup_output, fp8type=0, tokens_per_expert=masked_m,
+                limit=self.moe_runner_config.swiglu_limit,
+            )
         # The first-stage BF16 activation is no longer needed after quantization.
         # Releasing it here lowers peak memory during low-latency graph capture.
         del gateup_output
