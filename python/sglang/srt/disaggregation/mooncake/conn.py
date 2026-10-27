@@ -2763,12 +2763,99 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 continue
 
+    def _validate_wire_message(self, msg, prefill):
+        """Parse only fields consumed by r3, without publishing any state.
+
+        Deliberately no range/schema checks: int(), optional tails, ignored
+        frames and zero sentinels retain the existing peer protocol semantics.
+        Stateful handlers and ABI validation remain outside this boundary.
+        """
+        header = msg[0]
+
+        def integers(*indices):
+            for index in indices:
+                int(msg[index].decode("ascii"))
+
+        if prefill:
+            if header == self.PD_HIDDEN_CHUNK_ACK_HEADER:
+                integers(1, 2, 3)
+                return
+            room = header.decode("ascii")
+            if room == "WATERMARK":
+                integers(1, 2)
+                if len(msg) > 3:
+                    msg[3].decode("ascii")
+            elif room == "STAGING_RSP":
+                integers(1, 2, 3, 4, 5)
+                msg[6].decode("ascii")
+            elif room == "ABORT":
+                integers(1, 3)
+                msg[2].decode("ascii")
+            else:
+                msg[3].decode("ascii")
+                if room == "None":
+                    KVArgsRegisterInfo.from_zmq(msg)
+                elif len(msg) >= 8:
+                    TransferInfo.from_zmq(msg)
+                # r3 already ignores short metadata after reading session_id.
+            return
+
+        if header == self.AUX_DATA_HEADER:
+            integers(1, 2, 3)
+            struct.unpack(">I", msg[4])
+            msg[5]
+        elif header == self.PD_HIDDEN_CHUNK_READY_HEADER:
+            integers(1, 2, 3, 4, 8)
+            msg[5]
+            np.frombuffer(msg[6], dtype=np.int32)
+            msg[7].decode("ascii")
+        elif header == b"CHUNK_READY":
+            integers(1, 2, 3, 4)
+            msg[5].decode("ascii")
+            # The producer emits a seventh rank frame; r3 ignores it.
+        elif header == b"STAGING_REQ":
+            # Checked unconditionally: the room may be registered by another
+            # thread between this check and the handler. Real producers always
+            # send integers here; an unknown room is ignored either way.
+            integers(1, 2, 3)
+            msg[4].decode("ascii")
+            if len(msg) > 5:
+                integers(5)
+        elif header == b"ABORT_ACK":
+            integers(1)
+            if self.enable_deferred_decode_kv_release and len(msg) >= 3:
+                integers(2)
+        else:
+            room, status, rank = msg
+            int(status.decode("ascii"))
+            int(room.decode("ascii"))
+            int(rank.decode("ascii"))
+
+    def _wire_message_is_parseable(self, msg, prefill):
+        try:
+            self._validate_wire_message(msg, prefill)
+        except (IndexError, ValueError, UnicodeError, struct.error,
+                RecursionError, TypeError, AttributeError) as error:
+            self.wire_malformed_count = getattr(self, "wire_malformed_count", 0) + 1
+            self.wire_last_error = type(error).__name__
+            now = time.monotonic()
+            if now - getattr(self, "_wire_last_warning", float("-inf")) >= 5:
+                self._wire_last_warning = now
+                logger.warning(
+                    "Dropped malformed Mooncake message: error=%s total=%d",
+                    self.wire_last_error, self.wire_malformed_count,
+                )
+            return False
+        return True
+
     def start_prefill_thread(self):
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
+                if not self._wire_message_is_parseable(waiting_req_bytes, True):
+                    continue
                 if waiting_req_bytes[0] == MooncakeKVManager.PD_HIDDEN_CHUNK_ACK_HEADER:
                     room = int(waiting_req_bytes[1].decode("ascii"))
                     prefill_rank = int(waiting_req_bytes[2].decode("ascii"))
@@ -2958,6 +3045,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if self.server_socket not in events:
                     continue
                 msg = self.server_socket.recv_multipart()
+                if not self._wire_message_is_parseable(msg, False):
+                    continue
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)
                     continue

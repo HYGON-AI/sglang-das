@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    _all_reduce_polls,
     build_kv_layer_ids,
     get_dsv4_c128_state_indices,
     get_kv_class,
@@ -123,6 +124,10 @@ def trace_disagg_prefill(
     )
 
 _is_npu = is_npu()
+
+
+def _failed_cleanup_pending(inflight_queue: List[Req]) -> bool:
+    return any(req.external_kv_abort_requested for req in inflight_queue)
 
 
 def should_force_retry(req: Req) -> bool:
@@ -996,6 +1001,11 @@ class PrefillBootstrapQueue:
                 self.scheduler.attn_tp_cpu_group,
             )
 
+        # PP admits cross-stage consensus good RIDs as a unit. This same-call
+        # guard only covers the pp_size == 1 normal and overlap paths.
+        has_failed = self.pp_size == 1 and any(
+            poll == KVPoll.Failed for poll in polls
+        )
         resource_ready = self._get_consensus_bootstrap_resource_ready(polls)
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
@@ -1006,6 +1016,10 @@ class PrefillBootstrapQueue:
                 self.scheduler.handle_bootstrap_failure(req)
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
+            elif has_failed:
+                # Failure cleanup can change local resource availability here.
+                # Defer non-failed admission until joint retirement completes.
+                continue
             elif poll == KVPoll.Bootstrapping:
                 if self._requires_pd_hidden_transfer(req):
                     # PD hidden must be captured for every prefill chunk.
@@ -1140,6 +1154,10 @@ class SchedulerDisaggregationPrefillMixin:
 
     def _admit_prefill_bootstrapped_reqs(self: Scheduler) -> None:
         """Move requests whose bootstrap is ready into the waiting queue."""
+        # Inflight membership and abort flags agree within the attention group.
+        if _failed_cleanup_pending(self.disagg_prefill_inflight_queue):
+            return
+
         bootstrap_queue = self.disagg_prefill_bootstrap_queue
         bootstrapped_reqs = bootstrap_queue.pop_bootstrapped()
         if DAS_PREFETCH_TRACE_ENABLED:
@@ -1302,7 +1320,13 @@ class SchedulerDisaggregationPrefillMixin:
 
         self.process_prefill_chunk(last_batch=last_batch, running_batch=running_batch)
 
-        prefill_plan = self.get_new_batch_prefill(running_batch)
+        if _failed_cleanup_pending(self.disagg_prefill_inflight_queue):
+            prefill_plan = NextBatchPlan(
+                batch_to_run=None,
+                running_batch=running_batch,
+            )
+        else:
+            prefill_plan = self.get_new_batch_prefill(running_batch)
         batch = prefill_plan.batch_to_run
         if DAS_PREFETCH_TRACE_ENABLED and batch is not None:
             for req in batch.reqs:
@@ -1913,7 +1937,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req.pending_bootstrap = False
                     if cleanup_done:
                         req.time_stats.set_completion_time()
-                    elif req not in self.disagg_prefill_inflight_queue:
+                    if req not in self.disagg_prefill_inflight_queue:
                         self.disagg_prefill_inflight_queue.append(req)
                     advance_logprob_pt(i, req)
                     continue
@@ -1995,10 +2019,7 @@ class SchedulerDisaggregationPrefillMixin:
                         is_insert=False,
                         emit_response=False,
                     )
-                    if (
-                        self._pending_chunked_abort_req is not req
-                        and req not in self.disagg_prefill_inflight_queue
-                    ):
+                    if req not in self.disagg_prefill_inflight_queue:
                         self.disagg_prefill_inflight_queue.append(req)
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
@@ -2088,6 +2109,10 @@ class SchedulerDisaggregationPrefillMixin:
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+            if req.external_kv_cleanup_done:
+                done_reqs.append(req)
+                continue
+
             # Check if this request was marked for external KV abort
             external_abort_pending = req.rid in self._external_kv_abort_rids
 
@@ -2180,6 +2205,29 @@ class SchedulerDisaggregationPrefillMixin:
                 raise RuntimeError(
                     f"Unexpected poll state {poll} for req {req.rid} in inflight queue"
                 )
+
+        if _failed_cleanup_pending(self.disagg_prefill_inflight_queue):
+            local_done_req_ids = {id(req) for req in done_reqs}
+            retirement = [
+                int(id(req) in local_done_req_ids)
+                for req in self.disagg_prefill_inflight_queue
+            ]
+            retirement = _all_reduce_polls(retirement, self.attn_tp_cpu_group)
+            retirement = _all_reduce_polls(retirement, self.attn_cp_cpu_group)
+            done_reqs = [
+                req
+                for req, ready in zip(
+                    self.disagg_prefill_inflight_queue, retirement
+                )
+                if ready
+            ]
+            undone_reqs = [
+                req
+                for req, ready in zip(
+                    self.disagg_prefill_inflight_queue, retirement
+                )
+                if not ready
+            ]
 
         for req in done_reqs:
             req.time_stats.set_completion_time()
@@ -2333,7 +2381,7 @@ class SchedulerDisaggregationPrefillMixin:
             req.to_finish = FINISH_ABORT(
                 error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
-        cleanup_done = self.abort_external_kv_request(
+        self.abort_external_kv_request(
             req,
             forward_drained=self.prefill_abort_forward_drained(req),
             sender_terminal=self.prefill_abort_sender_terminal(req),
@@ -2341,7 +2389,7 @@ class SchedulerDisaggregationPrefillMixin:
             is_insert=False,
             emit_response=True,
         )
-        if not cleanup_done and req not in self.disagg_prefill_inflight_queue:
+        if req not in self.disagg_prefill_inflight_queue:
             # The bootstrap/waiting queue removes this request after the call.
             # Keep a strong reference, not just a RID, for the next cleanup pass.
             self.disagg_prefill_inflight_queue.append(req)

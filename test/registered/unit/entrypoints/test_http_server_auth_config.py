@@ -5,7 +5,9 @@ from types import SimpleNamespace
 
 from sglang.srt.entrypoints import http_server
 from sglang.srt.utils.auth import AuthConfigNotReady
+from sglang.test.ci.ci_register import register_cpu_ci
 
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 class TestMultiTokenizerAuthConfig(unittest.TestCase):
     def setUp(self):
