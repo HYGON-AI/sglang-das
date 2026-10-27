@@ -262,6 +262,44 @@ class MiniMaxH3Int8LinearMethod(MiniMaxH3QuantLinearMethod):
         return result.reshape(*shape[:-1], layer.weight.shape[0])
 
 
+# B bounds one row's Triton reduction footprint; it is not a measured register limit.
+MAX_ROW_QUANT_BLOCK_SIZE = 16384
+MAX_ROW_QUANT_LINEAR_OFFSET = (1 << 31) - 1
+
+
+def _row_quant_block_size(x, precision):
+    """Return a supported block size, or None for the existing Torch fallback.
+
+    Inputs may have a larger/zero row stride; only the last dimension must be
+    contiguous. No copies, padding of K, or activation-dependent decisions occur.
+    """
+    if precision == "int8":
+        dtypes = (torch.bfloat16,)
+    elif precision == "fp8":
+        dtypes = (torch.bfloat16, torch.float16)
+    else:
+        raise ValueError("Unsupported row-quant precision")
+    if (
+        x.ndim != 2
+        or x.layout != torch.strided
+        or x.dtype not in dtypes
+        or not x.is_cuda
+        or x.stride(1) != 1
+        or x.stride(0) < 0
+    ):
+        return None
+    m, k = x.shape
+    if m < 1 or k < 1:
+        return None
+    padded_m = max(32 if precision == "int8" else 16, ((m + 15) // 16) * 16)
+    if (m - 1) * x.stride(0) + k - 1 > MAX_ROW_QUANT_LINEAR_OFFSET:
+        return None
+    if padded_m * k - 1 > MAX_ROW_QUANT_LINEAR_OFFSET:
+        return None
+    block_size = triton.next_power_of_2(k)
+    return block_size if block_size <= MAX_ROW_QUANT_BLOCK_SIZE else None
+
+
 @triton.jit
 def _quant_rows(
     X, Q, S, M: tl.constexpr, K: tl.constexpr, STRIDE: tl.constexpr, B: tl.constexpr
@@ -304,11 +342,12 @@ def _restore_output(
 
 def quant_rows(x):
     """Per-token absmax/127, ties-to-even; pad M for _int_mm, not K."""
-    if x.ndim != 2 or x.dtype != torch.bfloat16 or not x.is_cuda or x.stride(1) != 1:
-        raise ValueError("Expected GPU BF16 [M,K], contiguous last dimension")
+    block_size = _row_quant_block_size(x, "int8")
+    if block_size is None:
+        raise ValueError(
+            "Expected GPU strided BF16 [M,K], M>0, stride(-1)=1, nextpow2(K)<=16384"
+        )
     m, k = x.shape
-    if m < 1 or k < 1 or k > 8192:
-        raise ValueError("Experimental supported domain: M>0, 0<K<=8192")
     padded_m = max(32, triton.cdiv(m, 16) * 16)
     q = torch.empty((padded_m, k), device=x.device, dtype=torch.int8)
     scale = torch.empty((padded_m, 1), device=x.device, dtype=torch.float32)
@@ -319,7 +358,7 @@ def quant_rows(x):
         m,
         k,
         x.stride(0),
-        triton.next_power_of_2(k),
+        block_size,
         num_warps=4,
         enable_fp_fusion=False,
     )
@@ -370,7 +409,12 @@ def linear(x, qw, sw, bias=None, *, mode="both", chunk=4096):
     """Dynamic per-token quantization, INT8 GEMM, and ordered FP32 epilogue."""
     if mode not in ("reference", "epilogue", "both"):
         raise ValueError(mode)
-    if x.ndim != 2 or x.dtype != torch.bfloat16 or x.stride(1) != 1:
+    if (
+        x.ndim != 2
+        or x.layout != torch.strided
+        or x.dtype != torch.bfloat16
+        or x.stride(1) != 1
+    ):
         raise ValueError("Expected BF16 [M,K] with contiguous last dimension")
     if not x.is_cuda or qw.device != x.device or sw.device != x.device:
         raise ValueError("Expected one GPU")
@@ -397,7 +441,7 @@ def linear(x, qw, sw, bias=None, *, mode="both", chunk=4096):
     out = torch.empty((m, qw.shape[0]), device=x.device, dtype=x.dtype)
     for lo in range(0, m, chunk):
         part = x[lo : lo + chunk]
-        if mode == "both" and k <= 8192:
+        if mode == "both" and _row_quant_block_size(part, "int8") is not None:
             qx, sx = quant_rows(part)
         else:
             r = part.float()
@@ -708,16 +752,12 @@ def _quant_rows_fp8(
 
 
 def quant_rows_fp8(x):
-    if (
-        x.ndim != 2
-        or x.dtype not in (torch.bfloat16, torch.float16)
-        or not x.is_cuda
-        or x.stride(1) != 1
-    ):
-        raise ValueError("Expected GPU BF16/FP16 [M,K], contiguous last dimension")
+    block_size = _row_quant_block_size(x, "fp8")
+    if block_size is None:
+        raise ValueError(
+            "Expected GPU strided BF16/FP16 [M,K], M>0, stride(-1)=1, nextpow2(K)<=16384"
+        )
     m, k = x.shape
-    if m < 1 or k < 1 or k > 8192:
-        raise ValueError("Supported domain: M>0, 0<K<=8192")
     padded_m = max(16, triton.cdiv(m, 16) * 16)
     q = torch.empty((padded_m, k), device=x.device, dtype=torch.float8_e4m3fn)
     scale = torch.empty((padded_m, 1), device=x.device, dtype=torch.float32)
@@ -728,7 +768,7 @@ def quant_rows_fp8(x):
         m,
         k,
         x.stride(0),
-        triton.next_power_of_2(k),
+        block_size,
         num_warps=4,
         enable_fp_fusion=False,
     )
@@ -739,6 +779,7 @@ def linear_fp8(x, weight, scale, bias=None, *, fused=True):
     """Optimized full-row GEMM or the chunked, unfused W8A8 reference path."""
     if (
         x.ndim != 2
+        or x.layout != torch.strided
         or x.dtype not in (torch.bfloat16, torch.float16)
         or x.stride(1) != 1
     ):
@@ -773,7 +814,7 @@ def linear_fp8(x, weight, scale, bias=None, *, fused=True):
     for start in range(0, m, chunk):
         part = x[start : start + chunk]
         count = part.shape[0]
-        if fused and k <= 8192:
+        if fused and _row_quant_block_size(part, "fp8") is not None:
             qx, scale_x = quant_rows_fp8(part)
         else:
             r = part.float()
