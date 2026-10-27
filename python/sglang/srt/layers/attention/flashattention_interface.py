@@ -15,9 +15,6 @@
 from typing import Optional, Union
 
 from flash_attn import flash_attn_varlen_func as flash_attn_varlen_func_interface
-from flash_attn.flash_attn_interface import (
-    flash_attn_varlen_func as flash_attn_varlen_func_direct_interface,
-)
 from flash_attn import flash_attn_with_kvcache as flash_attn_with_kvcache_interface
 from flash_attn import (
     vllm_flash_attn_varlen_func as vllm_flash_attn_varlen_func_interface,
