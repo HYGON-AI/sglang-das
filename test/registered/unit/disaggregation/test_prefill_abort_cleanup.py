@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -18,7 +18,7 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT  # noqa: E402
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-class TestPrefillAbortCleanup(unittest.TestCase):
+class TestPrefillAbortCleanup(CustomTestCase):
     def setUp(self):
         self.scheduler = prefill.SchedulerDisaggregationPrefillMixin()
         self.req = SimpleNamespace(
@@ -86,6 +86,13 @@ class TestPrefillAbortCleanup(unittest.TestCase):
         self.cache = self.stack.enter_context(patch.object(prefill, "release_kv_cache"))
         self.stack.enter_context(
             patch.object(prefill, "maybe_release_pd_hidden_rows_on_hidden_done")
+        )
+        self.stack.enter_context(
+            patch.object(
+                prefill,
+                "_all_reduce_polls",
+                side_effect=lambda values, group: values,
+            )
         )
         self.stack.enter_context(patch.object(prefill, "logger"))
 
@@ -338,6 +345,191 @@ class TestPrefillAbortCleanup(unittest.TestCase):
         self.scheduler.handle_bootstrap_failure(self.req)
         self.cache.assert_not_called()
         self.assertEqual(self.scheduler.disagg_prefill_inflight_queue, [self.req])
+
+    def test_local_cleanup_waits_for_peer_and_blocks_admission(self):
+        """A locally drained failure must stay queued until its peer also drains."""
+        self.scheduler.disagg_prefill_inflight_queue = [self.req]
+
+        def reduce_retirement(values, group):
+            if group is self.scheduler.attn_cp_cpu_group:
+                return [0]
+            return values
+
+        with (
+            patch.object(
+                prefill,
+                "poll_and_all_reduce_attn_cp_tp_group",
+                return_value=[KVPoll.Failed],
+            ),
+            patch.object(
+                prefill, "_all_reduce_polls", side_effect=reduce_retirement
+            ) as reducer,
+        ):
+            self.assertEqual(
+                self.scheduler.process_disagg_prefill_inflight_queue(), []
+            )
+
+        self.assertEqual(self.scheduler.disagg_prefill_inflight_queue, [self.req])
+        self.assertEqual(reducer.call_count, 2)
+        self.assertEqual(
+            [call.args[1] for call in reducer.call_args_list],
+            [
+                self.scheduler.attn_tp_cpu_group,
+                self.scheduler.attn_cp_cpu_group,
+            ],
+        )
+
+        pop_bootstrapped = Mock()
+        self.scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            pop_bootstrapped=pop_bootstrapped
+        )
+        self.scheduler.waiting_queue = []
+        self.scheduler._admit_prefill_bootstrapped_reqs()
+        pop_bootstrapped.assert_not_called()
+
+        self.scheduler._begin_scheduler_iteration = Mock()
+        self.scheduler.process_pending_chunked_abort = Mock()
+        self.scheduler.resolve_waiting_queue_bootstrap = Mock()
+        self.scheduler.process_prefill_chunk = Mock()
+        self.scheduler.get_new_batch_prefill = Mock()
+        self.scheduler.dp_attn_adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=Mock(side_effect=lambda batch: batch)
+        )
+        running_batch = SimpleNamespace(batch_is_full=True)
+        plan = self.scheduler.get_next_disagg_prefill_batch_to_run(
+            running_batch=running_batch,
+            last_batch=None,
+        )
+        self.assertIsNone(plan.batch_to_run)
+        self.assertIs(plan.running_batch, running_batch)
+        self.scheduler.get_new_batch_prefill.assert_not_called()
+
+    def test_same_pop_failure_defers_optimistic_admission(self):
+        """A bootstrap failure must defer same-call local resource admission."""
+        failed_req = SimpleNamespace(rid="failed", disagg_kv_sender=Mock())
+        optimistic_req = SimpleNamespace(
+            rid="optimistic",
+            disagg_kv_sender=Mock(),
+            pending_bootstrap=False,
+            prefill_attempt_count=0,
+            is_retracted=False,
+            time_stats=Mock(),
+        )
+        queue = prefill.PrefillBootstrapQueue.__new__(prefill.PrefillBootstrapQueue)
+        queue.queue = [failed_req, optimistic_req]
+        queue.pp_size = 1
+        queue.scheduler = SimpleNamespace(
+            attn_cp_cpu_group=object(),
+            attn_tp_cpu_group=object(),
+            handle_bootstrap_failure=Mock(),
+        )
+        queue._requires_pd_hidden_transfer = Mock(return_value=False)
+        queue.ensure_metadata_buffer = Mock(return_value=True)
+
+        with (
+            patch.object(
+                prefill,
+                "poll_and_all_reduce_attn_cp_tp_group",
+                return_value=[KVPoll.Failed, KVPoll.Bootstrapping],
+            ),
+            patch.object(
+                queue,
+                "_get_consensus_bootstrap_resource_ready",
+                return_value=[True, True],
+            ),
+            patch.object(
+                prefill,
+                "get_disagg",
+                return_value=SimpleNamespace(optimistic_prefill_attempts=1),
+            ),
+        ):
+            self.assertEqual(queue.pop_bootstrapped(), [])
+
+        queue.scheduler.handle_bootstrap_failure.assert_called_once_with(failed_req)
+        queue.ensure_metadata_buffer.assert_not_called()
+        self.assertEqual(queue.queue, [optimistic_req])
+
+    def test_pp_consensus_good_request_is_not_deferred_by_local_failure(self):
+        """PP consensus admissions must not inherit the non-PP same-call guard."""
+        failed_req = SimpleNamespace(rid="failed")
+        good_req = SimpleNamespace(
+            rid="good",
+            pending_bootstrap=False,
+            time_stats=Mock(),
+        )
+        queue = prefill.PrefillBootstrapQueue.__new__(prefill.PrefillBootstrapQueue)
+        queue.queue = [failed_req, good_req]
+        queue.pp_size = 2
+        queue.scheduler = SimpleNamespace(handle_bootstrap_failure=Mock())
+
+        with (
+            patch.object(
+                prefill,
+                "poll_and_all_reduce_pp",
+                return_value=[KVPoll.Failed, KVPoll.WaitingForInput],
+            ),
+            patch.object(
+                queue,
+                "_get_consensus_bootstrap_resource_ready",
+                return_value=[True, True],
+            ),
+        ):
+            self.assertEqual(
+                queue.pop_bootstrapped(
+                    pp_good_rids=[good_req.rid],
+                    pp_bad_rids=[failed_req.rid],
+                ),
+                [good_req],
+            )
+
+        self.assertEqual(queue.queue, [])
+
+    def test_success_retires_once_while_failed_peer_cleanup_is_pending(self):
+        """A healthy transfer beside a failed request must retire exactly once."""
+        success_req = SimpleNamespace(
+            rid="success",
+            disagg_kv_sender=Mock(),
+            pending_bootstrap=False,
+            finished_reason=None,
+            return_logprob=False,
+            bootstrap_host="peer",
+            external_kv_abort_requested=False,
+            external_kv_cleanup_done=False,
+            external_kv_response_sent=False,
+            external_kv_abort_response_via_chunked=False,
+            external_kv_metadata_released=True,
+            time_stats=Mock(),
+        )
+        self.scheduler.disagg_prefill_inflight_queue = [success_req, self.req]
+
+        def reduce_retirement(values, group):
+            if group is self.scheduler.attn_cp_cpu_group:
+                return [1, 0]
+            return values
+
+        with (
+            patch.object(
+                prefill,
+                "poll_and_all_reduce_attn_cp_tp_group",
+                return_value=[KVPoll.Success, KVPoll.Failed],
+            ),
+            patch.object(
+                prefill, "_all_reduce_polls", side_effect=reduce_retirement
+            ),
+        ):
+            self.assertEqual(
+                self.scheduler.process_disagg_prefill_inflight_queue(),
+                [success_req],
+            )
+
+        self.assertEqual(self.scheduler.disagg_prefill_inflight_queue, [self.req])
+        success_release_calls = [
+            call
+            for call in self.cache.call_args_list
+            if call.args and call.args[0] is success_req
+        ]
+        self.assertEqual(len(success_release_calls), 1)
+        success_req.disagg_kv_sender.clear.assert_called_once_with()
 
 
 if __name__ == "__main__":

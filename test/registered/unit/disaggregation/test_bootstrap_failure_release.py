@@ -43,13 +43,18 @@ def _req(rid="r"):
 
 def _scheduler(*, hicache, external_linker, tree_cache):
     s = types.SimpleNamespace(
+        enable_hierarchical_cache=False,
         enable_hicache_storage=hicache,
         enable_unified_cache_external_linker=external_linker,
         tree_cache=tree_cache,
         ps=types.SimpleNamespace(tp_rank=0),
+        abort_external_kv_request=MagicMock(return_value=True),
+        prefill_abort_forward_drained=MagicMock(return_value=True),
+        prefill_abort_sender_terminal=MagicMock(return_value=True),
         clear_pending_chunk_send=MagicMock(),
         req_to_metadata_buffer_idx_allocator=MagicMock(),
         disagg_metadata_buffers=None,
+        disagg_prefill_inflight_queue=[],
         output_streamer=MagicMock(),
         metrics_reporter=types.SimpleNamespace(enable_metrics=False),
     )
@@ -115,6 +120,8 @@ class TestReleaseFreesThePrefetch(CustomTestCase):
         wrapper.hit_markers = {"r": hit}
         wrapper.host_prefetch_hits = {"r": hit}
         wrapper.pending_host_prefetch_submissions = {}
+        wrapper.pending_lookups = {}
+        wrapper.lookup_results = {}
         wrapper.pending_loads = {}
         return wrapper
 
@@ -221,6 +228,8 @@ class TestReleaseAcrossBackgroundSubmitStages(CustomTestCase):
         )
         wrapper.hit_markers = {"r": hit}
         wrapper.host_prefetch_hits = {}
+        wrapper.pending_lookups = {}
+        wrapper.lookup_results = {}
         wrapper.pending_loads = {}
         self.transfers = (PoolTransfer(name=PoolName.KV, keys=[self.KEY]),)
         self.job = PreparedHostPrefetch(

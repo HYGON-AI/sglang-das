@@ -184,6 +184,8 @@ class TestPPPDConsensus(CustomTestCase):
             finished_reason=None,
             pending_bootstrap=False,
             return_logprob=False,
+            external_kv_abort_requested=False,
+            external_kv_cleanup_done=False,
             time_stats=SimpleNamespace(set_completion_time=Mock()),
         )
         handle_failure = Mock(return_value=(None, False))
