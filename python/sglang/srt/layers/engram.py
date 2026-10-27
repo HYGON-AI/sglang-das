@@ -69,6 +69,11 @@ _use_hcu_fused_engram_gate = is_hcu() and get_bool_env_var(
 )
 
 
+_use_hcu_fused_engram_hash_ids = is_hcu() and get_bool_env_var(
+    "SGLANG_HCU_OPT_ENGRAM_HASH_IDS", default="true"
+)
+
+
 _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 
 _is_hip = is_hip()
@@ -433,6 +438,24 @@ class EngramHasher(nn.Module):
         """Non-CUDA fallback of the hash kernel: predecessor table [T, n] and hash ids.
         ``history`` is already the per-request [bs, n - 1] rows of this batch."""
         n = self.max_ngram_size
+        if (
+            _use_hcu_fused_engram_hash_ids
+            and input_ids.is_cuda
+            and kmode == MODE_EXTEND
+            and n == 4
+            and self.multipliers.shape == (2, 4)
+            and self.primes.shape == (2, 3, 8)
+            and row is not None
+            and starts is not None
+            and all(x.is_contiguous() for x in (input_ids, positions, history, row, starts))
+        ):
+            from lightop.engram import engram_hash_ids_hcu
+
+            return engram_hash_ids_hcu(
+                input_ids, positions, history, row, starts, self.token_map,
+                self.multipliers, self.primes, self.offsets, num_real,
+                self.pad_id, self.image_token_id, MM_PAD_SHIFT_VALUE,
+            )
         num_tokens = input_ids.shape[0]
         device = input_ids.device
         input_ids = input_ids.to(torch.int64)
