@@ -59,6 +59,8 @@ def dequantize_k_cache_paged(
     page_size: int,
     out: Optional[torch.Tensor] = None,
     layout: Union[KVLayout, str] = KVLayout.V4,
+    *,
+    valid_count: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Dequantize the DeepSeek v4 paged KV cache for a list of token IDs.
 
@@ -70,14 +72,25 @@ def dequantize_k_cache_paged(
             May be a slice of a larger workspace; the kernel uses out.stride(0)
             so contiguous-along-dim-0 slices work.
         layout: the cache's :class:`KVLayout`.
+        valid_count: optional int32 GPU count U. Only the first U token IDs
+            are read and output rows written; unused capacity is untouched.
 
     Returns:
         (num_tokens, 1, DIM_NOPE + DIM_ROPE) bfloat16.
     """
     layout = KVLayout.parse(layout)
+    if valid_count is not None:
+        assert valid_count.is_cuda and valid_count.device == quant_k_cache.device
+        assert valid_count.dtype == torch.int32 and valid_count.numel() == 1
+        assert valid_count.is_contiguous()
     if layout is not KVLayout.V4:
         return dequantize_k_cache_paged_v41(
-            quant_k_cache, page_table_1_flattened, page_size, out=out, layout=layout
+            quant_k_cache,
+            page_table_1_flattened,
+            page_size,
+            out=out,
+            layout=layout,
+            valid_count=valid_count,
         )
     assert quant_k_cache.is_contiguous()
     assert page_table_1_flattened.dtype in (torch.int32, torch.int64)
@@ -105,6 +118,18 @@ def dequantize_k_cache_paged(
         assert out.dtype == torch.bfloat16
 
     if _hcu_dequantize_k_cache_paged is not None:
+        if valid_count is not None:
+            from lightop.kvcache import dequantize_k_cache_paged_hcu_counted
+
+            dequantize_k_cache_paged_hcu_counted(
+                quant_k_cache_u8,
+                page_table_1_flattened,
+                out,
+                page_size,
+                fp8_dtype == torch.float8_e4m3fnuz,
+                valid_count,
+            )
+            return out
         _hcu_dequantize_k_cache_paged(
             quant_k_cache_u8,
             page_table_1_flattened,
@@ -120,6 +145,7 @@ def dequantize_k_cache_paged(
         buf_bf16,
         buf_uint8,
         page_table_1_flattened,
+        valid_count,
         out.stride(0),
         BYTES_PER_PAGE=bytes_per_page,
         PAGE_SIZE=page_size,
@@ -130,6 +156,7 @@ def dequantize_k_cache_paged(
         NOPE_ROPE_BYTES=NOPE_ROPE_BYTES,
         PADDED_SCALE_PER_TOKEN=PADDED_SCALE_PER_TOKEN,
         S_OFFSET_BYTES=s_offset_bytes,
+        HAS_VALID_COUNT=valid_count is not None,
     )
     return out
 
@@ -140,6 +167,8 @@ def dequantize_k_cache_paged_v41(
     page_size: int,
     out: Optional[torch.Tensor] = None,
     layout: KVLayout = KVLayout.V41,
+    *,
+    valid_count: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Dequantize a V4.1 paged cache (fp8 ``V41`` or fp4 ``V41_FP4``) for a list
     of token IDs into ``(num_tokens, 1, 512)`` bf16.
@@ -149,7 +178,7 @@ def dequantize_k_cache_paged_v41(
     layout = KVLayout.parse(layout)
     assert layout in (KVLayout.V41, KVLayout.V41_FP4), layout
     if is_hip_runtime():
-        supported = is_gfx95_supported()
+        supported = is_hcu() or is_gfx95_supported()
     else:
         supported = get_jit_cuda_arch().major >= 10
     if not supported:
@@ -158,6 +187,10 @@ def dequantize_k_cache_paged_v41(
         )
     assert quant_k_cache.is_contiguous()
     assert page_table_1_flattened.dtype in (torch.int32, torch.int64)
+    if valid_count is not None:
+        assert valid_count.is_cuda and valid_count.device == quant_k_cache.device
+        assert valid_count.dtype == torch.int32 and valid_count.numel() == 1
+        assert valid_count.is_contiguous()
 
     quant_k_cache_u8 = quant_k_cache.view(torch.uint8)
     num_tokens = page_table_1_flattened.shape[0]
@@ -190,6 +223,7 @@ def dequantize_k_cache_paged_v41(
         buf_fp8,
         buf_uint8,
         page_table_1_flattened,
+        valid_count,
         out.stride(0),
         BYTES_PER_PAGE=bytes_per_page,
         PAGE_SIZE=page_size,
@@ -198,6 +232,7 @@ def dequantize_k_cache_paged_v41(
         TILE_SIZE=layout.tile_size,
         S_OFFSET_BYTES=layout.scale_offset(page_size),
         IS_HIP=is_hip_runtime(),
+        HAS_VALID_COUNT=valid_count is not None,
     )
     return out
 
@@ -474,6 +509,7 @@ def _dequantize_k_cache_paged_kernel(
     buf_bf16_ptr,
     buf_uint8_ptr,
     page_table_ptr,
+    valid_count_ptr,
     output_stride_0,
     BYTES_PER_PAGE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
@@ -484,38 +520,44 @@ def _dequantize_k_cache_paged_kernel(
     NOPE_ROPE_BYTES: tl.constexpr,
     PADDED_SCALE_PER_TOKEN: tl.constexpr,
     S_OFFSET_BYTES: tl.constexpr,
+    HAS_VALID_COUNT: tl.constexpr,
 ):
     # One program per token: load page_table[token_id] once and emit all
     # NUM_SCALE_TILES nope tiles + rope tail via tl.static_range.
     token_id = tl.program_id(0).to(tl.int64)
-    loc = tl.load(page_table_ptr + token_id).to(tl.int64)
-    page_idx = loc // PAGE_SIZE
-    in_page = loc % PAGE_SIZE
-    page_byte_base = page_idx * BYTES_PER_PAGE
-    token_data_base = page_byte_base + in_page * NOPE_ROPE_BYTES
-    token_scale_base = (
-        page_byte_base + S_OFFSET_BYTES + in_page * PADDED_SCALE_PER_TOKEN
-    )
-    out_row_base = token_id * output_stride_0
-
-    nope_offs = tl.arange(0, TILE_SIZE)
-    for tile_id in tl.static_range(NUM_SCALE_TILES):
-        fp8_off = token_data_base + tile_id * TILE_SIZE + nope_offs
-        fp8_vals = tl.load(buf_fp8_ptr + fp8_off).to(tl.float32)
-
-        scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + tile_id).to(tl.int32)
-        scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))
-
-        out_off = out_row_base + tile_id * TILE_SIZE + nope_offs
-        tl.store(
-            output_ptr + out_off,
-            (fp8_vals * scale_pow2).to(output_ptr.dtype.element_ty),
+    if HAS_VALID_COUNT:
+        active = token_id < tl.load(valid_count_ptr)
+    else:
+        active = True
+    if active:
+        loc = tl.load(page_table_ptr + token_id).to(tl.int64)
+        page_idx = loc // PAGE_SIZE
+        in_page = loc % PAGE_SIZE
+        page_byte_base = page_idx * BYTES_PER_PAGE
+        token_data_base = page_byte_base + in_page * NOPE_ROPE_BYTES
+        token_scale_base = (
+            page_byte_base + S_OFFSET_BYTES + in_page * PADDED_SCALE_PER_TOKEN
         )
+        out_row_base = token_id * output_stride_0
 
-    rope_offs = tl.arange(0, DIM_ROPE)
-    bf16_off = (token_data_base + DIM_NOPE) // 2 + rope_offs
-    rope_data = tl.load(buf_bf16_ptr + bf16_off)
-    tl.store(output_ptr + out_row_base + DIM_NOPE + rope_offs, rope_data)
+        nope_offs = tl.arange(0, TILE_SIZE)
+        for tile_id in tl.static_range(NUM_SCALE_TILES):
+            fp8_off = token_data_base + tile_id * TILE_SIZE + nope_offs
+            fp8_vals = tl.load(buf_fp8_ptr + fp8_off).to(tl.float32)
+
+            scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + tile_id).to(tl.int32)
+            scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))
+
+            out_off = out_row_base + tile_id * TILE_SIZE + nope_offs
+            tl.store(
+                output_ptr + out_off,
+                (fp8_vals * scale_pow2).to(output_ptr.dtype.element_ty),
+            )
+
+        rope_offs = tl.arange(0, DIM_ROPE)
+        bf16_off = (token_data_base + DIM_NOPE) // 2 + rope_offs
+        rope_data = tl.load(buf_bf16_ptr + bf16_off)
+        tl.store(output_ptr + out_row_base + DIM_NOPE + rope_offs, rope_data)
 
 
 @triton.jit
@@ -561,6 +603,7 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     buf_fp8_ptr,
     buf_uint8_ptr,
     page_table_ptr,
+    valid_count_ptr,
     output_stride_0,
     BYTES_PER_PAGE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
@@ -569,25 +612,31 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     TILE_SIZE: tl.constexpr,
     S_OFFSET_BYTES: tl.constexpr,
     IS_HIP: tl.constexpr,
+    HAS_VALID_COUNT: tl.constexpr,
 ):
     # V41: 512 e4m3 values per token, then 16 ue8m0 scales (one per 32 values).
     tl.static_assert(DATA_BYTES == 512 and SCALE_BYTES == 16 and TILE_SIZE == 32)
     token_id = tl.program_id(0).to(tl.int64)
-    loc = tl.load(page_table_ptr + token_id).to(tl.int64)
-    page_idx = loc // PAGE_SIZE
-    in_page = loc % PAGE_SIZE
-    page_byte_base = page_idx * BYTES_PER_PAGE
-    token_data_base = page_byte_base + in_page * DATA_BYTES
-    token_scale_base = page_byte_base + S_OFFSET_BYTES + in_page * SCALE_BYTES
+    if HAS_VALID_COUNT:
+        active = token_id < tl.load(valid_count_ptr)
+    else:
+        active = True
+    if active:
+        loc = tl.load(page_table_ptr + token_id).to(tl.int64)
+        page_idx = loc // PAGE_SIZE
+        in_page = loc % PAGE_SIZE
+        page_byte_base = page_idx * BYTES_PER_PAGE
+        token_data_base = page_byte_base + in_page * DATA_BYTES
+        token_scale_base = page_byte_base + S_OFFSET_BYTES + in_page * SCALE_BYTES
 
-    offs = tl.arange(0, DATA_BYTES)
-    vals = tl.load(buf_fp8_ptr + token_data_base + offs).to(tl.float32)
-    scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + offs // TILE_SIZE)
-    out = vals * _ue8m0_to_fp32(scale_u8)
-    tl.store(
-        output_ptr + token_id * output_stride_0 + offs,
-        _v41_dequant_to_bf16(out, IS_HIP),
-    )
+        offs = tl.arange(0, DATA_BYTES)
+        vals = tl.load(buf_fp8_ptr + token_data_base + offs).to(tl.float32)
+        scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + offs // TILE_SIZE)
+        out = vals * _ue8m0_to_fp32(scale_u8)
+        tl.store(
+            output_ptr + token_id * output_stride_0 + offs,
+            _v41_dequant_to_bf16(out, IS_HIP),
+        )
 
 
 @triton.jit
@@ -596,6 +645,7 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
     buf_fp8_ptr,
     buf_uint8_ptr,
     page_table_ptr,
+    valid_count_ptr,
     output_stride_0,
     BYTES_PER_PAGE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
@@ -604,29 +654,35 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
     TILE_SIZE: tl.constexpr,
     S_OFFSET_BYTES: tl.constexpr,
     IS_HIP: tl.constexpr,
+    HAS_VALID_COUNT: tl.constexpr,
 ):
     # V41_FP4: 512 e2m1 codes packed two per byte (even index in the low nibble),
     # then 32 e4m3 scales (one per 16 values).
     tl.static_assert(DATA_BYTES == 256 and SCALE_BYTES == 32 and TILE_SIZE == 16)
     token_id = tl.program_id(0).to(tl.int64)
-    loc = tl.load(page_table_ptr + token_id).to(tl.int64)
-    page_idx = loc // PAGE_SIZE
-    in_page = loc % PAGE_SIZE
-    page_byte_base = page_idx * BYTES_PER_PAGE
-    token_data_base = page_byte_base + in_page * DATA_BYTES
-    token_scale_base = page_byte_base + S_OFFSET_BYTES + in_page * SCALE_BYTES
+    if HAS_VALID_COUNT:
+        active = token_id < tl.load(valid_count_ptr)
+    else:
+        active = True
+    if active:
+        loc = tl.load(page_table_ptr + token_id).to(tl.int64)
+        page_idx = loc // PAGE_SIZE
+        in_page = loc % PAGE_SIZE
+        page_byte_base = page_idx * BYTES_PER_PAGE
+        token_data_base = page_byte_base + in_page * DATA_BYTES
+        token_scale_base = page_byte_base + S_OFFSET_BYTES + in_page * SCALE_BYTES
 
-    boffs = tl.arange(0, DATA_BYTES)
-    packed = tl.load(buf_uint8_ptr + token_data_base + boffs)
-    # Byte j holds elements 2j (low nibble) and 2j + 1, both in tile (2j) // 16.
-    scale = tl.load(buf_fp8_ptr + token_scale_base + (2 * boffs) // TILE_SIZE).to(
-        tl.float32
-    )
-    lo = _e2m1_code_to_fp32(packed & 0xF) * scale
-    hi = _e2m1_code_to_fp32(packed >> 4) * scale
-    out_base = output_ptr + token_id * output_stride_0
-    tl.store(out_base + 2 * boffs, _v41_dequant_to_bf16(lo, IS_HIP))
-    tl.store(out_base + 2 * boffs + 1, _v41_dequant_to_bf16(hi, IS_HIP))
+        boffs = tl.arange(0, DATA_BYTES)
+        packed = tl.load(buf_uint8_ptr + token_data_base + boffs)
+        # Byte j holds elements 2j (low nibble) and 2j + 1, both in tile (2j) // 16.
+        scale = tl.load(buf_fp8_ptr + token_scale_base + (2 * boffs) // TILE_SIZE).to(
+            tl.float32
+        )
+        lo = _e2m1_code_to_fp32(packed & 0xF) * scale
+        hi = _e2m1_code_to_fp32(packed >> 4) * scale
+        out_base = output_ptr + token_id * output_stride_0
+        tl.store(out_base + 2 * boffs, _v41_dequant_to_bf16(lo, IS_HIP))
+        tl.store(out_base + 2 * boffs + 1, _v41_dequant_to_bf16(hi, IS_HIP))
 
 
 @triton.jit
