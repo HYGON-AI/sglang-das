@@ -577,7 +577,11 @@ def topk_transform_512_pytorch_vectorized(
         page_size,
         out_raw_indices,
         topk_op=torch.topk,
-        topk_op_kwargs={"dim": 1, "largest": True, "sorted": False},
+        topk_op_kwargs={
+            "dim": 1,
+            "largest": True,
+            "sorted": envs.SGLANG_TOPK_TRANSFORM_512_TORCH_SORTED.get(),
+        },
     )
 
 

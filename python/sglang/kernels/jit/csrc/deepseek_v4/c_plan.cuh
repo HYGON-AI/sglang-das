@@ -726,9 +726,8 @@ inline PlanLens plan_compress_prefill_out(
   const auto device = device_.unwrap();
   const auto stream = LaunchKernel::resolve_device(device);
 
-  constexpr int32_t kMaxMTPDraftTokens = 4;
-  const auto mtp_pad = std::min(ring_size - compress_ratio, kMaxMTPDraftTokens);
-
+  const auto mtp_pad =
+      ring_size > window_size ? ring_size - window_size + 2 : 0;
   const auto input_device_type = cpu_or_gpu.unwrap().device_type;
   if (input_device_type == kDLCUDA || input_device_type == kDLROCM) {
     RuntimeCheck(batch_size <= kMaxPrefillBatchSize, "GPU plan only support batch size up to ", kMaxPrefillBatchSize);
@@ -789,7 +788,9 @@ inline PlanLens plan_compress_prefill_out(
     const int32_t extend_len = ext_ptr[i];
     const int32_t prefix_len = seq_len - extend_len;
     const int32_t last_c_pos = seq_len / compress_ratio * compress_ratio;
-    const int32_t first_w_pos = last_c_pos - (is_overlap ? compress_ratio : 0);
+    const int32_t first_w_pos = std::min(
+    last_c_pos - (is_overlap ? compress_ratio : 0),
+    seq_len - mtp_pad);
     RuntimeCheck(0 < extend_len && extend_len <= seq_len);
     const auto should_write = [=](int32_t position) {
       if (position >= first_w_pos) return true;
