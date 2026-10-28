@@ -4,7 +4,17 @@ import math
 from functools import lru_cache
 from typing import Optional, Tuple
 
+import msgspec
 import torch
+
+
+class Int8PerTokenInput(msgspec.Struct, frozen=True):
+    """A ColumnParallelLinear input prequantized by a fused RMSNorm: the linear
+    unpacks it into ``(x, input_quant_args=(q, scale))``."""
+
+    x: torch.Tensor  # normalized [M, K] bf16/fp16; sets the GEMM output dtype
+    q: torch.Tensor  # [M, K] int8
+    scale: torch.Tensor  # [M, 1] fp32, per token
 
 
 @lru_cache(maxsize=1)
@@ -24,6 +34,19 @@ def is_lightop_sglang_rms_quant_available() -> bool:
     )
 
 
+@lru_cache(maxsize=1)
+def is_lightop_rms_fp8_quant_available() -> bool:
+    """Return whether LightOp's RMSNorm + per-token FP8 quant can run on this host."""
+
+    if torch.version.hip is None:
+        return False
+    try:
+        from lightop import norm
+    except Exception:
+        return False
+    return hasattr(norm, "rms_norm_per_token_fp8_quant")
+
+
 def supports_fused_rms_quant_input(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -37,12 +60,17 @@ def supports_fused_rms_quant_input(
     instead of silently taking one of LightOp's generic strided paths.
     """
 
-    if (
-        input.numel() == 0
-        or input.dim() != 2
-        or not input.is_cuda
-        or not is_lightop_sglang_rms_quant_available()
-    ):
+    return is_lightop_sglang_rms_quant_available() and _is_narrow_rms_quant_input(
+        input, weight, residual
+    )
+
+
+def _is_narrow_rms_quant_input(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    residual: Optional[torch.Tensor] = None,
+) -> bool:
+    if input.numel() == 0 or input.dim() != 2 or not input.is_cuda:
         return False
     if input.dtype not in (torch.float16, torch.bfloat16):
         return False
@@ -111,6 +139,63 @@ def fused_rms_norm_per_token_quant(
         residual=residual,
         update_input=update_input,
     )
+
+
+def linear_takes_fp8_operand(linear) -> bool:
+    """Whether linear consumes LightOp's per-token ``(fp8, scale, orig_dtype)`` input
+    as is (the HCU channelwise W8A8-FP8 scheme)."""
+    return linear is not None and bool(
+        getattr(getattr(linear, "scheme", None), "supports_fp8_prequantized_input", False)
+    )
+
+
+def rms_norm_fp8_operand(
+    x: torch.Tensor, norm
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.dtype]]:
+    """RMSNorm ``x`` in place and quantize it to per-token FP8 in one LightOp launch,
+    as the ``(fp8, scale, orig_dtype)`` input a ``linear_takes_fp8_operand`` linear
+    reads; None, with ``x`` untouched, outside the narrow layout the INT8 sibling
+    accepts."""
+    if not (
+        is_lightop_rms_fp8_quant_available()
+        and _is_narrow_rms_quant_input(x, norm.weight)
+    ):
+        return None
+    from lightop.norm import rms_norm_per_token_fp8_quant
+
+    q, scale = rms_norm_per_token_fp8_quant(
+        x,
+        norm.weight,
+        epsilon=norm.variance_epsilon,
+        fp8type=0,
+        residual=None,
+        update_input=True,
+    )
+    return q, scale, x.dtype
+
+
+def opt_into_int8_operand(linear) -> bool:
+    """Opt linear into a per-token INT8 ``input_quant_args`` pair (W8A8-INT8,
+    SlimQuant W4A8) and return whether it now takes one."""
+    from sglang.srt.layers.quantization.base_config import LinearMethodBase
+
+    return isinstance(
+        linear.quant_method, LinearMethodBase
+    ) and linear.quant_method.enable_prequantized_input(linear)
+
+
+def rms_norm_int8_operand(x: torch.Tensor, norm) -> Optional[Int8PerTokenInput]:
+    """RMSNorm ``x`` in place and quantize it to per-token INT8 in one LightOp
+    launch; None, with ``x`` untouched, outside the narrow layout the op accepts."""
+    if not supports_fused_rms_quant_input(x, norm.weight):
+        return None
+    q, scale = fused_rms_norm_per_token_quant(
+        input=x,
+        rms_weight=norm.weight,
+        epsilon=norm.variance_epsilon,
+        update_input=True,
+    )
+    return Int8PerTokenInput(x=x, q=q, scale=scale)
 
 
 @lru_cache(maxsize=1)

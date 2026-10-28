@@ -1317,6 +1317,16 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
     def __init__(self, quantization_config: CompressedTensorsConfig):
         self.quantization_config = quantization_config
         self.quant_config = quantization_config
+        # Off until a model opts this layer in; see enable_prequantized_input.
+        self.supports_prequantized_input = False
+
+    def enable_prequantized_input(self, layer: torch.nn.Module) -> bool:
+        # One instance per layer, so the flag mirrors that layer's scheme.
+        if not layer.scheme.prequantized_input_eligible:
+            return False
+        layer.scheme.supports_prequantized_input = True
+        self.supports_prequantized_input = True
+        return True
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
