@@ -43,6 +43,11 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_hcu = is_hcu()
 
 
+def _hcu_fusion_on(env) -> bool:
+    """The V4.1 HCU fusions default on; setting ``env`` to false turns one off."""
+    return _is_hcu and (env.get() if env.is_set() else True)
+
+
 def fused_rmsnorm_fp8_operand_eligible(*linears) -> bool:
     """Whether an RMSNorm may emit a per-token FP8 operand in the LightOp launch.
 
@@ -52,8 +57,7 @@ def fused_rmsnorm_fp8_operand_eligible(*linears) -> bool:
     only the attn-TP-local layout `linear_takes_fp8_operand` already gates on.
     """
     return bool(
-        _is_hcu
-        and envs.SGLANG_USE_FUSED_RMS_QUANT.get()
+        _hcu_fusion_on(envs.SGLANG_USE_FUSED_RMS_QUANT)
         and is_lightop_rms_fp8_quant_available()
         and linears
         and all(linear_takes_fp8_operand(linear) for linear in linears)
@@ -65,23 +69,25 @@ def fused_rmsnorm_int8_operand_eligible(*linears) -> bool:
     SlimQuant W4A8 linears; opts each linear into the operand, which those shared
     methods keep off for other models."""
     return bool(
-        _is_hcu
-        and envs.SGLANG_USE_FUSED_RMS_QUANT.get()
+        _hcu_fusion_on(envs.SGLANG_USE_FUSED_RMS_QUANT)
         and is_lightop_sglang_rms_quant_available()
         and linears
         and all(opt_into_int8_operand(linear) for linear in linears)
     )
 
 
-def opt_shared_expert_into_int8_operand(mlp) -> None:
-    """Let the shared-expert down_proj take the fused SwiGLU-clamp INT8 operand."""
+def opt_shared_expert_into_fused_silu_mul_quant(mlp) -> None:
+    """Let the shared-expert down_proj take the fused SwiGLU-clamp FP8 / INT8 operand;
+    which one applies is left to its quant scheme."""
     shared_experts = getattr(mlp, "shared_experts", None)
-    if (
-        _is_hcu
-        and envs.SGLANG_USE_FUSED_SILU_MUL_QUANT.get()
-        and shared_experts is not None
-    ):
-        opt_into_int8_operand(shared_experts.down_proj)
+    if shared_experts is None:
+        return
+    down_proj = shared_experts.down_proj
+    down_proj.fused_silu_mul_fp8_quant_enabled = _hcu_fusion_on(
+        envs.SGLANG_USE_FUSED_SILU_MUL_FP8_QUANT
+    )
+    if _hcu_fusion_on(envs.SGLANG_USE_FUSED_SILU_MUL_QUANT):
+        down_proj.fused_silu_mul_int8_quant_enabled = opt_into_int8_operand(down_proj)
 
 
 # ---- MqaAttentionBase / MQALayer ----
@@ -108,9 +114,6 @@ def init_fused_rmsnorm_operand(attn) -> None:
     attn.fused_rmsnorm_int8_operand = attn.is_dsv41 and (
         fused_rmsnorm_int8_operand_eligible(attn.wq_b)
     )
-    attn._wq_b_native_consumer_checked = False
-    attn._wq_b_native_consumer = False
-    attn._wo_b_fp8_grid_operand = None
 
 
 def wo_a_emits_fp8_grid(attn) -> bool:

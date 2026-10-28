@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -20,23 +21,25 @@ _ROUTES = {
         'opt_into_int8_operand',
     ),
 }
+_RMS_QUANT_ENV = deepseek_v4_hip.envs.SGLANG_USE_FUSED_RMS_QUANT.name
 
 
 class TestDeepseekV4HcuRmsQuantGuard(unittest.TestCase):
-    def _eligible(self, route, *linears, linear_eligible=True):
+    def _eligible(
+        self, route, *linears, linear_eligible=True, is_hcu=True, env_value=None
+    ):
         eligible_fn, probe, takes_operand = _ROUTES[route]
         with (
-            patch.object(deepseek_v4_hip, '_is_hcu', True),
-            patch.object(
-                deepseek_v4_hip.envs.SGLANG_USE_FUSED_RMS_QUANT,
-                'get',
-                return_value=True,
-            ),
+            patch.dict(os.environ),
+            patch.object(deepseek_v4_hip, '_is_hcu', is_hcu),
             patch.object(deepseek_v4_hip, probe, return_value=True),
             patch.object(
                 deepseek_v4_hip, takes_operand, return_value=linear_eligible
             ),
         ):
+            os.environ.pop(_RMS_QUANT_ENV, None)
+            if env_value is not None:
+                os.environ[_RMS_QUANT_ENV] = env_value
             return getattr(deepseek_v4_hip, eligible_fn)(*linears)
 
     def test_eligible_linear_allows_fused_operand(self):
@@ -55,6 +58,26 @@ class TestDeepseekV4HcuRmsQuantGuard(unittest.TestCase):
         for route in _ROUTES:
             with self.subTest(route=route):
                 self.assertFalse(self._eligible(route))
+
+    def test_hcu_defaults_on_until_env_turns_it_off(self):
+        """On HCU the fusion needs no env var, an explicit false turns it off, and
+        other devices never fuse."""
+        cases = {
+            (True, None): True,
+            (True, '1'): True,
+            (True, '0'): False,
+            (False, None): False,
+            (False, '1'): False,
+        }
+        for route in _ROUTES:
+            for (is_hcu, env_value), expected in cases.items():
+                with self.subTest(route=route, is_hcu=is_hcu, env=env_value):
+                    self.assertIs(
+                        self._eligible(
+                            route, object(), is_hcu=is_hcu, env_value=env_value
+                        ),
+                        expected,
+                    )
 
     def test_only_v41_fuses_q_norm(self):
         """DeepSeek V4 (not V4.1) keeps the unfused q_norm even when eligible."""

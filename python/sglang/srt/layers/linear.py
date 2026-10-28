@@ -87,7 +87,8 @@ if _use_fused_silu_mul_quant:
         print(f"Error: Import fused silu_mul_quant error: {e}")
 
 _lightop_fuse_silu_mul_clamp_quant = None
-if _use_fused_silu_mul_quant:
+# On HCU a model may opt a layer in without the env flag; see RowParallelLinear.
+if _use_fused_silu_mul_quant or _is_hcu:
     try:
         from lightop import fuse_silu_mul_clamp_quant
 
@@ -100,6 +101,7 @@ if (
     _use_fused_silu_mul_fp8_quant
     or _use_fused_bailing_silu_mul_fp8_quant
     or _use_fused_dpskv4_silu_mul_fp8_quant
+    or _is_hcu
 ):
     try:
         from lightop.activation import (
@@ -1763,6 +1765,10 @@ class RowParallelLinear(LinearBase):
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
         self.use_dp_attention_reduce = use_dp_attention_reduce
+        # Set by a model that opts this layer into the fused SwiGLU-quant operand
+        # without the global SGLANG_USE_FUSED_SILU_MUL_*QUANT flags.
+        self.fused_silu_mul_int8_quant_enabled = False
+        self.fused_silu_mul_fp8_quant_enabled = False
 
         # Divide the weight matrix along the last dimension.
         _, tp_size = get_group_rank_size(self.tp_group)
@@ -1901,7 +1907,7 @@ class RowParallelLinear(LinearBase):
 
     def supports_fused_silu_mul_quant_input(self) -> bool:
         return bool(
-            _use_fused_silu_mul_quant
+            (_use_fused_silu_mul_quant or self.fused_silu_mul_int8_quant_enabled)
             and _lightop_fuse_silu_mul_clamp_quant is not None
             and getattr(
                 self.quant_method,
@@ -1912,7 +1918,7 @@ class RowParallelLinear(LinearBase):
 
     def supports_fused_silu_mul_fp8_quant_input(self) -> bool:
         return bool(
-            _use_fused_silu_mul_fp8_quant
+            (_use_fused_silu_mul_fp8_quant or self.fused_silu_mul_fp8_quant_enabled)
             and _lightop_fuse_silu_mul_fp8_quant is not None
             and getattr(
                 getattr(self, "scheme", None),

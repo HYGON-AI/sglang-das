@@ -2928,7 +2928,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             and config.vision_n_layers > 0,
         )
         if _hip is not None and config.model_type == "deepseek_v41":
-            _hip.opt_shared_expert_into_int8_operand(self.mlp)
+            _hip.opt_shared_expert_into_fused_silu_mul_quant(self.mlp)
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
