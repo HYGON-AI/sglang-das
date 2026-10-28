@@ -1716,7 +1716,8 @@ class Envs:
     # anonymous mapping per rank holding only its rows, gathered with the
     # all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
-    # HCU defaults to shared host tables; either enable flag enables the feature.
+    # Either enable flag requests host tables. HCU defaults to shared, falling
+    # back to device shards unless HSA_USERPTR_FOR_PAGED_MEM=0 is set at launch.
     SGLANG_HCU_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(True)
     SGLANG_HCU_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
 
