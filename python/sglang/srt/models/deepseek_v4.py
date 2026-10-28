@@ -470,6 +470,9 @@ def _flashinfer_hc_pre(
 
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not _is_hcu
+_use_hcu_wo_a_token_major = _is_hcu and get_bool_env_var(
+    "SGLANG_HCU_WO_A_TOKEN_MAJOR", default="true"
+)
 _use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC")
 
 
@@ -598,6 +601,30 @@ def _apply_wo_a_bf16_matmul(
     # o [T, G, D] @ wo_a [G, R, D] -> [T, G, R]; the fast paths below are gated
     # on the exact validated TP4 shapes and write token-major output directly.
     global _wo_a_aiter_batched_gemm_disabled
+    if (
+        _use_hcu_wo_a_token_major
+        and o.is_cuda
+        and o.device == wo_a.device
+        and fast_path
+        and (is_decode or is_target_verify)
+        and not (fuse_mxfp8_quant or fp8_grid or emit_fp8)
+        and 2 <= o.shape[0] <= 32
+        and o.shape[1:] == (8, 4096)
+        and wo_a.shape == (8, 1024, 4096)
+        and o.dtype == wo_a.dtype == torch.bfloat16
+        and o.is_contiguous()
+        and wo_a.is_contiguous()
+    ):
+        # The G8 einsum otherwise produces group-major output and flattening
+        # copies it before wo_b. Preserve the reduction and write its layout.
+        result = torch.empty(
+            (o.shape[0], 8, 1024), dtype=o.dtype, device=o.device
+        )
+        with torch.no_grad():
+            torch.bmm(
+                o.transpose(0, 1), wo_a.transpose(1, 2), out=result.transpose(0, 1)
+            )
+        return result
     # the gfx950 routes, like the CUDA ones, are V4.1's (fast_path); DSv4 keeps the
     # aiter batched GEMM / einsum below
     hip_fast_path = fast_path and _is_hip and _is_gfx95_supported
