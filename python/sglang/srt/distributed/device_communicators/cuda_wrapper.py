@@ -74,6 +74,24 @@ def find_loaded_library(lib_name) -> Optional[str]:
     return candidates[0]
 
 
+def get_loaded_hip_runtime() -> ctypes.CDLL:
+    """Reuse the active HCU/AMD HIP runtime without loading another copy."""
+    for soname in ("libgalaxyhip.so", "libamdhip64.so"):
+        try:
+            return ctypes.CDLL(soname, mode=os.RTLD_NOLOAD)
+        except OSError:
+            pass
+    # Runtime-only installations may expose only a versioned .so filename.
+    for name in ("libgalaxyhip", "libamdhip64"):
+        path = find_loaded_library(name)
+        if path is not None:
+            return ctypes.CDLL(path, mode=os.RTLD_NOLOAD)
+    raise RuntimeError(
+        "HIP runtime (libgalaxyhip.so or libamdhip64.so) is not loaded "
+        "in the current process"
+    )
+
+
 class CudaRTLibrary:
     exported_functions = [
         # ​cudaError_t cudaSetDevice ( int  device )
