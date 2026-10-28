@@ -1020,7 +1020,15 @@ class LogitsProcessor(nn.Module):
             # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)
         elif should_apply_lm_head_quant_method(lm_head, quant_method):
-            logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
+            apply_with_output_dtype = getattr(
+                quant_method, "apply_with_output_dtype", None
+            )
+            if self.use_fp32_lm_head and apply_with_output_dtype is not None:
+                logits = apply_with_output_dtype(
+                    lm_head, hidden_states, embedding_bias, output_dtype=torch.float32
+                )
+            else:
+                logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
             if self.use_fp32_lm_head:
