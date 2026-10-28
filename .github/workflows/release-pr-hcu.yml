@@ -56,7 +56,7 @@ jobs:
         --cap-add=SYS_PTRACE
         --security-opt seccomp=unconfined
         --privileged=true
-        -v /home/github/sgl_whl_temp/hcu-wheel-staging:/home/github/sgl_whl_temp/hcu-wheel-staging
+        -v /ci_public/sglang-das/hcu-wheel-staging:/ci_public/sglang-das/hcu-wheel-staging
 
     # ---- Matrix: 3 个 Python 版本并行编译 ----
     strategy:
@@ -71,7 +71,7 @@ jobs:
       PIP_TRUSTED_HOST: 10.16.1.201
       RESOURCE_SERVER: http://10.16.1.201:8000/
       WHEEL_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-      HCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp/hcu-wheel-staging
+      HCU_WHEEL_STAGING_ROOT: /ci_public/sglang-das/hcu-wheel-staging
 
     steps:
       - name: Validate manual build target
@@ -257,7 +257,7 @@ jobs:
           ls -lh output/
 
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
-          STAGING_ROOT="${HCU_WHEEL_STAGING_ROOT:-/home/github/sgl_whl_temp/hcu-wheel-staging}"
+          STAGING_ROOT="${HCU_WHEEL_STAGING_ROOT:-/ci_public/sglang-das/hcu-wheel-staging}"
           STAGING_DIR="${STAGING_ROOT}/${GITHUB_REPOSITORY_OWNER}_${REPO_NAME}/pr-${GITHUB_RUN_ID}/${WHEEL_COMMIT_SHA}"
           WHEEL_DIR="${STAGING_DIR}/wheels"
 
@@ -322,7 +322,7 @@ jobs:
 
       - name: Report staged PR wheels
         run: |
-          echo "HCU PR wheels are staged locally under /home/github/sgl_whl_temp/hcu-wheel-staging."
+          echo "HCU PR wheels are staged locally under /ci_public/sglang-das/hcu-wheel-staging."
           echo "Skipping devpi and GitHub artifact upload for PR wheels."
 
       - name: Normalize workspace ownership
