@@ -94,28 +94,4 @@ jobs:
     uses: ./.github/workflows/nightly-test-operator-hcu.yml
     with:
       docker_image: ${{ needs.build.outputs.docker_image }}
-      record_dashhub: false
     secrets: inherit
-
-  publish-dashhub:
-    name: Publish combined model and operator results
-    needs: [build, test-models, test-operator]
-    if: ${{ always() && needs.build.result == 'success' && needs.test-models.result == 'success' && needs.test-operator.result == 'success' }}
-    runs-on: [ci, bw1100]
-    timeout-minutes: 60
-    steps:
-      - name: Checkout shared CI actions
-        uses: actions/checkout@v4
-        with:
-          repository: guochenyang99/ci-model-test
-          ref: main
-          token: ${{ secrets.MODEL_SMOKE_REPO_TOKEN }}
-          persist-credentials: false
-          path: model-ci-tools
-      - name: Submit complete DashHub record
-        uses: ./model-ci-tools/.github/actions/deployment-smoke-combined-record
-        with:
-          framework: sglang
-          image: ${{ needs.build.outputs.docker_image }}
-          pypi-url: ${{ vars.PYPI_URL }}
-          dashhub-token: ${{ secrets.DASHHUB_CI_TOKEN }}

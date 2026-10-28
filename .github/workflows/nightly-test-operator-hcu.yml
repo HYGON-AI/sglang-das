@@ -10,20 +10,12 @@ on:
         description: 要测试的镜像全名, 例如 harbor.site/ns/sglang:0.5.18-xxx
         required: true
         type: string
-      record_dashhub:
-        description: 仅算子测试且确认镜像没有模型测试记录时才单独上报
-        type: boolean
-        default: false
   workflow_call:
     inputs:
       docker_image:
         description: 要测试的镜像全名, 例如 harbor.site/ns/sglang:0.5.18-xxx
         required: true
         type: string
-      record_dashhub:
-        description: 单独上报算子结果；同时运行模型测试时应由汇总任务合并上报
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -82,7 +74,7 @@ jobs:
           ls -l /op_test_output/total_output.json
 
       - name: 上报 DashHub 记录
-        if: ${{ always() && inputs.record_dashhub }}
+        if: always()
         run: |
           IMAGE_TAG=${{ inputs.docker_image }} CInotificate --notificate_type op_daily_display --record --ci_accelerators BW1100 --operator_result /op_test_output/total_output.json -l DEBUG
 
