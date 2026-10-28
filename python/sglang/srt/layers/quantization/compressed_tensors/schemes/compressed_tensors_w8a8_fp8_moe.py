@@ -558,13 +558,17 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             and _use_deepgemm_moe
             and _is_hcu
             and self.use_deepep
-            and not get_moe_runner_backend().is_deep_gemm()
+            and (
+                not get_moe_runner_backend().is_deep_gemm()
+                or not getattr(layer, "deprecate_flag", True)
+            )
         ):
             # SGLANG_USE_DEEPGEMM_MOE is process-wide, but DSpark may use a
             # standalone draft MoE alongside a DeepEP target MoE.  Repacking
             # the standalone layer here deletes its canonical w13/w2 weights,
             # which are still required by the draft Triton runner.
             self._prepare_dsv4_channel_fp8_deepgemm_weights(layer)
+            return
 
         elif (
             _is_hcu
