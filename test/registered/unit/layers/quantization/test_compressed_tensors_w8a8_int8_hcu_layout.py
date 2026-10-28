@@ -9,6 +9,9 @@ import torch
 from compressed_tensors.quantization import QuantizationStrategy
 from torch.nn import Parameter
 
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsLinearMethod,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     compressed_tensors_w8a8_int8 as w8a8_int8,
 )
@@ -88,6 +91,68 @@ class TestCompressedTensorsW8A8Int8HCULayout(CustomTestCase):
 
                 self.assertEqual(layer.azp_adj.shape, (1, 3))
                 self.assertTrue(torch.equal(layer.azp_adj, expected_azp))
+
+    def test_prequantized_input_only_for_dynamic_symmetric(self):
+        """A fused kernel's dynamic symmetric scale must not replace a static or
+        zero-pointed input scale."""
+        cases = {
+            (False, True): True,
+            (False, False): False,
+            (True, True): False,
+            (True, False): False,
+        }
+        for (is_static, symmetric), expected in cases.items():
+            with self.subTest(is_static=is_static, symmetric=symmetric):
+                scheme = w8a8_int8.CompressedTensorsW8A8Int8(
+                    strategy=QuantizationStrategy.CHANNEL,
+                    is_static_input_scheme=is_static,
+                    input_symmetric=symmetric,
+                )
+                layer = self._make_layer(torch.ones((3, 4), dtype=torch.int8))
+                layer.scheme = scheme
+                method = CompressedTensorsLinearMethod(mock.Mock())
+                self.assertEqual(method.enable_prequantized_input(layer), expected)
+                self.assertEqual(method.supports_prequantized_input, expected)
+
+    def test_prequantized_pair_only_wins_when_opted_in(self):
+        """The fused SwiGLU path passes the gate half as x, so an opted-in layer must
+        read the (q, scale) pair; a layer no model opted in keeps requantizing x."""
+        layer = self._make_layer(torch.ones((3, 4), dtype=torch.int8))
+        x = torch.zeros((2, 4), dtype=torch.bfloat16)
+        x_q = torch.ones((2, 4), dtype=torch.int8)
+        x_scale = torch.ones((2, 1), dtype=torch.float32)
+
+        for opted_in in (True, False):
+            with self.subTest(opted_in=opted_in):
+                with mock.patch.dict(os.environ, {"W8A8_SUPPORT_METHODS": "3"}):
+                    layer.scheme = w8a8_int8.CompressedTensorsW8A8Int8(
+                        strategy=QuantizationStrategy.CHANNEL,
+                        is_static_input_scheme=False,
+                        input_symmetric=True,
+                    )
+                if opted_in:
+                    CompressedTensorsLinearMethod(mock.Mock()).enable_prequantized_input(
+                        layer
+                    )
+                quant_out = (torch.full((2, 4), 2, dtype=torch.int8), x_scale.clone())
+                with mock.patch.object(
+                    w8a8_int8, "_use_fused_rms_quant", False
+                ), mock.patch.object(
+                    w8a8_int8, "per_token_quant_int8", return_value=quant_out
+                ) as quant, mock.patch.object(
+                    w8a8_int8.ops, "blaslt_scaled_mm"
+                ) as gemm:
+                    layer.scheme.apply_weights(
+                        layer, x, bias=None, input_quant_args=(x_q, x_scale)
+                    )
+
+                if opted_in:
+                    quant.assert_not_called()
+                    self.assertIs(gemm.call_args.args[0], x_q)
+                    self.assertIs(gemm.call_args.kwargs["scale_a"], x_scale)
+                else:
+                    quant.assert_called_once_with(x)
+                    self.assertIs(gemm.call_args.args[0], quant_out[0])
 
 
 if __name__ == "__main__":
