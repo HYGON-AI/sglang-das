@@ -144,4 +144,5 @@ jobs:
           cookbook-ref: ${{ needs.prepare.outputs.cookbook-ref }}
           controller-ref: ${{ needs.prepare.outputs.controller-ref }}
           dashhub-token: ${{ secrets.DASHHUB_CI_TOKEN }}
+          history-token: ${{ secrets.MODEL_SMOKE_REPO_TOKEN }}
           mode: ${{ inputs.mode || 'execute' }}
