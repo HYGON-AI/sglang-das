@@ -829,6 +829,8 @@ class EngramEmbedding(nn.Module):
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE they live in host memory instead.
     HCU also enables host storage with SGLANG_HCU_ENABLE_DSV41_ENGRAM_HOST_TABLE,
     which defaults to true, and uses its own layout setting (shared by default).
+    HCU shared storage requires HSA_USERPTR_FOR_PAGED_MEM=0 at startup;
+    otherwise the table remains sharded in device memory.
     Loading is sharded in every layout: a rank writes only its own row range.
     """
 
@@ -847,7 +849,7 @@ class EngramEmbedding(nn.Module):
         )
         if host_table_enabled:
             self._init_host_table(num_embeddings, dim, layer_id)
-        else:
+        if self.host_table is None:
             self.weight = nn.Parameter(
                 torch.empty(self.rows, dim, dtype=torch.float8_e4m3fn),
                 requires_grad=False,
@@ -862,11 +864,18 @@ class EngramEmbedding(nn.Module):
         self.scale.weight_loader = self._load_rows
 
     def _init_host_table(self, num_embeddings: int, dim: int, layer_id: int):
+        hcu = is_hcu()
         layout = (
             envs.SGLANG_HCU_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
-            if is_hcu()
+            if hcu
             else envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
         )
+        if (
+            hcu
+            and layout == "shared"
+            and os.environ.get("HSA_USERPTR_FOR_PAGED_MEM") != "0"
+        ):
+            return
         n = num_embeddings if layout == "shared" else self.rows
         w_bytes = n * dim
         s_bytes = n * (dim // FP8_BLOCK_SIZE)
