@@ -181,6 +181,10 @@ from sglang.srt.utils.common import is_sm120_supported
 
 _is_hcu = is_hcu()
 _is_sm120 = is_sm120_supported()
+_use_hcu_index_q_rope_pack = _is_hcu and get_bool_env_var(
+    "SGLANG_HCU_INDEX_Q_ROPE_PACK", default="true"
+)
+
 _use_dpskv4_lightop_quant_k_cache = get_bool_env_var(
     "SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE"
 )
@@ -226,6 +230,16 @@ def _supports_index_q_rope_pack() -> bool:
     is ported; HIP uses the portable query + Triton quantization fallback.
     """
     return torch.cuda.is_available() and torch.version.hip is None
+
+
+@functools.lru_cache(maxsize=1)
+def _has_native_hcu_rope_fake_quant() -> bool:
+    # This fusion matches the Torch fallback; preserve the native AOT path.
+    try:
+        from sgl_kernel import rope_fp4_fake_quant
+    except (ImportError, OSError):
+        return False
+    return callable(rope_fp4_fake_quant)
 
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -4678,7 +4692,38 @@ class DeepseekV4AttnBackend(
         # fp4 query as (payload, scale), kernel layout [bs, 1, n_heads, dim]. The
         # kernel sums head scores locally, so the indexer heads must be replicated.
         assert indexer.n_local_heads == indexer.n_heads
-        if (
+        use_hcu_pack = (
+            _use_hcu_index_q_rope_pack
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and q_lora.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and q_lora.is_contiguous()
+            and indexer.n_local_heads in (32, 64)
+            and indexer.index_head_dim == 128
+            and indexer.rope_head_dim == 64
+            and layer.freqs_cis.dtype == torch.complex64
+            and layer.freqs_cis.is_contiguous()
+            and pos.dtype in (torch.int32, torch.int64)
+            and pos.is_contiguous()
+            and not _has_native_hcu_rope_fake_quant()
+        )
+        if use_hcu_pack:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hcu import (
+                index_q_rope_pack_weights_hcu,
+            )
+
+            q, _ = indexer.wq_b(q_lora)
+            q = q.view(q.shape[0], indexer.n_local_heads, indexer.index_head_dim)
+            q_fp4, q_sf, weights = index_q_rope_pack_weights_hcu(
+                q,
+                layer.freqs_cis,
+                pos,
+                indexer.head_weights_raw(x),
+                indexer.head_weight_scale,
+                indexer.rope_head_dim,
+            )
+        elif (
             x.is_cuda
             and _supports_index_q_rope_pack()
             and x.dtype == torch.bfloat16
