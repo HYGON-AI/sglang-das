@@ -4370,6 +4370,9 @@ class DeepseekV4Model(nn.Module):
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
         state = mhc.HcState(hidden_states)
+        # Batch-invariant by design (see fused_boundary_allowed): the layer loop below
+        # must not re-evaluate it, and it must stay False whenever a tail is in play.
+        fused_boundary = _is_hip and _hip.fused_boundary_allowed(forward_batch, tail)
         for i in range(self.start_layer, end_layer):
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
@@ -4416,7 +4419,7 @@ class DeepseekV4Model(nn.Module):
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
-                if _is_hip and self.layers[i].hc_boundary_fused:
+                if fused_boundary and self.layers[i].hc_boundary_fused:
                     state = _hip.forward_layer_fused_boundary(
                         self,
                         i,

@@ -31,6 +31,7 @@ from sglang.srt.models.deepseek_common.amd import deepseek_v4_gfx95_dense as gfx
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (  # noqa: F401  deepseek_v4 reaches apply_attention_mhc through this module
     apply_attention_mhc,
     forward_hc_pre_from_prev_fused_boundary,
+    norm_hosting_sinkhorn,
 )
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_gfx95_supported, is_hcu
@@ -246,8 +247,28 @@ def init_decoder_layer(layer, quant_config) -> None:
     layer._wqkv_a_native_consumer_checked = False
     layer._wqkv_a_native_consumer = False
     layer.hc_boundary_fused = (
-        _is_gfx95_supported and layer.hc_pre_from_prev_sublayer and layer.hc_mult == 4
+        (_is_gfx95_supported or (_is_hcu and envs.SGLANG_HCU_FUSED_MHC_BOUNDARY.get()))
+        and layer.hc_pre_from_prev_sublayer
+        and layer.hc_mult == 4
     )
+
+
+def fused_boundary_allowed(forward_batch, tail) -> bool:
+    """Whether this forward may take the fused mHC boundary at all.
+
+    Non-HCU is a no-op: it returns True and the caller still gates on ``_is_hip`` and on
+    the per-layer ``hc_boundary_fused``. HCU runs the boundary only on decode / target
+    verify batches 鈥?prefill keeps the lightop path, and so does any forward carrying a
+    late-layer tail.
+
+    The result depends on the batch alone, never on the layer, so the model loop hoists
+    it out of the layer loop. Keep that invariant (or re-hoist it) if a per-layer tail
+    ever has to run the boundary.
+    """
+    if not _is_hcu:
+        return True
+    mode = forward_batch.forward_mode
+    return tail is None and (mode.is_decode_or_idle() or mode.is_target_verify())
 
 
 def hc_post(cfg, x, residual, post, comb) -> Optional[torch.Tensor]:
@@ -283,6 +304,9 @@ def input_norm(
         return hidden_states, x_quant
     if layer.fused_rmsnorm_fake_quant:
         return gfx95_dense.input_norm_fake_quant(layer, hidden_states, coefficients)
+    if _is_hcu and coefficients is not None:
+        norm = norm_hosting_sinkhorn(layer.input_layernorm, hidden_states, coefficients)
+        return norm, None
     if coefficients is not None:
         coefficients.materialize()
     return layer.input_layernorm(hidden_states), None
