@@ -93,6 +93,7 @@ class _HostWaterfill:
     """
 
     def __init__(self, phy2log: torch.Tensor, log2phy: torch.Tensor, num_gpus: int):
+        device = log2phy.device
         phy2log = phy2log.cpu().to(torch.int64)
         log2phy = log2phy.cpu().to(torch.int64)
         self.num_gpus = num_gpus
@@ -103,7 +104,8 @@ class _HostWaterfill:
         num_valid = valid.sum(-1)
         # Even split over replicas, for small batches and zero-count experts.
         self.uniform = valid.float() / num_valid.clamp_min(1).unsqueeze(-1)
-        self._uniform_dev = None
+        # Built up front: graph capture forbids pageable H2D copies.
+        self._uniform_dev = self.uniform.to(device) if device.type != "cpu" else None
         single = torch.nonzero(num_valid == 1).flatten()
         self.single_log = single.numpy()
         self.single_rank = (log2phy[single, 0] // local).numpy()
@@ -121,6 +123,11 @@ class _HostWaterfill:
     def solve(self, global_counts: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         if self._uniform_dev is None:
             self._uniform_dev = self.uniform.to(out.device)
+        # Decode graph capture cannot read counts back to the host: graphed
+        # batches keep the even replica split.
+        if torch.cuda.is_current_stream_capturing():
+            out.copy_(self._uniform_dev)
+            return out
         counts = global_counts.cpu().numpy()
         if not self.replicated or counts.sum() < self.min_pairs:
             out.copy_(self._uniform_dev)
