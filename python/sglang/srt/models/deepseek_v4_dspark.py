@@ -26,6 +26,7 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
+from sglang.srt.layers.quantization import dsv41_channelwise_fp8 as channelwise_fp8
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -461,7 +462,11 @@ class DSparkAttention(MqaAttentionBase):
             o.shape[1] * o.shape[2] // self.n_local_groups,
         )
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        if self._use_fast_kernel:
+        if self.wo_a_channelwise_fp8:
+            o = channelwise_fp8.grouped(
+                o, self.wo_a, self.n_local_groups, self.o_lora_rank
+            )
+        elif self._use_fast_kernel:
             o = _apply_wo_a_bf16_matmul(
                 o,
                 wo_a,
@@ -586,6 +591,16 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
     def project_bias(
         self, latent_states: torch.Tensor, *, weight: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        if isinstance(
+            getattr(self.markov_w2, "quant_method", None),
+            channelwise_fp8.ChannelwiseFp8Method,
+        ):
+            if weight is not None:
+                raise ValueError("FP8 Markov slices require matching scale offsets")
+            dtype = torch.bfloat16 if self._opt_markov_w2_bf16 else torch.float32
+            return self.markov_w2.quant_method.apply(
+                self.markov_w2, latent_states.to(dtype)
+            ).float()
         weight = self.markov_w2.weight if weight is None else weight
         if self._opt_markov_w2_bf16:
             return F.linear(latent_states.to(weight.dtype), weight).float()
@@ -606,6 +621,21 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
         weight_local = self.markov_w2.weight[
             shard.org_vocab_start : shard.org_vocab_end
         ]
+        if isinstance(
+            getattr(self.markov_w2, "quant_method", None),
+            channelwise_fp8.ChannelwiseFp8Method,
+        ):
+            bias = channelwise_fp8.linear(
+                latent,
+                weight_local,
+                self.markov_w2.weight_scale_inv[
+                    shard.org_vocab_start : shard.org_vocab_end
+                ],
+                output_dtype=torch.bfloat16
+                if self._opt_markov_w2_bf16
+                else torch.float32,
+            )
+            return bias, state
         if self._opt_markov_w2_bf16:
             # Keep the bias in BF16; the step add upcasts it to FP32.
             return F.linear(latent.to(weight_local.dtype), weight_local), state
@@ -805,6 +835,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        channelwise_fp8.configure_checkpoint(quant_config, config)
         self.num_fused_shared_experts = (
             0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
         )
@@ -927,6 +958,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             markov_rank=int(dspark_config.markov_rank),
             is_dsv41=getattr(config, "model_type", None) == "deepseek_v41",
         )
+        if channelwise_fp8.enabled(quant_config):
+            channelwise_fp8.install(self.markov_head.markov_w2)
         self.confidence_head = build_dspark_v4_confidence_head(
             config=config, markov_rank=int(dspark_config.markov_rank)
         )
@@ -1204,7 +1237,16 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         last = self.stages[-1]
         x = last.norm(x_post_hc)
         weight = self.lm_head.weight
-        if self._use_fp32_lm_head and weight.is_floating_point():
+        if self._use_fp32_lm_head and isinstance(
+            getattr(self.lm_head, "quant_method", None),
+            channelwise_fp8.ChannelwiseFp8Method,
+        ):
+            local_logits = project_through_lm_head(x.float(), self.lm_head)
+        elif self._use_fp32_lm_head and weight.dtype in (
+            torch.bfloat16,
+            torch.float16,
+            torch.float32,
+        ):
             local_logits = F.linear(x.float(), weight.float())
         else:
             local_logits = project_through_lm_head(x, self.lm_head)
@@ -1239,13 +1281,13 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self._dspark_scale_suffix = (
             "weight_scale"
             if any(
-                key.endswith((".weight_scale", "_weight_scale"))
-                for key in params_dict
+                key.endswith((".weight_scale", "_weight_scale")) for key in params_dict
             )
             else "weight_scale_inv"
         )
 
-        weights = _dequant_fp8_wo_a_streaming(weights)
+        if not channelwise_fp8.enabled(getattr(self, "quant_config", None)):
+            weights = _dequant_fp8_wo_a_streaming(weights)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -1265,6 +1307,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             )
             if mapped is None:
                 continue
+            if mapped not in params_dict and mapped.endswith(".weight_scale"):
+                candidate = mapped.removesuffix(".weight_scale") + ".weight_scale_inv"
+                if candidate in params_dict:
+                    mapped = candidate
+            if mapped not in params_dict and mapped.endswith(".scale"):
+                candidate = mapped.removesuffix(".scale") + ".weight_scale_inv"
+                if candidate in params_dict:
+                    mapped = candidate
             if self.num_fused_shared_experts > 0 and ".mlp.shared_experts." in mapped:
                 mapped = mapped.replace(
                     ".mlp.shared_experts.",
@@ -1372,18 +1422,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if mapped_rest.endswith(".gate.bias_vl"):
             return None
         mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
-        scale_suffix = getattr(
-            self, "_dspark_scale_suffix", "weight_scale_inv"
-        )
+        scale_suffix = getattr(self, "_dspark_scale_suffix", "weight_scale_inv")
         # Some loaders normalize checkpoint scale names to weight_scale_inv
         # before the model remapper runs. Per-channel FP8 parameters expose
         # weight_scale, so normalize either input form to
         # the suffix selected from the instantiated draft parameters.
         if mapped_rest.endswith(".weight_scale_inv"):
             mapped_rest = (
-                mapped_rest.removesuffix(".weight_scale_inv")
-                + "."
-                + scale_suffix
+                mapped_rest.removesuffix(".weight_scale_inv") + "." + scale_suffix
             )
         else:
             mapped_rest = mapped_rest.replace(".scale", "." + scale_suffix)

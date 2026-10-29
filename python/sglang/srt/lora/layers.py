@@ -280,6 +280,12 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         base_layer: ParallelLMHead,
         lora_backend: BaseLoRABackend,
     ) -> None:
+        quant_method = getattr(base_layer, "quant_method", None)
+        if getattr(quant_method, "supports_lm_head_lora", True) is False:
+            raise ValueError(
+                "The active LM-head quantization method does not support lm_head "
+                "LoRA. Remove lm_head from LoRA target modules."
+            )
         super().__init__(base_layer, lora_backend)
         self.weight = base_layer.weight
         self.embed_dim = base_layer.embedding_dim
