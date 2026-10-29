@@ -1105,11 +1105,14 @@ class Envs:
     SGLANG_USE_AITER_LINEAR_ATTN = EnvBool(False)
     SGLANG_USE_FUSED_DPSKV4_SILU_MUL_FP8_QUANT = EnvBool(False)
     SGLANG_USE_LIGHTOP_GROUP_FP8_QUANT = EnvBool(False)
+    # HCU DSV4.1 wo_a/LM/Markov projections: inspect checkpoint headers by
+    # default; "0" retains existing paths and "1" explicitly enables FP8.
+    SGLANG_DSV41_CHANNELWISE_FP8_RUNTIME = EnvStr("auto")
     SGLANG_USE_LINEAR_BF16_FP32_USE_BLASLT = EnvBool(False)
     SGLANG_ROCM_USE_AITER_TILELANG_MHC = EnvBool(False)
     SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM = EnvBool(False)
     SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE = EnvBool(False)
-       # LightOp FP4 indexer logits on gfx928/936/938,Set to 0 to fall back to Triton.
+    # LightOp FP4 indexer logits on gfx928/936/938,Set to 0 to fall back to Triton.
     SGLANG_USE_LIGHTOP_PAGED_MQA_LOGITS_FP4 = EnvBool(True)
     # DSV4.1 low-ratio decode/verify indexer on HCU via the paged path on LightOp;
     # falls back to the slot-based path when LightOp lacks the paged operators.

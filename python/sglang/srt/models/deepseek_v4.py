@@ -60,7 +60,10 @@ from sglang.srt.hardware_backend.npu.utils import (
     use_npu_arch35_mxfp8_wo_a,
 )
 from sglang.srt.layers.attention.dsa.utils import (
+    can_dsa_cp_split,
+    dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
+    is_dsa_prefill_cp_round_robin_split,
 )
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
@@ -68,11 +71,6 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Indexer,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
-from sglang.srt.layers.attention.dsa.utils import (
-    can_dsa_cp_split,
-    dsa_use_prefill_cp,
-    is_dsa_prefill_cp_round_robin_split,
-)
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStatePacker,
@@ -125,6 +123,7 @@ from sglang.srt.layers.moe.utils import (
     should_skip_post_experts_all_reduce,
     uses_per_rank_fused_shared_slots,
 )
+from sglang.srt.layers.quantization import dsv41_channelwise_fp8 as channelwise_fp8
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
@@ -149,13 +148,13 @@ from sglang.srt.managers.mm_utils import (
     embed_mm_inputs,
 )
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE, MultimodalInputs
-from sglang.srt.mem_cache.memory_pool import RadixAttention
 from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers import (
     is_cp_cache_layer_split_deepseek_v4_pool,
     maybe_prefetch_cp_kv_extra,
     maybe_prefetch_cp_kv_swa,
     maybe_wait_cp_kv_swa_prefetch,
 )
+from sglang.srt.mem_cache.memory_pool import RadixAttention
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -480,9 +479,7 @@ def _hcu_arch_supports_tilelang_mmac() -> bool:
     if not _is_hcu:
         return True
     try:
-        gcn_arch = getattr(
-            torch.cuda.get_device_properties(0), "gcnArchName", ""
-        )
+        gcn_arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
     except Exception:
         # Fail closed: an unreadable arch must not take the tilelang path,
         # which fatals at LayerInference on unsupported HCUs.
@@ -790,6 +787,7 @@ def _get_fused_qnorm_rope_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor
         _fused_qnorm_rope_cos_sin_cache[key] = cache
     return cache
 
+
 def _apply_gguf_grouped_wo_a(
     o: torch.Tensor,
     qweight: torch.Tensor,
@@ -1034,6 +1032,7 @@ class MqaAttentionBase(nn.Module):
 
         self.fuse_wqa_wkv = fuse
         self.wo_a_fp8 = fp8
+        self.wo_a_channelwise_fp8 = channelwise_fp8.enabled(quant_config)
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
         self._attn_sink_local: Optional[torch.Tensor] = None
@@ -1079,6 +1078,8 @@ class MqaAttentionBase(nn.Module):
             parallel_group="attn_tp",
             **({} if quantize_wo_a else {"params_dtype": torch.bfloat16}),
         )
+        if self.wo_a_channelwise_fp8:
+            channelwise_fp8.install(self.wo_a)
         if quantize_wo_a:
             assert hasattr(self.wo_a, "weight_scale_inv"), (
                 "FP8 quant_config must create weight_scale_inv"
@@ -1375,7 +1376,9 @@ class MQALayer(MqaAttentionBase):
             prefix=add_prefix("attn_mqa", prefix),
         )
 
-        self.use_fused_qk_norm_rope = _is_hip and not _is_hcu and _hip.use_fused_qk_norm_rope(self)
+        self.use_fused_qk_norm_rope = (
+            _is_hip and not _is_hcu and _hip.use_fused_qk_norm_rope(self)
+        )
         # Static eligibility; token count and wo_b's output format are checked
         # in forward, after weights have loaded.
         self.use_fused_wo_a = (
@@ -1971,7 +1974,9 @@ class MQALayer(MqaAttentionBase):
 
         # HCU shards inputs through legacy DSA CP, not the generic CP strategy.
         use_cp = (
-            dsa_use_prefill_cp(forward_batch) if _is_hcu else is_cp_active(forward_batch)
+            dsa_use_prefill_cp(forward_batch)
+            if _is_hcu
+            else is_cp_active(forward_batch)
         )
         layer_split_cp = (
             is_cp_cache_layer_split_deepseek_v4_pool(get_token_to_kv_pool())
@@ -2722,6 +2727,10 @@ class MQALayer(MqaAttentionBase):
                     out_mxfp8=fuse_mxfp8_quant,
                 )
                 o = Mxfp8SwizzledInput(*out) if fuse_mxfp8_quant else out[0]
+            elif self.wo_a_channelwise_fp8:
+                o = channelwise_fp8.grouped(
+                    o, self.wo_a, self.n_local_groups, self.o_lora_rank
+                )
             elif self.use_npu_arch35_mxfp8_wo_a:
                 o, o_scale = torch_npu.npu_dynamic_mx_quant(
                     o, dst_type=torch.float8_e4m3fn
@@ -3272,9 +3281,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             # pre_big_fuse_tilelang, which computes MHC pre but does not fuse
             # the decoder RMSNorm.  Keep the validated v0.5.15.post1_dev
             # contract so the caller still applies input_layernorm on HCU.
-            norm_fused = norm is not None and not (
-                _is_hcu and _use_aiter_tilelang_mhc
-            )
+            norm_fused = norm is not None and not (_is_hcu and _use_aiter_tilelang_mhc)
             return y, post.squeeze(-1), comb, norm_fused
 
         if _is_hip:
@@ -3627,7 +3634,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         return_moe_output: bool = False,
     ) -> Union[torch.Tensor, deepseek_v2.MoEOutput]:
         _use_cp = (
-            dsa_use_prefill_cp(forward_batch) if _is_hcu else is_cp_active(forward_batch)
+            dsa_use_prefill_cp(forward_batch)
+            if _is_hcu
+            else is_cp_active(forward_batch)
         )
         _use_tp_moe_gather = (
             not _use_cp
@@ -4302,9 +4311,10 @@ class DeepseekV4Model(nn.Module):
         assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
         hash_ids = None
         cp_extend = (
-            (dsa_use_prefill_cp(forward_batch) if _is_hcu else is_cp_active(forward_batch))
-            and forward_batch.forward_mode.is_extend()
-        )
+            dsa_use_prefill_cp(forward_batch)
+            if _is_hcu
+            else is_cp_active(forward_batch)
+        ) and forward_batch.forward_mode.is_extend()
         if self.engram_hasher is not None:
             if cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
@@ -4566,7 +4576,11 @@ class DeepseekV4Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         cp_v2_active = is_cp_v2_active(forward_batch)
-        use_prefill_cp = (dsa_use_prefill_cp(forward_batch) if _is_hcu else is_cp_active(forward_batch))
+        use_prefill_cp = (
+            dsa_use_prefill_cp(forward_batch)
+            if _is_hcu
+            else is_cp_active(forward_batch)
+        )
         incoming_pd_aux_hidden_states: List[torch.Tensor] = []
         local_dspark_aux_hidden_states: List[torch.Tensor] = []
         deferred_mhc_input = None
@@ -4596,6 +4610,7 @@ class DeepseekV4Model(nn.Module):
                 deferred_mhc_input = hidden_states
             else:
                 from sglang.kernels.ops.layernorm.mhc import hc_broadcast
+
                 hidden_states = hc_broadcast(hidden_states, self.hc_mult)
         else:
             assert pp_proxy_tensors is not None
@@ -4805,8 +4820,8 @@ class DeepseekV4Model(nn.Module):
                         local_dspark_aux_hidden_states, dim=-1
                     )
                 else:
-                    proxy_tensors["dspark_aux_hidden_states"] = (
-                        hidden_states.new_empty(hidden_states.shape[0], 0)
+                    proxy_tensors["dspark_aux_hidden_states"] = hidden_states.new_empty(
+                        hidden_states.shape[0], 0
                     )
             return PPProxyTensors(proxy_tensors)
 
@@ -4831,7 +4846,9 @@ class DeepseekV4Model(nn.Module):
             stream = torch.cuda.current_stream()
             gather_output = cp_all_gather_rerange_output
             if _is_hcu:
-                gather_output = functools.partial(gather_output, chunk_large_output=True)
+                gather_output = functools.partial(
+                    gather_output, chunk_large_output=True
+                )
             full_cp_metadata = forward_batch.attn_cp_metadata
             if hcu_cp_tail:
                 forward_batch.attn_cp_metadata = tail.cp_metadata
@@ -4849,9 +4866,7 @@ class DeepseekV4Model(nn.Module):
             if capture_dspark:
                 pd_aux_hidden = (
                     [
-                        gather_output(
-                            aux, self.cp_size, forward_batch, stream
-                        )
+                        gather_output(aux, self.cp_size, forward_batch, stream)
                         for aux in pd_aux_hidden
                     ]
                     if isinstance(pd_aux_hidden, list)
@@ -4888,21 +4903,15 @@ class DeepseekV4Model(nn.Module):
 
 def _should_disable_v41_vision_for_hcu(config: DeepSeekV4Config) -> bool:
     if not (
-        _is_hcu
-        and config.model_type == "deepseek_v41"
-        and config.vision_n_layers > 0
+        _is_hcu and config.model_type == "deepseek_v41" and config.vision_n_layers > 0
     ):
         return False
 
     # PD and HCU prefill CP keep the tower: prefill CP embeds images on the
     # full batch before its split.
     parallel = get_parallel()
-    return (
-        parallel.pp_group.world_size != 1
-        or not (
-            get_moe_a2a_backend().is_none()
-            or get_moe_a2a_backend().is_deepep()
-        )
+    return parallel.pp_group.world_size != 1 or not (
+        get_moe_a2a_backend().is_none() or get_moe_a2a_backend().is_deepep()
     )
 
 
@@ -4935,6 +4944,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
+        channelwise_fp8.configure_checkpoint(quant_config, config)
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.determine_num_fused_shared_experts()
         self.vision = None
@@ -4945,8 +4955,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 (get_parallel().attn_cp_size != 1 and not _is_hcu)
                 or get_parallel().pp_group.world_size != 1
                 or not (
-                    get_moe_a2a_backend().is_none()
-                    or get_moe_a2a_backend().is_deepep()
+                    get_moe_a2a_backend().is_none() or get_moe_a2a_backend().is_deepep()
                 )
             ):
                 raise ValueError(
@@ -4977,6 +4986,12 @@ class DeepseekV4ForCausalLM(nn.Module):
                 )
         else:
             self.lm_head = PPMissingLayer()
+        if channelwise_fp8.enabled(quant_config) and self.pp_group.is_last_rank:
+            if config.tie_word_embeddings:
+                raise ValueError(
+                    "Channelwise FP8 LM head does not support tied embeddings"
+                )
+            channelwise_fp8.install(self.lm_head)
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
         get_attn_tp_context().init_context(config.q_lora_rank, is_dsa=True)
@@ -5595,7 +5610,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
         # while the layer allocated an FP8 parameter (or vice versa) fails the
         # weight loader's dtype check.
-        if not (self.wo_a_fp8 or use_npu_arch35_mxfp8_wo_a(self.quant_config)):
+        if not (
+            self.wo_a_fp8
+            or channelwise_fp8.enabled(self.quant_config)
+            or use_npu_arch35_mxfp8_wo_a(self.quant_config)
+        ):
             weights = _prepare_deepseek_v4_weights(weights, self.quant_config)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
