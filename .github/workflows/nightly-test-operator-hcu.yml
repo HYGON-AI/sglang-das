@@ -46,7 +46,7 @@ jobs:
       - name: 安装 optest
         run: |
           PYPI_HOST=$(echo "${PYPI_URL}" | sed -E 's#^https?://##; s#:.*##')
-          pip install optest 'CInotificate>=0.0.34' \
+          pip install optest 'CInotificate>=0.0.35' \
             -i "${PYPI_URL}/nightly/dtk2604/+simple/" \
             --trusted-host "${PYPI_HOST}"
 
@@ -84,6 +84,24 @@ jobs:
             operator_status=ci_pass
           else
             operator_status=ci_fail
+          fi
+          if [ "$operator_status" = ci_pass ]; then
+            if ! python3 - <<'PY'
+          import json
+          from optest.config import CONFIG_PATH
+
+          with open(CONFIG_PATH, encoding='utf-8') as source:
+              config = json.load(source)
+          with open('/op_test_output/total_output.json', encoding='utf-8') as source:
+              report = json.load(source)
+          expected = {name for name, settings in config.items() if settings.get('enabled', True)}
+          reported = [item.get('op_name') for item in report.get('operators', [])]
+          if not expected or len(reported) != len(expected) or set(reported) != expected:
+              raise SystemExit(f'Operator result coverage incomplete: expected={sorted(expected)}, reported={reported}')
+          PY
+            then
+              operator_status=ci_fail
+            fi
           fi
           CInotificate --notificate_type op_daily_display --record \
             --ci_accelerators BW1100 \
