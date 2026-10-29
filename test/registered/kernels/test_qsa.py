@@ -806,6 +806,7 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
                 torch.zeros(15, dtype=torch.int32),
                 torch.zeros(15, dtype=torch.int32),
                 torch.tensor([15], dtype=torch.int32),
+                0,
             ),
         )
         indexer = SimpleNamespace(
@@ -825,7 +826,7 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
                     rope_rows=rope.numel(),
                 )
             ),
-            select_prefill_tokens=lambda q, keys, starts, ends, logical, lengths: (
+            select_prefill_tokens=lambda q, keys, starts, ends, logical, lengths, max_span=None: (
                 q.squeeze(1)
             ),
         )
@@ -1438,7 +1439,7 @@ class _DispatchIndexer:
         rows = hidden_states.shape[0]
         return torch.zeros(rows, 4, 128), torch.zeros(rows, 1, 128), False
 
-    def select_prefill_tokens(self, *args):
+    def select_prefill_tokens(self, *args, **kwargs):
         self.selected = "prefill"
         return torch.tensor([1])
 
@@ -1480,6 +1481,7 @@ class _DispatchMetadata:
             torch.zeros(1, dtype=torch.int32),
             torch.ones(1, dtype=torch.int32),
             torch.ones(1, dtype=torch.int32),
+            1,
         )
 
     @staticmethod

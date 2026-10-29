@@ -224,6 +224,8 @@ def prepare_for_draft(
     draft_model_runner: ModelRunner,
     topk: int,
     num_steps: int,
+    *,
+    defer_device_metadata: bool = False,
 ):
 
     if not batch.forward_mode.is_idle():
@@ -307,7 +309,14 @@ def prepare_for_draft(
         if draft_model_runner.spec_algorithm.is_standalone()
         else CaptureHiddenMode.LAST
     )
-    draft_input.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
+    # Draft steps increment positions in-place; keep them independent of
+    # committed sequence lengths. For a single chain a clone avoids the
+    # repeat_interleave index construction.
+    draft_input.positions = (
+        batch.seq_lens.clone()
+        if topk == 1
+        else batch.seq_lens.repeat_interleave(topk, dim=0)
+    )
     forward_batch = ForwardBatch.init_new(
         batch,
         draft_model_runner,
@@ -315,10 +324,14 @@ def prepare_for_draft(
         return_hidden_states_before_norm=(
             getattr(draft_model_runner.model_config, "hc_hidden_size", None) is not None
         ),
+        # Replay owns the persistent DP count buffers, just like draft extend.
+        defer_device_metadata=defer_device_metadata,
     )
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
+    if not can_run_decode_cuda_graph:
+        forward_batch.materialize_deferred_device_metadata(draft_model_runner.device)
     return forward_batch, can_run_decode_cuda_graph
 
 
