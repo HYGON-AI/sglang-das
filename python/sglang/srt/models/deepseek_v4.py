@@ -4847,6 +4847,13 @@ def _is_quark_checkpoint(config: DeepSeekV4Config) -> bool:
     return quantization_config.get("quant_method") == "quark"
 
 
+def _v41_vision_supports_moe_a2a() -> bool:
+    # Images are embedded before the first MoE layer, so the A2A backend only
+    # sees ordinary hidden states; listed backends are the validated ones.
+    backend = get_moe_a2a_backend()
+    return backend.is_none() or backend.is_deepep() or (
+        (_is_cuda or _is_hcu) and backend.is_megamoe()
+    )
 
 
 def _should_disable_v41_vision_for_hcu(config: DeepSeekV4Config) -> bool:
@@ -4858,9 +4865,7 @@ def _should_disable_v41_vision_for_hcu(config: DeepSeekV4Config) -> bool:
     # PD and HCU prefill CP keep the tower: prefill CP embeds images on the
     # full batch before its split.
     parallel = get_parallel()
-    return parallel.pp_group.world_size != 1 or not (
-        get_moe_a2a_backend().is_none() or get_moe_a2a_backend().is_deepep()
-    )
+    return parallel.pp_group.world_size != 1 or not _v41_vision_supports_moe_a2a()
 
 
 
@@ -4906,7 +4911,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             logger.info(
                 "Disabling the DeepSeek-V4.1 vision tower for this HCU text "
                 "serving topology; the V4.1 vision path does not support PP "
-                "or MoE A2A backends other than none/DeepEP."
+                "or MoE A2A backends other than none/DeepEP/MegaMoE."
             )
             config.vision_n_layers = 0
 
@@ -4926,15 +4931,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             if (
                 (get_parallel().attn_cp_size != 1 and not _is_hcu)
                 or get_parallel().pp_group.world_size != 1
-                or not (
-                    get_moe_a2a_backend().is_none()
-                    or get_moe_a2a_backend().is_deepep()
-                    or (_is_cuda and get_moe_a2a_backend().is_megamoe())
-                )
+                or not _v41_vision_supports_moe_a2a()
             ):
                 raise ValueError(
-                    "V4.1 vision supports TP/EP/DP without PP, CP only on HCU; "
-                    "MoE A2A requires none, DeepEP or CUDA MegaMoE"
+                    "V4.1 vision supports TP/EP/DP with none, DeepEP or MegaMoE A2A, "
+                    "without PP, and CP only on HCU"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
