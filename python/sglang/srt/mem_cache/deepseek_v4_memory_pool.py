@@ -2440,7 +2440,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         if freqs_cis is not None:
-            assert compress_kv_pool.kv_layout is KVLayout.V41_FP4, (
+            # HCU also fuses RoPE + fake FP4 into the V4 fp8 store (lightop
+            # dsv41_rope_fake_quant_store, see fused_store_cache).
+            assert compress_kv_pool.kv_layout is KVLayout.V41_FP4 or (
+                _is_hcu and compress_kv_pool.kv_layout is KVLayout.V4
+            ), (
                 "in-kernel RoPE is for the fp4 cache; fp8 caches take the finished value"
             )
         return compress_kv_pool.set_key_buffer_fused(
