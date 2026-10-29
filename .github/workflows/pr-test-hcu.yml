@@ -187,8 +187,7 @@ jobs:
 
           hcu_path_pattern='^(\.github/workflows/(pr-test-hcu|pr-gate|release-pr-hcu|hcu-full-enabled|release-pypi-nightly-hcu)\.yml|scripts/ci/hcu/|python/|rust/|test/run_suite\.py|test/registered/|python/sglang/kernels/aot/|sgl-model-gateway/|requirements_hcu\.txt$)'
 
-          # Consume the full list: grep -q can cause SIGPIPE under pipefail.
-          if grep -E "${hcu_path_pattern}" <<< "${changed_files}" > /dev/null; then
+          if echo "${changed_files}" | grep -Eq "${hcu_path_pattern}"; then
             echo "hcu=true" >> "${GITHUB_OUTPUT}"
             echo "auto_run_ci=true" >> "${GITHUB_OUTPUT}"
           else
@@ -259,11 +258,11 @@ jobs:
           wheel_required=false
           gateway_wheel_required=false
 
-          if grep -E '^(\.github/workflows/release-pr-hcu\.yml$|python/sglang/kernels/aot/|requirements_hcu\.txt$|python/|rust/)' <<< "${changed_files}" > /dev/null; then
+          if echo "${changed_files}" | grep -Eq '^(\.github/workflows/release-pr-hcu\.yml$|python/sglang/kernels/aot/|requirements_hcu\.txt$|python/|rust/)'; then
             wheel_required=true
           fi
 
-          if grep -E '^sgl-model-gateway/' <<< "${changed_files}" > /dev/null; then
+          if echo "${changed_files}" | grep -Eq '^sgl-model-gateway/'; then
             wheel_required=true
             gateway_wheel_required=true
           fi
@@ -413,17 +412,11 @@ jobs:
           echo "image=${image}" >> "${GITHUB_OUTPUT}"
           echo "continue_on_error_flag=${continue_on_error_flag}" >> "${GITHUB_OUTPUT}"
 
-      - name: Set up Python for HCU validation
-        if: github.event_name != 'workflow_dispatch'
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
       - name: Verify HCU registration
         if: github.event_name != 'workflow_dispatch'
         run: |
           cd "${HCU_CI_CHECKOUT_DIR}"
-          python scripts/ci/hcu/verify_hcu_registration.py
+          python3.9 scripts/ci/hcu/verify_hcu_registration.py || python3 scripts/ci/hcu/verify_hcu_registration.py
 
       - name: Setup HCU validation container
         if: github.event_name == 'workflow_dispatch'
@@ -780,26 +773,11 @@ jobs:
           # Temporarily excluded from the required HCU PR partition:
           # - test_server_args.py: HiCache expectations are stale after 1b9d81cc0.
           # - test_triton_scaled_mm.py: deterministic BW1100 int8 numeric mismatch.
-          # Include files must exist in the PR checkout: branches that lack a
-          # release-only test (e.g. test_profile_merger_http_api.py exists only
-          # on release/**) would otherwise abort run_suite.py at startup.
-          optional_include_files=(
-            registered/unit/managers/test_profile_merger_http_api.py
-          )
-          optional_include_args=()
-          for f in "${optional_include_files[@]}"; do
-            if [ -f "${HCU_CI_CHECKOUT_DIR}/test/$f" ]; then
-              optional_include_args+=(--include-file "$f")
-            else
-              echo "[stage-b] skip missing optional include: $f"
-            fi
-          done
           bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" -w /sglang-checkout/test --container-name "${HCU_CI_CONTAINER_NAME}" \
             -e SGLANG_HCU_RERANKER_MODEL="${SGLANG_HCU_RERANKER_MODEL}" -- \
             python3 run_suite.py \
               --hw hcu \
               --suite stage-b-test-1-hcu-small \
-              "${optional_include_args[@]}" \
               --include-file registered/hcu/interface/test_hcu_stage_b_flow_0.py \
               --include-file registered/hcu/interface/test_hcu_stage_b_flow_1.py \
               --include-file registered/unit/observability/test_metrics_utils.py \
@@ -819,6 +797,7 @@ jobs:
               --include-file registered/attention/test_create_kvindices.py \
               --include-file registered/layers/mamba/test_causal_conv1d.py \
               --include-file registered/unit/managers/test_io_struct.py \
+              --include-file registered/unit/managers/test_profile_merger_http_api.py \
               --include-file registered/unit/mem_cache/test_radix_cache_unit.py \
               --include-file registered/ops/test_repeat_interleave.py \
               --include-file registered/openai_server/basic/test_serving_completions.py \
