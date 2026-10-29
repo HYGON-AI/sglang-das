@@ -4180,6 +4180,9 @@ class DeepseekV4Model(nn.Module):
         if _is_cuda:
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
+        # Batch-invariant by design (see fused_boundary_allowed): the layer loop below
+        # must not re-evaluate it, and it must stay False whenever a tail is in play.
+        fused_boundary = _is_hip and _hip.fused_boundary_allowed(forward_batch, tail)
         for i in range(self.start_layer, end_layer):
             if _is_cuda:
                 layer = self.layers[i]
@@ -4293,7 +4296,7 @@ class DeepseekV4Model(nn.Module):
                         input_ids_global=input_ids_global,
                     )
                 else:
-                    if _is_hip and self.layers[i].hc_boundary_fused:
+                    if fused_boundary and self.layers[i].hc_boundary_fused:
                         state = forward_layer_fused_boundary(
                             self,
                             i,
