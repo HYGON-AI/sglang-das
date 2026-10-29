@@ -637,6 +637,9 @@ def _run_mega_routed(
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
     else:
+        # An empty rank still joins the per-layer LPLB count all-reduce.
+        if get_exec().moe.ep_dispatch_algorithm == "lp":
+            moe.topk.empty_topk_output(hidden_states.device, layer_id=moe.layer_id)
         topk_ids = None
         topk_weights = None
 

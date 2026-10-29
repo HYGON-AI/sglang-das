@@ -2928,7 +2928,16 @@ def _post_process_topk_ids(
         # expert-location mapping exists. With a trivial placement and EPLB off
         # the map is identity so the remap can be skipped safely.
         if remap_info is not None and not hip_deepep_postprocessed and not recorder_was_fused:
-            topk_ids = topk_ids_logical_to_physical(topk_ids, remap_info)
+            log2phy_prob = None
+            if remap_info.ep_dispatch_algorithm == "lp":
+                # Outside compiled regions: the solver all-reduces counts.
+                from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+                solver = get_global_lplb_solver(layer_id)
+                if solver is None:
+                    raise RuntimeError(f"Missing LPLB solver for layer {layer_id}")
+                log2phy_prob = solver.solve(topk_ids)
+            topk_ids = topk_ids_logical_to_physical(topk_ids, remap_info, log2phy_prob)
         # NOTE (HIP): padded-token routing-weight zeroing is deferred to the
         # single pass at the end of this function (gated by SGLANG_MORI_NO_PAD_MASK).
         # That final pass re-zeros after any shared-expert append/remap, so a
