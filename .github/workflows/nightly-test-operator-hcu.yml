@@ -46,11 +46,12 @@ jobs:
       - name: 安装 optest
         run: |
           PYPI_HOST=$(echo "${PYPI_URL}" | sed -E 's#^https?://##; s#:.*##')
-          pip install optest cinotificate \
+          pip install optest 'CInotificate>=0.0.34' \
             -i "${PYPI_URL}/nightly/dtk2604/+simple/" \
             --trusted-host "${PYPI_HOST}"
 
       - name: 运行 optest
+        id: run_optest
         timeout-minutes: 360
         env:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
@@ -75,8 +76,19 @@ jobs:
 
       - name: 上报 DashHub 记录
         if: always()
+        env:
+          IMAGE_TAG: ${{ inputs.docker_image }}
+          OPTEST_OUTCOME: ${{ steps.run_optest.outcome }}
         run: |
-          IMAGE_TAG=${{ inputs.docker_image }} CInotificate --notificate_type op_daily_display --record --ci_accelerators BW1100 --operator_result /op_test_output/total_output.json -l DEBUG
+          if [ "$OPTEST_OUTCOME" = success ]; then
+            operator_status=ci_pass
+          else
+            operator_status=ci_fail
+          fi
+          CInotificate --notificate_type op_daily_display --record \
+            --ci_accelerators BW1100 \
+            --operator_result /op_test_output/total_output.json \
+            --operator_test_status "$operator_status" -l DEBUG
 
       - name: 收集算子测试结果
         if: always()
