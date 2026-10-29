@@ -93,9 +93,13 @@ def _lplb_waterfill_kernel(
             mass = tl.load(counts_ptr + e)
             if mass > 0:
                 col = tl.load(rep_colrank_ptr + i * C + offs_c)
-                per_rank = tl.load(share_ptr + i * M + offs_m) / tl.load(rep_copies_ptr + i * M + offs_m)
+                sh = tl.load(share_ptr + i * M + offs_m)
+                per_rank = sh / tl.load(rep_copies_ptr + i * M + offs_m)
                 val = tl.sum(tl.where(col[:, None] == offs_m[None, :], per_rank[None, :], 0.0), axis=1)
-                tl.store(out_ptr + e * out_stride + offs_c, val / mass, mask=col >= 0)
+                # Normalise by the poured total, not by mass: level - rest
+                # cancels rank loads of ~1e4 pairs in fp32, which leaves a
+                # small expert's shares off its count by up to ~0.5%.
+                tl.store(out_ptr + e * out_stride + offs_c, val / tl.sum(sh), mask=col >= 0)
 
 
 class DeviceWaterfill:
