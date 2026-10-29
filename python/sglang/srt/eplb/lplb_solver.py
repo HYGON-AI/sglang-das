@@ -22,8 +22,10 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+import numpy as np
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_resources
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,9 @@ _LPLB_SUPPORTED_MODEL_ARCHS: frozenset[str] = frozenset(
         "MistralLarge3ForCausalLMEagle",
         "Glm4MoeLiteForCausalLM",
         "GlmMoeDsaForCausalLM",
+        # MegaMoE empty ranks join the solver through empty_topk_output.
+        "DeepseekV4ForCausalLM",
+        "DeepseekV41ForCausalLM",
     }
 )
 
@@ -73,6 +78,82 @@ def set_global_lplb_solver(layer_id: int, solver: LPLBSolver):
 def clear_global_lplb_solvers():
 
     get_resources().lplb_solvers.clear()
+
+
+
+class _HostWaterfill:
+    """Per-batch LPLB replica split solved on the host by water-filling.
+
+    HIP has no cuBLASDx IPM backend. The LP keeps every single-copy expert on
+    its rank and splits each replicated expert's tokens over its replicas to
+    minimise the peak rank load; Gauss-Seidel water-filling of the replicated
+    experts (largest first) reaches that optimum within ~0.2% in 3 passes on
+    DSV4.1 prefill routing, at ~0.2 ms of host time per layer. Reading the
+    counts synchronises the stream, so this suits prefill, not graph decode.
+    """
+
+    def __init__(self, phy2log: torch.Tensor, log2phy: torch.Tensor, num_gpus: int):
+        phy2log = phy2log.cpu().to(torch.int64)
+        log2phy = log2phy.cpu().to(torch.int64)
+        self.num_gpus = num_gpus
+        self.passes = envs.SGLANG_LPLB_HOST_PASSES.get()
+        self.min_pairs = envs.SGLANG_LPLB_HOST_MIN_PAIRS.get()
+        local = phy2log.numel() // num_gpus
+        valid = log2phy >= 0
+        num_valid = valid.sum(-1)
+        # Even split over replicas, for small batches and zero-count experts.
+        self.uniform = valid.float() / num_valid.clamp_min(1).unsqueeze(-1)
+        self._uniform_dev = None
+        single = torch.nonzero(num_valid == 1).flatten()
+        self.single_log = single.numpy()
+        self.single_rank = (log2phy[single, 0] // local).numpy()
+        # (logical id, distinct replica ranks, rank index per replica column,
+        #  replica copies per rank)
+        self.replicated = []
+        for e in torch.nonzero(num_valid > 1).flatten().tolist():
+            col_rank = (log2phy[e, : int(num_valid[e])] // local).tolist()
+            ranks = sorted(set(col_rank))
+            self.replicated.append(
+                (e, ranks, [ranks.index(r) for r in col_rank], [col_rank.count(r) for r in ranks])
+            )
+        self._prob = torch.empty(self.uniform.shape, dtype=torch.float32, pin_memory=True)
+
+    def solve(self, global_counts: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        if self._uniform_dev is None:
+            self._uniform_dev = self.uniform.to(out.device)
+        counts = global_counts.cpu().numpy()
+        if not self.replicated or counts.sum() < self.min_pairs:
+            out.copy_(self._uniform_dev)
+            return out
+        load = np.bincount(
+            self.single_rank, weights=counts[self.single_log], minlength=self.num_gpus
+        ).tolist()
+        mass = [float(counts[e]) for e, _, _, _ in self.replicated]
+        share = [[0.0] * len(ranks) for _, ranks, _, _ in self.replicated]
+        order = sorted(range(len(mass)), key=lambda i: -mass[i])
+        for _ in range(self.passes):
+            for i in order:
+                ranks, sh = self.replicated[i][1], share[i]
+                rest = [load[r] - s for r, s in zip(ranks, sh)]
+                by_load = sorted(range(len(ranks)), key=rest.__getitem__)
+                filled, level = 0.0, 0.0
+                for k, j in enumerate(by_load, 1):
+                    filled += rest[j]
+                    level = (mass[i] + filled) / k
+                    if k == len(by_load) or level <= rest[by_load[k]]:
+                        break
+                for j, r in enumerate(ranks):
+                    new = max(0.0, level - rest[j])
+                    load[r] += new - sh[j]
+                    sh[j] = new
+        prob = self._prob.numpy()
+        prob[:] = self.uniform.numpy()
+        for i, (e, _, col_idx, copies) in enumerate(self.replicated):
+            if mass[i] > 0:
+                for col, k in enumerate(col_idx):
+                    prob[e, col] = share[i][k] / copies[k] / mass[i]
+        out.copy_(self._prob, non_blocking=True)
+        return out
 
 
 class LPLBSolver:
@@ -206,9 +287,26 @@ class LPLBSolver:
         # real request. No-op when the fused backend is unavailable.
         nc = self.A_base.shape[0]
         nv = self.A_base.shape[1] + 1  # +1 for Big-M column added in solve()
-        from sglang.kernels.ops.lplb.torch_solver import warmup as _ipm_warmup
+        # HIP has no cuBLASDx IPM backend: split replicas by water-filling,
+        # on the stream by default (the host variant syncs every layer).
+        self._hip_solver = None
+        if torch.version.hip:
+            if envs.SGLANG_LPLB_HIP_SOLVER.get() == "host":
+                self._hip_solver = _HostWaterfill(phy2log, self.log2phy, num_gpus)
+            else:
+                from sglang.srt.eplb.lplb_hip_waterfill import DeviceWaterfill
 
-        _ipm_warmup(nc, nv, num_iters=5, device=device)
+                self._hip_solver = DeviceWaterfill(
+                    phy2log,
+                    self.log2phy,
+                    num_gpus,
+                    passes=envs.SGLANG_LPLB_HOST_PASSES.get(),
+                    min_pairs=envs.SGLANG_LPLB_HOST_MIN_PAIRS.get(),
+                )
+        if self._hip_solver is None:
+            from sglang.kernels.ops.lplb.torch_solver import warmup as _ipm_warmup
+
+            _ipm_warmup(nc, nv, num_iters=5, device=device)
 
         # Pre-compute A_base row sum (used in every prep call).
         self._A_base_row_sum = self.A_base.sum(dim=1).contiguous()  # (NC,)
@@ -285,6 +383,8 @@ class LPLBSolver:
             prep_lp_inputs → solve_ipm → extract_log2phy_prob
         Raises if the JIT CUDA backend is unavailable.
         """
+        if self._hip_solver is not None:
+            return self._hip_solver.solve(global_counts, self._log2phy_prob)
         from sglang.kernels.ops.lplb import cuda_solver
 
         cuda_solver.prep_lp_inputs(

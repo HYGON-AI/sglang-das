@@ -1311,6 +1311,11 @@ class Envs:
     SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL = EnvInt(0)
     # Fixed-layout replica probabilities; bypass per-forward LP and all-reduce.
     SGLANG_EXPERIMENTAL_LPLB_STATIC_PROBS = EnvStr(None)
+    # HIP per-batch LPLB: water-filling solver (device | host), its passes, and
+    # the routed (token, expert) pairs per layer below which replicas split evenly.
+    SGLANG_LPLB_HIP_SOLVER = EnvStr("host")  # device kernel fails its unit test (rows do not sum to 1)
+    SGLANG_LPLB_HOST_PASSES = EnvInt(4)
+    SGLANG_LPLB_HOST_MIN_PAIRS = EnvInt(6144)
     # Chunk size for the rebalance expert-weight P2P exchange; set
     # >= num_physical_experts to submit a single batch_isend_irecv.
     SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvIntWithAlias(
