@@ -25,6 +25,7 @@ from sglang.srt.utils.common import is_gfx1250_supported
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
+_is_hcu = is_hcu()
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 
@@ -34,6 +35,7 @@ if _is_hip:
     )
     from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
         hc_boundary_fused_deferred,
+        rmsnorm_with_sinkhorn,
     )
 if _is_gfx95_supported:
     from sglang.srt.models.deepseek_common.amd.deepseek_v4_gfx95_dense import (
@@ -653,9 +655,44 @@ def forward_hc_pre_from_prev_fused_boundary(
 
 def _gfx95_dense_post_attention_norm(layer, x: torch.Tensor, coefficients):
     """layer.post_attention_layernorm(x) hosting the pending reduce + sinkhorn where
-    the gfx950 norm kernel is available; the module norm plus a standalone reduce +
+    the gfx950 or HCU norm launch can; the module norm plus a standalone reduce +
     sinkhorn elsewhere."""
     if _is_gfx95_supported:
         return post_attention_norm(layer, x, coefficients)
+    if _is_hcu:
+        return norm_hosting_sinkhorn(layer.post_attention_layernorm, x, coefficients)
     coefficients.materialize()
     return layer.post_attention_layernorm(x)
+
+
+def norm_can_host_sinkhorn(norm, x: torch.Tensor, coefficients) -> bool:
+    """Whether the Triton row norm may host this boundary's reduce + sinkhorn.
+
+    Mirrors the guards of ``rmsnorm_with_sinkhorn`` (2-D rows, weight dtype, K % 32 == 0)
+    and excludes the norm variants that round differently or normalise over a prefix.
+    Keeping them in one place stops a new ``RMSNorm`` knob from being honoured by the
+    module norm while silently ignored by the hosting launch.
+    """
+    return not (
+        coefficients.materialized
+        or x.dim() != 2
+        or x.dtype != norm.weight.dtype
+        or x.shape[-1] % 32 != 0
+        or norm.variance_size_override is not None
+        or norm.cast_x_before_out_mul
+    )
+
+
+def norm_hosting_sinkhorn(norm, x: torch.Tensor, coefficients) -> torch.Tensor:
+    """norm(x) with the boundary's pending reduce + sinkhorn in the same launch; the
+    Triton row norm rounds x * rstd * w to bf16 once. Shapes it does not cover take
+    the module norm after a standalone reduce + sinkhorn."""
+    # The import above is `_is_hip`-guarded; fail with a clear message instead of NameError.
+    assert _is_hip, "the sinkhorn-hosting norm is a ROCm kernel"
+    if not norm_can_host_sinkhorn(norm, x, coefficients):
+        coefficients.materialize()
+        return norm(x)
+    _, out = rmsnorm_with_sinkhorn(
+        x, norm.weight.data, norm.variance_epsilon, coefficients, fake_quant=False
+    )
+    return out

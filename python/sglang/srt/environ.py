@@ -1091,6 +1091,9 @@ class Envs:
     SGLANG_KV_LAYOUT_HCU_FA = EnvBool(True)
     SGLANG_USE_LIGHTOP = EnvBool(False)
     SGLANG_HCU_HC_MIX_STATS_OPT = EnvBool(True)
+    # Opt-in: DSV4.1 decode/verify on HCU runs the Triton fused mHC boundary instead of
+    # lightop stats + aiter post + combine; prefill keeps the lightop path.
+    SGLANG_HCU_FUSED_MHC_BOUNDARY = EnvBool(False)
     SGLANG_USE_LIGHTOP_MOE_SUM_MUL_ADD = EnvBool(False)
     SGLANG_USE_OPT_CAT = EnvBool(False)
     SGLANG_USE_FUSED_MLA_CAT = EnvBool(False)
