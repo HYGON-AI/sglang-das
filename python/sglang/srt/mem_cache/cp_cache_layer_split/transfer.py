@@ -43,7 +43,9 @@ def configure_v4_transfer(kv_args, pool, draft_pool):
             for kind, layer in draft_pool.get_kv_transfer_layout()
         ]
     states = []
-    swa_seen = False
+    swa_seen = (
+        pool.request_window is not None and not pool.get_state_transfer_layout()
+    )
     for state_type, ptrs in zip(kv_args.state_types, kv_args.state_data_ptrs):
         if state_type == StateType.SWA and not swa_seen:
             layout = pool.get_state_transfer_layout()
@@ -55,6 +57,8 @@ def configure_v4_transfer(kv_args, pool, draft_pool):
             ]
         elif state_type == StateType.DSV4_REQUEST_STATE:
             layout = pool.get_request_state_transfer_layout()
+        elif state_type == StateType.DSV41_SWA_WINDOW:
+            layout = pool.get_swa_window_transfer_layout()
         else:
             layout = []
         if layout and len(layout) != len(ptrs):

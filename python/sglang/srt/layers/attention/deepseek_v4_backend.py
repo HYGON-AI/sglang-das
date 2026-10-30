@@ -1765,6 +1765,7 @@ class DeepseekV4AttnBackend(
             dspark_block_size=dspark_block_size,
             dspark_swa_buffers=dspark_swa_buffers,
             num_tokens=num_write_tokens if cp_active else None,
+            window_num_tokens=num_tokens,
             swa_replay_start=swa_replay_start,
             num_groups=len(extend_seq_lens_cpu),
         )
@@ -4894,7 +4895,7 @@ class DeepseekV4AttnBackend(
         if self.token_to_kv_pool.request_window is not None:
             layout = metadata.core_attn_metadata.request_window_layout
             self.token_to_kv_pool.request_window.activate(layout)
-            return layout.write_loc
+            return metadata.core_attn_metadata.swa_out_cache_loc
         if isinstance(metadata, DSV4Metadata) and metadata.late_layer_tail is not None:
             # The tail's q rows are a subset of the extend, so the full
             # out_cache_loc below would be the wrong length; the tail owns its own.
@@ -5355,6 +5356,10 @@ class DeepseekV4AttnBackend(
             window is not None
             and not self.is_dspark_draft
             and not forward_batch.forward_mode.is_idle()
+            and (
+                not is_cp_cache_layer_split_deepseek_v4_pool(self.token_to_kv_pool)
+                or self.token_to_kv_pool._owns_swa_layer_id(layer.layer_id)
+            )
         ):
             window.commit(self.token_to_kv_pool._swa_local_layer_id(layer.layer_id))
         return result
@@ -5650,6 +5655,7 @@ class DeepseekV4AttnBackend(
             if forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
                 if (
                     self.forward_metadata.late_layer_tail is None
+                    and token_to_kv_pool.request_window is None
                     and _should_use_sparse_prefill(
                         q, forward_batch, allow_cp=self.is_dsv41
                     )
@@ -6054,6 +6060,7 @@ class DeepseekV4AttnBackend(
         swa_replay_start: Optional[torch.Tensor] = None,
         num_groups: Optional[int] = None,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        window_num_tokens: Optional[int] = None,
     ) -> DSV4AttnMetadata:
         small_metadata = (
             not is_prefill
@@ -6087,28 +6094,50 @@ class DeepseekV4AttnBackend(
 
         raw_positions = prep.positions_casual
         request_layout = None
+        window_write_loc = None
         if self.token_to_kv_pool.request_window is not None:
             from sglang.srt.mem_cache.dsv41_request_window import window_layout
 
+            # Build the request ring from real GLOBAL rows. CP query tables
+            # are sharded later; execution padding must never commit tags.
+            live = (
+                raw_positions.shape[0]
+                if window_num_tokens is None
+                else window_num_tokens
+            )
+            window_positions = raw_positions[:live]
+            window_req = req_pool_indices_repeated[:live]
+            window_floor = (
+                swa_replay_start[:live] if swa_replay_start is not None else None
+            )
             if self.encoder_replay:
-                starts = torch.ones_like(raw_positions, dtype=torch.bool)
+                starts = torch.ones_like(window_positions, dtype=torch.bool)
                 starts[1:] = (
-                    req_pool_indices_repeated[1:] != req_pool_indices_repeated[:-1]
+                    window_req[1:] != window_req[:-1]
                 )
                 offset = torch.arange(
-                    raw_positions.numel(), device=raw_positions.device
+                    window_positions.numel(), device=window_positions.device
                 )
                 group_first = torch.cummax(torch.where(starts, offset, 0), dim=0).values
-                swa_replay_start = raw_positions - (offset - group_first)
+                window_floor = window_positions - (offset - group_first)
             request_layout = window_layout(
-                req_pool_indices_repeated,
-                raw_positions,
+                window_req,
+                window_positions,
                 capacity=self.token_to_kv_pool.request_window.capacity,
-                floor=swa_replay_start,
+                floor=window_floor,
                 num_groups=num_groups,
             )
-            swa_page_indices = _pad_last_dim(request_layout.indices)
-            swa_topk_lengths = request_layout.lengths
+            swa_page_indices = _pad_tensor_to_size(
+                _pad_last_dim(request_layout.indices), raw_positions.shape[0], value=-1
+            )
+            swa_topk_lengths = _pad_tensor_to_size(
+                request_layout.lengths, raw_positions.shape[0], value=1
+            )
+            # Padded stores use a workspace-only sink, outside live/history
+            # rows. The ring commit still uses only layout.write_loc.
+            window_write_loc = _pad_tensor_to_size(
+                request_layout.write_loc, out_loc.shape[0], value=request_layout.size
+            )
         elif dspark_block_size is not None:
             assert (
                 self.is_dspark_draft
@@ -6164,9 +6193,7 @@ class DeepseekV4AttnBackend(
             present_ratios=self.present_ratios,
             low_ratios=self.low_ratios,
             request_window_layout=request_layout,
-            swa_out_cache_loc=(
-                request_layout.write_loc if request_layout is not None else None
-            ),
+            swa_out_cache_loc=window_write_loc,
         )
 
         if need_compress:

@@ -4665,7 +4665,10 @@ class DeepseekV4Model(nn.Module):
         )
         if dspark_layers_to_capture is None:
             dspark_layers_to_capture = self.dspark_layers_to_capture
-        capture_dspark = dspark_layers_to_capture is not None
+        capture_dspark = (
+            dspark_layers_to_capture is not None
+            and not forward_batch.encoder_swa_replay
+        )
         # Under CP-v2 the body returns rank-local hidden/aux rows; the CP runner
         # gathers them and finishes through DeepseekV4ForCausalLM.logits_from_body_output.
         use_packed_pd_aux = capture_dspark and self.pp_group.world_size == 1
@@ -5277,14 +5280,18 @@ class DeepseekV4ForCausalLM(nn.Module):
         """
         aux_hidden_states = None
         pd_aux_hidden_states = None
+        capture_aux_hidden_states = (
+            self.capture_aux_hidden_states and not forward_batch.encoder_swa_replay
+        )
         has_pd_hidden_capture = (
-            getattr(forward_batch, "pd_hidden_capture_layer_ids", None) is not None
+            not forward_batch.encoder_swa_replay
+            and getattr(forward_batch, "pd_hidden_capture_layer_ids", None) is not None
         )
         if has_pd_hidden_capture:
             hidden_states, pd_aux_hidden_states = hidden_states
-            if self.capture_aux_hidden_states:
+            if capture_aux_hidden_states:
                 aux_hidden_states = pack_aux_hidden_states(pd_aux_hidden_states)
-        elif self.capture_aux_hidden_states:
+        elif capture_aux_hidden_states:
             hidden_states, captured_aux_hidden_states = hidden_states
             aux_hidden_states = pack_aux_hidden_states(captured_aux_hidden_states)
             # Eager/static forward-batch wrappers can preserve the global
@@ -5299,7 +5306,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         logits_metadata = forward_batch
         tail = None
         if (
-            self.capture_aux_hidden_states
+            capture_aux_hidden_states
             and self.model.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
             # A mid-chunk prefill skipped the tail and returned full rows.

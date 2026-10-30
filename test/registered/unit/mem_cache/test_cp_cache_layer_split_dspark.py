@@ -235,7 +235,7 @@ class TestCpCacheLayerSplitDspark(CustomTestCase):
         self.assertFalse(draft.use_cp_cache_layer_split)
         self.assertEqual(draft.cp_draft_layers, 0)
 
-    def _transfer_args(self, rank=None):
+    def _transfer_args(self, rank=None, *, request_window=False):
         kv = []
         for ratio, sources in ((1, (20,)), (2, (2, 8, 14))):
             kv.extend(
@@ -267,10 +267,32 @@ class TestCpCacheLayerSplitDspark(CustomTestCase):
                 states=[[key for key, _ in entries] for entries in states],
             ),
         )
+        if request_window:
+            window = [
+                ((family, layer), size)
+                for family, size in (
+                    ("dsv41_swa_window_kv", 32768),
+                    ("dsv41_swa_window_tags", 2048),
+                )
+                for layer in swa_layers
+            ]
+            states = [states[1], window, states[2]]
+            args.state_types = [
+                StateType.DSV4_REQUEST_STATE,
+                StateType.DSV41_SWA_WINDOW,
+                StateType.SWA,
+            ]
+            args.state_item_lens = [[size for _, size in entries] for entries in states]
+            args.v4_transfer_metadata["states"] = [
+                [key for key, _ in entries] for entries in states
+            ]
         return args, [kv, *states]
 
-    def test_layer_split_handshake_matches_unsharded_decode(self):
-        peers = [self._transfer_args(rank) for rank in range(8)]
+    def _check_handshake(self, *, request_window):
+        peers = [
+            self._transfer_args(rank, request_window=request_window)
+            for rank in range(8)
+        ]
         gather = mock.Mock(return_value=[entries for _, entries in peers])
         with (
             mock.patch.object(
@@ -289,7 +311,7 @@ class TestCpCacheLayerSplitDspark(CustomTestCase):
                 create=True,
             ),
         ):
-            decode, _ = self._transfer_args()
+            decode, _ = self._transfer_args(request_window=request_window)
             expected = disagg_utils.get_dsv41_spec_layout(decode)
             self.assertEqual(
                 expected["kv_layer_ids"],
@@ -298,6 +320,23 @@ class TestCpCacheLayerSplitDspark(CustomTestCase):
             gather.assert_not_called()
             for args, _ in peers:
                 self.assertEqual(disagg_utils.get_dsv41_spec_layout(args), expected)
+
+    def test_layer_split_handshake_matches_unsharded_decode(self):
+        self._check_handshake(request_window=False)
+
+    def test_request_window_handshake_matches_unsharded_decode(self):
+        self._check_handshake(request_window=True)
+
+    def test_request_window_handshake_requires_paged_draft(self):
+        args, _ = self._transfer_args(request_window=True)
+        args.state_types[-1] = StateType.DSV4_REQUEST_STATE
+        with (
+            mock.patch.object(disagg_utils, "get_spec", return_value=SimpleNamespace(
+                speculative_algorithm="DSPARK", speculative_num_draft_tokens=6,
+            )),
+            self.assertRaisesRegex(RuntimeError, "target and draft SWA state"),
+        ):
+            disagg_utils.get_dsv41_spec_layout(args)
 
     def test_layer_split_handshake_rejects_page_abi_mismatch(self):
         peers = [self._transfer_args(rank) for rank in range(8)]

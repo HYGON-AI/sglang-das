@@ -34,6 +34,8 @@ class StateType(str, enum.Enum):
     SWA_RING = "swa_ring"
     # DeepSeek-V4 request-scoped compression state; preserve the legacy wire value.
     DSV4_REQUEST_STATE = "c128_state"
+    # A complete request-owned SWA ring plus its absolute-position tags.
+    DSV41_SWA_WINDOW = "dsv41_swa_window"
     # A block-scaled KV dtype keeps its per-block scales in buffers parallel to
     # K/V, one component per sub-pool so each carries the index payload of the
     # KV it describes (whole sequence for full attention, window for SWA).

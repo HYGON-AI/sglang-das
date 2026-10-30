@@ -1288,7 +1288,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.request_window = RequestWindow(
                 make_window_pool,
                 num_slots=self.num_req_slots,
-                layers=stage_layer_num,
+                layers=swa_layer_num,
                 page_size=swa_page_size,
                 capacity=self.sliding_window + (online_mtp_max_draft_tokens or 0),
                 workspace_rows=(self.num_req_slots + 1) * self.sliding_window
@@ -1391,7 +1391,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     @property
     def is_bf16_attention_kv_cache(self) -> bool:
-        return self._unified_kv or self.swa_kv_pool.is_bf16_attention_kv_cache
+        if self._unified_kv:
+            return True
+        pool = (
+            self.request_window.state
+            if self.request_window is not None
+            else self.swa_kv_pool
+        )
+        return pool.is_bf16_attention_kv_cache
 
     def get_unified_kv_rope(self, layer_id: int) -> torch.Tensor:
         self.wait_layer_transfer(layer_id)
@@ -1554,6 +1561,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             for layer_id, pool in enumerate(self.compress_state_pools)
             if pool is not None and pool.request_scoped
         ]
+
+    def get_swa_window_transfer_layout(self) -> List[Tuple[str, int]]:
+        if self.request_window is None:
+            return []
+        layer_ids = list(range(self._stage_start, self._stage_end))
+        return self.request_window.transfer_layout(layer_ids)
 
     def get_unified_swa_ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         # StateType.SWA_RING transfers [0, swa_pages) of each unified_kv layer;
@@ -2364,9 +2377,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 freqs_cis,
                 positions=positions,
             )
-            self.swa_kv_pool.set_key_buffer_fused(
-                self._swa_local_layer_id(layer_id), swa_loc, kv
-            )
+            if self.request_window is not None:
+                self.set_swa_key_buffer_radix_fused(layer_id, swa_loc, kv)
+            else:
+                self.swa_kv_pool.set_key_buffer_fused(
+                    self._swa_local_layer_id(layer_id), swa_loc, kv
+                )
             return
         if self.uniform_fp8:
             assert q is None, "uniform FP8 store does not fuse query RoPE"
@@ -2400,6 +2416,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         cache_k: torch.Tensor,
         eps: float = 1e-8,
     ) -> None:
+        if self.request_window is not None:
+            # The paged LightOp setter owns swa_kv_pool; request-window writes
+            # target a shared scratch buffer instead of that persistent pool.
+            return self.set_swa_key_buffer_radix_fused(layer_id, swa_loc, cache_k)
         return self.swa_kv_pool.set_key_buffer_lightop_fused(
             self._swa_local_layer_id(layer_id), swa_loc, cache_k, eps
         )

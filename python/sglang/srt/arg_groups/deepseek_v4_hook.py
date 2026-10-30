@@ -242,23 +242,45 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             "DeepSeek-V4.1 TRT-LLM requires --cuda-graph-backend-prefill disabled"
         )
     if cfg.enable_encoder_swa_bounded_replay:
+        hcu_layer_split_replay = (
+            _is_hcu
+            and cfg.enable_cp_cache_layer_split
+            and cfg.disaggregation_mode == "prefill"
+            and cfg.enable_prefill_cp
+            and cfg.cp_strategy == "interleave"
+        )
+        hcu_pd_replay = (
+            _is_hcu
+            and cfg.disaggregation_mode in ("prefill", "decode")
+            and cfg.disaggregation_transfer_backend == "mooncake"
+        )
         incompatible = (
             (
-                "hardware other than CUDA or gfx950",
+                "hardware other than CUDA, gfx950 or HCU",
                 not (
                     get_platform().is_cuda
                     or (get_platform().is_hip and is_gfx95_supported())
+                    or _is_hcu
                 ),
             ),
             (
                 "prefill CUDA graphs",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            ("DP attention", attn_dp_enabled_of(cfg)),
-            ("context parallelism", cfg.attn_cp_size > 1),
+            (
+                "prefill DP attention",
+                attn_dp_enabled_of(cfg) and cfg.disaggregation_mode != "decode",
+            ),
+            (
+                "context parallelism without HCU interleave LayerSplit",
+                cfg.attn_cp_size > 1 and not hcu_layer_split_replay,
+            ),
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
-            ("PD disaggregation", cfg.disaggregation_mode != "null"),
+            (
+                "PD disaggregation outside the HCU Mooncake path",
+                cfg.disaggregation_mode != "null" and not hcu_pd_replay,
+            ),
             ("mixed prefill/decode", cfg.enable_mixed_chunk),
             ("LoRA", cfg.enable_lora),
             ("radix sessions", cfg.enable_session_radix_cache),

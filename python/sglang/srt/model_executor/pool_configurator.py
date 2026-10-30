@@ -1307,18 +1307,24 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
         self.paged_draft_layers = 0
         if self.encoder_replay and kvc.spec_algorithm.is_dspark():
-            self.paged_draft_layers = int(
-                kvc.spec_aux_config.dflash_draft_num_layers or 0
-            )
+            self.paged_draft_layers = len(cfg.hf_text_config.dspark_target_layer_ids)
             assert self.paged_draft_layers > 0, "DSpark draft layer count is required"
         self.request_window_bytes = 0
         if self.encoder_replay:
-            slots = self.requested_max_running_requests_per_worker + 1
+            # Decode also owns preallocated PD receive slots. They need rings
+            # even before they enter the runnable batch.
+            slots = self._get_num_req_slots(
+                self.requested_max_running_requests_per_worker
+            )
             capacity = ceil_align(
                 self.sliding_window_size + self.online_c128_mtp_max_draft_tokens,
                 self.page_size,
             )
-            layers = self.num_layers_total
+            layers = (
+                self.swa_priced_layers - 1
+                if self.use_cp_cache_layer_split
+                else self.num_layers_total
+            )
             scratch = (
                 max(
                     get_schedule().chunked_prefill_size,

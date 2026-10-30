@@ -43,10 +43,8 @@ def validate_cp_cache_layer_split(args, hf_config):
         "does not yet support HiSparse or HiCache in this HCU port",
     )
     require(not args.prefill_only_disable_kv_cache, "requires the prefill KV cache")
-    require(
-        not args.enable_encoder_swa_bounded_replay,
-        "does not support encoder SWA bounded replay",
-    )
+    if args.enable_encoder_swa_bounded_replay:
+        require(is_hcu(), "encoder SWA bounded replay currently requires HCU")
     require(envs.SGLANG_OPT_USE_COMPRESSOR_V2.get(), "requires Compressor V2")
     require(
         not envs.SGLANG_DISAGG_STAGING_BUFFER.get(),

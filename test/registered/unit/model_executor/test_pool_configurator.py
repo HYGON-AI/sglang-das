@@ -1338,6 +1338,7 @@ class TestSWAPoolFloor(CustomTestCase):
             compress_ratios=[0, 0] + [2] * 18 + [1] * 20,
             window_size=128,
             hf_config=SimpleNamespace(kv_source_layer_ids=[2, 8, 14, 20]),
+            hf_text_config=SimpleNamespace(dspark_target_layer_ids=[8, 20, 32]),
         )
         spec = SimpleNamespace(is_dspark=lambda: True, is_none=lambda: False)
         kvc = SimpleNamespace(
@@ -1349,7 +1350,9 @@ class TestSWAPoolFloor(CustomTestCase):
             sliding_window_size=128,
             page_size=256,
             spec_algorithm=spec,
-            spec_aux_config=SimpleNamespace(dflash_draft_num_layers=3),
+            # The checkpoint's num_hidden_layers can still be the target's 40;
+            # DSpark allocates only its three selected draft layers.
+            spec_aux_config=SimpleNamespace(dflash_draft_num_layers=40),
         )
         planner = DSV4PoolConfigurator(kvc)
         self.assertEqual(planner.bytes_per_swa_token, 3 * 584)
