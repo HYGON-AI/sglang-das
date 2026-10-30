@@ -2075,8 +2075,9 @@ def _mask_topk_ids_padded_region(
     elif _can_fuse_padded_region(topk_ids):
         _fill_padded_rows(topk_ids, num_token_non_padded, fill_value)
     else:
-        indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
-        topk_ids[indices >= num_token_non_padded, :] = fill_value
+        raise RuntimeError(
+            f"Unsupported top-k id layout for padded-row fill: shape={tuple(topk_ids.shape)}"
+        )
 
 
 def _zero_topk_weights_padded_region(
@@ -2088,8 +2089,9 @@ def _zero_topk_weights_padded_region(
     if _can_fuse_padded_region(topk_weights):
         _fill_padded_rows(topk_weights, num_token_non_padded, 0.0)
         return
-    indices = torch.arange(0, topk_weights.shape[0], device=topk_weights.device)
-    topk_weights[indices >= num_token_non_padded, :] = 0.0
+    raise RuntimeError(
+        f"Unsupported top-k weight layout for padded-row fill: shape={tuple(topk_weights.shape)}"
+    )
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())

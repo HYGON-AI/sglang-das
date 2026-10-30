@@ -365,14 +365,27 @@ class EagerRunner(BaseRunner):
         """
         model = self.model_runner.model
 
+        global_input_ids = forward_batch.input_ids
         if prepare_inputs := getattr(model, "prepare_cp_inputs", None):
             input_embeds, positions, model_kwargs = prepare_inputs(
                 forward_batch, **kwargs
             )
         else:
             input_embeds = kwargs.get("input_embeds")
+            # Model hook (e.g. DeepSeek-V4.1 vision): build GLOBAL multimodal
+            # embeddings and image-hash remapping on the full sequence before CP
+            # sharding; a no-op for text-only models/batches.
+            prep = getattr(model, "prepare_cp_extend_global_inputs", None)
+            if prep is not None:
+                global_input_ids, mm_input_embeds = prep(global_input_ids, forward_batch)
+                if mm_input_embeds is not None:
+                    if input_embeds is not None:
+                        raise ValueError(
+                            "Cannot combine input_embeds and image inputs"
+                        )
+                    input_embeds = mm_input_embeds
             if input_embeds is None:
-                input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+                input_embeds = model.get_input_embeddings()(global_input_ids)
             positions = forward_batch.positions
             model_kwargs = {}
             if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
@@ -382,7 +395,7 @@ class EagerRunner(BaseRunner):
             input_embeds,
             positions,
             forward_batch,
-            forward_batch.input_ids,
+            global_input_ids,
         ) as (sharded_input_embeds, sharded_positions, model_input_ids):
             position_tokens = sharded_positions.shape[-1]
             if sharded_input_embeds.shape[0] != position_tokens:
@@ -458,7 +471,7 @@ class EagerRunner(BaseRunner):
                 else hidden_states
             )
             return logits_from_body_output(
-                forward_batch.input_ids, body_output, forward_batch
+                global_input_ids, body_output, forward_batch
             )
         logits_kwargs = {}
         # DSV4 returns (hidden_states, hidden_states_before_norm) from its model body.
@@ -468,7 +481,7 @@ class EagerRunner(BaseRunner):
             # DSpark aux capture is on, else it overrides the packed aux.
             if aux_hidden_states is None:
                 logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
-        input_ids = forward_batch.input_ids
+        input_ids = global_input_ids
         logits_metadata = forward_batch
         if tail is not None:
             from sglang.srt.layers.logits_processor import LogitsMetadata

@@ -1033,8 +1033,7 @@ class MMEncoder:
         forward_start = time.perf_counter()
         with torch.inference_mode():
             new_embeddings = get_feature_fn(mm_items)
-            if new_embeddings.ndim != 2:
-                new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
+            new_embeddings = self._flatten_embedding_output(new_embeddings)
         if encoder_metrics_collector is not None:
             encoder_metrics_collector.observe_model_forward(
                 time.perf_counter() - forward_start, modality=modality.name.lower()
@@ -1173,7 +1172,11 @@ class MMEncoder:
                 sum(items_per_req), modality=modality_str
             )
         target = self.model.thinker if hasattr(self.model, "thinker") else self.model
-        get_feature_fn = getattr(target, f"get_{modality_str}_feature")
+        get_feature_fn = getattr(
+            target, f"get_{modality_str}_feature_for_encoder", None
+        )
+        if get_feature_fn is None:
+            get_feature_fn = getattr(target, f"get_{modality_str}_feature")
 
         mm_inputs = preprocess_result.mm_inputs
         grid_thw = preprocess_result.grid_thw
@@ -1531,6 +1534,34 @@ class MMEncoder:
             tensor = tensor.reshape(-1, tensor.shape[-1])
         return tensor
 
+    @classmethod
+    def _flatten_embedding_output(cls, embedding) -> torch.Tensor:
+        """Normalize model feature output without retaining per-item tensors."""
+        if isinstance(embedding, (list, tuple)):
+            if not embedding:
+                raise InternalError("Encoder returned no multimodal embeddings")
+            tensors = [
+                cls._as_2d_tensor(
+                    value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+                )
+                for value in embedding
+            ]
+            if len(tensors) == 1:
+                return tensors[0]
+            width = tensors[0].shape[1]
+            if any(tensor.shape[1] != width for tensor in tensors):
+                raise InternalError("Encoder returned embeddings with mismatched width")
+            output = tensors[0].new_empty(
+                (sum(tensor.shape[0] for tensor in tensors), width)
+            )
+            offset = 0
+            for tensor in tensors:
+                end = offset + tensor.shape[0]
+                output[offset:end].copy_(tensor)
+                offset = end
+            return output
+        return cls._as_2d_tensor(embedding)
+
     def _assemble_global_cache_cpu(
         self,
         ctx: EncodeContext,
@@ -1779,10 +1810,9 @@ class MMEncoder:
                 forward_start = time.perf_counter()
                 with torch.inference_mode():
                     mm_embedding: torch.Tensor = ctx.get_feature_fn(mm_items)
+                    mm_embedding = self._flatten_embedding_output(mm_embedding)
                     if not keep_on_gpu:
                         mm_embedding = mm_embedding.cpu()
-                if len(mm_embedding.shape) != 2:
-                    mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
                 if encoder_metrics_collector is not None and not ctx.is_health_check:
                     encoder_metrics_collector.observe_model_forward(
                         time.perf_counter() - forward_start, modality=modality_str
