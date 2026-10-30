@@ -1935,9 +1935,13 @@ def setup_state_kv_args(
         # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
         # state list is described per-entry via get_state_buf_infos.
         if isinstance(token_to_kv_pool, BaseSWAKVPool):
-            append_state_component(
-                kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
-            )
+            # Request-window-only targets have no page-addressed SWA state.
+            # Do not evaluate its page-index payload (the draft, if present,
+            # registers a separate paged SWA component below).
+            if data_ptrs or getattr(token_to_kv_pool, "request_window", None) is None:
+                append_state_component(
+                    kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
+                )
             if isinstance(token_to_kv_pool, SWAKVPool) and isinstance(
                 token_to_kv_pool.swa_kv_pool, MHATokenToKVPool
             ):
@@ -1986,6 +1990,14 @@ def setup_state_kv_args(
                         c128_lens,
                         c128_item_lens,
                     )
+            window = getattr(token_to_kv_pool, "request_window", None)
+            if window is not None:
+                append_state_component(
+                    kv_args,
+                    StateType.DSV41_SWA_WINDOW,
+                    *window.transfer_buf_infos(),
+                    data_format=window.transfer_format,
+                )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             kv_args.hcu_kda_state_sharded = token_to_kv_pool.mamba_pool.use_hcu_kda
             dim = (
@@ -2340,7 +2352,9 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
 
     from sglang.srt.disaggregation.base.conn import StateType
 
-    if kv_args.state_types.count(StateType.SWA) != 2:
+    window_count = kv_args.state_types.count(StateType.DSV41_SWA_WINDOW)
+    swa_count = kv_args.state_types.count(StateType.SWA)
+    if (window_count, swa_count) not in ((0, 2), (1, 1)):
         raise RuntimeError(
             "DeepSeek-V4.1 DSpark PD requires target and draft SWA state"
         )

@@ -1556,6 +1556,7 @@ class TestSWAPoolFloor(CustomTestCase):
             compress_ratios=[0, 0] + [2] * 18 + [1] * 20,
             window_size=128,
             hf_config=SimpleNamespace(kv_source_layer_ids=[2, 8, 14, 20]),
+            hf_text_config=SimpleNamespace(dspark_target_layer_ids=[8, 20, 32]),
         )
         spec = SimpleNamespace(is_dspark=lambda: True, is_none=lambda: False)
         kvc = SimpleNamespace(

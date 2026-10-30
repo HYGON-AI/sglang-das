@@ -224,7 +224,11 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             self._swa_global_to_local,
             key=lambda layer_id: self._swa_global_to_local[layer_id],
         )
-        swa_layers = swa_layers[: len(self.swa_kv_pool.kv_buffer)]
+        swa_layers = (
+            []
+            if self.request_window is not None
+            else swa_layers[: len(self.swa_kv_pool.kv_buffer)]
+        )
         layout.extend((DSV4_TRANSFER_SWA_KV, layer_id) for layer_id in swa_layers)
 
         layout.extend(
@@ -240,6 +244,12 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             and self._owns_indexer_state_layer_id(layer_id)
         )
         return layout
+
+    def get_swa_window_transfer_layout(self) -> list:
+        if self.request_window is None:
+            return []
+        layer_ids = sorted(self._swa_global_to_local, key=self._swa_global_to_local.get)
+        return self.request_window.transfer_layout(layer_ids)
 
     def get_c128_state_transfer_layout(self) -> list:
         """Descriptors parallel to this rank's C128 state buffer list."""
@@ -262,7 +272,11 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         swa_layers_sorted = sorted(
             self._swa_global_to_local.items(), key=lambda kv: kv[1]
         )
-        swa_layers_kept = swa_layers_sorted[: len(self.swa_kv_pool.kv_buffer)]
+        swa_layers_kept = (
+            []
+            if self.request_window is not None
+            else swa_layers_sorted[: len(self.swa_kv_pool.kv_buffer)]
+        )
         swa_map: dict[int, int] = {
             gid - pp_start: local_id for gid, local_id in swa_layers_kept
         }
@@ -472,6 +486,13 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             )
         return buffer
 
+    def _swa_read_pool(self):
+        if self.request_window is not None:
+            # Stores and reads address this forward's GLOBAL workspace, not
+            # the persistent request ring nor allocator-global paged SWA.
+            return self.request_window.workspace
+        return self.swa_kv_pool
+
     def _allocate_staging_buffers(self) -> None:
         """Allocate the budgeted worst-case read scratch before serving."""
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -480,10 +501,11 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
                 if self.custom_mem_pool
                 else nullcontext()
             ):
+                swa_pool = self._swa_read_pool()
                 self._staging.allocate(
                     "swa",
-                    self._pool_num_pages(self.swa_kv_pool),
-                    lambda n: self.swa_kv_pool.create_buffer(num_pages=n),
+                    self._pool_num_pages(swa_pool),
+                    lambda n: swa_pool.create_buffer(num_pages=n),
                 )
                 # C4 and C128 are mutually exclusive within a layer. Both use
                 # the same "extra" broadcast slot; the eager layer loop consumes
@@ -601,8 +623,9 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         """Start current-layer SWA page broadcast; caller waits before attention."""
         self.wait_layer_transfer(layer_id)
         self._clear_extra_read_state()
-        max_pages = self._pool_num_pages(self.swa_kv_pool)
-        page_size = self.swa_kv_pool.page_size
+        swa_pool = self._swa_read_pool()
+        max_pages = self._pool_num_pages(swa_pool)
+        page_size = swa_pool.page_size
         swa_cache = self._batch_active_pages["swa"]
         if swa_cache.selected_pages is None:
             static_size = None
@@ -637,7 +660,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         owner_cp = self._get_layer_owner_rank(layer_id)
         owner_buf = None
         if self.cp_rank == owner_cp:
-            owner_buf = self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
+            owner_buf = self.get_swa_raw_buffer(layer_id)
         self._compact_broadcast_for_read(
             layer_id,
             indices,
@@ -1017,7 +1040,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         """
         if family == "swa":
             assert self._swa_remapped_layer_id == layer_id
-            pool = self.swa_kv_pool
+            pool = self._swa_read_pool()
             selected_cache = self._batch_active_pages["swa"]
         else:
             assert self._extra_staging_layer_id == layer_id

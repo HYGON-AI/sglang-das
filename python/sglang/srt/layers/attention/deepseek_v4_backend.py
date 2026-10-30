@@ -1908,6 +1908,7 @@ class DeepseekV4AttnBackend(
             dspark_block_size=dspark_block_size,
             dspark_swa_buffers=dspark_swa_buffers,
             num_tokens=num_write_tokens if cp_active else None,
+            window_num_tokens=num_tokens,
             swa_replay_start=swa_replay_start,
             # Captured kernels read the window history by address, so a graph
             # keeps one group per request slot, at most one per row.
@@ -5544,7 +5545,7 @@ class DeepseekV4AttnBackend(
         if self.token_to_kv_pool.request_window is not None:
             layout = metadata.core_attn_metadata.request_window_layout
             self.token_to_kv_pool.request_window.activate(layout)
-            return layout.write_loc
+            return metadata.core_attn_metadata.swa_out_cache_loc
         if isinstance(metadata, DSV4Metadata) and metadata.late_layer_tail is not None:
             # The tail's q rows are a subset of the extend, so the full
             # out_cache_loc below would be the wrong length; the tail owns its own.
@@ -6005,6 +6006,10 @@ class DeepseekV4AttnBackend(
             window is not None
             and not self.is_dspark_draft
             and not forward_batch.forward_mode.is_idle()
+            and (
+                not is_cp_cache_layer_split_deepseek_v4_pool(self.token_to_kv_pool)
+                or self.token_to_kv_pool._owns_swa_layer_id(layer.layer_id)
+            )
         ):
             window.commit(self.token_to_kv_pool._swa_local_layer_id(layer.layer_id))
         return result
@@ -6316,6 +6321,7 @@ class DeepseekV4AttnBackend(
             if forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
                 if (
                     self.forward_metadata.late_layer_tail is None
+                    and token_to_kv_pool.request_window is None
                     and _should_use_sparse_prefill(
                         q, forward_batch, allow_cp=self.is_dsv41
                     )
@@ -6733,6 +6739,7 @@ class DeepseekV4AttnBackend(
         num_groups: Optional[int] = None,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         request_window_live_rows: Optional[int] = None,
+        window_num_tokens: Optional[int] = None,
     ) -> DSV4AttnMetadata:
         small_metadata = (
             not is_prefill
@@ -6770,28 +6777,38 @@ class DeepseekV4AttnBackend(
         if self.token_to_kv_pool.request_window is not None:
             from sglang.srt.mem_cache.dsv41_request_window import window_layout
 
+            # Build the request ring from real GLOBAL rows. CP query tables
+            # are sharded later; execution padding must never commit tags.
+            live = (
+                raw_positions.shape[0]
+                if window_num_tokens is None and request_window_live_rows is None
+                else (window_num_tokens if window_num_tokens is not None
+                      else request_window_live_rows)
+            )
+            window_positions = raw_positions[:live]
+            window_req = req_pool_indices_repeated[:live]
+            window_floor = (
+                swa_replay_start[:live] if swa_replay_start is not None else None
+            )
             if self.encoder_replay:
-                starts = torch.ones_like(raw_positions, dtype=torch.bool)
+                starts = torch.ones_like(window_positions, dtype=torch.bool)
                 starts[1:] = (
-                    req_pool_indices_repeated[1:] != req_pool_indices_repeated[:-1]
+                    window_req[1:] != window_req[:-1]
                 )
                 offset = torch.arange(
-                    raw_positions.numel(), device=raw_positions.device
+                    window_positions.numel(), device=window_positions.device
                 )
                 group_first = torch.cummax(torch.where(starts, offset, 0), dim=0).values
-                swa_replay_start = raw_positions - (offset - group_first)
-            elif swa_replay_start is None and self.encoder_row_floor is not None:
-                # Folded replay: hits floor every row at their replay start;
-                # MLP-sync padding rows follow the real ones with floor 0.
-                swa_replay_start = _pad_rows(
+                window_floor = window_positions - (offset - group_first)
+            if window_floor is None and self.encoder_row_floor is not None:
+                window_floor = _pad_rows(
                     self.encoder_row_floor, num_rows=raw_positions.shape[0]
-                )
-            live = request_window_live_rows
+                )[:live]
             request_layout = window_layout(
-                req_pool_indices_repeated[:live],
-                raw_positions[:live],
+                window_req,
+                window_positions,
                 capacity=self.token_to_kv_pool.request_window.capacity,
-                floor=None if swa_replay_start is None else swa_replay_start[:live],
+                floor=window_floor,
                 num_groups=num_groups,
                 padded_rows=None if live is None else raw_positions.numel(),
             )
