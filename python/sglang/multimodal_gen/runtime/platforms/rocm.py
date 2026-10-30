@@ -112,6 +112,15 @@ class RocmPlatform(Platform):
             logger.info("Using Torch SDPA backend.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
+        elif selected_backend == AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN:
+            # The denoising stage also resolves this class with fp16 to build
+            # metadata. Validate real QKV in the implementation/native boundary,
+            # not at class selection (as on the NVIDIA SubBlock path).
+            if not is_hcu():
+                raise ValueError("DCU SubBlock sparse attention requires HCU.")
+            logger.info("Using DCU SubBlock sparse attention backend.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn.SubBlockSparseAttentionBackend"
+
         elif selected_backend in (
             AttentionBackendEnum.FA,
             AttentionBackendEnum.FA2,
