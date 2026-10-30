@@ -10,6 +10,7 @@ import ctypes
 import errno
 import functools
 import glob
+import inspect
 import logging
 import mmap
 import os
@@ -77,6 +78,40 @@ _use_hcu_fused_engram_hash_ids = is_hcu() and get_bool_env_var(
 _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 
 _is_hip = is_hip()
+
+_hcu_engram_hash_op = None
+_hcu_engram_hash_op_loaded = False
+_hcu_engram_hash_op_supports_block = False
+
+
+def _load_hcu_engram_hash_op(*, require_block: bool = False):
+    """Load once; older LightOp wheels may support EXTEND but not VERIFY."""
+    global _hcu_engram_hash_op, _hcu_engram_hash_op_loaded
+    global _hcu_engram_hash_op_supports_block
+    if not _hcu_engram_hash_op_loaded:
+        try:
+            from lightop.engram import engram_hash_ids_hcu
+        except (ImportError, AttributeError):
+            pass
+        else:
+            _hcu_engram_hash_op = engram_hash_ids_hcu
+            try:
+                block_param = inspect.signature(engram_hash_ids_hcu).parameters.get(
+                    "block"
+                )
+            except (TypeError, ValueError):
+                block_param = None
+            _hcu_engram_hash_op_supports_block = block_param is not None and (
+                block_param.kind
+                in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                )
+            )
+        _hcu_engram_hash_op_loaded = True
+    if require_block and not _hcu_engram_hash_op_supports_block:
+        return None
+    return _hcu_engram_hash_op
 
 
 def _cuda_kernels(t: torch.Tensor) -> bool:
@@ -441,21 +476,56 @@ class EngramHasher(nn.Module):
         if (
             _use_hcu_fused_engram_hash_ids
             and input_ids.is_cuda
-            and kmode == MODE_EXTEND
+            and kmode in (MODE_EXTEND, MODE_VERIFY)
             and n == 4
             and self.multipliers.shape == (2, 4)
             and self.primes.shape == (2, 3, 8)
-            and row is not None
-            and starts is not None
-            and all(x.is_contiguous() for x in (input_ids, positions, history, row, starts))
         ):
-            from lightop.engram import engram_hash_ids_hcu
-
-            return engram_hash_ids_hcu(
-                input_ids, positions, history, row, starts, self.token_map,
-                self.multipliers, self.primes, self.offsets, num_real,
-                self.pad_id, self.image_token_id, MM_PAD_SHIFT_VALUE,
-            )
+            op = _load_hcu_engram_hash_op(require_block=kmode == MODE_VERIFY)
+            if op is not None:
+                if kmode == MODE_VERIFY:
+                    if all(
+                        x.is_contiguous() for x in (input_ids, positions, history)
+                    ):
+                        return op(
+                            input_ids,
+                            positions,
+                            history,
+                            None,
+                            None,
+                            self.token_map,
+                            self.multipliers,
+                            self.primes,
+                            self.offsets,
+                            num_real,
+                            self.pad_id,
+                            self.image_token_id,
+                            MM_PAD_SHIFT_VALUE,
+                            block=block,
+                        )
+                elif (
+                    row is not None
+                    and starts is not None
+                    and all(
+                        x.is_contiguous()
+                        for x in (input_ids, positions, history, row, starts)
+                    )
+                ):
+                    return op(
+                        input_ids,
+                        positions,
+                        history,
+                        row,
+                        starts,
+                        self.token_map,
+                        self.multipliers,
+                        self.primes,
+                        self.offsets,
+                        num_real,
+                        self.pad_id,
+                        self.image_token_id,
+                        MM_PAD_SHIFT_VALUE,
+                    )
         num_tokens = input_ids.shape[0]
         device = input_ids.device
         input_ids = input_ids.to(torch.int64)
