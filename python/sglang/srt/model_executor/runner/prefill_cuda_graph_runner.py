@@ -569,6 +569,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.enable_cp_bcg_capture = isinstance(
             self.backend, BreakableCudaGraphBackend
         ) and should_enable_cp_bcg_capture(server_args)
+        # PrefillCPBCGInput shards plain token embeddings only; V4.1 builds its
+        # multimodal embeddings in EagerRunner's CP path, so those batches stay eager.
+        self._dsv41_cp_bcg_mm_eager = (
+            self.enable_cp_bcg_capture
+            and model_runner.model_config.hf_config.model_type == "deepseek_v41"
+        )
         if self.enable_cp_bcg_capture:
             if self.max_context_size is not None:
                 # TODO(SYChen123): Preserve max_seq_len_override through CP's padded
@@ -1274,7 +1280,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         rank-uniform; forward-time-only checking cannot split the group).
         """
         if contains_mm_inputs and (
-            self._qwen_bcg_hc_sidechannel or self._qwen_bcg_mtp_draft
+            self._qwen_bcg_hc_sidechannel
+            or self._qwen_bcg_mtp_draft
+            or self._dsv41_cp_bcg_mm_eager
         ):
             return False
         if self._is_full_backend and batch_size > self._capture_req_slots:

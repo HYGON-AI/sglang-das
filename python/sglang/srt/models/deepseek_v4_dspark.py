@@ -739,7 +739,11 @@ def _dspark_stage_config(config: DeepSeekV4Config) -> DeepSeekV4Config:
     n_routed = int(getattr(config, "dspark_n_routed_experts", 0) or 0)
     n_active = int(getattr(config, "dspark_num_experts_per_tok", 0) or 0)
     has_vision = int(getattr(config, "vision_n_layers", 0) or 0) > 0
-    if not (n_routed or n_active or has_vision):
+    # --language-only also enables the VL routing bias in DeepseekV4DecoderLayer,
+    # but the draft checkpoint has no gate.bias_vl (dropped by the remapper), so
+    # the stages must not build it either.
+    language_only = bool(getattr(config, "language_only", False))
+    if not (n_routed or n_active or has_vision or language_only):
         return config
     stage_config = copy.copy(config)
     if n_routed:
@@ -748,6 +752,8 @@ def _dspark_stage_config(config: DeepSeekV4Config) -> DeepSeekV4Config:
         stage_config.num_experts_per_tok = n_active
     if has_vision:
         stage_config.vision_n_layers = 0
+    if language_only:
+        stage_config.language_only = False
     return stage_config
 
 

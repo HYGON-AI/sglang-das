@@ -13,7 +13,7 @@ from collections import OrderedDict, defaultdict
 from contextlib import asynccontextmanager
 from enum import IntEnum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import aiohttp
 import numpy as np
@@ -88,6 +88,11 @@ class _ReceiveRegistrationRunner:
 
     def submit(self, coroutine):
         return asyncio.run_coroutine_threadsafe(coroutine, self.loop)
+
+
+# Models whose pool slots are owned by item leases and released once consumed;
+# their embedding path must call release_consumed_pool_slots.
+_POOL_SLOT_LEASE_MODEL_TYPES = frozenset({"deepseek_v41"})
 
 
 def _mark_keep_device_embedding(mm_inputs) -> None:
@@ -984,6 +989,7 @@ class WaitingMMRequestBase(ABC):
         self.mm_processor = mm_processor
         self.encoder_urls = encoder_urls
         self.model_type = model_type
+        self.lease_pool_slots = model_type in _POOL_SLOT_LEASE_MODEL_TYPES
         self.host_name = host_name
         self.receive_count = receive_count
         self.num_items_assigned = recv_req.num_items_assigned
@@ -1009,7 +1015,7 @@ class WaitingMMRequestBase(ABC):
         self.embeddings_buffer = None
         self._pool_slot_id: Optional[int] = None
         # Success-path finalizer handle so abort can release the slot early.
-        self._mm_finalizer: Optional[weakref.finalize] = None
+        self._mm_finalizer: Optional[Callable[[], None]] = None
         self._pool_full_warned = False
         self.registration_runner = registration_runner
         self.registration_future = None
@@ -1168,7 +1174,7 @@ class WaitingMMRequestBase(ABC):
         self._fail_and_release(f"Failed to assemble multimodal inputs: {e}")
 
     def _bind_pool_slot_to_mm_inputs(self, mm_inputs) -> bool:
-        """Bind pool-slot release to mm_inputs GC. Returns True if bound."""
+        """Bind pool-slot release to mm_inputs' lifetime. Returns True if bound."""
         if (
             mm_inputs is None
             or self._pool_slot_id is None
@@ -1176,11 +1182,18 @@ class WaitingMMRequestBase(ABC):
         ):
             return False
         # Keep the handle so abort can release the slot immediately.
-        self._mm_finalizer = self.embedding_pool.release_on_gc(
-            mm_inputs, self._pool_slot_id
-        )
+        if self.lease_pool_slots:
+            # The scheduler rebuilds mm_inputs into a new MultimodalInputs that shares
+            # only the items, so the items (not mm_inputs) must own the slot.
+            lease = EmbeddingSlotLease(self.embedding_pool, self._pool_slot_id)
+            _attach_slot_leases(mm_inputs, [lease])
+            self._mm_finalizer = lease.release
+        else:
+            self._mm_finalizer = self.embedding_pool.release_on_gc(
+                mm_inputs, self._pool_slot_id
+            )
         _mark_keep_device_embedding(mm_inputs)
-        # Detach so _cleanup_gpu_buffer no-ops; finalize now owns release.
+        # Detach so _cleanup_gpu_buffer no-ops; the lease/finalizer now owns release.
         self._pool_slot_id = None
         self.embeddings_buffer = None
         return True
@@ -1918,9 +1931,13 @@ class EmbeddingPool:
     alloc returns a slot_id that must be passed back to release() when the
     consumer is done with the buffer. With `engine` set (mooncake), the
     buffer is registered once so encoder RDMA writes land in pool slots.
+    A release may carry a CUDA event; the slot is reused only after it
+    completes, since encoder RDMA writes are not ordered with the stream.
     """
 
     _ALIGN = 256
+    # Arbitrary; how often a blocked alloc() re-checks deferred releases.
+    _DEFERRED_POLL_S = 0.001
 
     def __init__(self, gpu_id: int, size_bytes: int, engine=None):
         self.gpu_id = gpu_id
@@ -1934,6 +1951,8 @@ class EmbeddingPool:
             engine.register(self.base, self.buffer.nbytes)
         self._segments_free: List[Tuple[int, int]] = [(0, size_bytes)]
         self._inflight: Dict[int, Tuple[int, int]] = {}
+        # (ready_event, offset, aligned): released on CPU, still read by queued kernels.
+        self._deferred_free: List[Tuple[torch.cuda.Event, int, int]] = []
         self._next_slot_id = 0
         self._total_inflight = 0
         self._lock = threading.Lock()
@@ -2025,11 +2044,15 @@ class EmbeddingPool:
                         f"{timeout}s waiting for {nbytes // (1024 * 1024)}MB."
                     )
                     return None
+                if self._deferred_free:
+                    # No release() fires when a deferred event completes; poll for it.
+                    remaining = min(remaining, self._DEFERRED_POLL_S)
                 self._cond.wait(timeout=remaining)
 
     def _try_alloc_locked(
         self, nbytes: int, aligned: int
     ) -> Optional[Tuple[torch.Tensor, int, int]]:
+        self._reap_deferred_locked()
         for i, (off, length) in enumerate(self._segments_free):
             if length >= aligned:
                 if length == aligned:
@@ -2044,17 +2067,37 @@ class EmbeddingPool:
                 return view, self.base + off, slot_id
         return None
 
-    def release(self, slot_id: int) -> None:
+    def release(
+        self, slot_id: int, ready_event: Optional[torch.cuda.Event] = None
+    ) -> None:
         """Return a previously-allocated slot to the free list and wake any
-        blocked alloc() waiters."""
+        blocked alloc() waiters. With ``ready_event``, the space is reused only
+        once the event has completed. Idempotent per slot_id."""
         with self._cond:
             seg = self._inflight.pop(slot_id, None)
             if seg is None:
                 return
             off, aligned = seg
-            self._total_inflight -= aligned
-            self._coalesce_free_locked(off, aligned)
-            self._cond.notify_all()
+            if ready_event is not None and not ready_event.query():
+                self._deferred_free.append((ready_event, off, aligned))
+                return
+            self._free_locked(off, aligned)
+
+    def _reap_deferred_locked(self) -> None:
+        if not self._deferred_free:
+            return
+        still_pending = []
+        for ready_event, off, aligned in self._deferred_free:
+            if ready_event.query():
+                self._free_locked(off, aligned)
+            else:
+                still_pending.append((ready_event, off, aligned))
+        self._deferred_free = still_pending
+
+    def _free_locked(self, off: int, aligned: int) -> None:
+        self._total_inflight -= aligned
+        self._coalesce_free_locked(off, aligned)
+        self._cond.notify_all()
 
     def _coalesce_free_locked(self, off: int, length: int) -> None:
         self._segments_free.append((off, length))
@@ -2067,6 +2110,41 @@ class EmbeddingPool:
             else:
                 merged.append((s_off, s_len))
         self._segments_free = merged
+
+
+class EmbeddingSlotLease:
+    """Owns one EmbeddingPool slot on behalf of the mm items that view it.
+
+    Released at most once: early by the embedding consumer once the request's
+    last prefill chunk has read it, or by GC when the last holding item dies
+    (abort, or a model path that never calls the early hook).
+    """
+
+    __slots__ = ("_last_use", "_finalizer", "__weakref__")
+
+    def __init__(self, pool: EmbeddingPool, slot_id: int):
+        # A cell, not an attribute: the finalizer must not reference self.
+        self._last_use: List[Optional[torch.cuda.Event]] = [None]
+        self._finalizer = weakref.finalize(
+            self, _release_slot_after_last_use, pool, slot_id, self._last_use
+        )
+
+    def mark_used(self, event: Optional[torch.cuda.Event]) -> None:
+        if event is not None:
+            self._last_use[0] = event
+
+    def release(self, event: Optional[torch.cuda.Event] = None) -> None:
+        self.mark_used(event)
+        self._finalizer()
+
+
+def _release_slot_after_last_use(pool, slot_id, last_use) -> None:
+    pool.release(slot_id, ready_event=last_use[0])
+
+
+def _attach_slot_leases(mm_inputs, leases: List[EmbeddingSlotLease]) -> None:
+    for item in mm_inputs.mm_items:
+        item.attach_pool_slot_leases(leases)
 
 
 def _iter_part_ranges(embedding_data, dtype):

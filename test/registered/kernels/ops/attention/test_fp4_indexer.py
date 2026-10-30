@@ -17,6 +17,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    dequant_fp4_index_k,
     finish_paged_indexer_topk,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
@@ -847,6 +848,29 @@ def test_flat_indexer_slot_count_does_not_recompile(write_raw):
             expected_raw = torch.where(chosen, selected - starts[:, None], -1)
             torch.testing.assert_close(raw, expected_raw, rtol=0, atol=0)
     assert len(hashes) == 1, "Changing the visible slot count must reuse the kernel"
+
+
+def test_dequant_fp4_index_k_matches_table_lookup():
+    from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
+
+    device = get_device()
+    num_rows = 1000
+    payload = torch.randint(-128, 128, (num_rows, FP4_DIM), device=device).to(
+        torch.int8
+    )
+    exps = torch.randint(110, 140, (num_rows, SCALE_GROUPS), device=device)
+    packed = sum(exps[:, g] << (8 * g) for g in range(SCALE_GROUPS))
+    scales = packed.to(torch.int64).to(torch.int32)
+
+    out = dequant_fp4_index_k(payload, scales)
+
+    u = payload.view(torch.uint8)
+    codes = torch.stack([u & 0x0F, (u >> 4) & 0x0F], dim=-1).long()
+    vals = DSV4_DEQUANT_FP4_TABLE.to(device)[codes].flatten(1)
+    group_scale = torch.exp2(exps.float() - 127).repeat_interleave(GROUP_SIZE, dim=-1)
+    torch.testing.assert_close(
+        out, (vals * group_scale).to(torch.bfloat16), rtol=0, atol=0
+    )
 
 
 if __name__ == "__main__":

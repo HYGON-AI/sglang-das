@@ -570,6 +570,11 @@ class ModelConfig:
         self.requires_mm_token_modalities = requires_mm_token_modalities(
             self.hf_config.architectures, self.hf_text_config
         )
+        # Other models keep their model-specific pad_input_ids when the
+        # processor omits padded_input_ids; V4.1 fills it from item offsets.
+        self.builds_missing_mm_padded_input_ids = (
+            self.hf_config.model_type == "deepseek_v41"
+        )
         self.is_embedding_gemma = is_embedding_gemma(self.hf_text_config)
         self.embedding_model_spec = resolve_embedding_model_spec(
             self.hf_config.architectures,
