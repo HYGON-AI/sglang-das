@@ -516,6 +516,7 @@ class LogitsProcessor(nn.Module):
         )
 
         self.draft_lm_head_vp = None
+        self.target_lm_head_vp = None
 
     def set_draft_lm_head_vp(self, draft_lm_head_vp) -> None:
         """Install the draft-only vocabulary-parallel top-1 helper."""
@@ -1015,6 +1016,21 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        target_vp = getattr(self, "target_lm_head_vp", None)
+        if target_vp is not None:
+            if embedding_bias is not None:
+                raise ValueError(
+                    "Experimental DSPARK target VP does not support embedding bias."
+                )
+            # Graph buckets have the same padded row count on every DP rank.
+            # Eager execution agrees on the largest count, including idle ranks.
+            capturing = (
+                hidden_states.is_cuda and torch.cuda.is_current_stream_capturing()
+            )
+            return target_vp.project_logits(
+                hidden_states.to(lm_head.weight.dtype),
+                padded_rows=hidden_states.shape[0] if capturing else None,
+            )
         quant_method = getattr(lm_head, "quant_method", None)
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
