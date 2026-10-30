@@ -38,6 +38,7 @@ from sglang.srt.managers.mm_schedule import (
 from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
     Modality,
+    MultimodalDataItem,
     MultimodalInputs,
     MultimodalProcessorOutput,
 )
@@ -548,6 +549,74 @@ def embed_mm_inputs(
             )
 
     return input_embeds, other_info
+
+
+def _pool_items_consumed(items: List[MultimodalDataItem], processed_len: int) -> bool:
+    # Offsets are inclusive [start, end] positions in the padded input ids.
+    return all(
+        item.offsets is not None
+        and isinstance(item.precomputed_embeddings, torch.Tensor)
+        and all(end < processed_len for _, end in item.offsets)
+        for item in items
+    )
+
+
+def release_consumed_pool_slots(
+    mm_inputs_list: List[MultimodalInputs],
+    extend_prefix_lens: List[int],
+    extend_seq_lens: List[int],
+) -> None:
+    """Return EPD receiver pool slots once a request's last prefill chunk has read them.
+
+    Only items bound with slot leases are touched (see the receiver's
+    ``_POOL_SLOT_LEASE_MODEL_TYPES``); every other item is left as is.
+
+    Consumed views are offloaded to CPU first, so a re-prefill (e.g. retraction)
+    still has its embeddings. The release carries an event recorded after this
+    batch's reads; the pool reuses the slot only once it completes.
+    """
+    per_req = []
+    for mm_inputs, prefix_len, seq_len in zip(
+        mm_inputs_list, extend_prefix_lens, extend_seq_lens
+    ):
+        items = [
+            item
+            for item in mm_inputs.mm_items
+            if item is not None and item.pool_slot_leases
+        ]
+        if items:
+            per_req.append((items, _pool_items_consumed(items, prefix_len + seq_len)))
+    if not per_req:
+        return
+
+    stream = None
+    offloaded = False
+    for items, consumed in per_req:
+        for item in items:
+            embedding = item.precomputed_embeddings
+            if not (isinstance(embedding, torch.Tensor) and embedding.is_cuda):
+                continue
+            stream = torch.cuda.current_stream(embedding.device)
+            if consumed:
+                item.precomputed_embeddings = embedding.to("cpu", non_blocking=True)
+                offloaded = True
+
+    last_use = None
+    if stream is not None:
+        last_use = torch.cuda.Event()
+        last_use.record(stream)
+        if offloaded:
+            if mm_schedule.host_offload_event is None:
+                mm_schedule.host_offload_event = torch.cuda.Event()
+            mm_schedule.host_offload_event.record(stream)
+
+    for items, consumed in per_req:
+        leases = {id(lease): lease for item in items for lease in item.pool_slot_leases}
+        for lease in leases.values():
+            if consumed:
+                lease.release(last_use)
+            else:
+                lease.mark_used(last_use)
 
 
 def _embed_mm_inputs_with_split(

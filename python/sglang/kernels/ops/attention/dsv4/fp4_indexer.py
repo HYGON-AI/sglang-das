@@ -1019,3 +1019,61 @@ def fp4_index_logits_paged(
         num_warps=4,
     )
     return out[:, :max_len]
+
+
+@triton.jit
+def _dequant_fp4_index_k_kernel(
+    Payload,
+    Scales,
+    Out,
+    num_rows,
+    payload_stride,
+    out_stride,
+    BLOCK_N: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    cols = tl.arange(0, INDEX_K_PAYLOAD_BYTES)
+    row_mask = rows < num_rows
+    pay = tl.load(
+        Payload + rows[:, None].to(tl.int64) * payload_stride + cols[None, :],
+        mask=row_mask[:, None],
+        other=0,
+    ).to(tl.uint8, bitcast=True)
+    packed = tl.load(Scales + rows, mask=row_mask, other=127)
+    # Element j uses ue8m0 block j // 32, so payload byte i uses block i // 16.
+    exps = (packed[:, None] >> (8 * (cols[None, :] // 16))) & 0xFF
+    scale = tl.exp2(exps.to(tl.float32) - 127.0)
+    low = (_e2m1_decode(pay & 0x0F) * scale).to(tl.bfloat16)
+    high = (_e2m1_decode((pay >> 4) & 0x0F) * scale).to(tl.bfloat16)
+    out = Out + rows[:, None].to(tl.int64) * out_stride + 2 * cols[None, :]
+    tl.store(out, low, mask=row_mask[:, None])
+    tl.store(out + 1, high, mask=row_mask[:, None])
+
+
+def dequant_fp4_index_k(payload: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Dequantize packed index-K rows to bf16 ``[n, 128]``.
+
+    ``payload`` is int8 ``[n, 64]`` (low nibble is element ``2i``); ``scales``
+    holds the four ue8m0 block exponents of each row packed into one int32.
+    """
+    num_rows = payload.shape[0]
+    assert payload.shape == (num_rows, INDEX_HEAD_DIM // 2) and payload.stride(1) == 1
+    scales = scales.reshape(-1).to(torch.int32).contiguous()
+    assert scales.numel() == num_rows
+    out = torch.empty(
+        (num_rows, INDEX_HEAD_DIM), dtype=torch.bfloat16, device=payload.device
+    )
+    if num_rows == 0:
+        return out
+    block_n = 32
+    _dequant_fp4_index_k_kernel[(triton.cdiv(num_rows, block_n),)](
+        payload,
+        scales,
+        out,
+        num_rows,
+        payload.stride(0),
+        out.stride(0),
+        BLOCK_N=block_n,
+        num_warps=4,
+    )
+    return out

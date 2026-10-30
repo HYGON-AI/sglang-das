@@ -1,6 +1,7 @@
 """Unit tests for the encode-disaggregation receiver."""
 
 import asyncio
+import gc
 import threading
 import time
 import unittest
@@ -9,7 +10,10 @@ from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.disaggregation.encoder.receiver import (
+    EmbeddingPool,
     MMReceiverBase,
     WaitingMMRequestStatus,
     WaitingRDMARequest,
@@ -19,7 +23,12 @@ from sglang.srt.disaggregation.encoder.receiver import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import EncoderDispatchErrorReq
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.mm_utils import release_consumed_pool_slots
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -393,6 +402,162 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
         self.assertTrue(waiting_req.released)
         self.assertTrue(waiting_req.closed)
         self.assertEqual(len(abort_reqs), 1)
+
+
+_real_empty = torch.empty
+
+
+def _make_pool(size_bytes):
+    # The pool hardcodes a CUDA device; back it with host memory for CPU CI.
+    with patch.object(
+        torch, "empty", lambda n, dtype, device: _real_empty(n, dtype=dtype)
+    ):
+        return EmbeddingPool(gpu_id=0, size_bytes=size_bytes)
+
+
+class _FakeEvent:
+    def __init__(self, done_after_queries):
+        self._remaining = done_after_queries
+
+    def query(self):
+        self._remaining -= 1
+        return self._remaining < 0
+
+
+class _RecordingLease:
+    def __init__(self):
+        self.released = 0
+
+    def mark_used(self, event):
+        pass
+
+    def release(self, event=None):
+        self.released += 1
+
+
+def _image_item(offsets, embedding):
+    return MultimodalDataItem(
+        modality=Modality.IMAGE, offsets=offsets, precomputed_embeddings=embedding
+    )
+
+
+def _make_bound_request(pool, slot, view, lease_pool_slots):
+    request = WaitingRDMARequest.__new__(WaitingRDMARequest)
+    request.embedding_pool = pool
+    request.lease_pool_slots = lease_pool_slots
+    request._pool_slot_id = slot
+    request.embeddings_buffer = view
+    request._mm_finalizer = None
+    return request
+
+
+class TestPoolSlotLifetime(CustomTestCase):
+    def test_slot_outlives_rebuilt_mm_container(self):
+        """The scheduler rebuilds the receiver's mm container keeping only its items;
+        dropping the original container must not free a slot the items still view,
+        or the next request's RDMA overwrites embeddings before prefill reads them."""
+        pool = _make_pool(size_bytes=1024)
+        view, _, slot = pool.try_alloc(256)
+        item = _image_item(offsets=[(0, 127)], embedding=view.view(torch.bfloat16))
+        original = SimpleNamespace(mm_items=[item])
+
+        request = _make_bound_request(pool, slot, view, lease_pool_slots=True)
+        self.assertTrue(request._bind_pool_slot_to_mm_inputs(original))
+
+        rebuilt = MultimodalInputs(mm_items=[item])
+        del original, request
+        gc.collect()
+        self.assertIn(slot, pool._inflight)
+
+        del rebuilt, item
+        gc.collect()
+        self.assertNotIn(slot, pool._inflight)
+
+    def test_lease_binding_scoped_to_opted_in_models(self):
+        """Models outside the lease allowlist must bind no item leases, so the
+        consumed-slot release path never touches their embeddings."""
+        pool = _make_pool(size_bytes=1024)
+        view, _, slot = pool.try_alloc(256)
+        item = _image_item(offsets=[(0, 127)], embedding=view.view(torch.bfloat16))
+        original = SimpleNamespace(mm_items=[item])
+
+        request = _make_bound_request(pool, slot, view, lease_pool_slots=False)
+        self.assertTrue(request._bind_pool_slot_to_mm_inputs(original))
+        self.assertEqual(item.pool_slot_leases, ())
+
+    def test_release_with_pending_event_defers_reuse(self):
+        """A slot released while the GPU reads of it are still queued must not be
+        handed to the next RDMA write until the reads' event completes."""
+        pool = _make_pool(size_bytes=256)
+        _, _, slot = pool.try_alloc(256)
+        pool.release(slot, ready_event=_FakeEvent(done_after_queries=2))
+        self.assertIsNone(pool.try_alloc(256))
+        self.assertIsNotNone(pool.try_alloc(256))
+
+    def test_blocked_alloc_wakes_when_deferred_event_completes(self):
+        """No release() call fires when a deferred event completes, so a blocked
+        alloc() must poll for it instead of sleeping until its timeout."""
+        pool = _make_pool(size_bytes=256)
+        _, _, slot = pool.try_alloc(256)
+        pool.release(slot, ready_event=_FakeEvent(done_after_queries=3))
+
+        result = {}
+
+        def alloc():
+            start = time.monotonic()
+            result["slot"] = pool.alloc(256, timeout=10.0)
+            result["elapsed"] = time.monotonic() - start
+
+        worker = threading.Thread(target=alloc)
+        worker.start()
+        worker.join(timeout=15.0)
+        self.assertIsNotNone(result["slot"])
+        self.assertLess(result["elapsed"], 5.0)
+
+
+class TestReleaseConsumedPoolSlots(CustomTestCase):
+    def test_slot_released_only_after_last_chunk(self):
+        """An image spanning two prefill chunks must keep its slot after the first;
+        offsets are inclusive, so it frees only once the end position is processed."""
+        lease = _RecordingLease()
+        item = _image_item(offsets=[(2, 9)], embedding=torch.zeros(8, 4))
+        item.attach_pool_slot_leases([lease])
+        mm_inputs = MultimodalInputs(mm_items=[item])
+
+        release_consumed_pool_slots(
+            mm_inputs_list=[mm_inputs], extend_prefix_lens=[0], extend_seq_lens=[6]
+        )
+        self.assertEqual(lease.released, 0)
+
+        release_consumed_pool_slots(
+            mm_inputs_list=[mm_inputs], extend_prefix_lens=[6], extend_seq_lens=[3]
+        )
+        self.assertEqual(lease.released, 0)
+
+        release_consumed_pool_slots(
+            mm_inputs_list=[mm_inputs], extend_prefix_lens=[6], extend_seq_lens=[4]
+        )
+        self.assertEqual(lease.released, 1)
+
+    def test_shared_lease_waits_for_every_item(self):
+        """Per-part leases are shared by all items of a request; one finished image
+        must not free a slot that a later image in the same request still reads."""
+        lease = _RecordingLease()
+        first = _image_item(offsets=[(0, 3)], embedding=torch.zeros(4, 4))
+        second = _image_item(offsets=[(10, 13)], embedding=torch.zeros(4, 4))
+        for item in (first, second):
+            item.attach_pool_slot_leases([lease])
+        mm_inputs = MultimodalInputs(mm_items=[first, second])
+
+        release_consumed_pool_slots(
+            mm_inputs_list=[mm_inputs], extend_prefix_lens=[0], extend_seq_lens=[8]
+        )
+        self.assertEqual(lease.released, 0)
+
+        release_consumed_pool_slots(
+            mm_inputs_list=[mm_inputs], extend_prefix_lens=[8], extend_seq_lens=[8]
+        )
+        self.assertEqual(lease.released, 1)
 
 
 if __name__ == "__main__":

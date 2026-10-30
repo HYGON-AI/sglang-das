@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import enum
 import functools
+import itertools
 import logging
 import os
 from dataclasses import dataclass, field
@@ -45,7 +46,10 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     gather_upconvert_k_cache_paged,
     q8kv8_padded_num_heads,
 )
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    dequant_fp4_index_k,
+    fp4_index_logits_decode,
+)
 from sglang.kernels.ops.attention.dsv4.lightop_indexer import (
     lightop_paged_indexer_available,
     lightop_paired_rows_available,
@@ -538,6 +542,24 @@ def _as_int_list(values) -> Optional[List[int]]:
             return None
         values = values.tolist()
     return [int(v) for v in values]
+
+
+def _extend_k_slots(req_to_token, *, ratio, lc_per_req, req_pool_indices, device):
+    """Per request, the c1/c2 pool slots of its visible compressed positions, and
+    each request's start offset in their concatenation."""
+    starts = [0, *itertools.accumulate(lc_per_req)]
+    total = starts.pop()
+    counts = torch.tensor(lc_per_req, dtype=torch.int64, device=device)
+    req_rows = torch.repeat_interleave(
+        req_pool_indices.to(torch.int64), counts, output_size=total
+    )
+    j = torch.arange(total, device=device) - torch.repeat_interleave(
+        torch.tensor(starts, dtype=torch.int64, device=device),
+        counts,
+        output_size=total,
+    )
+    slots = req_to_token[req_rows, j * ratio].to(torch.int64) // ratio
+    return slots, starts
 
 
 def _low_ratio_compression_metadata(
@@ -1401,6 +1423,9 @@ class DeepseekV4AttnBackend(
         self.has_c128: bool = 128 in self.present_ratios
         cfg = model_runner.model_config.hf_text_config
         self.is_dsv41: bool = getattr(cfg, "model_type", None) == "deepseek_v41"
+        # V4.1 on HCU gathers low-ratio indexer slots with dedicated kernels
+        # instead of HCU's generic index kernel; V4 keeps the upstream path.
+        self.dsv41_hcu_indexer_kernels: bool = _is_hcu and self.is_dsv41
         self.prefill_candidates, self.decode_candidates = make_candidate_indexer(
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
@@ -4207,20 +4232,35 @@ class DeepseekV4AttnBackend(
                 layer.layer_id, k_slots, use_hcu_fused_gather=True
             )
         else:
-            req_pool_indices = forward_batch.req_pool_indices.to(torch.int64)
-            slot_chunks, starts, start = [], [], 0
-            for r, lc in enumerate(lc_per_req):
-                starts.append(start)
-                if lc == 0:
-                    continue
-                j = torch.arange(lc, device=device)
-                slot_chunks.append(
-                    self.req_to_token[req_pool_indices[r], j * ratio].to(torch.int64)
-                    // ratio
+            if self.dsv41_hcu_indexer_kernels:
+                k_slots, starts = _extend_k_slots(
+                    self.req_to_token,
+                    ratio=ratio,
+                    lc_per_req=lc_per_req,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    device=device,
                 )
-                start += lc
-            k_slots = torch.cat(slot_chunks)
-            k_fp4, k_sf = pool.get_low_ratio_index_k_fp4(layer.layer_id, k_slots)
+            else:
+                req_pool_indices = forward_batch.req_pool_indices.to(torch.int64)
+                slot_chunks, starts, start = [], [], 0
+                for r, lc in enumerate(lc_per_req):
+                    starts.append(start)
+                    if lc == 0:
+                        continue
+                    j = torch.arange(lc, device=device)
+                    slot_chunks.append(
+                        self.req_to_token[req_pool_indices[r], j * ratio].to(
+                            torch.int64
+                        )
+                        // ratio
+                    )
+                    start += lc
+                k_slots = torch.cat(slot_chunks)
+            k_fp4, k_sf = pool.get_low_ratio_index_k_fp4(
+                layer.layer_id,
+                k_slots,
+                use_hcu_fused_gather=self.dsv41_hcu_indexer_kernels,
+            )
 
         q = indexer.queries(q_lora, layer.freqs_cis[pos])  # [T, H, 128] fp4 grid
         if not use_hcu_prep:
@@ -4837,9 +4877,21 @@ class DeepseekV4AttnBackend(
                     )
                 continue
             j = torch.arange(lc, device=pos.device)
-            slots_j = self.req_to_token[r, j * ratio].to(torch.int64) // ratio
+            if self.dsv41_hcu_indexer_kernels:
+                row = self.req_to_token[int(r)]
+                slots_j = row[: lc * ratio : ratio].to(torch.int64) // ratio
+            else:
+                slots_j = self.req_to_token[r, j * ratio].to(torch.int64) // ratio
             # Dequantize only this request's visible K rows; the table is pool-sized.
-            index_k = pool.get_low_ratio_index_k_dequant(layer.layer_id, slots_j)
+            if self.dsv41_hcu_indexer_kernels:
+                k_fp4, k_sf = pool.get_low_ratio_index_k_fp4(
+                    layer.layer_id,
+                    slots_j,
+                    use_hcu_fused_gather=True,
+                )
+                index_k = dequant_fp4_index_k(k_fp4, k_sf)
+            else:
+                index_k = pool.get_low_ratio_index_k_dequant(layer.layer_id, slots_j)
             k = min(topk, lc)
             # Every step below is per query row; chunk rows so the [rows, heads, lc]
             # bf16 scores stay under the budget (16 GiB at once for a 16k-token prompt).

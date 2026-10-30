@@ -420,6 +420,16 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     def set(self, key: str, value: MultimodalDataValue) -> None:
         self.__setitem__(key, value)
 
+    def attach_pool_slot_leases(self, leases) -> None:
+        # Kept in __dict__, not a struct field: never encoded and not inherited by
+        # copies, so the slot follows this exact item object.
+        msgspec.Struct.__setattr__(self, "_pool_slot_leases", tuple(leases))
+
+    @property
+    def pool_slot_leases(self) -> tuple:
+        """Receiver pool slots that ``precomputed_embeddings`` views, if any."""
+        return self.__dict__.get("_pool_slot_leases", ())
+
     def set_hash(self, hash_value: int) -> None:
         self.hash = hash_value
         self.pad_value = _compute_pad_value(hash_value)
@@ -739,7 +749,10 @@ class MultimodalInputs:
 
     @staticmethod
     def from_processor_output(
-        obj: MultimodalProcessorOutput, *, requires_mm_token_modalities: bool = False
+        obj: MultimodalProcessorOutput,
+        *,
+        requires_mm_token_modalities: bool = False,
+        builds_missing_padded_input_ids: bool = False,
     ):
         mm_items = obj.mm_items
         assert isinstance(mm_items, list)
@@ -790,6 +803,12 @@ class MultimodalInputs:
         for item in mm_items:
             item.set_pad_value()
 
+        padded_input_ids = obj.padded_input_ids
+        if padded_input_ids is None and builds_missing_padded_input_ids:
+            padded_input_ids = MultimodalProcessorOutput.build_padded_input_ids(
+                obj.input_ids, mm_items
+            )
+
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             for item in mm_items:
                 if item.feature is not None:
@@ -797,7 +816,7 @@ class MultimodalInputs:
 
         mm_inputs = MultimodalInputs(
             mm_items=mm_items,
-            padded_input_ids=obj.padded_input_ids,
+            padded_input_ids=padded_input_ids,
             token_modalities=token_modalities,
         )
         optional_args = [

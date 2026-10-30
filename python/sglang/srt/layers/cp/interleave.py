@@ -182,15 +182,16 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         cp_rank = self.cp_rank
         if isinstance(input_, (tuple, list)):
             indices = range(cp_rank, len(input_), cp_size)
-            return input_[indices]
+            selected = (input_[index] for index in indices)
+            return list(selected) if isinstance(input_, list) else tuple(selected)
 
         tokens = len(input_)
         if tokens % cp_size != 0:
             cur_len = tokens // cp_size + (tokens % cp_size > cp_rank)
             if cur_len == 0:
                 return input_.new_empty(0, *input_.shape[1:])
-            indices = torch.arange(cp_rank, tokens, cp_size, device=input_.device)
-            return input_[indices]
+            # A strided slice reads only this rank's rows, without an index kernel.
+            return input_[cp_rank::cp_size].contiguous()
 
         return input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank].contiguous()
 
@@ -315,11 +316,12 @@ class InterleaveCPStrategy(ContextParallelStrategy):
                 .reshape(total_tokens, *x.shape[1:])
             )
 
-        flat_indices = torch.arange(total_tokens, device=x.device)
-        gather_indices = (
-            flat_indices % self.cp_size
-        ) * physical_rank_len + flat_indices // self.cp_size
-        return gathered.index_select(0, gather_indices)
+        # Uneven rank lengths: reorder with views instead of HCU's generic index
+        # kernel; the padding lands in the last interleaved row and is sliced off.
+        interleaved = gathered.view(
+            self.cp_size, physical_rank_len, *x.shape[1:]
+        ).transpose(0, 1)
+        return interleaved.reshape(-1, *x.shape[1:])[:total_tokens]
 
     def get_supported_attention_backend(self):
         return [CPAttentionBackendKind.DSA]

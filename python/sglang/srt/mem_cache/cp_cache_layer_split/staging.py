@@ -19,13 +19,13 @@ def build_active_pages_mask(
     max_pages: int,
 ) -> torch.Tensor:
     local_mask = torch.zeros(max_pages, dtype=torch.int32, device=indices.device)
-    valid = indices >= 0
-    safe_indices = torch.clamp(indices, min=0)
+    valid = (indices >= 0) & (indices < max_pages * page_size)
+    safe_indices = torch.clamp(indices, min=0, max=max_pages * page_size - 1)
     page_ids = torch.div(safe_indices, page_size, rounding_mode="floor")
-    local_mask.index_put_(
-        (page_ids.flatten().to(torch.long),),
+    local_mask.scatter_add_(
+        0,
+        page_ids.flatten().to(torch.long),
         valid.flatten().to(torch.int32),
-        accumulate=True,
     )
     return local_mask
 
@@ -35,6 +35,32 @@ def all_reduce_active_pages_mask(local_mask: torch.Tensor, pynccl_comm) -> torch
     with pynccl_comm.change_state(enable=True):
         pynccl_comm.all_reduce(local_mask)
     return local_mask
+
+
+def _staging_page_map(
+    selected_pages: torch.Tensor,
+    max_pages: int,
+    static_selected_pages: bool = False,
+) -> torch.Tensor:
+    """Pool page -> staging slot table; -1 marks pages outside the selection."""
+    selected = selected_pages.to(torch.long)
+    num_selected = selected.numel()
+    if static_selected_pages:
+        # nonzero_static pads with -1; park the padding past the real pages.
+        selected = torch.where(
+            selected >= 0,
+            selected,
+            max_pages
+            + torch.arange(num_selected, dtype=torch.long, device=selected.device),
+        )
+        num_rows = max_pages + num_selected
+    else:
+        num_rows = max_pages
+    page_map = torch.full((num_rows,), -1, dtype=torch.int32, device=selected.device)
+    page_map[selected] = torch.arange(
+        num_selected, dtype=torch.int32, device=selected.device
+    )
+    return page_map
 
 
 def contiguous_request_page_capacity(
@@ -69,36 +95,17 @@ def remap_indices_to_staging(
             indices, selected_pages, page_size, max_pages, static_selected_pages
         )
 
-    if static_selected_pages:
-        selected_valid = selected_pages >= 0
-        selected_slots = torch.where(
-            selected_valid,
-            selected_pages.to(torch.long),
-            max_pages
-            + torch.arange(
-                selected_pages.numel(), dtype=torch.long, device=indices.device
-            ),
-        )
-        page_map = torch.full(
-            (max_pages + selected_pages.numel(),),
-            -1,
-            dtype=torch.int32,
-            device=indices.device,
-        )
-    else:
-        selected_slots = selected_pages.to(torch.long)
-        page_map = torch.full((max_pages,), -1, dtype=torch.int32, device=indices.device)
-    page_map[selected_slots] = torch.arange(
-        selected_pages.numel(), dtype=torch.int32, device=indices.device
-    )
-
-    valid = indices >= 0
-    safe_indices = torch.clamp(indices, min=0)
+    valid = (indices >= 0) & (indices < max_pages * page_size)
+    safe_indices = torch.clamp(indices, min=0, max=max_pages * page_size - 1)
     page_ids = torch.div(safe_indices, page_size, rounding_mode="floor")
     offsets = safe_indices - page_ids * page_size
-    new_pages = page_map[page_ids.to(torch.long)].to(indices.dtype)
-    remapped = new_pages * page_size + offsets
-    return torch.where(valid, remapped, indices)
+    page_map = _staging_page_map(selected_pages, max_pages, static_selected_pages)
+    new_pages = page_map[page_ids.to(torch.long)]
+    valid &= new_pages >= 0
+    remapped = new_pages.to(indices.dtype) * page_size + offsets
+    # An unmapped index must not fall through as a pool index: the caller reads
+    # the staging buffer with it, which would silently fetch another page's KV.
+    return torch.where(valid, remapped, torch.where(indices < 0, indices, -1))
 
 
 @torch.compile(dynamic=True)
@@ -107,15 +114,16 @@ def remap_page_table_to_staging(
     selected_pages: torch.Tensor,
     max_pages: int,
 ) -> torch.Tensor:
-    page_map = torch.full((max_pages,), -1, dtype=torch.int32, device=page_table.device)
-    page_map[selected_pages.to(torch.long)] = torch.arange(
-        selected_pages.numel(), dtype=torch.int32, device=page_table.device
+    valid = (page_table >= 0) & (page_table < max_pages)
+    safe_pages = torch.clamp(page_table, min=0, max=max_pages - 1)
+    page_map = _staging_page_map(selected_pages, max_pages)
+    remapped = page_map[safe_pages.to(torch.long)]
+    valid &= remapped >= 0
+    return torch.where(
+        valid,
+        remapped.to(page_table.dtype),
+        torch.where(page_table < 0, page_table, -1),
     )
-
-    valid = page_table >= 0
-    safe_pages = torch.clamp(page_table, min=0)
-    remapped = page_map[safe_pages.to(torch.long)].to(page_table.dtype)
-    return torch.where(valid, remapped, page_table)
 
 
 def active_pages_for_indices(

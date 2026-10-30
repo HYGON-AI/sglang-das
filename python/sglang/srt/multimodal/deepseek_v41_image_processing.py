@@ -9,7 +9,9 @@ Every one of those positions carries `image_token_id` in `input_ids`; only the t
 apart. The IMAGE slots are filled with aligner rows in reading order.
 """
 
+import logging
 import math
+from functools import cache, partial
 
 import numpy as np
 import torch
@@ -20,6 +22,8 @@ IMAGE_START, IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(4)
 
 
 GPU_PLAN_KEY = "dsv41_gpu_plan"
+
+logger = logging.getLogger(__name__)
 
 
 def num_image_tokens(n_llm_h: int, n_llm_w: int) -> int:
@@ -95,6 +99,56 @@ def plan_image_grid(width: int, height: int, args):
 def to_rgb(image: Image.Image) -> Image.Image:
     """The same RGB conversion for every preprocessing backend."""
     return image.convert("RGB")
+
+
+@cache
+def resolve_patchify_backend(
+    image_processor_backend: str,
+    disable_fast_image_processor: bool,
+    use_gpu_preprocessing: bool,
+):
+    """Select the V4.1 image preprocessing backend shared by all entry points."""
+    if image_processor_backend == "pil" or disable_fast_image_processor:
+        return "cpu", patchify_image
+    if use_gpu_preprocessing:
+        return "gpu", None
+    if image_processor_backend == "auto":
+        try:
+            from sglang.srt.rust_extensions import load_rust_extension
+
+            extension = load_rust_extension(
+                "sglang.srt.rust_extensions._multimodal"
+            )
+            resize_patchify = extension.dsv41.resize_patchify
+        except (ImportError, OSError, RuntimeError, AttributeError) as error:
+            logger.warning(
+                "V4.1 Rust image processor unavailable; using PIL: %s", error
+            )
+        else:
+            return "rust", partial(
+                patchify_image_rust, resize_patchify=resize_patchify
+            )
+    return "cpu", patchify_image
+
+
+def patchify_for_vit(image, args, *, backend: str, cpu_patchify):
+    """Prepare one image for the ViT on a backend from resolve_patchify_backend.
+
+    Returns ``(feature, metadata, n_llm_h, n_llm_w)``; ``metadata`` is the
+    item's model_specific_data (ViT patch grid, plus the resize plan on GPU).
+    """
+    if backend == "gpu":
+        feature, plan, n_llm_h, n_llm_w = prepare_image_gpu(image, args)
+        p = plan["patch_size"]
+        metadata = {
+            "n_vit_h": plan["height"] // p,
+            "n_vit_w": plan["width"] // p,
+            GPU_PLAN_KEY: plan,
+        }
+    else:
+        feature, n_vit_h, n_vit_w, n_llm_h, n_llm_w = cpu_patchify(image, args)
+        metadata = {"n_vit_h": int(n_vit_h), "n_vit_w": int(n_vit_w)}
+    return feature, metadata, n_llm_h, n_llm_w
 
 
 def patchify_image(image, args):
