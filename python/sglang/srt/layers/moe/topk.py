@@ -2747,6 +2747,17 @@ def capture_routed_experts_if_allowed(
         )
 
 
+def _lp_or_static_remap(topk_ids, remap_info, solver, log2phy_prob):
+    """Logical -> physical remap; HIP LPLB solvers dispatch on their compact map."""
+    if log2phy_prob is not None and getattr(solver, "dispatch_map", None) is not None:
+        from sglang.kernels.ops.lplb import cuda_solver
+
+        return cuda_solver.dispatch_probability(
+            topk_ids, log2phy_prob, solver.dispatch_map
+        )
+    return topk_ids_logical_to_physical(topk_ids, remap_info, log2phy_prob)
+
+
 def _post_process_topk_ids(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -2808,8 +2819,8 @@ def _post_process_topk_ids(
                 log2phy_prob = lplb_solver.solve(topk_ids)
 
         if log2phy_prob is not None:
-            topk_ids = topk_ids_logical_to_physical(
-                topk_ids, expert_location_dispatch_info, log2phy_prob
+            topk_ids = _lp_or_static_remap(
+                topk_ids, expert_location_dispatch_info, lplb_solver, log2phy_prob
             )
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
         elif num_fused_shared_experts > 0:
@@ -2929,6 +2940,7 @@ def _post_process_topk_ids(
         # the map is identity so the remap can be skipped safely.
         if remap_info is not None and not hip_deepep_postprocessed and not recorder_was_fused:
             log2phy_prob = None
+            solver = None
             if remap_info.ep_dispatch_algorithm == "lp":
                 # Outside compiled regions: the solver all-reduces counts.
                 from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
@@ -2937,7 +2949,7 @@ def _post_process_topk_ids(
                 if solver is None:
                     raise RuntimeError(f"Missing LPLB solver for layer {layer_id}")
                 log2phy_prob = solver.solve(topk_ids)
-            topk_ids = topk_ids_logical_to_physical(topk_ids, remap_info, log2phy_prob)
+            topk_ids = _lp_or_static_remap(topk_ids, remap_info, solver, log2phy_prob)
         # NOTE (HIP): padded-token routing-weight zeroing is deferred to the
         # single pass at the end of this function (gated by SGLANG_MORI_NO_PAD_MASK).
         # That final pass re-zeros after any shared-expert append/remap, so a
