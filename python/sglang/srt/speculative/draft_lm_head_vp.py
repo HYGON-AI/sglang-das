@@ -306,6 +306,8 @@ class DSparkLMHeadVocabParallel:
         max_rows_per_rank: int,
         local_world_size: int,
         process_group=None,
+        weight_shard_t: torch.Tensor | None = None,
+        workspace: DSparkLMHeadVocabParallel | None = None,
     ) -> None:
         if vp_size <= 1 or max_rows_per_rank <= 0:
             raise ValueError(
@@ -321,6 +323,15 @@ class DSparkLMHeadVocabParallel:
             raise ValueError("The vocabulary size must be divisible by DSPARK VP size.")
         self._pynccl_comm = None
         self._cpu_group = None
+        if workspace is not None:
+            if (
+                process_group is not None
+                and process_group is not workspace.process_group
+            ):
+                raise ValueError("Shared VP workspace requires the same process group.")
+            process_group = workspace.process_group
+            self._pynccl_comm = workspace._pynccl_comm
+            self._cpu_group = workspace._cpu_group
         if process_group is None:
             from sglang.srt.runtime_context import get_parallel
 
@@ -375,29 +386,63 @@ class DSparkLMHeadVocabParallel:
         self.shard_size = vocab_size // vp_size
         self.dtype = full_weight.dtype
         self.device = full_weight.device
-        # A contiguous transpose also avoids the HCU strided-transpose GEMM
-        # issue handled by the existing EAGLE VP implementation.
-        self.weight_shard_t = full_weight.narrow(
-            0, self.vp_rank * self.shard_size, self.shard_size
-        ).T.contiguous()
+        # Own the transposed shard storage, even when a one-row/one-column
+        # slice is already contiguous, so releasing the full weight frees it.
+        # Contiguous layout also avoids the HCU strided-transpose GEMM issue.
+        if weight_shard_t is None:
+            self.weight_shard_t = (
+                full_weight.detach()
+                .narrow(0, self.vp_rank * self.shard_size, self.shard_size)
+                .T.clone(memory_format=torch.contiguous_format)
+            )
+        else:
+            if (
+                weight_shard_t.shape != (self.hidden_size, self.shard_size)
+                or weight_shard_t.device != self.device
+                or weight_shard_t.dtype != self.dtype
+                or not weight_shard_t.is_contiguous()
+            ):
+                raise ValueError("Shared VP weight shard has an incompatible layout.")
+            self.weight_shard_t = weight_shard_t
         options = dict(device=self.device, dtype=self.dtype)
-        total_rows = max_rows_per_rank * vp_size
-        self.local_hidden = torch.empty(
-            (max_rows_per_rank, self.hidden_size), **options
-        )
-        self.gathered_hidden = torch.empty((total_rows, self.hidden_size), **options)
-        self.shard_logits = torch.empty((total_rows, self.shard_size), **options)
-        self.received_logits = torch.empty_like(self.shard_logits)
+        if workspace is None:
+            self._workspace_state = dict(rows=0, frozen=False, references=1)
+            self.reserve_workspace(max_rows_per_rank)
+            self._cpu_row_count = torch.empty((), dtype=torch.int64, device="cpu")
+        else:
+            if (
+                workspace.vp_size != self.vp_size
+                or workspace.hidden_size != self.hidden_size
+                or workspace.vocab_size != self.vocab_size
+                or workspace.device != self.device
+                or workspace.dtype != self.dtype
+            ):
+                raise ValueError("Shared VP workspace has an incompatible layout.")
+            # Initialization only: expand before either target or draft graphs
+            # capture these addresses. Replays use the same ordered forward stream.
+            workspace.reserve_workspace(max_rows_per_rank)
+            self._workspace_state = workspace._workspace_state
+            self._workspace_state["references"] += 1
+            self._cpu_row_count = workspace._cpu_row_count
+            for name in (
+                "local_hidden",
+                "gathered_hidden",
+                "shard_logits",
+                "received_logits",
+            ):
+                setattr(self, name, getattr(workspace, name))
+        # Keep outputs separate. Draft logits can outlive projection while the
+        # target computes p; reusing this output would corrupt the proposal q.
         self.full_logits = torch.empty((max_rows_per_rank, vocab_size), **options)
-        self._cpu_row_count = torch.empty((), dtype=torch.int64, device="cpu")
 
-        # Warm both collective types before capture and memory accounting.
-        warm_send = torch.zeros(vp_size, device=self.device, dtype=self.dtype)
-        warm_recv = torch.empty_like(warm_send)
-        self._all_gather(warm_recv, warm_send[:1])
-        self._all_to_all(warm_recv, warm_send)
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
+        # Initialize both collective types before CUDA Graph capture.
+        if workspace is None:
+            warm_send = torch.zeros(vp_size, device=self.device, dtype=self.dtype)
+            warm_recv = torch.empty_like(warm_send)
+            self._all_gather(warm_recv, warm_send[:1])
+            self._all_to_all(warm_recv, warm_send)
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
 
     @staticmethod
     def guard_online_weight_updates(*models) -> None:
@@ -441,6 +486,22 @@ class DSparkLMHeadVocabParallel:
         else:
             dist.all_to_all_single(output, input, group=self.process_group)
 
+    def reserve_workspace(self, rows: int) -> None:
+        """Grow scratch once at initialization, never after use or aliasing."""
+        if rows <= self._workspace_state["rows"]:
+            return
+        if self._workspace_state["frozen"] or self._workspace_state["references"] > 1:
+            raise RuntimeError(
+                "VP scratch addresses cannot change after use or sharing."
+            )
+        options = dict(device=self.device, dtype=self.dtype)
+        total_rows = rows * self.vp_size
+        self.local_hidden = torch.empty((rows, self.hidden_size), **options)
+        self.gathered_hidden = torch.empty((total_rows, self.hidden_size), **options)
+        self.shard_logits = torch.empty((total_rows, self.shard_size), **options)
+        self.received_logits = torch.empty_like(self.shard_logits)
+        self._workspace_state["rows"] = rows
+
     @torch.no_grad()
     def project_logits(
         self, hidden_states: torch.Tensor, *, padded_rows: int | None = None
@@ -453,6 +514,7 @@ class DSparkLMHeadVocabParallel:
         """
         if hidden_states.ndim != 2 or hidden_states.shape[1] != self.hidden_size:
             raise ValueError("DSPARK VP hidden states have an unexpected shape.")
+        self._workspace_state["frozen"] = True
         rows = hidden_states.shape[0]
         if hidden_states.device != self.device:
             raise ValueError("DSPARK VP hidden states changed device.")

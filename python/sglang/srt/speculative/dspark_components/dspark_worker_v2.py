@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
@@ -622,6 +623,12 @@ class DSparkWorkerV2(BaseSpecWorker):
     ):
         if not self._hosts_draft or self._is_lifecycle_only_pp_prefill_rank:
             return
+        vp_size = get_spec().speculative_draft_lm_head_vp_size
+        target_vp_size = int(os.environ.get("SGLANG_DSPARK_TARGET_LM_HEAD_VP_SIZE", "1"))
+        if target_vp_size not in (1, 4, 8, 16):
+            raise ValueError("SGLANG_DSPARK_TARGET_LM_HEAD_VP_SIZE must be 1, 4, 8 or 16.")
+        if (vp_size > 1 or target_vp_size > 1) and get_exec().features.enable_memory_saver:
+            raise ValueError("DSPARK LM-head VP does not support --enable-memory-saver.")
         if memory_pool_config is not None and self._is_context_only_pp_prefill_rank:
             page_size = int(self.page_size)
 
@@ -645,24 +652,94 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        # DSPARK loads weights before the scheduler creates the request pool.
-        # Size VP buffers here, after the pool is bound and before any target
-        # or draft graph is captured. This also covers eager-only serving.
-        vp_size = get_spec().speculative_draft_lm_head_vp_size
+        # Allocate projection buffers once, after request-pool sizing and before
+        # graph capture. A standalone VP keeps the other head's full weight.
+        if vp_size == 1 and target_vp_size == 1:
+            return
+        if not self._draft_is_moe or not hasattr(self.draft_model, "enable_draft_lm_head_vp"):
+            raise ValueError("DSPARK LM-head VP currently requires a DeepSeek-V4 draft.")
+        from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+        from sglang.srt.speculative.draft_lm_head_vp import DSparkLMHeadVocabParallel
+
+        parallel = get_parallel()
+        target_model = self.target_worker.model_runner.model
+        target_logits = target_model.logits_processor
+        head = target_model.lm_head
+        both_vp = vp_size > 1 and target_vp_size > 1
+        if target_vp_size > 1:
+            if (
+                self._is_pd_prefill
+                or get_disagg().disaggregation_mode != "decode"
+                or parallel.pp_size != 1
+                or parallel.attn_cp_size != 1
+                or not parallel.enable_dp_lm_head
+                or (both_vp and target_vp_size != vp_size)
+            ):
+                raise ValueError(
+                    "Target VP requires decode, PP1/CP1, DP LM-head, and matching sizes when both heads use VP."
+                )
+            if (
+                int(head.tp_size) != 1
+                or target_logits.use_fp32_lm_head
+                or hasattr(head, "set_lora")
+                or should_apply_lm_head_quant_method(head, head.quant_method)
+            ):
+                raise ValueError(
+                    "Target VP requires an unquantized replicated LM-head without LoRA or FP32-head mode."
+                )
+        if both_vp:
+            if self.draft_model.lm_head.weight is not head.weight:
+                raise ValueError("Compact target+draft VP requires a shared LM-head weight.")
+            storage = head.weight.untyped_storage().data_ptr()
+            for embed in (
+                getattr(target_model.model, "embed_tokens", None),
+                getattr(self.draft_model, "embed_tokens", None),
+            ):
+                weight = getattr(embed, "weight", None)
+                if (
+                    weight is not None
+                    and weight.device == head.weight.device
+                    and weight.untyped_storage().data_ptr() == storage
+                ):
+                    raise ValueError("Full-head release cannot discard tied input embeddings.")
         if vp_size > 1 and getattr(self.draft_model, "draft_lm_head_vp", None) is None:
             max_bs = max(
                 self.draft_model_runner.req_to_token_pool.size,
                 max(get_exec().graph.cuda_graph_config.decode.bs or [1]),
             )
-            parallel = get_parallel()
             self.draft_model.enable_draft_lm_head_vp(
                 vp_size=vp_size,
                 max_rows_per_rank=max_bs * self.gamma,
                 local_world_size=parallel.tp_size // parallel.nnodes,
             )
-            self.draft_model.draft_lm_head_vp.guard_online_weight_updates(
-                self.draft_model, self.target_worker.model_runner.model
+        if target_vp_size > 1 and target_logits.target_lm_head_vp is None:
+            max_bs = max(
+                self.target_worker.model_runner.req_to_token_pool.size,
+                max(get_exec().graph.cuda_graph_config.decode.bs or [1]),
             )
+            draft_vp = getattr(self.draft_model, "draft_lm_head_vp", None)
+            target_logits.target_lm_head_vp = DSparkLMHeadVocabParallel(
+                full_weight=head.weight,
+                vocab_size=int(head.org_vocab_size),
+                vp_size=target_vp_size,
+                max_rows_per_rank=max_bs * self.verify_num_draft_tokens,
+                local_world_size=parallel.tp_size // parallel.nnodes,
+                weight_shard_t=draft_vp.weight_shard_t if both_vp else None,
+                workspace=draft_vp if both_vp else None,
+            )
+            if both_vp:
+                # Both paths now use the same GPU shard. Release the complete
+                # weight without a CPU backup; keep only interface metadata.
+                metadata_weight = torch.nn.Parameter(
+                    torch.empty(head.weight.shape, dtype=head.weight.dtype, device="meta"),
+                    requires_grad=head.weight.requires_grad,
+                )
+                head.weight = metadata_weight
+                self.draft_model.lm_head.weight = metadata_weight
+                if draft_vp.device.type == "cuda":
+                    with torch.cuda.device(draft_vp.device):
+                        torch.cuda.empty_cache()
+        DSparkLMHeadVocabParallel.guard_online_weight_updates(target_model, self.draft_model)
 
     def init_attention_backends(self):
         if not self._hosts_draft or self._is_context_only_pp_prefill_rank:
