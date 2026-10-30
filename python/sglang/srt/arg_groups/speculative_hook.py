@@ -296,12 +296,12 @@ def _validate_draft_lm_head_vp(server_args: ServerArgs) -> None:
         )
     if cfg.speculative_draft_lm_head_vp_size > 1:
         vp_size = cfg.speculative_draft_lm_head_vp_size
-        if cfg.speculative_algorithm != "EAGLE":
+        if cfg.speculative_algorithm not in ("EAGLE", "DSPARK"):
             raise ValueError(
                 "--speculative-draft-lm-head-vp-size > 1 currently requires "
-                "speculative_algorithm == EAGLE."
+                "speculative_algorithm == EAGLE or DSPARK."
             )
-        if cfg.speculative_eagle_topk != 1:
+        if cfg.speculative_algorithm == "EAGLE" and cfg.speculative_eagle_topk != 1:
             raise ValueError(
                 "--speculative-draft-lm-head-vp-size > 1 currently requires "
                 "--speculative-eagle-topk 1."
@@ -332,9 +332,27 @@ def _validate_draft_lm_head_vp(server_args: ServerArgs) -> None:
             raise ValueError(
                 "Draft LM-head VP does not currently support --enable-fp32-lm-head."
             )
+        if cfg.speculative_algorithm == "DSPARK":
+            if cfg.enable_memory_saver:
+                raise ValueError(
+                    "DSPARK LM-head VP does not support --enable-memory-saver; "
+                    "its vocabulary shards must remain resident."
+                )
+            if cfg.pp_size != 1 or cfg.attn_cp_size != 1:
+                raise ValueError(
+                    "DSPARK draft LM-head VP requires PP=1 and attention CP=1."
+                )
+            if cfg.enable_lora:
+                raise ValueError("DSPARK draft LM-head VP does not support LoRA.")
+            local_world_size = cfg.tp_size // cfg.nnodes
+            if local_world_size % vp_size:
+                raise ValueError(
+                    "DSPARK draft LM-head VP must divide the node-local TP size."
+                )
 
     if (
         cfg.speculative_draft_lm_head_vp_size > 1
+        and cfg.speculative_algorithm == "EAGLE"
         and cfg.speculative_use_rejection_sampling
     ):
         raise ValueError(

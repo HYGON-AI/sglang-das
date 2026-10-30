@@ -1012,6 +1012,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         )
         self.embed_tokens: Optional[nn.Module] = None
         self.lm_head: Optional[nn.Module] = None
+        self.draft_lm_head_vp = None
         self._partial_feature_indices: tuple[int, ...] = ()
         self._partial_main_proj: Optional[_BlockFp8LinearSlice] = None
         self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
@@ -1108,6 +1109,30 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             self.embed_tokens = embed_tokens
             self.lm_head = lm_head
         self.markov_head.configure_tp_shard(lm_head=self.lm_head)
+
+    def enable_draft_lm_head_vp(
+        self, *, vp_size: int, max_rows_per_rank: int, local_world_size: int
+    ) -> None:
+        from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+        from sglang.srt.speculative.draft_lm_head_vp import DSparkLMHeadVocabParallel
+
+        if self._use_fp32_lm_head:
+            raise ValueError(
+                "DSPARK draft LM-head VP cannot be combined with "
+                "SGLANG_DSPARK_FP32_LM_HEAD."
+            )
+        if self.lm_head is None or int(self.lm_head.tp_size) != 1:
+            raise ValueError("DSPARK draft VP requires a replicated DP LM-head.")
+        if should_apply_lm_head_quant_method(self.lm_head, self.lm_head.quant_method):
+            raise ValueError("DSPARK draft VP does not support a quantized LM-head.")
+        self.draft_lm_head_vp = DSparkLMHeadVocabParallel(
+            full_weight=self.lm_head.weight,
+            vocab_size=int(self.lm_head.org_vocab_size),
+            vp_size=vp_size,
+            max_rows_per_rank=max_rows_per_rank,
+            local_world_size=local_world_size,
+        )
+        self.draft_lm_head_vp.guard_online_weight_updates(self, self.lm_head)
 
     def prune_to_ctx_projection(self) -> None:
         if vars(self).get("is_lifecycle_only", False):
@@ -1321,11 +1346,17 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             hc_eps=self.hc_eps,
         )
 
-    def compute_base_logits(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def compute_base_logits(
+        self, x: torch.Tensor, *, vp_padded_rows: Optional[int] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         x_post_hc = self.collapse_hc_head(x)
-        return self._logits_from_x_post_hc(x_post_hc), x_post_hc
+        return self._logits_from_x_post_hc(
+            x_post_hc, vp_padded_rows=vp_padded_rows
+        ), x_post_hc
 
-    def _logits_from_x_post_hc(self, x_post_hc: torch.Tensor) -> torch.Tensor:
+    def _logits_from_x_post_hc(
+        self, x_post_hc: torch.Tensor, *, vp_padded_rows: Optional[int] = None
+    ) -> torch.Tensor:
         if self.lm_head is None:
             raise ValueError(
                 "DeepseekV4ForCausalLMDSpark requires the target lm_head "
@@ -1334,6 +1365,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         last = self.stages[-1]
         x = last.norm(x_post_hc)
         weight = self.lm_head.weight
+        draft_vp = getattr(self, "draft_lm_head_vp", None)
+        if draft_vp is not None:
+            return draft_vp.project_logits(x, padded_rows=vp_padded_rows)
         if self._use_fp32_lm_head and isinstance(
             getattr(self.lm_head, "quant_method", None),
             channelwise_fp8.ChannelwiseFp8Method,
