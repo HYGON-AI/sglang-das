@@ -807,6 +807,13 @@ class NativeSparseAttnBackend(
             if configure_page_plan is not None:
                 configure_page_plan(None, forward_batch)
 
+        # An unpadded idle DP rank still participates in the model
+        # collectives, but its attention has no rows and must not reuse a
+        # preceding request's metadata (or reduce an empty CPU length tensor).
+        if forward_batch.batch_size == 0:
+            self.forward_metadata = None
+            return
+
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 

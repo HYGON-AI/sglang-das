@@ -12,6 +12,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.utils import is_hcu
 
 # Architectures whose model code implements CP-TP group sharing: the CP group
 # is the TP group, the residual stream / attention / indexer are CP-sharded,
@@ -26,6 +27,15 @@ _SUPPORTED_MODELS: set[str] = {
 
 def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
     cfg, view = resolving_view(server_args), resolved_view(server_args)
+    if is_hcu() and model.hf_config.architectures[0] in (
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "Glm5VNextForCausalLM",
+        "Glm5VNextForConditionalGeneration",
+    ):
+        # HCU keeps TX's CP/MHC and LayerSplit path, not the generic shared
+        # CP/TP topology, which excludes disaggregated LayerSplit serving.
+        return
     if (
         not cfg.enable_prefill_cp
         or view.attn_cp_size <= 1

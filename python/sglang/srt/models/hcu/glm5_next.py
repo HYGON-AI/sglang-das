@@ -26,7 +26,6 @@ from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
 from sglang.kernels.ops.layernorm.mhc import hc_pre as _hc_pre_fn
 from sglang.srt.configs.glm5_next import Glm5NextConfig as ModelNextConfig
 from sglang.srt.configs.model_config import is_deepseek_dsa
-
 from sglang.srt.distributed.utils import divide
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import (
@@ -39,12 +38,6 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
 )
-from sglang.srt.layers.layer_boundary.hcu_legacy import (
-    LayerCommunicator,
-    LayerScatterModes,
-    enable_moe_dense_fully_dp,
-    get_attn_tp_context,
-)
 from sglang.srt.layers.communicator_glm5_next_cp import (
     Glm5NextCPLayerCommunicator,
     maybe_prefetch_full_attention_kv,
@@ -56,6 +49,12 @@ from sglang.srt.layers.communicator_glm5_next_mhc_cp import (
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.fused_rms_quant import (
     is_lightop_sglang_rms_quant_available,
+)
+from sglang.srt.layers.layer_boundary.hcu_legacy import (
+    LayerCommunicator,
+    LayerScatterModes,
+    enable_moe_dense_fully_dp,
+    get_attn_tp_context,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -896,12 +895,13 @@ class ModelNextDecoderLayer(nn.Module):
             if self.is_linear_attn and attn_input_quant_args is not None
             else {}
         )
+        if self.is_linear_attn:
+            attn_quant_kwargs["layer_scatter_modes"] = self.layer_scatter_modes
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
-            layer_scatter_modes=self.layer_scatter_modes,
             prev_topk_indices=prev_topk_indices,
             **attn_quant_kwargs,
         )
@@ -936,11 +936,9 @@ class ModelNextDecoderLayer(nn.Module):
             else None
         )
 
-        should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
+        # Main's MLP/MoE implementations own their collective completion.
+        # Keep the legacy HCU boundary on the ordinary completed-output path.
+        should_allreduce_fusion = False
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
@@ -962,7 +960,6 @@ class ModelNextDecoderLayer(nn.Module):
             self.mlp.set_shared_expert_input_quant_args(mlp_input_quant_args)
         try:
             with get_forward().scoped(
-                fuse_mlp_allreduce=should_allreduce_fusion,
                 mlp_reduce_scatter=use_reduce_scatter,
             ):
                 hidden_states = self.mlp(
@@ -1117,9 +1114,7 @@ class ModelNextModel(nn.Module):
                         or a2a_backend.is_mori()
                         or a2a_backend.is_mooncake()
                     )
-                    tp_size = (
-                        1 if is_a2a_moe else get_parallel().tp_size
-                    )
+                    tp_size = 1 if is_a2a_moe else get_parallel().tp_size
                     intermediate_size = (
                         config.moe_intermediate_size * config.n_shared_experts
                     )
@@ -1540,6 +1535,10 @@ class ModelNextForCausalLM(nn.Module):
         weight_names = []
 
         for name, loaded_weight in weights:
+            if qc is not None and qc.get_name() == "slimquant_w4a8":
+                name, loaded_weight = qc.normalize_expert_weight(name, loaded_weight)
+                if name is None:
+                    continue
             weight_names.append(name)
 
             if is_nextn or is_eagle:
@@ -1600,6 +1599,10 @@ class ModelNextForCausalLM(nn.Module):
                         shard_id=shard_id,
                         expert_id=expert_id,
                     )
+                elif qc is not None and qc.get_name() == "slimquant_w4a8":
+                    raise ValueError(
+                        f"SlimQuant expert parameter {name} maps to missing {mapped}"
+                    )
                 break
             if is_expert_weight:
                 continue
@@ -1648,8 +1651,9 @@ class ModelNextForCausalLM(nn.Module):
             loader = getattr(param, "weight_loader", default_weight_loader)
             loader(param, loaded_weight)
 
-        if getattr(config, "mla", False):
-            self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        # Modern GLM configs select MLA through full_attention_layer_ids and
+        # no longer require the legacy `mla` flag. The loader skips non-MLA layers.
+        self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
     def post_load_weights(self, is_nextn: bool = False, weight_names=None):
         if not is_nextn:
@@ -1779,11 +1783,8 @@ class Glm5NextForConditionalGeneration(GlmVisualEncoderMixin, ModelNextForCausal
             vision_utils.update_vit_attn_dummy_heads_config(self.config)
             vision_quant_config = quant_config
             quant_ignore = getattr(quant_config, "ignore", ())
-            if (
-                quant_config is not None
-                and any(
-                    name in quant_ignore for name in ("visual", "model.visual")
-                )
+            if quant_config is not None and any(
+                name in quant_ignore for name in ("visual", "model.visual")
             ):
                 # GLM checkpoints can exclude the complete vision subtree.
                 # Leaf-name matching misses packed qkv/gate-up projections and

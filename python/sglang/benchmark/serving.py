@@ -1478,6 +1478,12 @@ async def benchmark(
     # Warmup
     print(f"Starting warmup with {warmup_requests} sequences...")
 
+    if not 0 <= warmup_requests < len(input_requests):
+        raise ValueError(
+            "--warmup-requests must be between 0 and one less than the number "
+            f"of loaded requests ({len(input_requests)}); got {warmup_requests}."
+        )
+
     # Handle the data structure difference for the warmup request
     if is_mooncake:
         # For mooncake, input_requests is a list of dicts.
@@ -1501,42 +1507,52 @@ async def benchmark(
             output_len=output_len,
             image_data=None,  # Mooncake doesn't have image data
         )
+        warmup_rows: List[DatasetRow] = [test_request] * warmup_requests
+        warmup_batch_size = max(1, warmup_requests)
+        warmup_indices = set()
+    elif args.dataset_name == "generated-shared-prefix":
+        # Warm up with real requests spread over the whole dataset instead of a
+        # contiguous prefix: with --gsp-ordered the rows are group-major, so a
+        # prefix would only ever warm the first few groups. Evenly spaced picks
+        # cover every group in both ordered and shuffled modes.
+        step = len(input_requests) / max(1, warmup_requests)
+        warmup_indices = {int(i * step) for i in range(warmup_requests)}
+        warmup_rows = [input_requests[i] for i in sorted(warmup_indices)]
+        # Send one wave per group so a single wave already touches every group
+        # instead of warming the same prefix repeatedly.
+        warmup_batch_size = max(1, args.gsp_num_groups)
     else:
-        # For all other datasets, input_requests is a list of DatasetRow objects
-        test_request = input_requests[0]
+        # Use the first `warmup_requests` real requests instead of repeating a
+        # single one, so the warmup actually primes distinct prompts.
+        warmup_indices = set(range(warmup_requests))
+        warmup_rows = input_requests[:warmup_requests]
+        warmup_batch_size = max(1, len(warmup_rows))
 
     if lora_names is not None and len(lora_names) != 0:
         lora_name = lora_names[0]
     else:
         lora_name = None
 
-    # Create the test input once
-    test_input = RequestFuncInput(
-        model=model_id,
-        prompt=test_request.prompt,
-        api_url=api_url,
-        prompt_len=test_request.prompt_len,
-        output_len=min(test_request.output_len, 32),
-        lora_name=lora_name,
-        image_data=test_request.image_data,
-        extra_request_body=extra_request_body,
-    )
-
     # Run warmup requests
-    warmup_tasks = []
-    # Keep warmup at the same concurrency as the measured run. Otherwise,
-    # --warmup-requests also becomes an unbounded warmup burst.
-    for _ in range(warmup_requests):
-        warmup_tasks.append(
-            asyncio.create_task(
-                limited_request_func(
-                    request_func_input=test_input,
-                    pbar=None,
-                )
+    warmup_outputs = []
+    for batch_start in range(0, len(warmup_rows), warmup_batch_size):
+        warmup_tasks = []
+        for test_request in warmup_rows[batch_start : batch_start + warmup_batch_size]:
+            warmup_input = RequestFuncInput(
+                model=model_id,
+                prompt=test_request.prompt,
+                api_url=api_url,
+                prompt_len=test_request.prompt_len,
+                output_len=min(test_request.output_len, 32),
+                lora_name=lora_name,
+                image_data=test_request.image_data,
+                extra_request_body=extra_request_body,
             )
-        )
+            warmup_tasks.append(
+                asyncio.create_task(request_func(request_func_input=warmup_input))
+            )
+        warmup_outputs.extend(await asyncio.gather(*warmup_tasks))
 
-    warmup_outputs = await asyncio.gather(*warmup_tasks)
     if is_multi_turn:
         warmup_outputs = [x for output in warmup_outputs for x in output]
 
@@ -1585,23 +1601,35 @@ async def benchmark(
             if profile_output.success:
                 print("Profiler started")
 
+    # Exclude the warmup rows from the measured set: they were just executed,
+    # so counting them again would inflate the cache hit rate and depress the
+    # per-request new-token count.
+    measured_requests = [
+        row for idx, row in enumerate(input_requests) if idx not in warmup_indices
+    ]
+    if warmup_requests > 0:
+        print(
+            f"Excluding {warmup_requests} warmup sequences from the benchmark; "
+            f"{len(measured_requests)} sequences will be measured."
+        )
+
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
-    pbar_total = len(input_requests)
+    pbar_total = len(measured_requests)
     if (
         backend == "sglang" and is_mooncake
     ):  # Assuming mooncake is mainly for sglang or similar backends
         print("Using time-based Mooncake request scheduler, ignoring --request-rate.")
         request_generator = get_mooncake_request_over_time(
-            input_requests, tokenizer, mooncake_slowdown_factor, mooncake_num_rounds
+            measured_requests, tokenizer, mooncake_slowdown_factor, mooncake_num_rounds
         )
         print(
-            f"Starting Mooncake trace replay. Sessions: {len(input_requests)}, Rounds per session: {mooncake_num_rounds}. Slowdown factor: {mooncake_slowdown_factor}"
+            f"Starting Mooncake trace replay. Sessions: {len(measured_requests)}, Rounds per session: {mooncake_num_rounds}. Slowdown factor: {mooncake_slowdown_factor}"
         )
         pbar_total *= args.mooncake_num_rounds
     else:
-        request_generator = get_request(input_requests, request_rate)
+        request_generator = get_request(measured_requests, request_rate)
 
     # Prepare LoRA request distribution parameters
     if lora_request_distribution == "distinct":

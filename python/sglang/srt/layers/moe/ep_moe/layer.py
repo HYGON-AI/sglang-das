@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-from sglang.srt.runtime_context import get_parallel
 import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
@@ -35,7 +34,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
-
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
 from sglang.srt.layers import deep_gemm_wrapper
@@ -98,6 +96,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     ceil_div,
     direct_register_custom_op,
@@ -134,8 +133,28 @@ except ImportError:
 
 from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
 from lightop import fuse_silu_mul_clamp_quant
-from lightop import fuse_situ_mul_quant_contiguous as fuse_situ_mul_quant
-from lightop import fuse_situ_mul_quant_ep
+
+try:
+    from lightop import fuse_situ_mul_quant_contiguous as fuse_situ_mul_quant
+    from lightop import fuse_situ_mul_quant_ep
+except ImportError:
+    # SiTU is used by other model families; GLM uses the existing SiLU path.
+    # Defer the optional dependency error until a SiTU model actually uses it.
+    def fuse_situ_mul_quant(
+        input: torch.Tensor, situ_beta: float, situ_linear_beta: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        raise RuntimeError("Installed LightOp does not provide SiTU quantization")
+
+    def fuse_situ_mul_quant_ep(
+        input: torch.Tensor,
+        masked_m: torch.Tensor,
+        situ_beta: float,
+        situ_linear_beta: float,
+        expect_m: int = -1,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        raise RuntimeError("Installed LightOp does not provide SiTU quantization")
+
+
 from lightop import moe as lightop_op
 from lightop.activation import (
     fuse_silu_and_mul,
@@ -150,6 +169,7 @@ try:
 except ImportError:
     # HCU wheels can expose this operator only from the package root.
     from lightop import fuse_silu_mul_clamp_quant
+
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_hcu = is_hcu()
@@ -920,20 +940,13 @@ class DeepEPMoE(FusedMoE):
 
         self.deepep_mode = get_deepep_mode()
 
-        _configure_deepep_dispatcher_quantization(
-            self.dispatcher,
-            quant_config,
-            self.quant_method,
-        )
-        if _use_hcu_legacy_channel_fp8_deepep(self):
-            # The groupgemm kernels consume the vendor per-token FP8 dispatch
-            # (LightOp normal quant, DeepEP LL quant_type), not the DeepGEMM one.
-            self.dispatcher.set_quant_config(
-                {
-                    **(getattr(self.dispatcher, "quant_config", None) or {}),
-                    "hcu_legacy_groupgemm": True,
-                }
-            )
+        if quant_config is not None and quant_config.get_name() == "slimquant_w4a8":
+            self.dispatcher.set_quant_config({"int8_dispatch": True})
+        if quant_config is None and hasattr(self.dispatcher, "set_quant_config"):
+            self.dispatcher.set_quant_config({"bf16_dispatch": True})
+            if _is_hcu:
+                # DeepEP's grouped BF16 path consumes ordinary, unshuffled weights.
+                self._skip_aiter_moe_shuffle = True
         if (
             self.deepep_mode.enable_low_latency()
             and not _is_npu
@@ -1311,7 +1324,14 @@ class DeepEPMoE(FusedMoE):
 
         if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
             # assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
-            if (
+            if _is_hcu and self.quant_config is None:
+                output = self.forward_groupgemm_bf16_contiguous(dispatch_output)
+            elif (
+                self.quant_config is not None
+                and self.quant_config.get_name() == "slimquant_w4a8"
+            ):
+                output = self.quant_method.apply_deepep_normal(self, dispatch_output)
+            elif (
                 _is_hcu
                 and _use_deepgemm_moe
                 and (
@@ -1363,6 +1383,10 @@ class DeepEPMoE(FusedMoE):
                 self.quant_method
             ):
                 output = self.forward_unquantized_deepep_ll(dispatch_output)
+            elif self.quant_config.get_name() == "slimquant_w4a8":
+                output = self.quant_method.apply_deepep_low_latency(
+                    self, dispatch_output
+                )
             elif (
                 get_moe_runner_backend().is_flashinfer_cutedsl()
                 and self.quant_config is not None
@@ -1994,6 +2018,7 @@ class DeepEPMoE(FusedMoE):
             topk_weights,
             num_recv_tokens_per_expert,
         ) = dispatch_output
+        assert hidden_states_scale is None and hidden_states.dtype == torch.bfloat16
         assert self.moe_runner_config.activation == "silu"
         if num_recv_tokens_per_expert is None:
             return hidden_states.bfloat16()
@@ -2473,7 +2498,9 @@ class DeepEPMoE(FusedMoE):
                 )
             del gate_up
             padded_size = getattr(
-                self, "w4a8_ll_padded_intermediate_size", self.w4a8_padded_intermediate_size
+                self,
+                "w4a8_ll_padded_intermediate_size",
+                self.w4a8_padded_intermediate_size,
             )
             if a2.shape[-1] != padded_size:
                 a2 = F.pad(a2, (0, padded_size - a2.shape[-1]))
@@ -2687,7 +2714,9 @@ class DeepEPMoE(FusedMoE):
         )
 
         q_a2_all, q_a2_scale = fuse_silu_mul_fp8_quant_ep(
-            input=gateup_output, fp8type=0, tokens_per_expert=masked_m,
+            input=gateup_output,
+            fp8type=0,
+            tokens_per_expert=masked_m,
             limit=self.moe_runner_config.swiglu_limit,
         )
         # The first-stage BF16 activation is no longer needed after quantization.
@@ -2931,6 +2960,119 @@ class DeepEPMoE(FusedMoE):
         )
         return down_output
 
+    def forward_deepgemm_w4a8_contiguous(
+        self,
+        dispatch_output: DeepEPNormalDispatchOutput,
+    ):
+        from deepgemm import m_grouped_w4a8_gemm_nt_contiguous_hipc
+
+        (
+            hidden_states,
+            hidden_states_scale,
+            topk_ids,
+            topk_weights,
+            num_recv_tokens_per_expert,
+        ) = dispatch_output
+        assert self.quant_method is not None
+        assert self.moe_runner_config.activation == "silu"
+        if hidden_states_scale is None:
+            raise RuntimeError(
+                "DeepEP W4A8 INT8 dispatch must return activation scales."
+            )
+        if num_recv_tokens_per_expert is None:
+            return hidden_states.bfloat16()
+
+        all_tokens = sum(num_recv_tokens_per_expert)
+        if all_tokens <= 0:
+            return hidden_states.bfloat16()
+
+        _, k = hidden_states.shape
+        n1 = self.w13_weight_scale.size(1)
+        # The current HIPC contiguous API defaults to MODE=1002, whose
+        # output tile is 128 columns x 4. Both GEMMs need full 512-column
+        # tiles; smaller widths can leave unwritten/invalid output values.
+        if k % 512 or n1 % 512:
+            raise ValueError(
+                "DeepGEMM W4A8 contiguous MODE=1002 requires both GEMM output "
+                f"widths divisible by 512; got gate_up={n1}, down={k}"
+            )
+        hidden_states_shape = hidden_states.shape
+        hidden_states_device = hidden_states.device
+        counts_are_aligned = all(
+            count % 256 == 0 for count in num_recv_tokens_per_expert
+        )
+        if not counts_are_aligned or all_tokens % 256 != 0:
+            raise RuntimeError(
+                "W4A8 contiguous HIPC requires DeepEP normal dispatch counts "
+                "aligned to 256; got counts="
+                f"{num_recv_tokens_per_expert}"
+            )
+
+        a_int8 = torch.empty(
+            (all_tokens, k), device=hidden_states_device, dtype=hidden_states.dtype
+        )
+        a_scale = torch.empty(
+            (all_tokens, 1), device=hidden_states_device, dtype=torch.float32
+        )
+        if get_offloader().forbid_copy_engine_usage:
+            num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
+                num_recv_tokens_per_expert
+            )
+        else:
+            num_recv_tokens_per_expert_gpu = torch.tensor(
+                num_recv_tokens_per_expert,
+                dtype=torch.int32,
+                pin_memory=True,
+                device="cpu",
+            ).cuda(non_blocking=True)
+        m_indices, output_index = _ep_scatter_with_optional_lightop(
+            hidden_states,
+            hidden_states_scale,
+            topk_ids,
+            num_recv_tokens_per_expert_gpu,
+            a_int8,
+            a_scale,
+            all_tokens,
+            counts_are_aligned=counts_are_aligned,
+        )
+
+        gateup_output = torch.empty(
+            (all_tokens, n1), device=hidden_states_device, dtype=torch.bfloat16
+        )
+        m_grouped_w4a8_gemm_nt_contiguous_hipc(
+            (a_int8, a_scale),
+            (self.w13_weight_deepgemm, self.w13_weight_scale),
+            gateup_output,
+            m_indices,
+        )
+        del a_int8, a_scale
+
+        swiglu_limit = getattr(self.moe_runner_config, "swiglu_limit", None)
+        if swiglu_limit is None:
+            q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
+        else:
+            q_a2_all, q_a2_scale = fuse_silu_mul_clamp_quant(
+                gateup_output, float(swiglu_limit)
+            )
+        del gateup_output
+
+        down_output = torch.empty(
+            (all_tokens, k), device=hidden_states_device, dtype=torch.bfloat16
+        )
+        m_grouped_w4a8_gemm_nt_contiguous_hipc(
+            (q_a2_all, q_a2_scale),
+            (self.w2_weight_deepgemm, self.w2_weight_scale),
+            down_output,
+            m_indices,
+        )
+        gather_out = torch.zeros(
+            hidden_states_shape, device=hidden_states_device, dtype=torch.bfloat16
+        )
+        _ep_gather_with_optional_lightop(
+            down_output, topk_ids, topk_weights, output_index, gather_out
+        )
+        return gather_out
+
     def forward_groupgemm_w8a8_int8_contiguous(
         self,
         dispatch_output: DeepEPNormalDispatchOutput,
@@ -3125,14 +3267,16 @@ class DeepEPMoE(FusedMoE):
         )
 
         if self.use_int8_w8a8_deepgemm_asm:
-            from deepgemm import m_grouped_w8a8_gemm_nt_masked
+            from deepgemm import m_grouped_i8_gemm_nt_masked
 
-            m_grouped_w8a8_gemm_nt_masked(
+            m_grouped_i8_gemm_nt_masked(
                 (hidden_states, hidden_states_scale),
                 (self.w13_weight_deepgemm_masked, self.w13_weight_scale),
                 gateup_output,
                 masked_m,
                 expected_m,
+                shuffle_unique=0,
+                backend="cooperative",
             )
         elif self.use_gfx936_w8a8_int8_deepgemm:
             from deepgemm import m_grouped_w8a8_gemm_nt_masked_gfx936
@@ -3187,14 +3331,16 @@ class DeepEPMoE(FusedMoE):
         )
 
         if self.use_int8_w8a8_deepgemm_asm:
-            from deepgemm import m_grouped_w8a8_gemm_nt_masked
+            from deepgemm import m_grouped_i8_gemm_nt_masked
 
-            m_grouped_w8a8_gemm_nt_masked(
+            m_grouped_i8_gemm_nt_masked(
                 (q_a2_all, q_a2_scale),
                 (self.w2_weight_deepgemm_masked, self.w2_weight_scale),
                 down_output,
                 masked_m,
                 expected_m,
+                shuffle_unique=0,
+                backend="cooperative",
             )
         elif self.use_gfx936_w8a8_int8_deepgemm:
             from deepgemm import m_grouped_w8a8_gemm_nt_masked_gfx936

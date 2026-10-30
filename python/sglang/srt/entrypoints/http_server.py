@@ -536,6 +536,9 @@ v1_loads_router.route_class = ORJSONRoute
 app.include_router(v1_loads_router)
 
 from sglang.srt.arg_groups.serving_hook import ssl_verify_of
+from sglang.srt.disaggregation.encoder.prefill_response import (
+    epd_prefill_forces_non_streaming,
+)
 from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -769,9 +772,7 @@ async def health_generate(request: Request) -> Response:
     tokenizer_manager = _global_state.tokenizer_manager
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     health_dp_size = (
-        tokenizer_manager.elastic_worker_count
-        if get_parallel().attn_dp_enabled
-        else 1
+        tokenizer_manager.elastic_worker_count if get_parallel().attn_dp_enabled else 1
     )
     health_requests = []
     if tokenizer_manager.is_generation and health_dp_size > 1:
@@ -862,10 +863,7 @@ async def health_generate(request: Request) -> Response:
             # cannot be admitted.  As in the single-rank check below, output for
             # user requests since the probe started proves the scheduler is
             # stepping; only an idle server needs the full fan-out.
-            if (
-                serving_user_requests()
-                and tokenizer_manager.last_receive_tstamp > tic
-            ):
+            if serving_user_requests() and tokenizer_manager.last_receive_tstamp > tic:
                 drop_health_requests()
                 tokenizer_manager.server_status = ServerStatus.Up
                 return Response(status_code=200)
@@ -1052,6 +1050,8 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
     this directly, so the body is not decoded and checked a second time."""
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
+    if epd_prefill_forces_non_streaming():
+        obj.stream = False
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:

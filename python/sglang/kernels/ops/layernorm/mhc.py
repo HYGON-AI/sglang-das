@@ -251,11 +251,15 @@ def _use_deep_gemm_hc_prenorm() -> bool:
 
 
 def _use_tilelang_mhc_pre() -> bool:
-    return envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get() and not is_hip()
+    return envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get() and (
+        not is_hip() or (_is_hcu and _use_aiter_tilelang_mhc)
+    )
 
 
 def _use_tilelang_mhc_post() -> bool:
-    return envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get() and not is_hip()
+    return envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get() and (
+        not is_hip() or (_is_hcu and _use_aiter_tilelang_mhc)
+    )
 
 
 FP8 = "float8_e4m3"

@@ -32,7 +32,6 @@ from sglang.srt.disaggregation.encoder.glm_routing import (
     encoder_part_routes,
 )
 from sglang.srt.distributed.parallel_state import (
-    GroupCoordinator,
     get_mooncake_transfer_engine,
 )
 from sglang.srt.environ import envs
@@ -89,6 +88,38 @@ class _ReceiveRegistrationRunner:
 
     def submit(self, coroutine):
         return asyncio.run_coroutine_threadsafe(coroutine, self.loop)
+
+
+async def _post_encoder_aborts(parts_by_url: Dict[str, List[str]]) -> None:
+    """Best-effort retirement notification; acceptance is not a DMA fence."""
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=5.0)
+    ) as session:
+
+        async def notify(url, req_ids):
+            for attempt in range(3):
+                try:
+                    async with session.post(
+                        f"{url.rstrip('/')}/abort", json={"req_ids": req_ids}
+                    ) as response:
+                        response.raise_for_status()
+                        await response.read()
+                    return
+                except Exception:
+                    if attempt == 2:
+                        logger.warning(
+                            "Failed to notify encoder abort url=%s req_ids=%s; "
+                            "encoder timeout cleanup remains the fallback",
+                            url,
+                            req_ids,
+                            exc_info=True,
+                        )
+                    else:
+                        await asyncio.sleep(0.1 * (attempt + 1))
+
+        await asyncio.gather(
+            *(notify(url, req_ids) for url, req_ids in parts_by_url.items())
+        )
 
 
 def _mark_keep_device_embedding(mm_inputs) -> None:
@@ -873,7 +904,7 @@ class WaitingMMRequestStatus(IntEnum):
 
 def _select_mm_processor_prompt(recv_req, mm_processor):
     """Mirror tokenizer-side prompt selection for scheduler-side EPD rebuilds."""
-    if mm_processor.prefer_tokenized_input and recv_req.input_ids is not None:
+    if mm_processor.prefer_tokenized_input and recv_req.input_ids:
         return list(recv_req.input_ids)
     return recv_req.input_text or recv_req.input_ids
 
@@ -1473,6 +1504,25 @@ class WaitingRDMARequest(WaitingMMRequestBase):
         self._receive_running = False
         self._receive_error = None
         self._receive_error_lock = threading.Lock()
+
+    def encoder_abort_routes(self) -> List[dict]:
+        routes = getattr(self.recv_req, "encoder_part_routes", None)
+        if routes:
+            return routes
+        # Legacy encodes group items once per nonempty modality/encoder pair.
+        routes = []
+        for counts in self.num_items_assigned.values():
+            for encoder_idx, count in enumerate(counts):
+                if count:
+                    routes.append(
+                        {
+                            "encoder_idx": encoder_idx,
+                            "req_id": create_part_req_id(
+                                self.recv_req.rid, len(routes)
+                            ),
+                        }
+                    )
+        return routes
 
     def send_encode_request(self):
         # Base-class hook. The tokenizer owns /encode, so this rank only pulls
@@ -2302,6 +2352,44 @@ class MMReceiverBase(ABC):
     def process_waiting_requests(self, recv_reqs):
         pass
 
+    def _encoder_abort_done(self, future) -> None:
+        self._abort_futures.discard(future)
+        try:
+            future.result()
+        except Exception:
+            logger.exception("Encoder abort notification failed")
+
+    def _notify_encoder_abort(self, waiting_req) -> None:
+        # One notifier per receiving TP group; all ranks still retire locally.
+        if (
+            self.encoder_transfer_backend != "mooncake"
+            or self.tp_rank not in (None, 0)
+            or not isinstance(waiting_req, WaitingRDMARequest)
+        ):
+            return
+        try:
+            parts_by_url = defaultdict(list)
+            for route in waiting_req.encoder_abort_routes():
+                url = waiting_req.encoder_urls[route["encoder_idx"]]
+                parts_by_url[url].append(route["req_id"])
+            parts_by_url = {
+                url: list(dict.fromkeys(req_ids))
+                for url, req_ids in parts_by_url.items()
+            }
+            if not parts_by_url:
+                return
+            if getattr(self, "_abort_runner", None) is None:
+                self._abort_runner = _ReceiveRegistrationRunner("encoder-abort")
+                self._abort_futures = set()
+            # Only IDs/URLs cross the thread boundary; do not retain GPU buffers.
+            future = self._abort_runner.submit(_post_encoder_aborts(parts_by_url))
+            self._abort_futures.add(future)
+            future.add_done_callback(self._encoder_abort_done)
+        except Exception:
+            logger.exception(
+                "Failed to schedule encoder abort for rid=%s", waiting_req.rid
+            )
+
     def abort_waiting_requests(self, recv_req) -> None:
         """Mark matching waiting requests FAIL and free their resources; the
         next process_waiting_requests tick reports the abort through the
@@ -2314,8 +2402,8 @@ class MMReceiverBase(ABC):
                 WaitingMMRequestStatus.PENDING,
                 WaitingMMRequestStatus.SUCCESS,
             ):
+                self._notify_encoder_abort(waiting_req)
                 waiting_req._fail_and_release("Aborted by user", error_code=400)
-                waiting_req.release_resources()
                 logger.info(f"Abort waiting mm request. rid={waiting_req.rid}")
 
     async def recv_mm_data(

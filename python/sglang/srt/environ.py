@@ -343,8 +343,7 @@ class Envs:
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
     # too short when many workers cold-start and load tokenizers in parallel.
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(15)
-    # ASGI import string that multi-worker Uvicorn and Granian processes load;
-    # point it at an app that extends `http_server.app` with extra routes.
+    # ASGI import string used by the main multi-worker server launcher.
     SGLANG_HTTP_SERVER_APP_PATH = EnvStr("sglang.srt.entrypoints.http_server:app")
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
     SGLANG_EXPOSE_OWN_ENV_VARS = EnvBool(False)
@@ -378,8 +377,8 @@ class Envs:
     # value instead of asking the OS for a random port.  Useful to keep all
     # SGLang ports in a predictable range behind a firewall.
     SGLANG_PORT = EnvInt(None)
+    # Legacy GLM receiver GPU-pool size fallback. Encoder sources are direct.
     SGLANG_MC_RDMA_POOL_MAX_MB = EnvInt(0)
-    SGLANG_MC_RDMA_POOL_ACQUIRE_TIMEOUT_SECS = EnvFloat(60)
     SGLANG_ENCODER_VIDEO_SHARD_MIN_MB = EnvInt(128)
     SGLANG_ENCODER_VIDEO_SHARD_MIN_FRAMES_PER_ENCODER = EnvInt(80)
     SGLANG_ENCODER_MAX_PENDING_VIT = EnvInt(32)
@@ -1169,7 +1168,7 @@ class Envs:
     SGLANG_ROCM_USE_AITER_TILELANG_MHC = EnvBool(False)
     SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM = EnvBool(False)
     SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE = EnvBool(False)
-       # LightOp FP4 indexer logits on gfx928/936/938,Set to 0 to fall back to Triton.
+    # LightOp FP4 indexer logits on gfx928/936/938,Set to 0 to fall back to Triton.
     SGLANG_USE_LIGHTOP_PAGED_MQA_LOGITS_FP4 = EnvBool(True)
     # DSV4.1 low-ratio decode/verify indexer on HCU via the paged path on LightOp;
     # falls back to the slot-based path when LightOp lacks the paged operators.
@@ -1609,6 +1608,8 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    # Opt-in HCU GLM-Next draft submission before the CPU sequence-length wait.
+    SGLANG_HCU_SPEC_ASYNC_SCHEDULING = EnvBool(False)
     # Which speculative decisions rank 0 broadcasts to its TP group; narrowing
     # it under live traffic isolates where ranks actually diverge. Comma
     # separated presets ("all", "rng", "init", "off"), or SpecTpSyncSite slugs
@@ -1719,6 +1720,9 @@ class Envs:
     SGLANG_ENCODER_MM_RECEIVER_MODE = EnvStr("http")
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
+    # Disabled at zero; logs logical staged bytes and transfer queue ages.
+    SGLANG_ENCODER_LIFECYCLE_LOG_INTERVAL = EnvFloat(0.0)
+    SGLANG_ENCODER_LIFECYCLE_TRACE = EnvBool(False)
     SGLANG_ENCODER_HTTP_TIMEOUT = EnvFloat(1800.0)
     SGLANG_ENCODER_REQ_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
@@ -1728,7 +1732,11 @@ class Envs:
     SGLANG_ENCODER_MM_LOAD_WORKERS = EnvInt(4)
     # EncoderBootstrapServer health-check tuning.  Interval == 0 disables it.
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL = EnvFloat(10.0)
-    SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT = EnvFloat(2.0)
+    # Match the encoder server's HEALTH_CHECK_TIMEOUT (30s): a functional
+    # /health probe drains behind the encode dispatch lock, so a 2s client
+    # timeout evicts a healthy encoder under load and forces the no-encoder
+    # fallback. Busy encoders now answer immediately (see /health fast path).
+    SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT = EnvFloat(30.0)
     # Seconds before permanently dropping an unhealthy encoder (0 = keep probing).
     SGLANG_ENCODER_BOOTSTRAP_EVICTED_TTL = EnvFloat(600.0)
     # Persistent receiver-side GPU embedding pool size for mooncake EPD transport.
@@ -2323,6 +2331,7 @@ class Envs:
     SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
     SGLANG_DSA_KPOOL_AITER_TOPK = EnvBool(False)
     SGLANG_DSA_HCU_MQA_LOGITS_WORKSPACE_GB = EnvFloat(2.0)
+    SGLANG_DSA_MQA_SPLIT_BY_SEQ = EnvBool(False)
     SGLANG_DSA_HCU_USE_TRITON_PAGED_MQA = EnvBool(False)
     SGLANG_DSA_HCU_USE_INT8_MQA_LOGITS = EnvBool(True)
     SGLANG_DSA_KPOOL_LIGHTOP_TOPK = EnvBool(False)

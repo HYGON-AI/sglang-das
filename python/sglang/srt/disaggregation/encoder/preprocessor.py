@@ -132,10 +132,15 @@ class EncoderPreprocessor:
         model_config: ModelConfig,
         encoder_media_processor_config: EncoderMediaProcessorConfig,
         model_preprocessor: Optional[Callable] = None,
+        gpu_work_runner: Optional[Callable] = None,
     ):
         self.server_args = server_args
         self.model_config = model_config
         self._model_preprocessor = model_preprocessor
+        # Optional runner owned by MMEncoder. GPU-aware model hooks must use
+        # the encoder's pinned device/stream instead of executing on the
+        # asyncio event-loop thread or an unrelated executor thread.
+        self._gpu_work_runner = gpu_work_runner
         self.encoder_media_processor_config = encoder_media_processor_config
         self.model_type = getattr(
             model_config.hf_config, "model_type", "unknown"
@@ -162,6 +167,11 @@ class EncoderPreprocessor:
         self._build_vision_config(get_mm().mm_process_config)
         self.model_audio_sr = self._resolve_audio_sr()
         logger.info(f"Resolved model audio sample rate: {self.model_audio_sr} Hz")
+        logger.info(
+            "Encoder model preprocessor=%s image_processor_gpu=%s",
+            getattr(model_preprocessor, "__qualname__", None),
+            self.use_image_processor_gpu,
+        )
 
         self.device_module = torch.get_device_module(self.device)
         self.gpu_id = (
@@ -968,13 +978,15 @@ class EncoderPreprocessor:
                 image_processor=self.image_processor,
                 use_gpu_preprocessing=self.use_image_processor_gpu,
             )
-            processor_output = (
-                await asyncio.get_running_loop().run_in_executor(
+            if self.use_image_processor_gpu and self._gpu_work_runner is not None:
+                # Some model hooks perform resize/normalize/patchify on GPU.
+                # Keep those operations off the event loop while preserving
+                # MMEncoder's explicit device and stream affinity.
+                processor_output = await self._gpu_work_runner(invoke)
+            else:
+                processor_output = await asyncio.get_running_loop().run_in_executor(
                     self.preproc_executor, invoke
                 )
-                if self.encoder_media_processor_config.preprocess_off_event_loop
-                else invoke()
-            )
             if (
                 isinstance(processor_output, EncoderPreprocessOutput)
                 and processor_output.materialize_local_items is not None

@@ -1,4 +1,3 @@
-import logging
 from typing import Optional
 
 import torch
@@ -9,14 +8,9 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
 
-logger = logging.getLogger(__name__)
-
-# FlashKDA chunk size. Sequences shorter than this fall back to Triton.
+# FlashKDA chunk size; the model passes raw token lengths and the kernel
+# tiles them in 64-token chunks (also used to size intermediate states).
 _FLASHKDA_CHUNK_SIZE = 64
-
-# FlashKDA's max sequence length, Batches whose longest sequence exceeds this
-# fall back to Triton for the whole batch.
-_FLASHKDA_MAX_SEQ_LEN = 2048
 
 
 @triton.jit
@@ -154,14 +148,18 @@ class FlashKDAKernel(LinearAttnKernelBase):
     FlashKDA fuses q/k L2 norm, beta sigmoid, and the KDA gate *inside* the
     kernel, so we pass RAW tensors plus ``A_log``/``dt_bias``/``lower_bound``.
     It is prefill-only, bf16, K == V == 128, HV == H (no GVA), and requires the
-    safe (bounded) gate (``lower_bound`` set). The non-safe path and sequences
-    outside [chunk_size, max_seq_len] fall back to Triton ``chunk_kda``.
+    safe (bounded) gate (``lower_bound`` set). Once this backend is selected
+    via the prefill switch, every extend length runs on the fused kernel; only
+    the correctness guards in ``_should_fall_back`` (unsafe gate, spec-decode
+    draft-extend) route to the fallback.
     Requires an SM90+ GPU with the ``flash_kda`` package.
     """
 
-    # Tracked batches always take the Triton fallback, which forwards the
-    # fp32 snapshot arguments (see _triton_fallback).
-    supports_track_state_snapshot: bool = True
+    def __init__(self, fallback_kernel: Optional[LinearAttnKernelBase] = None):
+        # Optional kernel serving the Triton fallback path. On HCU the generic
+        # fla chunk_kda is unavailable; callers there wire the HcuKDAKernel in,
+        # whose extend expects an ACTIVATED beta (beta_is_raw must stay False).
+        self.fallback_kernel = fallback_kernel
 
     def decode(
         self,
@@ -199,15 +197,33 @@ class FlashKDAKernel(LinearAttnKernelBase):
         beta_is_raw: bool = False,
         return_intermediate_states: bool = False,
         **kwargs,
-    ) -> torch.Tensor:
-        # The fused kernel cannot expose per-chunk states (h), which the mamba
-        # radix extra_buffer track path needs; route tracked batches through
-        # the Triton chunk_kda fallback instead of silently skipping the
-        # snapshot (that would corrupt prefix-cache restores).
-        if return_intermediate_states or self._should_fall_back(
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self._should_fall_back(
             lower_bound, is_spec_decode, query_start_loc, extend_seq_lens_cpu
         ):
-            logger.info("FlashKDA prefill fall back to Triton chunk_kda")
+            if self.fallback_kernel is not None:
+                if beta_is_raw:
+                    raise ValueError(
+                        "flashkda fallback kernel expects an ACTIVATED beta; "
+                        "raw-beta models are only supported with the generic "
+                        "Triton fallback."
+                    )
+                # Returns plain o, or (o, h) when intermediate states were
+                # requested -- the same contract as the fused path below.
+                return self.fallback_kernel.extend(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    lower_bound=lower_bound,
+                    return_intermediate_state=return_intermediate_states,
+                )
             return _triton_fallback(
                 q,
                 k,
@@ -226,22 +242,20 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 track_chunk_idx=kwargs.get("track_chunk_idx"),
             )
 
-        return (
-            self._flashkda_extend(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                lower_bound=lower_bound,
-                beta_is_raw=beta_is_raw,
-            ),
-            None,
+        return self._flashkda_extend(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            beta_is_raw=beta_is_raw,
+            return_intermediate_states=return_intermediate_states,
         )
 
     @staticmethod
@@ -251,34 +265,20 @@ class FlashKDAKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         extend_seq_lens_cpu: Optional[list],
     ) -> bool:
-        """Whether to use the Triton chunk_kda path instead of the fused kernel."""
-        # Safe-gate only: the fused kernel does not support the unbounded gate
-        # (-exp(A_log)*softplus); those models leave lower_bound unset.
-        if lower_bound is None:
-            return True
-        # FlashKDA writes the committed recurrent state back in place, so it is
-        # unsafe for speculative verify / draft-extend forwards (which must stay
-        # rollback-able). Those reach this backend through forward_extend, so
-        # gate them here rather than relying on the decode/target_verify stubs.
-        if is_spec_decode:
-            return True
-        # Short sequences (< chunk size) and long sequences (> the crossover
-        # where Triton's chunked prefill wins) are faster on Triton. Read the
-        # per-request lengths from the CPU-side extend_seq_lens to avoid a
-        # GPU->CPU sync on every layer; derive from query_start_loc (one sync)
-        # only if they are unavailable.
-        if extend_seq_lens_cpu is not None:
-            if torch.is_tensor(extend_seq_lens_cpu):
-                lo = int(extend_seq_lens_cpu.min())
-                hi = int(extend_seq_lens_cpu.max())
-            else:
-                lo = min(extend_seq_lens_cpu)
-                hi = max(extend_seq_lens_cpu)
-        else:
-            seq_lens = query_start_loc[1:] - query_start_loc[:-1]
-            lo_t, hi_t = torch.aminmax(seq_lens)
-            lo, hi = int(lo_t), int(hi_t)
-        return lo < _FLASHKDA_CHUNK_SIZE or hi > _FLASHKDA_MAX_SEQ_LEN
+        """Whether to use the fallback kernel instead of the fused kernel.
+
+        Only correctness guards remain -- the backend switch alone routes
+        every prefill length through FlashKDA:
+        - the fused kernel math requires the bounded (safe) gate; models with
+          the unbounded gate (-exp(A_log)*softplus) leave lower_bound unset;
+        - FlashKDA writes the committed recurrent state back in place, so it
+          is unsafe for spec-decode draft-extend forwards (which must stay
+          rollback-able). Those reach this backend through forward_extend, so
+          gate them here rather than relying on the decode/target_verify stubs.
+        Sequence lengths are no longer inspected (the parameters stay part of
+        the signature because callers pass them).
+        """
+        return lower_bound is None or is_spec_decode
 
     def _flashkda_extend(
         self,
@@ -295,7 +295,8 @@ class FlashKDAKernel(LinearAttnKernelBase):
         dt_bias: Optional[torch.Tensor] = None,
         lower_bound: Optional[float] = None,
         beta_is_raw: bool = False,
-    ) -> torch.Tensor:
+        return_intermediate_states: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         flash_kda = _load_flash_kda()
 
         # Input shapes (varlen, B == 1, matching chunk_kda's contract):
@@ -339,6 +340,17 @@ class FlashKDAKernel(LinearAttnKernelBase):
 
         out_buf = torch.empty_like(v)
         final_state = torch.empty_like(initial_state)
+        intermediate_states = None
+        if return_intermediate_states:
+            sequence_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            num_intermediate_states = int(
+                ((sequence_lengths + _FLASHKDA_CHUNK_SIZE - 1) // _FLASHKDA_CHUNK_SIZE)
+                .sum()
+                .item()
+            )
+            intermediate_states = initial_state.new_empty(
+                (num_intermediate_states, num_heads, v.shape[-1], head_dim)
+            )
 
         flash_kda.fwd(
             q,
@@ -354,9 +366,20 @@ class FlashKDAKernel(LinearAttnKernelBase):
             initial_state=initial_state,
             final_state=final_state,
             cu_seqlens=cu_seqlens,
+            intermediate_states=intermediate_states,
         )
 
         _copy_kda_state(ssm_states, final_state, cache_indices, gather=False)
 
-        # out_buf is already [1, packed_seq, HV, V].
+        # FlashKDA returns per-64-token states as [chunks, H, V, K].
+        # SGLang's tracking path consumes [1, chunks, H, V, K]. Match the
+        # Triton kernel's contract: (o, h) only when intermediate states are
+        # requested, plain o otherwise.
+        h = (
+            intermediate_states.unsqueeze(0)
+            if intermediate_states is not None
+            else None
+        )
+        if return_intermediate_states:
+            return out_buf, h
         return out_buf

@@ -1942,6 +1942,7 @@ class ModelConfig:
             "auto-round",
             "auto-round-int8",
             "quark_int4fp8_moe",
+            "slimquant_w4a8",
             "slimquant_w4a8_marlin",
             "w8a8_int8",
             "slimquant_marlin",

@@ -43,7 +43,6 @@ from sglang.kernels.ops.attention.clamp_position import clamp_position
 from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.disaggregation.hidden_state import get_pd_hidden_capture_layer_ids
-
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
@@ -994,16 +993,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             and enable_num_token_non_padded()
         ):
             self.global_num_token_non_padded = torch.tensor(
-                self.global_num_token_non_padded_cpu, dtype=torch.int32, device=device
-            )
+                self.global_num_token_non_padded_cpu,
+                dtype=torch.int32,
+                pin_memory=_pin_host_metadata(device),
+            ).to(device, non_blocking=True)
 
         if (
             self.global_num_tokens_cpu is not None
             and self.global_num_tokens_gpu is None
         ):
             self.global_num_tokens_gpu = torch.tensor(
-                self.global_num_tokens_cpu, dtype=torch.int64, device=device
-            )
+                self.global_num_tokens_cpu,
+                dtype=torch.int64,
+                pin_memory=_pin_host_metadata(device),
+            ).to(device, non_blocking=True)
         if (
             self.global_num_tokens_for_logprob_cpu is not None
             and self.global_num_tokens_for_logprob_gpu is None
@@ -1011,8 +1014,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.global_num_tokens_for_logprob_gpu = torch.tensor(
                 self.global_num_tokens_for_logprob_cpu,
                 dtype=torch.int64,
-                device=device,
-            )
+                pin_memory=_pin_host_metadata(device),
+            ).to(device, non_blocking=True)
 
     @classmethod
     def init_new(

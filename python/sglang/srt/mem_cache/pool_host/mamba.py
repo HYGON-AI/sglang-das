@@ -19,9 +19,10 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hcu, is_hip, is_npu
 
 _is_cuda = is_cuda()
+_is_hcu = is_hcu()
 _is_hip = is_hip()
 _is_npu = is_npu()
 transfer_state_per_layer_direct_pf_lf = None
@@ -34,7 +35,42 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_direct_pf_lf,
         transfer_kv_per_layer_mla,
     )
-if _is_cuda or _is_hip:
+if _is_hcu:
+    from sgl_kernel.kvcacheio import (
+        transfer_kv_all_layer_mla_lf_pf as _hcu_mamba_backup,
+    )
+    from sgl_kernel.kvcacheio import (
+        transfer_kv_per_layer_mla_pf_lf as _hcu_mamba_restore,
+    )
+
+    def transfer_kv_mamba_lf_pf(
+        src_ptrs, dst, src_indices, dst_indices, item_size, dst_layout_dim, num_layers
+    ):
+        # Existing HCU wheels already provide the same byte-copy layout for MLA.
+        # Reuse it for Mamba state instead of compiling a new CUDA JIT module.
+        _hcu_mamba_backup(
+            src_layers=src_ptrs,
+            dst=dst,
+            src_indices=src_indices.to(src_ptrs.device, non_blocking=True),
+            dst_indices=dst_indices.to(src_ptrs.device, non_blocking=True),
+            item_size=item_size,
+            dst_layout_dim=dst_layout_dim,
+            num_layers=num_layers,
+        )
+
+    def transfer_kv_mamba_pf_lf(
+        src, dst, src_indices, dst_indices, layer_id, item_size, src_layout_dim
+    ):
+        _hcu_mamba_restore(
+            src=src,
+            dst=dst,
+            src_indices=src_indices.to(dst.device, non_blocking=True),
+            dst_indices=dst_indices.to(dst.device, non_blocking=True),
+            layer_id=layer_id,
+            item_size=item_size,
+            src_layout_dim=src_layout_dim,
+        )
+elif _is_cuda or _is_hip:
     from sglang.kernels.ops.mamba.transfer_mamba import (
         transfer_kv_mamba_lf_pf,
         transfer_kv_mamba_pf_lf,

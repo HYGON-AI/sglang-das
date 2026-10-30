@@ -5,11 +5,11 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.pool_host import dsa, mla
 from sglang.srt.mem_cache.pool_host.common import kernel_accessible_host_ptr
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.utils import is_hcu
 
 _is_hcu = is_hcu()
@@ -63,7 +63,13 @@ class _HcuLayerOwnership:
         )
 
     def _backup_hcu_layer_first(self, host_indices, device_indices):
-        from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla_lf_lf_D2H_hcu
+        try:
+            from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla_lf_lf_D2H_hcu
+        except ImportError:
+            # Existing HCU wheels retain the previous DCU export name.
+            from sgl_kernel.kvcacheio import (
+                transfer_kv_all_layer_mla_lf_lf_D2H_dcu as transfer_kv_all_layer_mla_lf_lf_D2H_hcu,
+            )
 
         if self._hcu_is_indexer:
             host_indices, device_indices = self._get_indexer_page_indices(
@@ -159,7 +165,9 @@ class Glm5NextMLAPoolHost(_HcuLayerOwnership, MLATokenToKVPoolHost):
         self.device_pool = device_pool
         self.mtp_draft_device_pools = tuple(kwargs.pop("mtp_draft_device_pools", ()))
         # get_size_per_token reserves the indexer budget before HostKVCache allocates.
-        self.page_size = kwargs.get("page_size", args[2] if len(args) > 2 else device_pool.page_size)
+        self.page_size = kwargs.get(
+            "page_size", args[2] if len(args) > 2 else device_pool.page_size
+        )
         capacity = device_pool.host_capacity_tokens
         super().__init__(
             device_pool.get_device_pool_infos()[0].buffer_info,
@@ -169,7 +177,10 @@ class Glm5NextMLAPoolHost(_HcuLayerOwnership, MLATokenToKVPoolHost):
             end_layer=device_pool.end_layer,
             target_layer_num=self._effective_host_layer_num(device_pool),
             layer_shard_enabled=device_pool.layer_shard_enabled,
-            draft_buffer_infos=tuple(pool.get_device_pool_infos()[0].buffer_info for pool in self.mtp_draft_device_pools),
+            draft_buffer_infos=tuple(
+                pool.get_device_pool_infos()[0].buffer_info
+                for pool in self.mtp_draft_device_pools
+            ),
             **kwargs,
         )
         self.data_ptrs = torch.tensor(
@@ -232,9 +243,14 @@ class Glm5NextMLAPoolHost(_HcuLayerOwnership, MLATokenToKVPoolHost):
                         element_dim=self.kv_cache_dim,
                     )
                 elif envs.SGLANG_USE_HICACHE_OPTIMIZATION_KERNEL.get():
-                    from sgl_kernel.kvcacheio import (
-                        transfer_kv_per_layer_mla_lf_lf_H2D_hcu,
-                    )
+                    try:
+                        from sgl_kernel.kvcacheio import (
+                            transfer_kv_per_layer_mla_lf_lf_H2D_hcu,
+                        )
+                    except ImportError:
+                        from sgl_kernel.kvcacheio import (
+                            transfer_kv_per_layer_mla_lf_lf_H2D_dcu as transfer_kv_per_layer_mla_lf_lf_H2D_hcu,
+                        )
 
                     transfer_kv_per_layer_mla_lf_lf_H2D_hcu(
                         src=self.kv_buffer[host_layer_id],
@@ -415,7 +431,9 @@ class Glm5NextIndexerPoolHost(_HcuLayerOwnership, DSAIndexerPoolHost):
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
         self.target_layer_num = self._effective_host_layer_num()
-        self.mtp_draft_device_pools = tuple(packed_draft_device_pools or anchor_host.mtp_draft_device_pools)
+        self.mtp_draft_device_pools = tuple(
+            packed_draft_device_pools or anchor_host.mtp_draft_device_pools
+        )
         self.layer_num = self.target_layer_num + self._owned_draft_layer_num()
 
         self.index_head_dim = device_pool.index_head_dim
@@ -557,9 +575,14 @@ class Glm5NextIndexerPoolHost(_HcuLayerOwnership, DSAIndexerPoolHost):
         if use_kernel:
             if self.layout == "layer_first":
                 if envs.SGLANG_USE_HICACHE_OPTIMIZATION_KERNEL.get():
-                    from sgl_kernel.kvcacheio import (
-                        transfer_kv_per_layer_mla_lf_lf_H2D_hcu,
-                    )
+                    try:
+                        from sgl_kernel.kvcacheio import (
+                            transfer_kv_per_layer_mla_lf_lf_H2D_hcu,
+                        )
+                    except ImportError:
+                        from sgl_kernel.kvcacheio import (
+                            transfer_kv_per_layer_mla_lf_lf_H2D_dcu as transfer_kv_per_layer_mla_lf_lf_H2D_hcu,
+                        )
 
                     transfer_kv_per_layer_mla_lf_lf_H2D_hcu(
                         src=self.index_k_with_scale_buffer[host_layer_id],

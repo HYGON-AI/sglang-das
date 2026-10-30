@@ -739,6 +739,10 @@ class MultimodalInputs:
 
     # items of data
     mm_items: List[MultimodalDataItem]
+    # Legacy encoder receive slots must outlive zero-copy feature views.
+    _encoder_buffer_owners: List[MultimodalProcessorOutput] = dataclasses.field(
+        default_factory=list, repr=False, compare=False, kw_only=True
+    )
     padded_input_ids: Optional[List[int]] = None
     image_pad_len: Optional[list] = None
     num_image_tokens: Optional[int] = None
@@ -846,6 +850,9 @@ class MultimodalInputs:
             mm_items=mm_items,
             padded_input_ids=obj.padded_input_ids,
             token_modalities=token_modalities,
+            _encoder_buffer_owners=(
+                [obj] if any(item.keep_device_embedding for item in mm_items) else []
+            ),
         )
         optional_args = [
             "mrope_positions",
@@ -907,6 +914,7 @@ class MultimodalInputs:
         optional_args = [
             "mm_items",
             "image_pad_len",
+            "_encoder_buffer_owners",
         ]
         for arg in optional_args:
             self_arg = getattr(self, arg, None)

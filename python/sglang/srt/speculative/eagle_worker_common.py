@@ -9,12 +9,11 @@ from sglang.kernels.ops.speculative.cache_locs import (
 )
 from sglang.kernels.ops.speculative.eagle import (
     build_chain_tree,
-    fill_bonus_tokens_func,
+    fill_bonus_tokens_from_predict_func,
     prepare_draft_extend_layout,
     prepare_draft_extend_lengths,
     prepare_verify_commit_outputs,
 )
-from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_from_predict_func
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
@@ -23,6 +22,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.runtime_context import mamba_track_grid
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
@@ -235,7 +235,12 @@ def prepare_for_draft_extend(
     if not can_run_decode_cuda_graph:
         forward_batch.materialize_deferred_device_metadata(draft_model_runner.device)
     if not batch.forward_mode.is_idle() and not can_run_decode_cuda_graph:
-        draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+        # Eager draft metadata is prepared before ModelRunner.forward opens its
+        # context. K-pool planning must resolve the draft backend's KV pool.
+        with forward_context(
+            ForwardContext(attn_backend=draft_model_runner.attn_backend)
+        ):
+            draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
         # cannot rebuild its deep_gemm schedule_meta on a DP-padded batch
         # (the `_batch_size == batch_size` assertion, see #27091); the

@@ -322,6 +322,26 @@ impl PDRouter {
         Ok(Cow::Owned(decode_request))
     }
 
+    /// Force the prefill leg to non-streaming so its HTTP status is the only
+    /// failure signal: a streamed prefill reports late failures as 200 + an SSE
+    /// error event, which would leave the paired decode waiting for KV.
+    fn force_non_streaming_prefill(prefill_request: Cow<'_, Value>) -> Cow<'_, Value> {
+        let streams = prefill_request
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !streams {
+            return prefill_request;
+        }
+        let mut prefill_request = prefill_request.into_owned();
+        if let Some(obj) = prefill_request.as_object_mut() {
+            obj.insert("stream".to_string(), Value::Bool(false));
+            // OpenAI servers reject stream_options without stream=true.
+            obj.remove("stream_options");
+        }
+        Cow::Owned(prefill_request)
+    }
+
     async fn prepare_worker_request<'a>(
         route: &'static str,
         worker: &dyn Worker,
@@ -356,8 +376,12 @@ impl PDRouter {
         prefill: &dyn Worker,
         decode: &dyn Worker,
     ) -> Result<(PreparedWorkerRequest<'a>, PreparedWorkerRequest<'a>), String> {
-        let prefill_request =
-            Self::prepare_worker_request(route, prefill, Cow::Borrowed(json_request)).await?;
+        let prefill_request = Self::prepare_worker_request(
+            route,
+            prefill,
+            Self::force_non_streaming_prefill(Cow::Borrowed(json_request)),
+        )
+        .await?;
         let decode_json_request =
             Self::inject_prefill_dp_rank_for_decode(Cow::Borrowed(json_request), prefill)?;
         let decode_request =
@@ -1765,6 +1789,23 @@ impl RouterTrait for PDRouter {
 mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
+
+    /// A streamed prefill reports late failures as 200 + SSE error, so the router
+    /// never aborted the paired decode; the prefill leg must not stream.
+    #[test]
+    fn force_non_streaming_prefill_rewrites_streaming_body() {
+        let body = serde_json::json!({
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "bootstrap_room": 7,
+        });
+        let out = PDRouter::force_non_streaming_prefill(Cow::Borrowed(&body));
+        assert_eq!(out["stream"], serde_json::json!(false));
+        assert!(out.get("stream_options").is_none());
+        assert_eq!(out["bootstrap_room"], serde_json::json!(7));
+        // The caller's body (later sent to decode) is untouched.
+        assert_eq!(body["stream"], serde_json::json!(true));
+    }
 
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());

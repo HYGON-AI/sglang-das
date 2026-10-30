@@ -177,7 +177,16 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     )
                 # A logical page must own a whole pooled index group so that a
                 # prefix hit never ends inside one.
-                page_size = 64 * index_kpool
+                if is_hcu() and model_arch in (
+                    "Glm5NextForCausalLM",
+                    "Glm5NextForConditionalGeneration",
+                    "Glm5VNextForCausalLM",
+                    "Glm5VNextForConditionalGeneration",
+                ):
+                    # TX's HCU pooled indexer and FlashMLA use 64-token KV pages.
+                    page_size = 64
+                else:
+                    page_size = 64 * index_kpool
                 overrides["page_size"] = page_size
                 logger.warning(f"Setting page size to {page_size} for DeepSeek DSA.")
         elif get_platform().is_xpu:

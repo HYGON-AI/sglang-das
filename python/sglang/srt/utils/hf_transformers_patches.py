@@ -65,6 +65,7 @@ def apply_all():
     _patch_layer_types_validation()
     _patch_removed_symbols()
     _patch_image_processing_utils_fast_symbols()
+    _patch_video_processor_docstring()
     _patch_image_processor_kwargs()
     _patch_image_process_cuda_tensor()
 
@@ -221,10 +222,13 @@ def _patch_broken_torchaudio_availability():
 
         _ui.is_torchaudio_available = lambda: False
         _u.is_torchaudio_available = lambda: False
+
+
 def _patch_layer_types_validation():
     from transformers import PretrainedConfig
 
-    validators = PretrainedConfig.__class_validators__
+    # Transformers before 5.4 has no class-level validator registry.
+    validators = getattr(PretrainedConfig, "__class_validators__", ())
     for index, validator in enumerate(validators):
         if validator.__name__ != "validate_layer_type":
             continue
@@ -372,6 +376,17 @@ def _patch_image_processing_utils_fast_symbols():
         logger.debug(
             "_patch_image_processing_utils_fast_symbols: required modules not importable, patch skipped"
         )
+
+
+def _patch_video_processor_docstring():
+    """Keep older checkpoint processor code importable on Transformers 5.19."""
+    try:
+        import transformers.video_processing_utils as video
+    except ImportError:
+        return
+    if not hasattr(video, "BASE_VIDEO_PROCESSOR_DOCSTRING"):
+        # This constant is only consumed by documentation decorators.
+        video.BASE_VIDEO_PROCESSOR_DOCSTRING = ""
 
 
 def _patch_image_process_cuda_tensor():

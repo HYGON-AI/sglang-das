@@ -13,6 +13,8 @@
 # ==============================================================================
 
 import logging
+import re
+from fnmatch import fnmatchcase
 
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.glm5_next import Glm5NextForCausalLM
@@ -41,8 +43,18 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
         )
 
     def _resolve_nextn_quant_config(self, config, quant_config):
-        """Mixed checkpoints list the BF16 NextN block in ``quantization_config.ignore``;
-        inheriting global FP8 quantization would corrupt its QKV weights."""
+        """Keep checkpoint-excluded NextN blocks in BF16, including their experts."""
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "slimquant_w4a8"
+            and getattr(quant_config, "legacy_w4_dir", False)
+            and config.num_hidden_layers in quant_config.moe_int8_layers
+        ):
+            logger.info(
+                "GLM5 NextN layer %s is checkpoint-declared INT8; using W8A8 draft modules",
+                config.num_hidden_layers,
+            )
+            return quant_config.get_int8_config()
         raw_quant_config = getattr(config, "quantization_config", None) or {}
         if hasattr(raw_quant_config, "to_dict"):
             raw_quant_config = raw_quant_config.to_dict()
@@ -51,8 +63,23 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
             if isinstance(raw_quant_config, dict)
             else []
         )
-        nextn_layer_pattern = f"model.layers.{config.num_hidden_layers}.*"
-        if nextn_layer_pattern in ignored:
+        # Check the whole block, not a projection that may be individually ignored.
+        # Multimodal checkpoints retain language_model in their ignore rules even
+        # though the weight loader strips that prefix before loading NextN.
+        nextn_prefixes = (
+            f"model.layers.{config.num_hidden_layers}",
+            f"model.language_model.layers.{config.num_hidden_layers}",
+        )
+        nextn_layer_pattern = nextn_prefixes[0] + ".*"
+        if any(
+            (
+                re.match(pattern[3:], block) is not None
+                if pattern.startswith("re:")
+                else pattern == block or fnmatchcase(block + ".*", pattern)
+            )
+            for pattern in ignored
+            for block in nextn_prefixes
+        ):
             logger.warning(
                 "GLM5 NextN layer %s is checkpoint-declared unquantized; "
                 "using BF16 draft modules",

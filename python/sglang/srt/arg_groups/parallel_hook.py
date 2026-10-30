@@ -116,6 +116,16 @@ def handle_context_parallelism(server_args: Any):
             cfg.enable_prefill_cp
             and get_platform().is_hip
             and model_arch != "DeepseekV4ForCausalLM"
+            and not (
+                is_hcu()
+                and model_arch
+                in (
+                    "Glm5NextForCausalLM",
+                    "Glm5NextForConditionalGeneration",
+                    "Glm5VNextForCausalLM",
+                    "Glm5VNextForConditionalGeneration",
+                )
+            )
         ):
             raise ValueError(
                 "Prefill CP on HIP is only supported for "

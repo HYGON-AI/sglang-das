@@ -230,6 +230,19 @@ def is_dsa_enable_prefill_cp():
     from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
     hf_config = process_model_config().hf_config
+    if is_hcu() and any(
+        arch
+        in (
+            "Glm5NextForCausalLM",
+            "Glm5NextForConditionalGeneration",
+            "Glm5NextForCausalLMNextN",
+            "Glm5NextForConditionalGenerationNextN",
+        )
+        for arch in (getattr(hf_config, "architectures", None) or ())
+    ):
+        # TX shards GLM KDA heads over CP, including weights and state pools.
+        # The generic HIP restriction must not turn that topology into TP=1.
+        return is_deepseek_dsa(hf_config)
     if is_hip():
         return is_deepseek_v4(hf_config)
     return is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
@@ -290,10 +303,14 @@ def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
         is_dsa_prefill_cp_round_robin_split()
         and seq_len > 0
         and seq_len >= cp_size
-        # CP-v2 interleave shards uneven batches and the DSA indexer metadata
-        # must follow that same layout. The divisibility guard only protects
-        # the legacy model-level split, which requires equal rank lengths.
-        and (seq_len % cp_size == 0 or _can_dsa_cp_v2_split_uneven(forward_batch))
+        # HCU platform CP and CP-v2 admit uneven logical lengths. Padding
+        # supplies equal physical shards before the model's split/gather.
+        # Other legacy layouts still require divisible logical lengths.
+        and (
+            is_hcu()
+            or seq_len % cp_size == 0
+            or _can_dsa_cp_v2_split_uneven(forward_batch)
+        )
         and cp_size > 1
     )
 

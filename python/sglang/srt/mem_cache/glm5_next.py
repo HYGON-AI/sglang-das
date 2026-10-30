@@ -109,6 +109,10 @@ class Glm5NextMLATokenToKVPool(DSATokenToKVPool):
             if override_kv_cache_dim is not None
             else (kv_lora_rank + qk_rope_head_dim)
         )
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
+        )
+        self.kv_scale_buffer = None
         self.mla_kv_prefetch_ring_size = max(1, mla_kv_prefetch_ring_size)
         self.layer_split_scratch_source = layer_split_scratch_source
         self.shares_layer_split_scratch = layer_split_scratch_source is not None
@@ -1062,6 +1066,9 @@ class Glm5NextDSATokenToKVPool(Glm5NextMLATokenToKVPool):
         self.index_buf_size = size if index_buf_size is None else index_buf_size
         self.tail_extra_slots = tail_extra_slots
         self.slots_per_page = self.page_size // index_kpool
+        # HiCache declarations use token-page geometry before selecting the
+        # HCU packed-index storage adapter.
+        self.index_page_size = self.page_size
         self._tail_k = None
         self._tail_score = None
         if index_buf_size is None:

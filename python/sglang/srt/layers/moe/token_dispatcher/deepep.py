@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
 import os
 from contextlib import nullcontext
@@ -23,14 +22,11 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from lightop.quant import per_token_quant_fp8, per_token_quant_int8
 
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
-from sglang.srt.layers.moe.token_dispatcher.aiter_utils import (
-    build_aiter_sink_expert_metadata,
-    should_use_aiter_runner,
-)
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     BaseDispatcherConfig,
@@ -49,7 +45,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
     is_tbo_enabled,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
@@ -61,15 +57,13 @@ from sglang.srt.utils import (
     load_json_config,
 )
 
-_is_hcu = is_hcu()
 _is_npu = is_npu()
-_is_hcu = is_hcu()
 _use_zbal = _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
 
-_deepep_import_error: Optional[BaseException] = None
+_deepep_import_error = None
 try:
     if _use_zbal:
         from zbal.zbal.deepep_adaptor import Config
@@ -84,8 +78,6 @@ try:
 
     use_deepep = True
 except Exception as exc:
-    # deep_ep's import-time host checks raise more than ImportError; defer any
-    # failure to the first DeepEP use so other models still start.
     use_deepep = False
     _deepep_import_error = exc
 
@@ -94,7 +86,7 @@ from enum import Enum, IntEnum, auto
 import torch
 import torch.distributed as dist
 
-from sglang.srt.runtime_context import get_model, get_resources
+from sglang.srt.runtime_context import get_resources
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
@@ -118,98 +110,6 @@ def _set_nvshmem_qp_depth(num_max_dispatch_tokens_per_rank: int) -> None:
     )
 
 
-# The BW1100 DeepEP wheel exposes a vendor API where low-latency dispatch uses
-# ``topk_weight`` plus an integer ``quant_type``. Upstream DeepEP instead uses
-# ``use_fp8`` and does not require top-k weights during dispatch. Resolve the
-# ABI once at import time; signature inspection must not sit on the decode hot
-# path.
-_DEEPEP_LL_DISPATCH_USES_QUANT_TYPE = (
-    _is_hcu
-    and use_deepep
-    and "quant_type" in inspect.signature(Buffer.low_latency_dispatch).parameters
-)
-
-
-def _low_latency_dispatch_compat(
-    buffer,
-    hidden_states: torch.Tensor,
-    topk_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    num_max_dispatch_tokens_per_rank: int,
-    num_experts: int,
-    *,
-    use_fp8: bool,
-    use_nvfp4: bool,
-    input_global_scale: Optional[torch.Tensor],
-    round_scale: bool,
-    use_ue8m0: bool,
-    async_finish: bool,
-    return_recv_hook: bool,
-    **platform_kwargs,
-):
-    """Call either upstream or BW1100-vendor DeepEP low-latency ABI."""
-    if _DEEPEP_LL_DISPATCH_USES_QUANT_TYPE:
-        if use_nvfp4 or input_global_scale is not None:
-            raise RuntimeError(
-                "The installed DeepEP quant_type API does not support SGLang's "
-                "NVFP4/x_global_scale low-latency dispatch contract."
-            )
-
-        # Vendor quant types: 0=unquantized, 2=FP8 E4M3, 3=FP8 UE8M0.
-        quant_type = 3 if use_ue8m0 else (2 if use_fp8 else 0)
-        quant_group_size = 128 if use_ue8m0 else 0
-        return buffer.low_latency_dispatch(
-            x=hidden_states,
-            topk_idx=topk_ids,
-            topk_weight=topk_weights,
-            num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
-            num_experts=num_experts,
-            quant_type=quant_type,
-            quant_group_size=quant_group_size,
-            fp8_round_scale=round_scale or use_ue8m0,
-            async_finish=async_finish,
-            return_recv_hook=return_recv_hook,
-        )
-
-    return buffer.low_latency_dispatch(
-        hidden_states,
-        topk_ids,
-        num_max_dispatch_tokens_per_rank,
-        num_experts,
-        use_fp8=use_fp8,
-        **(dict(topk_weights=topk_weights) if _is_npu and not _use_zbal else dict()),
-        **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
-        **(
-            dict(x_global_scale=input_global_scale)
-            if input_global_scale is not None
-            else dict()
-        ),
-        async_finish=async_finish,
-        return_recv_hook=return_recv_hook,
-        **(dict(round_scale=round_scale, use_ue8m0=use_ue8m0) if use_fp8 else {}),
-        **platform_kwargs,
-    )
-
-
-def _hcu_deepgemm_is_selected() -> bool:
-    """Keep package availability separate from the active MoE runner."""
-    return (
-        deep_gemm_wrapper.ENABLE_HCU_DEEPGEMM
-        and get_moe_runner_backend().is_deep_gemm()
-        # SlimQuant's legacy HCU grouped kernels consume INT8 activations.
-        # Selecting DeepGEMM must not change their vendor quant_type ABI.
-        and get_model().quantization
-        not in ("slimquant_marlin", "slimquant_w4a8_marlin")
-    )
-
-
-def _deepgemm_is_selected() -> bool:
-    # Preserve CUDA's existing JIT-DeepGEMM policy. HCU DeepGEMM is opt-in via
-    # --moe-runner-backend deep_gemm and must not alter an AITER deployment
-    # merely because the vendor package happens to be installed.
-    return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _hcu_deepgemm_is_selected()
-
-
 def _is_mnnvl_fabric_supported() -> bool:
     if not is_flashinfer_available():
         return False
@@ -225,21 +125,13 @@ def _deepep_precompile_tp_barrier() -> None:
     # To avoid this, we use torch.distributed's barrier during the compile stage.
     # We apply this barrier only in the compile stage to prevent extra all-reduce overhead at runtime.
     if envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get():
-        get_parallel().tp_group.barrier()
+        get_tp_group().barrier()
 
 
 class DeepEPPDispatchHooks(DispatcherBaseHooks):
     def __call__(self, dispatcher: BaseDispatcher):
         for hook_fun in self.hook_dict.values():
             hook_fun(dispatcher)
-
-
-class _DeepEPCombineHooks(DispatcherBaseHooks):
-    """Optional current-stream work between combine send and receive."""
-
-    def __call__(self, dispatcher: BaseDispatcher):
-        for hook in tuple(self.hook_dict.values()):
-            hook(dispatcher)
 
 
 class DeepEPNormalDispatchOutput(NamedTuple):
@@ -275,40 +167,6 @@ assert isinstance(DeepEPNormalDispatchOutput, DispatchOutput)
 assert isinstance(DeepEPLLDispatchOutput, DispatchOutput)
 
 
-@dataclass
-class DeepEPNormalLocalSharedDispatchOutput:
-    """Normal DeepEP output with a local-only shared group appended."""
-
-    hidden_states: torch.Tensor
-    hidden_states_scale: Optional[torch.Tensor]
-    topk_ids: torch.Tensor
-    topk_weights: torch.Tensor
-    num_recv_tokens_per_expert: List[int]
-    local_shared_rows: int
-    routed_recv_rows: int
-
-    @property
-    def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.DEEPEP_NORMAL
-
-
-@dataclass
-class DeepEPLLLocalSharedDispatchOutput:
-    """Low-latency DeepEP output with a local-only shared group appended."""
-
-    hidden_states: torch.Tensor
-    hidden_states_scale: Optional[torch.Tensor]
-    topk_ids: torch.Tensor
-    topk_weights: torch.Tensor
-    masked_m: torch.Tensor
-    expected_m: int
-    local_shared_rows: int
-
-    @property
-    def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.DEEPEP_LL
-
-
 class DeepEPNormalCombineInput(NamedTuple):
     """DeepEP normal combine input."""
 
@@ -333,16 +191,25 @@ class DeepEPLLCombineInput(NamedTuple):
         return CombineInputFormat.DEEPEP_LL
 
 
+assert isinstance(DeepEPNormalCombineInput, CombineInput)
+assert isinstance(DeepEPLLCombineInput, CombineInput)
+
+
 @dataclass
-class DeepEPNormalLocalSharedCombineInput:
+class DeepEPLLLocalSharedDispatchOutput:
+    """Low-latency DeepEP output with a local-only shared group appended."""
+
     hidden_states: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
-    local_shared_output: torch.Tensor
+    masked_m: torch.Tensor
+    expected_m: int
+    local_shared_rows: int
 
     @property
-    def format(self) -> CombineInputFormat:
-        return CombineInputFormat.DEEPEP_NORMAL
+    def format(self) -> DispatchOutputFormat:
+        return DispatchOutputFormat.DEEPEP_LL
 
 
 @dataclass
@@ -357,8 +224,16 @@ class DeepEPLLLocalSharedCombineInput:
         return CombineInputFormat.DEEPEP_LL
 
 
-assert isinstance(DeepEPNormalCombineInput, CombineInput)
-assert isinstance(DeepEPLLCombineInput, CombineInput)
+@dataclass
+class DeepEPNormalLocalSharedCombineInput:
+    hidden_states: torch.Tensor
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    local_shared_output: torch.Tensor
+
+    @property
+    def format(self) -> CombineInputFormat:
+        return CombineInputFormat.DEEPEP_NORMAL
 
 
 class DeepEPDispatchMode(IntEnum):
@@ -375,41 +250,17 @@ class DeepEPBuffer:
         from types import SimpleNamespace
 
         buffers = get_resources().buffers
-        # DeepEP's low-latency runtime is process-wide. Creating a second LL
-        # Buffer for the speculative model invalidates/hangs the first runtime
-        # on HCU, so target and draft must share one compatible allocation.
         state = buffers.get("deepep_ep_state")
         if state is None:
             state = SimpleNamespace(
                 buffer=None,
                 dispatch_mode=None,
-                deepep_mode=None,
-                group_size=None,
                 hidden_size=None,
                 num_max_dispatch_tokens_per_rank=None,
                 num_experts=None,
-                num_topk=None,
-                low_latency_rdma_bytes=0,
-                low_latency_num_qps=0,
             )
             buffers["deepep_ep_state"] = state
         return state
-
-    @classmethod
-    def register_low_latency_layout(
-        cls, group, num_tokens, hidden_size, num_experts, num_topk
-    ):
-        state = cls._state()
-        args = (num_tokens, hidden_size, group.size(), num_experts)
-        state.low_latency_rdma_bytes = max(
-            state.low_latency_rdma_bytes,
-            Buffer.get_low_latency_rdma_size_hint(*args, num_topk=num_topk),
-            # Layout cleaning uses the native API's default top-k requirement.
-            Buffer.get_low_latency_rdma_size_hint(*args),
-        )
-        state.low_latency_num_qps = max(
-            state.low_latency_num_qps, num_experts // group.size()
-        )
 
     @classmethod
     def get_deepep_buffer(
@@ -420,61 +271,14 @@ class DeepEPBuffer:
         deepep_mode: DeepEPMode,
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
-        num_topk: int = -1,
     ):
         state = cls._state()
         if state.buffer is not None:
-            if _is_hcu and deepep_mode.enable_low_latency():
-                cls.set_low_latency_layout(
-                    num_max_dispatch_tokens_per_rank, hidden_size, num_experts
-                )
-            else:
-                incompatible = []
-                if state.group_size != group.size():
-                    incompatible.append(
-                        f"EP size {state.group_size} != requested {group.size()}"
-                    )
-                if state.hidden_size != hidden_size:
-                    incompatible.append(
-                        f"hidden size {state.hidden_size} != requested {hidden_size}"
-                    )
-                if deepep_mode.enable_normal() and not state.deepep_mode.enable_normal():
-                    incompatible.append("existing buffer has no normal-mode allocation")
-                if deepep_mode.enable_low_latency():
-                    if not state.deepep_mode.enable_low_latency():
-                        incompatible.append("existing buffer has no low-latency allocation")
-                    if (
-                        state.num_max_dispatch_tokens_per_rank
-                        != num_max_dispatch_tokens_per_rank
-                    ):
-                        incompatible.append(
-                            "max dispatch tokens "
-                            f"{state.num_max_dispatch_tokens_per_rank} != requested "
-                            f"{num_max_dispatch_tokens_per_rank}"
-                        )
-                    if state.num_experts != num_experts:
-                        incompatible.append(
-                            f"expert count {state.num_experts} != requested {num_experts}"
-                        )
-                    if state.num_topk != num_topk:
-                        incompatible.append(
-                            f"topk {state.num_topk} != requested {num_topk}"
-                        )
-                if incompatible:
-                    raise RuntimeError(
-                        "Target and speculative DeepEP cannot create independent "
-                        "low-latency buffers in one process. Make their DeepEP "
-                        "layouts compatible or use a non-DeepEP speculative MoE "
-                        "backend. Incompatibilities: " + "; ".join(incompatible)
-                    )
             return state.buffer
 
-        state.deepep_mode = deepep_mode
-        state.group_size = group.size()
         state.hidden_size = hidden_size
         state.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         state.num_experts = num_experts
-        state.num_topk = num_topk
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
@@ -496,7 +300,6 @@ class DeepEPBuffer:
         if deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
-            assert num_topk != -1
             if not _is_npu:
                 _set_nvshmem_qp_depth(num_max_dispatch_tokens_per_rank)
             num_rdma_bytes = max(
@@ -505,13 +308,9 @@ class DeepEPBuffer:
                     hidden_size,
                     group.size(),
                     num_experts,
-                    num_topk=num_topk,
                 ),
                 num_rdma_bytes,
             )
-
-            if _is_hcu:
-                num_rdma_bytes = max(num_rdma_bytes, state.low_latency_rdma_bytes)
 
         # We should calculate num_qps_per_rank consistently with DeepEP's test script logic:
         if deepep_mode == DeepEPMode.NORMAL:
@@ -528,9 +327,6 @@ class DeepEPBuffer:
             )
         else:
             raise NotImplementedError
-
-        if _is_hcu and deepep_mode.enable_low_latency():
-            num_qps_per_rank = max(num_qps_per_rank, state.low_latency_num_qps)
 
         if not _is_npu:
             total_num_sms = torch.cuda.get_device_properties(
@@ -564,10 +360,7 @@ class DeepEPBuffer:
         #            auto-enables fabric in C++ when supported, so we skip it:
         #            https://github.com/fzyzcjy/DeepEP/blob/814e508537c6ffc775d59f6f1b9ba43f3a65968c/csrc/deep_ep.cpp#L52
         is_cu12 = get_cuda_version()[0] == 12
-        supports_use_fabric = (
-            "use_fabric" in inspect.signature(Buffer.__init__).parameters
-        )
-        if not is_cu12 and use_mnnvl_fabric and supports_use_fabric:
+        if not is_cu12 and use_mnnvl_fabric:
             buffer_kwargs["use_fabric"] = True
 
         state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
@@ -576,7 +369,7 @@ class DeepEPBuffer:
     @classmethod
     def get_low_latency_layout(cls):
         state = cls._state()
-        if not _is_hcu or state.buffer is None or not state.buffer.low_latency_mode:
+        if not is_hcu() or state.buffer is None or not state.buffer.low_latency_mode:
             return None
         return (
             state.num_max_dispatch_tokens_per_rank,
@@ -689,13 +482,9 @@ class _DeepEPDispatcherImplBase:
     ):
         if not use_deepep:
             raise ImportError(
-                "DeepEP is not available. Please install DeepEP package from "
+                "DeepEP is not installed. Please install DeepEP package from "
                 "https://github.com/deepseek-ai/deepep."
-                + (
-                    f" Original import error: {_deepep_import_error}"
-                    if _deepep_import_error is not None
-                    else ""
-                )
+                f" Original import error: {_deepep_import_error}"
             ) from _deepep_import_error
 
         self.group = group
@@ -760,14 +549,10 @@ class _DeepEPDispatcherImplBase:
         config_map = {
             DispatcherOutputDtype.BF16: {
                 "use_fp8": False,
-                "use_mxfp4": False,
-                "use_mxfp8": False,
                 "use_nvfp4": False,
             },
             DispatcherOutputDtype.FP8: {
                 "use_fp8": True,
-                "use_mxfp4": False,
-                "use_mxfp8": False,
                 "use_nvfp4": False,
             },
             # Needed for Ascend A2/A3 NPU case,
@@ -775,27 +560,11 @@ class _DeepEPDispatcherImplBase:
             # quantization will be performed in int8
             DispatcherOutputDtype.INT8: {
                 "use_fp8": True,
-                "use_mxfp4": False,
-                "use_mxfp8": False,
                 "use_nvfp4": False,
             },
             DispatcherOutputDtype.NVFP4: {
                 "use_fp8": False,
-                "use_mxfp4": False,
-                "use_mxfp8": False,
                 "use_nvfp4": True,
-            },
-            DispatcherOutputDtype.MXFP4: {
-                "use_fp8": False,
-                "use_mxfp4": True,
-                "use_mxfp8": False,
-                "use_nvfp4": False,
-            },
-            DispatcherOutputDtype.MXFP8: {
-                "use_fp8": False,
-                "use_mxfp4": False,
-                "use_mxfp8": True,
-                "use_nvfp4": False,
             },
         }
 
@@ -805,8 +574,6 @@ class _DeepEPDispatcherImplBase:
         # Apply configuration
         config = config_map[self.deepep_output_dtype]
         self.use_fp8 = config["use_fp8"]
-        self.use_mxfp4 = config["use_mxfp4"]
-        self.use_mxfp8 = config["use_mxfp8"]
         self.use_nvfp4 = config["use_nvfp4"]
 
         # Handle environment variables
@@ -815,23 +582,14 @@ class _DeepEPDispatcherImplBase:
 
     def _validate_and_adjust_dtype(self) -> None:
         """Validate dtype against hardware and adjust if necessary."""
-        if (
-            _is_hcu
-            and self.deepep_output_dtype == DispatcherOutputDtype.INT8
-            and (self.quant_config or {}).get("hcu_w4a8_int8_dispatch", False)
-        ):
-            return  # The HCU DeepEP W4A8 kernels support INT8 communication.
-        if _is_npu and self.deepep_output_dtype == DispatcherOutputDtype.FP8:
-            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-
-            if not is_npu_arch35():
+        if _is_npu:
+            if self.deepep_output_dtype == DispatcherOutputDtype.FP8:
                 logger.warning_once(
                     "Ascend A2/A3 NPU does not support fp8 "
-                    "deepep_dispatcher_output_dtype; DeepEP will use int8."
+                    "deepep_dispatcher_output_dtype, switching to int8..."
                 )
-
-        if _is_npu:
-            if self.deepep_output_dtype == DispatcherOutputDtype.NVFP4:
+                self.deepep_output_dtype = DispatcherOutputDtype.INT8
+            elif self.deepep_output_dtype == DispatcherOutputDtype.NVFP4:
                 raise RuntimeError(
                     "Ascend A2/A3 NPU does not support nvfp4 deepep_dispatcher_output_dtype."
                 )
@@ -876,29 +634,13 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
-        if self.quant_config.get("preserve_input_dtype", False):
-            # BF16 drafts must not inherit target activation quantization.
+        if self.quant_config.get("bf16_dispatch", False):
+            # Mixed checkpoints can have BF16 NextN experts alongside INT4/FP8
+            # target experts. Respect the layer's precision before global flags.
             pass
-        elif _is_hcu and self.quant_config.get("hcu_w4a8_int8_dispatch", False):
+        elif self.quant_config.get("int8_dispatch", False):
             hidden_states = per_token_quant_int8(hidden_states)
-        elif (
-            _deepgemm_is_selected()
-            and self.use_fp8
-            and not self.quant_config.get("hcu_legacy_groupgemm", False)
-        ):
-            quant_group_size = (
-                hidden_states.shape[-1] if _hcu_deepgemm_is_selected() else 128
-            )
-            hidden_states = sglang_per_token_group_quant_fp8(
-                hidden_states,
-                quant_group_size,
-                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-            )
-        elif use_groupgemm and not (
-            _is_hcu and self.deepep_output_dtype == DispatcherOutputDtype.BF16
-        ):
+        elif use_groupgemm:
             if _use_fp8_w8a8_moe:
                 hidden_states = per_token_quant_fp8(hidden_states)
             elif _use_marlin_w16a16_moe:
@@ -924,40 +666,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 )
         previous_event = Buffer.capture() if self.async_finish else None
         return hidden_states, topk_ids, topk_weights, previous_event
-
-    def _get_quantization_kwargs(self, buffer: Buffer) -> dict:
-        if not _is_npu:
-            return {}
-
-        dispatch_params = inspect.signature(buffer.dispatch).parameters
-        flag_kwargs = {
-            "use_fp8": self.use_fp8,
-            "use_mxfp4": self.use_mxfp4,
-            "use_mxfp8": self.use_mxfp8,
-        }
-        if all(name in dispatch_params for name in flag_kwargs):
-            return flag_kwargs
-
-        if "quant_mode" in dispatch_params:
-            if self.use_mxfp4:
-                quant_mode = "mx_fp4_e2m1"
-            elif self.use_mxfp8:
-                quant_mode = "mx_fp8_e4m3"
-            elif self.use_fp8:
-                quant_mode = "int8"
-            else:
-                quant_mode = "bf16"
-            return {"quant_mode": quant_mode}
-
-        if not self.use_mxfp4 and not self.use_mxfp8:
-            # A3's legacy pybind Buffer does not expose its dispatch signature.
-            # It selects BF16/INT8 dispatch through the DeepEP runtime instead.
-            return {}
-
-        raise RuntimeError(
-            "Installed DeepEP normal dispatch does not support either "
-            "use_fp8/use_mxfp4/use_mxfp8 or quant_mode."
-        )
 
     def dispatch_b(self, hidden_states, topk_ids, topk_weights, previous_event):
         (
@@ -1006,52 +714,79 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
-
         _deepep_precompile_tp_barrier()
-        npu_quantization_opts = self._get_quantization_kwargs(buffer)
-        needs_256_alignment = _hcu_deepgemm_is_selected() or (
-            use_groupgemm
-            and (
-                get_model().quantization
-                in ("slimquant_marlin", "slimquant_w4a8_marlin")
-                or _use_fp8_w8a8_moe
-                or _use_marlin_w16a16_moe
-                or self.quant_config.get("preserve_input_dtype", False)
+        if use_groupgemm:
+            (
+                recv_x,
+                recv_topk_ids,
+                recv_topk_weights,
+                num_recv_tokens_per_expert,
+                self.handle,
+                event,
+            ) = buffer.dispatch(
+                x,
+                topk_idx=topk_ids,
+                topk_weights=topk_weights,
+                num_tokens_per_rank=num_tokens_per_rank,
+                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+                is_token_in_rank=is_token_in_rank,
+                num_tokens_per_expert=num_tokens_per_expert,
+                previous_event=previous_event,
+                async_finish=self.async_finish,
+                allocate_on_comm_stream=(previous_event is not None)
+                and self.async_finish,
+                expert_alignment=(
+                    256
+                    if (
+                        (
+                            get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
+                            if is_hcu()
+                            else get_global_server_args().quantization
+                            == "slimquant_marlin"
+                        )
+                        or _use_fp8_w8a8_moe
+                        or _use_marlin_w16a16_moe
+                        or (is_hcu() and self.quant_config.get("bf16_dispatch", False))
+                    )
+                    else 1
+                ),
+                config=DeepEPConfig.get_instance().normal_dispatch_config,
             )
-        )
-        (
-            recv_x,
-            recv_topk_ids,
-            recv_topk_weights,
-            num_recv_tokens_per_expert,
-            self.handle,
-            event,
-        ) = buffer.dispatch(
-            x,
-            topk_idx=topk_ids,
-            topk_weights=topk_weights,
-            num_tokens_per_rank=num_tokens_per_rank,
-            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-            is_token_in_rank=is_token_in_rank,
-            num_tokens_per_expert=num_tokens_per_expert,
-            previous_event=previous_event,
-            async_finish=self.async_finish,
-            allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-            expert_alignment=(
-                256
-                if needs_256_alignment
-                else (128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1)
-            ),
-            config=DeepEPConfig.get_instance().normal_dispatch_config,
-            **npu_quantization_opts,
-        )
+        else:
+            (
+                recv_x,
+                recv_topk_ids,
+                recv_topk_weights,
+                num_recv_tokens_per_expert,
+                self.handle,
+                event,
+            ) = buffer.dispatch(
+                x,
+                topk_idx=topk_ids,
+                topk_weights=topk_weights,
+                num_tokens_per_rank=num_tokens_per_rank,
+                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+                is_token_in_rank=is_token_in_rank,
+                num_tokens_per_expert=num_tokens_per_expert,
+                previous_event=previous_event,
+                async_finish=self.async_finish,
+                allocate_on_comm_stream=(previous_event is not None)
+                and self.async_finish,
+                expert_alignment=(
+                    256
+                    if is_hcu() and self.quant_config.get("bf16_dispatch", False)
+                    else 128
+                    if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                    else 1
+                ),
+                config=DeepEPConfig.get_instance().normal_dispatch_config,
+            )
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
             num_recv_tokens_per_expert,
             num_tokens_per_rank=num_tokens_per_rank,
             num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
             num_tokens_per_expert=num_tokens_per_expert,
         )
-
         return (
             recv_x,
             recv_topk_ids,
@@ -1067,18 +802,32 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
 
-        # Legacy HCU groupgemm/Marlin paths also gather their expert outputs
-        # back into dispatch-token order before normal combine.
-        if (
-            _deepgemm_is_selected()
-            or should_use_aiter_runner()
-            or _is_npu
-            or (_is_hcu and use_groupgemm)
-        ):
-            output = hidden_states
-        else:
-            raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
-
+        # if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
+        output = hidden_states
+        # else:
+        #     if hidden_states.shape[0] > 0:
+        #         num_tokens = self.src2dst.shape[0] // self.router_topk
+        #         output = torch.empty(
+        #             (num_tokens, hidden_states.shape[1]),
+        #             device=hidden_states.device,
+        #             dtype=hidden_states.dtype,
+        #         )
+        #         deepep_post_reorder_triton_kernel[(num_tokens,)](
+        #             hidden_states,
+        #             output,
+        #             self.src2dst,
+        #             topk_idx,
+        #             topk_weights,
+        #             self.router_topk,
+        #             hidden_states.shape[1],
+        #             BLOCK_SIZE=512,
+        #         )
+        #     else:
+        #         output = torch.zeros(
+        #             (0, hidden_states.shape[1]),
+        #             device=hidden_states.device,
+        #             dtype=hidden_states.dtype,
+        #         )
         previous_event = Buffer.capture() if self.async_finish else None
         return output, previous_event
 
@@ -1112,7 +861,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
-            self.router_topk,
         )
 
 
@@ -1122,16 +870,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     def __init__(self, return_recv_hook: bool, **kwargs):
         super().__init__(**kwargs)
 
-        if _is_hcu:
-            # Both target and draft dispatchers exist before the first forward.
-            DeepEPBuffer.register_low_latency_layout(
-                self.group,
-                self.num_max_dispatch_tokens_per_rank,
-                self.hidden_size,
-                self.num_experts,
-                self.router_topk,
-            )
-
         """
         num_max_dispatch_tokens_per_rank: the actual batch size in the decoding engine should be less than 256
         https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
@@ -1139,29 +877,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.return_recv_hook = return_recv_hook
         self.device_module = torch.get_device_module()
         self.quant_config = {}
-        self._combine_input_ready_event = None
-        self._combine_input_ready_event_pending = False
-
-    def set_quant_config(self, quant_config: dict) -> None:
-        super().set_quant_config(quant_config)
-        if (
-            _is_hcu
-            and quant_config.get("hcu_w4a8_deepep_ll_producer_event", False)
-            and self._combine_input_ready_event is None
-        ):
-            self._combine_input_ready_event = self.device_module.Event()
-
-    def record_combine_input_ready_event(self) -> None:
-        if self._combine_input_ready_event is None:
-            raise RuntimeError(
-                "Combine-input ready events are only enabled for HCU DeepEP"
-            )
-        if self._combine_input_ready_event_pending:
-            raise RuntimeError(
-                "DeepEP combine-input ready event was recorded twice before combine"
-            )
-        self._combine_input_ready_event.record(self.device_module.current_stream())
-        self._combine_input_ready_event_pending = True
 
     def dispatch_a(
         self,
@@ -1228,10 +943,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         input_global_scale = self.quant_config.get("input_global_scale", None)
-        preserve_input_dtype = self.quant_config.get("preserve_input_dtype", False)
 
-        # round_scale / use_ue8m0 are FP8-DeepGEMM specific. Dropping use_ue8m0
-        # makes DeepEP return fp32 column-major scales the e8m0 cast cannot view.
+        # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
+        # to return int32-packed UE8M0 scales that don't feed the flashinfer
+        # cutedsl kernel.
         fp8_deepgemm_scale_opts = (
             dict(
                 round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -1239,23 +954,18 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
             )
-            if self.use_fp8 and not preserve_input_dtype
+            if self.use_fp8
             else dict()
         )
 
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
-        npu_mxfp_quantization_opts = self._get_npu_mxfp_quantization_kwargs(buffer)
-        if (
-            use_groupgemm
-            and _DEEPEP_LL_DISPATCH_USES_QUANT_TYPE
-            and (
-                not _hcu_deepgemm_is_selected()
-                # DeepEPMoE kept the HCU groupgemm kernels: vendor quant_type.
-                or self.quant_config.get("hcu_legacy_groupgemm", False)
-            )
-        ):
-            if _is_hcu and self.quant_config.get("hcu_w4a8_int8_dispatch", False):
+        if use_groupgemm:
+            if self.quant_config.get("bf16_dispatch", False) or self.quant_config.get(
+                "int8_dispatch", False
+            ):
+                # A mixed checkpoint's BF16 draft must not inherit target INT8.
+                quant_type = 0 if self.quant_config.get("bf16_dispatch", False) else 1
                 packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
                     buffer.low_latency_dispatch(
                         hidden_states,
@@ -1263,13 +973,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                         topk_weights,
                         self.num_max_dispatch_tokens_per_rank,
                         self.num_experts,
-                        quant_type=1,
+                        quant_type=quant_type,
                         fp8_round_scale=False,
                         async_finish=not self.return_recv_hook,
                         return_recv_hook=self.return_recv_hook,
                     )
                 )
-            elif _use_fp8_w8a8_moe and not preserve_input_dtype:
+            elif _use_fp8_w8a8_moe:
                 packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
                     buffer.low_latency_dispatch(
                         hidden_states,
@@ -1283,12 +993,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                         return_recv_hook=self.return_recv_hook,
                     )
                 )
-            elif (
-                preserve_input_dtype
-                or self.deepep_output_dtype == DispatcherOutputDtype.BF16
-                or _use_marlin_w16a16_moe
-                or _use_marlin_w4a16_moe
-            ):
+            elif _use_marlin_w16a16_moe or _use_marlin_w4a16_moe:
                 packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
                     buffer.low_latency_dispatch(
                         hidden_states,
@@ -1318,46 +1023,29 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 )
         else:
             packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
-                _low_latency_dispatch_compat(
-                    buffer,
+                buffer.low_latency_dispatch(
                     hidden_states,
                     topk_ids,
-                    topk_weights,
                     self.num_max_dispatch_tokens_per_rank,
                     self.num_experts,
-                    use_fp8=self.use_fp8 and not preserve_input_dtype,
-                    use_nvfp4=self.use_nvfp4 and not preserve_input_dtype,
-                    input_global_scale=input_global_scale,
-                    round_scale=fp8_deepgemm_scale_opts.get("round_scale", False),
-                    use_ue8m0=fp8_deepgemm_scale_opts.get("use_ue8m0", False),
-                    **npu_mxfp_quantization_opts,
+                    use_fp8=self.use_fp8,
+                    **(
+                        dict(topk_weights=topk_weights)
+                        if _is_npu and not _use_zbal
+                        else dict()
+                    ),
+                    **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
+                    **(
+                        dict(x_global_scale=input_global_scale)
+                        if input_global_scale is not None
+                        else dict()
+                    ),
                     async_finish=not self.return_recv_hook,
                     return_recv_hook=self.return_recv_hook,
+                    **fp8_deepgemm_scale_opts,
                 )
             )
         return packed_recv_hidden, self.packed_recv_count, event, hook
-
-    def _get_npu_mxfp_quantization_kwargs(self, buffer: Buffer) -> dict:
-        if not _is_npu:
-            return {}
-
-        parameters = inspect.signature(buffer.low_latency_dispatch).parameters
-        if any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters.values()
-        ):
-            return {
-                "use_mxfp4": self.use_mxfp4,
-                "use_mxfp8": self.use_mxfp8,
-            }
-        return {
-            name: value
-            for name, value in {
-                "use_mxfp4": self.use_mxfp4,
-                "use_mxfp8": self.use_mxfp8,
-            }.items()
-            if name in parameters
-        }
 
     def combine_a(
         self,
@@ -1417,15 +1105,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         else:
             overlap_args_dict = {}
 
-        combine_stream = (
-            overlap_args.stream
-            if overlap_args is not None
-            else self.device_module.current_stream()
-        )
-        if self._combine_input_ready_event_pending:
-            combine_stream.wait_event(self._combine_input_ready_event)
-            self._combine_input_ready_event_pending = False
-
         with ctx:
             _deepep_precompile_tp_barrier()
             if use_groupgemm:
@@ -1462,7 +1141,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
-            self.router_topk,
         )
 
 
@@ -1516,24 +1194,19 @@ class DeepEPDispatcher(BaseDispatcher):
 
         self._stage = _Stage.INITIAL
         self._deepep_dispatch_hooks = DeepEPPDispatchHooks()
-        self._deepep_combine_hooks = None
 
         # DeepEP/Mooncake/Nixl mark invalid topk slots with -1; the AITER
         # pre_permute reroutes them to a sink slot at index num_local_experts,
         # which is masked off here.
         self.expert_mask_gpu = None
-        self.aiter_expert_map_gpu = None
-        if should_use_aiter_runner() and num_local_experts is not None:
-            expert_mask, aiter_expert_map = build_aiter_sink_expert_metadata(
-                num_local_experts,
-                torch.cuda.current_device(),
+        if _use_aiter and num_local_experts is not None:
+            expert_mask = torch.zeros(
+                num_local_experts + 1,
+                device=torch.cuda.current_device(),
+                dtype=torch.int,
             )
+            expert_mask[:-1] = 1
             self.expert_mask_gpu = expert_mask
-            # The unified aiter.moe API consumes either a global->local map or
-            # a bool mask. Keep the legacy int mask above unchanged for other
-            # AITER users and expose an unambiguous bool view for the unified
-            # MiniMax path.
-            self.aiter_expert_map_gpu = aiter_expert_map
 
     def dispatch(
         self,
@@ -1570,8 +1243,6 @@ class DeepEPDispatcher(BaseDispatcher):
         combine_input: CombineInput,
     ) -> torch.Tensor:
         self.combine_a(combine_input)
-        if self._deepep_combine_hooks is not None:
-            self._deepep_combine_hooks(self)
         ret = self.combine_b()
         return ret
 
@@ -1579,9 +1250,7 @@ class DeepEPDispatcher(BaseDispatcher):
         self,
         combine_input: CombineInput,
     ):
-        hidden_states = combine_input.hidden_states
-        topk_ids = combine_input.topk_ids
-        topk_weights = combine_input.topk_weights
+        hidden_states, topk_ids, topk_weights = combine_input
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
         inner_state = self._get_impl().combine_a(
             hidden_states=hidden_states,
@@ -1618,14 +1287,6 @@ class DeepEPDispatcher(BaseDispatcher):
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher.set_quant_config(quant_config)
 
-    def record_combine_input_ready_event(self) -> None:
-        impl = self._get_impl()
-        if not isinstance(impl, _DeepEPDispatcherImplLowLatency):
-            raise RuntimeError(
-                "Combine-input ready events require DeepEP low-latency mode"
-            )
-        impl.record_combine_input_ready_event()
-
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
     ):
@@ -1648,15 +1309,3 @@ class DeepEPDispatcher(BaseDispatcher):
 
     def register_deepep_dispatch_hook(self, hook):
         return self._deepep_dispatch_hooks.register_hook(hook)
-
-    def register_deepep_combine_hook(self, hook):
-        if (
-            self.deepep_mode != DeepEPMode.LOW_LATENCY
-            or not self._low_latency_dispatcher.return_recv_hook
-        ):
-            raise ValueError(
-                "Combine compute hook requires DeepEP low_latency recv hooks"
-            )
-        if self._deepep_combine_hooks is None:
-            self._deepep_combine_hooks = _DeepEPCombineHooks()
-        return self._deepep_combine_hooks.register_hook(hook)

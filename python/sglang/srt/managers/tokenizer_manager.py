@@ -615,7 +615,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.tokenizer = self.processor = None
             else:
                 self.processor = _processor
-                self.tokenizer = get_tokenizer_from_processor(self.processor)
+                self.tokenizer = copy.deepcopy(
+                    get_tokenizer_from_processor(self.processor)
+                )
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
         else:
             self.mm_processor = self.processor = None
@@ -1242,7 +1244,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             mm_inputs = None
             mm_processor_input = (
                 input_ids
-                if self.mm_processor.prefer_tokenized_input and input_ids is not None
+                if self.mm_processor.prefer_tokenized_input and input_ids
                 else (input_text or input_ids)
             )
 
@@ -2069,6 +2071,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         finish_reason = out["meta_info"]["finish_reason"]
 
         status_code = finish_reason.get("status_code")
+        if (
+            finish_reason.get("type") == "abort"
+            and not is_stream
+            and self.disaggregation_mode == DisaggregationMode.PREFILL
+            and status_code is None
+        ):
+            # The PD router must see an HTTP failure to abort the paired decode.
+            status_code = HTTPStatus.INTERNAL_SERVER_ERROR
         if (
             finish_reason.get("type") != "abort"
             or status_code is None

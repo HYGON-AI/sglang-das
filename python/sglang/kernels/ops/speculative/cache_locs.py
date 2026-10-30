@@ -28,9 +28,12 @@ _is_musa = is_musa()
 _is_xpu = is_xpu()
 
 if _is_hcu:
-    from sgl_kernel.kvcacheio import (
-        hcu_assign_extend_cache_locs,
-    )
+    try:
+        from sgl_kernel.kvcacheio import hcu_assign_extend_cache_locs
+    except ImportError:
+        from sgl_kernel.kvcacheio import (
+            dcu_assign_extend_cache_locs as hcu_assign_extend_cache_locs,
+        )
 
 if _is_cpu:
     from sgl_kernel import assign_extend_cache_locs_cpu

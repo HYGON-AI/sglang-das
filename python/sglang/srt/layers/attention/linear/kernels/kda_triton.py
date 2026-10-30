@@ -38,7 +38,6 @@ if not is_cpu():
     from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update as _target_verify_update,
     )
-    from sglang.kernels.ops.attention.fla.kda import chunk_kda
 
 
 class TritonKDAKernel(LinearAttnKernelBase):
@@ -272,6 +271,10 @@ class TritonKDAKernel(LinearAttnKernelBase):
         return_intermediate_states: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # HCU GLM selects HcuKDAKernel; do not import the generic CUDA/BoltOPs
+        # prefill implementation unless this backend is actually used.
+        from sglang.kernels.ops.attention.fla.kda import chunk_kda
+
         return chunk_kda(
             q=q,
             k=k,
