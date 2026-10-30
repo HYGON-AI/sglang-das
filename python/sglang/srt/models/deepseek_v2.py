@@ -1656,7 +1656,21 @@ class DeepseekV2MoE(nn.Module):
 
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states, forward_batch=forward_batch)
+            use_vision_topk = self.gate.e_score_correction_bias_vl is not None and (
+                not _is_hip or _hip_moe.batch_has_images(forward_batch)
+            )
+            fused_topk_output = (
+                self.topk.forward_hcu_mega_gate(
+                    hidden_states, self.gate.weight, forward_batch.hcu_moe_valid_token_mask
+                )
+                if _is_hcu and not self.is_hash and not self.is_nextn and not use_vision_topk
+                else None
+            )
+            router_logits = (
+                fused_topk_output.router_logits
+                if fused_topk_output is not None
+                else self.gate(hidden_states, forward_batch=forward_batch)
+            )
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
                 if self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
@@ -1678,10 +1692,10 @@ class DeepseekV2MoE(nn.Module):
                 if getattr(self, "is_hash", False)
                 else {}
             )
-            # Text batches need standard TopK's EPLB expert-ID postprocessing.
-            if self.gate.e_score_correction_bias_vl is not None and (
-                not _is_hip or _hip_moe.batch_has_images(forward_batch)
-            ):
+            if fused_topk_output is not None:
+                topk_output = fused_topk_output
+                self.topk.record_mega_gate_output(topk_output)
+            elif use_vision_topk:
                 topk_output = vision_topk(
                     self,
                     router_logits,

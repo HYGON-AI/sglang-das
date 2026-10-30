@@ -713,6 +713,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     global_num_token_non_padded: Optional[torch.Tensor] = None  # scalar, GLOBAL
     global_num_token_non_padded_cpu: int = None  # host int, GLOBAL
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar, LOCAL (derived)
+    # Refreshed once per V4 forward; graph capture records the mask producer.
+    hcu_moe_valid_token_mask: Optional[torch.Tensor] = None
 
     # Whether this forward's sequence is sharded across the attn-TP group (SP on)
     # vs. replicated; stamped per forward, defaults to replicated.
@@ -1366,6 +1368,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_num_token_non_padded=self.global_num_token_non_padded,
             num_tokens_per_dp=num_tokens_per_dp,
             sharded=sharded,
+        )
+
+    def prepare_hcu_moe_valid_token_mask(self, num_tokens: int) -> None:
+        """Build one routing mask per model forward, including inside graphs."""
+        self.hcu_moe_valid_token_mask = None
+        if not (self.forward_mode.is_decode() or self.forward_mode.is_target_verify()):
+            return
+        count = self.moe_num_token_non_padded()
+        self.hcu_moe_valid_token_mask = (
+            torch.arange(num_tokens, device=self.input_ids.device) < count
+            if count is not None
+            else torch.ones(num_tokens, dtype=torch.bool, device=self.input_ids.device)
         )
 
     def moe_num_token_non_padded(self) -> Optional[torch.Tensor]:
