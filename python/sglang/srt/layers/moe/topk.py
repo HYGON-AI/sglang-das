@@ -17,10 +17,12 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
+from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -124,6 +126,8 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
+
+from sglang.srt.utils.custom_op import register_custom_op
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
@@ -781,6 +785,117 @@ def _simulate_balanced_routing(
 # -------------------------------- TopK ---------------------------------------
 
 
+@lru_cache(maxsize=1)
+def _load_hcu_bf16_mega_gate_op() -> Optional[Callable]:
+    """Resolve the public MoE API once; older wheels keep the existing router."""
+    try:
+        from lightop.moe import bf16_mega_gate_hcu
+    except ImportError:
+        return None
+    # Older wheels expose only the two-result DeepGEMM convention. Probe
+    # the needed keyword capabilities instead of a numeric API version.
+    try:
+        parameters = inspect.signature(bf16_mega_gate_hcu).parameters
+    except (TypeError, ValueError):
+        return None
+    if not {"return_logits", "renormalize", "apply_scale"}.issubset(parameters):
+        return None
+    return bf16_mega_gate_hcu
+
+
+def _hcu_mega_gate_inputs_supported(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    valid_token_mask: torch.Tensor,
+    top_k: int,
+) -> bool:
+    """Check the native tensor contract before choosing fusion over fallback."""
+    if not (
+        x.is_cuda
+        and x.ndim == 2
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and weight.ndim == 2
+        and weight.shape[1] == x.shape[1]
+        and weight.dtype == x.dtype
+        and weight.device == x.device
+        and weight.is_contiguous()
+        and bias is not None
+        and bias.shape == (weight.shape[0],)
+        and bias.dtype == torch.float32
+        and bias.device == x.device
+        and bias.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and weight.data_ptr() % 16 == 0
+        and bias.data_ptr() % 32 == 0
+        and valid_token_mask.shape == (x.shape[0],)
+        and valid_token_mask.dtype == torch.bool
+        and valid_token_mask.device == x.device
+        and valid_token_mask.is_contiguous()
+    ):
+        return False
+    # Accept LightOp's supported shapes, independent of
+    # device marketing names or previously benchmarked token counts.
+    m, hidden = x.shape
+    experts = weight.shape[0]
+    if not (
+        hidden > 0
+        and hidden % 256 == 0
+        and 0 < experts <= 512
+        and experts % 4 == 0
+        and 0 < top_k <= min(experts, 32)
+        and max(m * hidden, hidden * experts, m * experts) <= 2**31 - 1
+    ):
+        return False
+    return True
+
+
+def _fake_hcu_bf16_mega_gate(
+    x, weight, bias, topk, renormalize, scale, apply_scale, mask
+):
+    return (
+        x.new_empty((x.shape[0], topk), dtype=torch.float32),
+        x.new_empty((x.shape[0], topk), dtype=torch.int64),
+        x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.float32),
+    )
+
+
+@register_custom_op(mutates_args=[], fake_impl=_fake_hcu_bf16_mega_gate)
+def hcu_bf16_mega_gate(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    scale: float,
+    apply_scale: bool,
+    mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    op = _load_hcu_bf16_mega_gate_op()
+    if op is None:
+        raise RuntimeError("HCU BF16 mega gate requires lightop.moe.bf16_mega_gate_hcu with logits support")
+
+    # Preserve DeepInfer/DeepGEMM's IDs-first convention at the public API,
+    # then adapt to StandardTopKOutput without another GEMM or copy.
+    ids, weights, logits = op(
+        x,
+        weight,
+        num_topk=topk,
+        use_shared_as_routed=False,
+        num_shared_experts=0,
+        routed_scaling_factor=scale,
+        ep_rank=0,  # Unused when shared-as-routed and physical mapping are disabled.
+        scoring_func="sqrtsoftplus",
+        mask=mask,
+        bias=bias,
+        return_logits=True,
+        renormalize=renormalize,
+        apply_scale=apply_scale,
+    )
+    return weights, ids, logits
+
+
 class TopK(BaseFusedOp):
     """
     Parameters:
@@ -867,6 +982,91 @@ class TopK(BaseFusedOp):
             sqrtsoftplus_log1p=sqrtsoftplus_log1p,
             fused_gate_packed_ids=fused_gate_packed_ids,
             allow_routed_experts_capture=allow_routed_experts_capture,
+        )
+
+    def forward_hcu_mega_gate(
+        self,
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> Optional[StandardTopKOutput]:
+        """Try fused GEMM + routing; None selects the existing router.
+
+        The batch prepares its mask once before the layer loop. LightOp emits
+        final INT64 IDs (-1 for padding) and zero padded weights in the kernel.
+        V4.1's fused_gate_packed_ids preference only applies to CUDA/FlashInfer;
+        this HCU/DeepEP path returns standard IDs regardless of that preference.
+        """
+        if not (
+            _is_hcu
+            and _use_lightop
+            and envs.SGLANG_HCU_ENABLE_DSV41_BF16_MEGA_GATE.get()
+            and valid_token_mask is not None
+        ):
+            return None
+        if not self._hcu_mega_gate_routing_supported():
+            return None
+        config = self.topk_config
+        x, bias = hidden_states, config.correction_bias
+        if not _hcu_mega_gate_inputs_supported(
+            x, weight, bias, valid_token_mask, config.top_k
+        ):
+            return None
+        if _load_hcu_bf16_mega_gate_op() is None:
+            return None
+        return StandardTopKOutput(
+            *hcu_bf16_mega_gate(
+                x,
+                weight,
+                bias,
+                config.top_k,
+                config.renormalize,
+                config.routed_scaling_factor,
+                config.apply_routed_scaling_factor_on_output,
+                valid_token_mask,
+            )
+        )
+
+    def _hcu_mega_gate_routing_supported(self) -> bool:
+        """Keep mutable routing settings and runtime overrides live."""
+        config = self.topk_config
+        if (
+            config.scoring_func != "sqrtsoftplus"
+            or not config.sqrtsoftplus_log1p
+            or config.use_grouped_topk
+            or config.num_fused_shared_experts != 0
+            or config.custom_routing_function is not None
+            or config.torch_native
+            or config.output_format not in (None, TopKOutputFormat.STANDARD)
+            or self.enable_waterfill
+            or config.routed_scaling_factor is None
+            or not math.isfinite(config.routed_scaling_factor)
+            or get_exec().deterministic.enable_deterministic_inference
+            or _eplb_remap_enabled()
+            or _use_aiter
+            or _skip_hip_pad_mask
+            or not get_moe_a2a_backend().is_deepep()
+            or not (get_moe_runner_backend().is_deep_gemm() or _use_deepgemm_moe)
+            or any(
+                flag.get()
+                for flag in (
+                    envs.SGLANG_SIMULATE_UNIFORM_EXPERTS,
+                    envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS,
+                    envs.SGLANG_SIMULATED_EXPERT_BALANCE,
+                )
+            )
+        ):
+            return False
+        return True
+
+    def record_mega_gate_output(self, output: StandardTopKOutput) -> None:
+        # Keep these hooks at the original TopK site, after shared experts have
+        # been scheduled. No padding, remapping or dtype-conversion kernels.
+        capture_routed_experts_if_allowed(
+            self.topk_config, self.layer_id, output.topk_ids
+        )
+        get_global_expert_distribution_recorder().on_select_experts(
+            topk_ids=output.topk_ids
         )
 
     def _apply_waterfill(self, topk_output: TopKOutput, num_tokens: int) -> TopKOutput:

@@ -4737,6 +4737,9 @@ class DeepseekV4Model(nn.Module):
                 forward_batch,
                 positions,
             )
+        if _is_hcu and envs.SGLANG_HCU_ENABLE_DSV41_BF16_MEGA_GATE.get():
+            forward_batch.prepare_hcu_moe_valid_token_mask(hidden_states.shape[0])
+
         last_pre = None
         tail = None
         if self.hc_pre_from_prev_sublayer:

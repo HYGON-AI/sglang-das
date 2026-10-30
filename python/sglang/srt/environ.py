@@ -1090,6 +1090,8 @@ class Envs:
     SGLANG_ENABLE_DP_ATTENTION_LOCAL_CONTROL_BROADCAST = EnvBool(False)
     SGLANG_KV_LAYOUT_HCU_FA = EnvBool(True)
     SGLANG_USE_LIGHTOP = EnvBool(False)
+    # Use fused HCU BF16 routing when the backend and inputs are supported.
+    SGLANG_HCU_ENABLE_DSV41_BF16_MEGA_GATE = EnvBool(True)
     SGLANG_HCU_HC_MIX_STATS_OPT = EnvBool(True)
     # Opt-in: DSV4.1 decode/verify on HCU runs the Triton fused mHC boundary instead of
     # lightop stats + aiter post + combine; prefill keeps the lightop path.
