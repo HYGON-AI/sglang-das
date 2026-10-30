@@ -297,15 +297,25 @@ class LPLBSolver:
         # HIP has no cuBLASDx IPM backend: split replicas by water-filling,
         # on the stream by default (the host variant syncs every layer).
         self._hip_solver = None
+        self.dispatch_map = None
         if torch.version.hip:
+            # Metadata pads every row to all physical experts (416 for r32), and
+            # the dispatch kernel is templated on that width: per-thread arrays
+            # that size spill to scratch, which costs ~0.5 ms of GPU stall per
+            # layer. Solve and dispatch on the compact replica width instead.
+            width = max(int((self.log2phy >= 0).sum(-1).max()), 1)
+            if bool((self.log2phy[:, width:] >= 0).any()):
+                raise ValueError("Compact LP table would drop valid replicas")
+            compact = self.log2phy[:, :width].contiguous()
+            self.dispatch_map = compact.to(torch.int32)
             if envs.SGLANG_LPLB_HIP_SOLVER.get() == "host":
-                self._hip_solver = _HostWaterfill(phy2log, self.log2phy, num_gpus)
+                self._hip_solver = _HostWaterfill(phy2log, compact, num_gpus)
             else:
                 from sglang.srt.eplb.lplb_hip_waterfill import DeviceWaterfill
 
                 self._hip_solver = DeviceWaterfill(
                     phy2log,
-                    self.log2phy,
+                    compact,
                     num_gpus,
                     passes=envs.SGLANG_LPLB_HOST_PASSES.get(),
                     min_pairs=envs.SGLANG_LPLB_HOST_MIN_PAIRS.get(),
@@ -329,7 +339,9 @@ class LPLBSolver:
         self._t1 = torch.empty(self.num_single, dtype=torch.float32, device=device)
         self._x = torch.empty(nv, dtype=torch.float32, device=device)
         self._log2phy_prob = torch.empty(
-            log2phy.shape, dtype=torch.float32, device=device
+            log2phy.shape if self.dispatch_map is None else self.dispatch_map.shape,
+            dtype=torch.float32,
+            device=device,
         )
 
     def solve(self, topk_ids: torch.Tensor) -> torch.Tensor:
