@@ -329,6 +329,14 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if not getattr(self.draft_model, "uses_own_vocab_modules", False):
             self._attach_shared_modules()
+        vp_size = get_spec().speculative_draft_lm_head_vp_size
+        if vp_size > 1:
+            if not self._draft_is_moe or not hasattr(
+                self.draft_model, "enable_draft_lm_head_vp"
+            ):
+                raise ValueError(
+                    "DSPARK draft LM-head VP currently requires a DeepSeek-V4 draft."
+                )
         self._target_hidden_projection_enabled = False
 
         self._verify_planner = DSparkVerifyPlanner(
@@ -626,6 +634,24 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        # DSPARK loads weights before the scheduler creates the request pool.
+        # Size VP buffers here, after the pool is bound and before any target
+        # or draft graph is captured. This also covers eager-only serving.
+        vp_size = get_spec().speculative_draft_lm_head_vp_size
+        if vp_size > 1 and getattr(self.draft_model, "draft_lm_head_vp", None) is None:
+            max_bs = max(
+                self.draft_model_runner.req_to_token_pool.size,
+                max(get_exec().graph.cuda_graph_config.decode.bs or [1]),
+            )
+            parallel = get_parallel()
+            self.draft_model.enable_draft_lm_head_vp(
+                vp_size=vp_size,
+                max_rows_per_rank=max_bs * self.gamma,
+                local_world_size=parallel.tp_size // parallel.nnodes,
+            )
+            self.draft_model.draft_lm_head_vp.guard_online_weight_updates(
+                self.draft_model, self.target_worker.model_runner.model
+            )
 
     def init_attention_backends(self):
         if not self._hosts_draft or self._is_context_only_pp_prefill_rank:

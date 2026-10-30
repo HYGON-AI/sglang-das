@@ -81,6 +81,12 @@ def _unsupported_derived_weight_cache_error(
     return None
 
 
+def _raise_if_dspark_vp_weights_are_frozen(model) -> None:
+    reason = getattr(model, "_dspark_vp_weight_update_error", None)
+    if reason is not None:
+        raise RuntimeError(reason)
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class WeightUpdater:
     tp_rank: int
@@ -259,6 +265,7 @@ class WeightUpdater:
         load_format: Optional[str] = None,
     ):
         """Receive one broadcast without loading it; only the target runner joined the group."""
+        _raise_if_dspark_vp_weights_are_frozen(self.get_model())
         assert group_name in self._model_update_group, (
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
             "Please call `init_weights_update_group` first."
@@ -310,6 +317,7 @@ class WeightUpdater:
         return bucket.reconstruct_tensors()
 
     def begin_weight_update(self: WeightUpdater) -> None:
+        _raise_if_dspark_vp_weights_are_frozen(self.get_model())
         DefaultModelLoader.restore_weights_before_loading(
             self.get_model(), torch.device(self.device)
         )

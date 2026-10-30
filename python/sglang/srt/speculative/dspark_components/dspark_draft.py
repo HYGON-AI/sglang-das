@@ -323,9 +323,22 @@ class DraftBlockProposer:
                 folded_confidence = draft_sampler.confidence_out[:bs]
         else:
             with self._base_logits_context():
-                base_logits, confidence_tap = self.draft_model.compute_base_logits(
-                    fwd.raw_hidden
-                )
+                draft_vp = getattr(self.draft_model, "draft_lm_head_vp", None)
+                if (
+                    draft_vp is not None
+                    and draft_sampler is not None
+                    and fwd.can_run_graph
+                ):
+                    # The greedy-only graph hook already projected every VP
+                    # owner. Reuse its full logits for stochastic proposals;
+                    # repeating the projection here would add collectives only
+                    # on the ranks with random requests and deadlock peers.
+                    base_logits = draft_vp.full_logits[: bs * self.gamma]
+                    confidence_tap = self.draft_model.collapse_hc_head(fwd.raw_hidden)
+                else:
+                    base_logits, confidence_tap = self.draft_model.compute_base_logits(
+                        fwd.raw_hidden
+                    )
                 base_logits = base_logits.view(bs, self.gamma, -1)
             draft_block = sample_draft_block(
                 base_logits=base_logits,
@@ -375,7 +388,14 @@ class DraftBlockProposer:
         self.draft_model_runner.kv_index_translator.bind_own_plan(idle_batch)
         self._fill_dp_moe_sync_metadata(idle_batch, batch)
         with torch.inference_mode():
-            self.draft_model_runner.forward(idle_batch)
+            draft_out = self.draft_model_runner.forward(idle_batch)
+            draft_vp = getattr(self.draft_model, "draft_lm_head_vp", None)
+            # A folded graph already ran the head on its padded idle rows.
+            # Otherwise join the active owners' eager projection collectives.
+            if draft_vp is not None and not (
+                self._draft_sampler is not None and draft_out.can_run_graph
+            ):
+                draft_vp.project_logits(draft_vp.local_hidden[:0])
 
     def _run_forward(
         self,
