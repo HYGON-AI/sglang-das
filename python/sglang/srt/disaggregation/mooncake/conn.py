@@ -1141,8 +1141,38 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         check.
         """
         state_types = getattr(self.kv_args, "state_types", [])
+        window_type = StateType.DSV41_SWA_WINDOW
+        dst_types = registration_info.dst_state_types
+        if (window_type in state_types) != (window_type in dst_types):
+            return False, (
+                "Encoder SWA replay requires matching request-window state on both P and D"
+            )
         fully_checked = True
         for i, st in enumerate(state_types):
+            if st == window_type:
+                j = resolve_state_component_dst_index(state_types, dst_types, i)
+                src_format = self.kv_args.state_data_formats[i]
+                dst_formats = registration_info.dst_state_data_formats
+                if j >= len(dst_formats) or src_format != dst_formats[j]:
+                    return False, (
+                        "Encoder SWA replay ring capacity or KV format differs between P and D"
+                    )
+                src_layouts = self.kv_args.v4_transfer_metadata["states"]
+                dst_layouts = registration_info.v4_transfer_metadata.get("states", [])
+                if j >= len(dst_layouts) or not src_layouts[i] or not dst_layouts[j]:
+                    return False, (
+                        "Encoder SWA replay requires global-layer window descriptors from both peers"
+                    )
+                try:
+                    match_transfer_entries(
+                        src_layouts[i],
+                        dst_layouts[j],
+                        self.kv_args.state_item_lens[i],
+                        registration_info.dst_state_item_lens[j],
+                    )
+                except (IndexError, RuntimeError) as exc:
+                    return False, str(exc)
+                continue
             if not self._is_generic_kvcache_state_type(st):
                 # Mamba, DSA tail and MiniMax send paths check their own layout.
                 continue
@@ -1244,6 +1274,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if (
             dst_item_lens is not None
             and mooncake_session_id not in self.state_strides_validated
+            # A window's owner subset is validated by descriptor pairing,
+            # not against D's first positional KV/tag entries.
+            and not (
+                state_type == StateType.DSV41_SWA_WINDOW and src_layout is not None
+            )
         ):
             mismatch = self._state_stride_mismatch(
                 src_data_ptrs=src_data_ptrs,
@@ -2204,6 +2239,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.QSA_COMPRESSED,
             StateType.SWA_RING,
             StateType.DSV4_REQUEST_STATE,
+            StateType.DSV41_SWA_WINDOW,
             StateType.BLOCK_SCALE,
             StateType.BLOCK_SCALE_SWA,
         )
@@ -2215,6 +2251,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.QSA_COMPRESSED,
             StateType.SWA_RING,
             StateType.DSV4_REQUEST_STATE,
+            StateType.DSV41_SWA_WINDOW,
         )
 
     def maybe_send_extra(
@@ -2451,6 +2488,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         continue
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
+                dst_layout_index = (
+                    dst_component_index if st == StateType.DSV41_SWA_WINDOW else i
+                )
                 if (
                     st == StateType.DSV4_REQUEST_STATE
                     and len(src_indices) == 0
@@ -2491,24 +2531,34 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         # MHA branch would compute zero layers and ship nothing
                         # (same reason as in `send_kvcache`).
                         force_flat=(
-                            st in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED)
+                            st in (
+                                StateType.QSA_PENDING,
+                                StateType.QSA_COMPRESSED,
+                                StateType.DSV41_SWA_WINDOW,
+                            )
                             or get_memory().enable_unified_memory
                         ),
                         src_layer_ids=src_state_layer_ids,
                         dst_layer_ids=dst_state_layer_ids,
                         src_layout=(
                             self.kv_args.v4_transfer_metadata["states"][i]
-                            if self.cp_cache_layer_split
+                            if (
+                                self.cp_cache_layer_split
+                                or st == StateType.DSV41_SWA_WINDOW
+                            )
                             and self.kv_args.v4_transfer_metadata["states"][i]
                             else None
                         ),
                         dst_layout=(
                             target_rank_registration_info.v4_transfer_metadata.get(
                                 "states", []
-                            )[i]
-                            if self.cp_cache_layer_split
+                            )[dst_layout_index]
+                            if (
+                                self.cp_cache_layer_split
+                                or st == StateType.DSV41_SWA_WINDOW
+                            )
                             and target_rank_registration_info is not None
-                            and i < len(
+                            and dst_layout_index < len(
                                 target_rank_registration_info.v4_transfer_metadata.get(
                                     "states", []
                                 )

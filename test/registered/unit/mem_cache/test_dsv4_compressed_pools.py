@@ -24,6 +24,17 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestDSV4CompressedPools(CustomTestCase):
+    def test_swa_dtype_uses_request_window_storage(self):
+        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        pool._unified_kv = False
+        pool.swa_kv_pool = None
+        for bf16 in (False, True):
+            with self.subTest(bf16=bf16):
+                pool.request_window = SimpleNamespace(
+                    state=SimpleNamespace(is_bf16_attention_kv_cache=bf16)
+                )
+                self.assertIs(pool.is_bf16_attention_kv_cache, bf16)
+
     def test_swa_key_page_size_uses_physical_paged_size(self):
         pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
         pool.request_window = None

@@ -192,6 +192,39 @@ class RequestWindow:
         self.tags[:, loc.flatten()] = -1
         self.prepared = None
 
+    def transfer_buf_infos(self):
+        """One PD item is a whole request ring, including its position tags.
+
+        Exclude the zero/sink page. The destination's request slot can differ
+        from the source's; both use the same page-aligned ring capacity.
+        """
+        data_ptrs, data_lens, item_lens = [], [], []
+        pages_per_slot = self.capacity // self.page_size
+        for buf in self.state.kv_buffer:
+            item_bytes = pages_per_slot * buf[0].nbytes
+            data_ptrs.append(buf.data_ptr())
+            data_lens.append(self.num_slots * item_bytes)
+            item_lens.append(item_bytes)
+        for tags in self.tags:
+            item_bytes = self.capacity * tags.element_size()
+            data_ptrs.append(tags.data_ptr())
+            data_lens.append(self.num_slots * item_bytes)
+            item_lens.append(item_bytes)
+        return data_ptrs, data_lens, item_lens
+
+    def transfer_layout(self, layer_ids):
+        if len(layer_ids) != len(self.state.kv_buffer):
+            raise RuntimeError("SWA request-window layer descriptors are incomplete")
+        return [
+            (family, layer_id)
+            for family in ("dsv41_swa_window_kv", "dsv41_swa_window_tags")
+            for layer_id in layer_ids
+        ]
+
+    @property
+    def transfer_format(self):
+        return f"dsv41_swa_window_v1/{self.capacity}/{self.state.kv_layout.value}"
+
     def activate(self, layout):
         if self.layout is layout:
             return

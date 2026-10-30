@@ -955,6 +955,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
         return_hidden_states_before_norm: bool,
+        encoder_swa_replay: bool = False,
         extend_position_info=None,
         spec_mrope_positions: Optional[torch.Tensor] = None,
         kv_loc_plan: Optional[KVLocPlan] = None,
@@ -968,7 +969,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # the columns of its window this forward writes. Without one, this
         # forward is its own iteration and builds the plan itself.
 
-        pd_hidden_capture_layer_ids = get_pd_hidden_capture_layer_ids(batch.reqs)
+        # A replay rebuilds SWA, not the PD hidden rows for the original extend.
+        pd_hidden_capture_layer_ids = (
+            [] if encoder_swa_replay else get_pd_hidden_capture_layer_ids(batch.reqs)
+        )
         if (
             model_runner.server_args.disaggregation_mode == "prefill"
             and get_parallel().attn_cp_size > 1
@@ -1045,6 +1049,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         ret = cls(
             # Required core inputs
+            encoder_swa_replay=encoder_swa_replay,
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
             input_ids=batch.input_ids,
