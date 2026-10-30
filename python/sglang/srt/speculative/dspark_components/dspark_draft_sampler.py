@@ -101,7 +101,12 @@ class DsparkDraftSampler:
                 bs=bs,
                 gamma=self.gamma,
             )
-        base_logits, confidence_features = self.model.compute_base_logits(model_hidden)
+        if getattr(self.model, "draft_lm_head_vp", None) is not None:
+            base_logits, confidence_features = self.model.compute_base_logits(
+                model_hidden, vp_padded_rows=model_hidden.shape[0]
+            )
+        else:
+            base_logits, confidence_features = self.model.compute_base_logits(model_hidden)
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.query_token_num)[:, 0]
 

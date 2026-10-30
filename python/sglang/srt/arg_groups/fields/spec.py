@@ -65,7 +65,7 @@ class Spec(msgspec.Struct):
     ] = None
     speculative_draft_lm_head_vp_size: A[
         int,
-        "Node-local vocabulary parallel size for EAGLE draft top-1. Requires attention TP=1 and DP LM-head.",
+        "Node-local vocabulary parallel size for EAGLE draft top-1 or DSPARK full draft logits. Requires attention TP=1 and DP LM-head. DSPARK retains greedy and stochastic proposal sampling.",
     ] = 1
     speculative_num_draft_tokens: A[
         Optional[int],
