@@ -30,6 +30,14 @@ def _base_logits_dtype(model) -> torch.dtype:
     return next(model.markov_head.parameters()).dtype
 
 
+def _corrected_logits_dtype(model) -> torch.dtype:
+    if getattr(model, "_dspark_lm_head_vp_active", False):
+        # Any active DSPARK VP configuration must keep the exact FP32 Markov
+        # scores used for proposals, including explicitly forced graph sampling.
+        return torch.float32
+    return _base_logits_dtype(model)
+
+
 def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
     del step_idx
     return torch.argmax(step_logits, dim=-1)
@@ -87,7 +95,7 @@ class DsparkDraftSampler:
             )
             self.corrected_out = torch.empty(
                 (max_bs * self.gamma, vocab),
-                dtype=_base_logits_dtype(model),
+                dtype=_corrected_logits_dtype(model),
                 device=device,
             )
 
@@ -203,12 +211,28 @@ def _resolve_folded_sampling(
         return False
     if mode == DsparkFoldedSampling.FORCE:
         return True
-    # The V4.1 TP head reduces compact argmax summaries in the greedy graph.
+    # Keep the compact V4.1 TP greedy path, except for VP8 with a TP1 Markov
+    # head: VP8 already returns the full vocabulary to each DP owner, so fold
+    # its actual proposal instead of computing a disposable greedy chain.
     if getattr(model.markov_head, "supports_sharded_greedy", False):
-        return False
+        draft_vp = getattr(model, "draft_lm_head_vp", None)
+        shard = getattr(model.markov_head, "_tp_shard", None)
+        if (
+            draft_vp is None
+            or draft_vp.vp_size != 8
+            or shard is None
+            or shard.tp_size != 1
+        ):
+            return False
+        if (
+            not envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
+            or not envs.SGLANG_DSPARK_FAST_SAMPLING.get()
+            or getattr(model, "_use_fp32_lm_head", False)
+        ):
+            return False
     vocab = int(model.lm_head.org_vocab_size)
     noise_bytes = max_bs * vocab * 4
-    logits_bytes = max_bs * gamma * vocab * _base_logits_dtype(model).itemsize
+    logits_bytes = max_bs * gamma * vocab * _corrected_logits_dtype(model).itemsize
     need_gb = (noise_bytes + logits_bytes) / (1 << 30)
     if available_memory_gb - need_gb >= _CAPTURE_HEADROOM_GB:
         return True
