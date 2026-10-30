@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
@@ -285,6 +286,7 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             algo.handle_server_args(server_args)
 
     _validate_draft_lm_head_vp(server_args)
+    _validate_dspark_target_lm_head_vp(server_args)
 
 
 def _validate_draft_lm_head_vp(server_args: ServerArgs) -> None:
@@ -358,6 +360,40 @@ def _validate_draft_lm_head_vp(server_args: ServerArgs) -> None:
         raise ValueError(
             "Draft LM-head VP top-1 cannot provide full proposal probabilities for rejection sampling."
         )
+
+
+def _validate_dspark_target_lm_head_vp(server_args: ServerArgs) -> None:
+    target_vp_size = int(os.environ.get("SGLANG_DSPARK_TARGET_LM_HEAD_VP_SIZE", "1"))
+    if target_vp_size not in (1, 4, 8, 16):
+        raise ValueError("SGLANG_DSPARK_TARGET_LM_HEAD_VP_SIZE must be 1, 4, 8 or 16.")
+    if target_vp_size == 1:
+        return
+    cfg = resolving_view(server_args)
+    if cfg.speculative_algorithm != "DSPARK":
+        raise ValueError("Target LM-head VP requires speculative_algorithm == DSPARK.")
+    if cfg.enable_memory_saver:
+        raise ValueError(
+            "DSPARK LM-head VP does not support --enable-memory-saver; "
+            "its vocabulary shards must remain resident."
+        )
+    if (
+        cfg.disaggregation_mode != "decode"
+        or cfg.pp_size != 1
+        or cfg.attn_cp_size != 1
+        or cfg.attn_dp_size <= 1
+        or not cfg.enable_dp_lm_head
+        or cfg.tp_size != cfg.attn_dp_size
+        or cfg.enable_lora
+        or cfg.enable_fp32_lm_head
+    ):
+        raise ValueError(
+            "DSPARK target LM-head VP requires decode, PP1/CP1, attention TP1, "
+            "DP LM-head, and no LoRA or FP32 LM-head."
+        )
+    if cfg.speculative_draft_lm_head_vp_size not in (1, target_vp_size):
+        raise ValueError("When both DSPARK VP heads are enabled their sizes must match.")
+    if cfg.tp_size % cfg.nnodes or (cfg.tp_size // cfg.nnodes) % target_vp_size:
+        raise ValueError("DSPARK target VP must divide the node-local TP size.")
 
 
 def _handle_dflash(server_args: ServerArgs) -> None:
