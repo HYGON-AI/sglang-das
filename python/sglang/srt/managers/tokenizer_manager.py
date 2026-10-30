@@ -858,7 +858,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else:
                     async for response in self._handle_batch_request(obj, request):
                         yield response
-        except BaseException:
+        except BaseException as e:
             # _init_req_state created a rid_to_state entry per (sub-)request up
             # front. The normal remover is the scheduler-response path
             # (_handle_batch_output), so a failure *before* a request reaches the
@@ -866,7 +866,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # request -- would otherwise leak those entries forever. Drop any that
             # are still pending; entries already removed on the normal completion
             # path are left untouched (pop is a no-op).
-            self._discard_pending_req_states(obj)
+            # A client disconnect cancels/closes this generator, possibly after
+            # the request already reached the scheduler, so abort it as well.
+            self._discard_pending_req_states(
+                obj, abort=isinstance(e, (asyncio.CancelledError, GeneratorExit))
+            )
             raise
 
     def _detect_input_format(
@@ -3453,18 +3457,41 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
 
-    def _discard_pending_req_states(self, obj):
+    def _discard_pending_req_states(self, obj, abort: bool = False):
         """Drop rid_to_state entries created by _init_req_state for *obj*.
 
         Safe to call after a partial/failed dispatch: only entries still present
         are removed, and the scheduler-response path looks up state with
         ``.get(...)`` so a later output for a discarded rid is ignored, not fatal.
+
+        With ``abort=True``, still-pending rids that were already dispatched
+        are aborted on the scheduler before being dropped. With a single
+        tokenizer worker, abort_request (e.g. from create_abort_task) skips rids
+        missing from rid_to_state, so the scheduler would otherwise keep
+        generating them. Multi-worker mode always forwards that later abort, so
+        nothing extra is sent here.
         """
         if not hasattr(obj, "is_single") or obj.is_single:
             rids = [obj.rid]
         else:
             rids = obj.rid
         for rid in rids:
+            state = self.rid_to_state.get(rid)
+            if (
+                abort
+                and state is not None
+                # Set only after _dispatch_to_scheduler returned: never abort a
+                # rid the scheduler has not seen (abort matching is by prefix).
+                and state.time_stats.api_server_dispatch_finish_time
+                and get_serving().tokenizer_worker_num == 1
+            ):
+                # Runs while a cancellation is propagating: a failed abort must
+                # neither skip the local cleanup nor replace that exception. If
+                # it failed before sending, the scheduler may keep generating.
+                try:
+                    self.abort_request(rid)
+                except Exception:
+                    logger.exception("Failed to abort rid=%s on cancellation", rid)
             self.rid_to_state.pop(rid, None)
 
     def _should_dispatch_to_encoder(

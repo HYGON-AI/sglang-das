@@ -595,6 +595,111 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         for r in rids:
             self.assertNotIn(r, tm.rid_to_state)
 
+    def test_cancel_after_dispatch_aborts_scheduler_once(self):
+        """A streaming client disconnect cancels generate_request after the
+        request reached the scheduler. Dropping rid_to_state makes the later
+        create_abort_task abort a no-op, so the abort must be sent here."""
+        tm = _make_tm_for_generate(self)
+        rid = "stream_disconnect"
+        obj = _make_generate_obj(rid, is_single=True)
+        obj.return_prompt_token_ids = False
+        tm._tokenize_one_request = AsyncMock(return_value=Mock())
+        # Like the real sender, mark the request state as dispatched.
+        tm._send_one_request = Mock(
+            side_effect=lambda _: tm.rid_to_state[
+                rid
+            ].time_stats.set_api_server_dispatch_finish_time()
+        )
+        tm._dispatch_to_scheduler = Mock()
+
+        async def drive():
+            task = asyncio.create_task(tm.generate_request(obj).__anext__())
+            while not tm._send_one_request.called:
+                await asyncio.sleep(0)
+            await asyncio.sleep(0)  # park in _wait_one_response
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(drive())
+
+        self.assertNotIn(rid, tm.rid_to_state)
+        tm._dispatch_to_scheduler.assert_called_once()
+        abort_req = tm._dispatch_to_scheduler.call_args.args[0]
+        self.assertIsInstance(abort_req, AbortReq)
+        self.assertEqual(abort_req.rid, rid)
+
+        # The background create_abort_task still runs afterwards; it must not
+        # send a second abort.
+        tm.abort_request(rid)
+        tm._dispatch_to_scheduler.assert_called_once()
+
+    def test_cancel_abort_failure_keeps_cleanup_and_cancellation(self):
+        """If the abort send raises, the rid is still dropped and the original
+        CancelledError, not the send error, propagates."""
+        tm = _make_tm_for_generate(self)
+        rid = "abort_send_fails"
+        obj = _make_generate_obj(rid, is_single=True)
+        obj.return_prompt_token_ids = False
+        tm._tokenize_one_request = AsyncMock(return_value=Mock())
+        tm._send_one_request = Mock(
+            side_effect=lambda _: tm.rid_to_state[
+                rid
+            ].time_stats.set_api_server_dispatch_finish_time()
+        )
+        tm._dispatch_to_scheduler = Mock(side_effect=RuntimeError("send failed"))
+
+        async def drive():
+            task = asyncio.create_task(tm.generate_request(obj).__anext__())
+            while not tm._send_one_request.called:
+                await asyncio.sleep(0)
+            await asyncio.sleep(0)  # park in _wait_one_response
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        with self.assertLogs(
+            "sglang.srt.managers.tokenizer_manager", level="ERROR"
+        ) as logs:
+            asyncio.run(drive())
+
+        self.assertIn("Failed to abort rid=abort_send_fails", logs.output[0])
+        self.assertNotIn(rid, tm.rid_to_state)
+        tm._dispatch_to_scheduler.assert_called_once()
+
+    def test_cancel_before_dispatch_sends_no_abort(self):
+        """Cancelling while still tokenizing must not abort on the scheduler:
+        it matches rids by prefix, so AbortReq("job") would also hit "job-2"."""
+        tm = _make_tm_for_generate(self)
+        rid = "job"
+        obj = _make_generate_obj(rid, is_single=True)
+        tokenize_started = asyncio.Event()
+
+        async def blocked_tokenize(_):
+            tokenize_started.set()
+            await asyncio.Event().wait()
+
+        tm._tokenize_one_request = blocked_tokenize
+        tm._send_one_request = Mock()
+        tm._dispatch_to_scheduler = Mock()
+
+        async def drive():
+            task = asyncio.create_task(tm.generate_request(obj).__anext__())
+            await tokenize_started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(drive())
+
+        self.assertNotIn(rid, tm.rid_to_state)
+        tm._send_one_request.assert_not_called()
+        tm._dispatch_to_scheduler.assert_not_called()
+
+        # The background create_abort_task is a no-op as before.
+        tm.abort_request(rid)
+        tm._dispatch_to_scheduler.assert_not_called()
+
     def test_thinking_budget_rejects_runtime_without_strict_thinking(self):
         tm = _make_tm_for_generate(self)
         obj = GenerateReqInput(
