@@ -1,4 +1,4 @@
-"""Node-local vocabulary parallelism for EAGLE draft LM-head top-1."""
+"""Node-local LM-head vocabulary parallelism for EAGLE and DSPARK."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import os
 from typing import List, Sequence, Tuple
 
 import torch
+import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
@@ -293,3 +294,200 @@ class DraftLMHeadVocabParallelTop1:
             global_scores[local_start:local_end],
             global_token_ids[local_start:local_end],
         )
+
+
+class DSparkLMHeadVocabParallel:
+    def __init__(
+        self,
+        *,
+        full_weight: torch.Tensor,
+        vocab_size: int,
+        vp_size: int,
+        max_rows_per_rank: int,
+        local_world_size: int,
+        process_group=None,
+    ) -> None:
+        if vp_size <= 1 or max_rows_per_rank <= 0:
+            raise ValueError(
+                "DSPARK VP requires vp_size > 1 and positive row capacity."
+            )
+        if full_weight.ndim != 2 or full_weight.shape[0] != vocab_size:
+            raise ValueError("DSPARK VP requires a full, unpadded 2-D LM-head weight.")
+        if full_weight.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise ValueError(
+                "DSPARK VP requires an unquantized floating-point LM-head."
+            )
+        if vocab_size % vp_size:
+            raise ValueError("The vocabulary size must be divisible by DSPARK VP size.")
+        self._pynccl_comm = None
+        self._cpu_group = None
+        if process_group is None:
+            from sglang.srt.runtime_context import get_parallel
+
+            tp_group = get_parallel().tp_group
+            groups = build_node_local_vp_groups(
+                tp_group.ranks, vp_size, local_world_size
+            )
+            rank = dist.get_rank()
+            ranks = next(ranks for ranks in groups if rank in ranks)
+            if ranks == tp_group.ranks:
+                # VP8/TP8 uses the existing rank order. Reuse its communicator
+                # instead of initializing both WORLD (for metadata exchange)
+                # and a second NCCL group with their own resident buffers.
+                process_group = tp_group.device_group
+                self._cpu_group = tp_group.cpu_group
+                comm = getattr(tp_group, "pynccl_comm", None)
+                if (
+                    comm is not None
+                    and comm.available
+                    and comm.world_size == vp_size
+                    and comm.rank == dist.get_rank(process_group)
+                    and comm.device == full_weight.device
+                    and "ncclAllToAll" in comm.nccl._funcs
+                ):
+                    self._pynccl_comm = comm
+            else:
+                # VP groups are disjoint and known locally. Avoid object
+                # collectives on WORLD, which may otherwise stage through GPUs.
+                process_group = dist.new_group(
+                    ranks=ranks,
+                    backend=dist.get_backend(tp_group.device_group),
+                    use_local_synchronization=True,
+                )
+        if process_group is None or dist.get_world_size(process_group) != vp_size:
+            raise ValueError("DSPARK VP process group does not match vp_size.")
+        if self._cpu_group is None:
+            if dist.get_backend(process_group) == "gloo":
+                self._cpu_group = process_group
+            else:
+                self._cpu_group = dist.new_group(
+                    ranks=dist.get_process_group_ranks(process_group),
+                    backend="gloo",
+                    use_local_synchronization=True,
+                )
+
+        self.process_group = process_group
+        self.vp_size = vp_size
+        self.vp_rank = dist.get_rank(process_group)
+        self.max_rows_per_rank = max_rows_per_rank
+        self.vocab_size = vocab_size
+        self.hidden_size = full_weight.shape[1]
+        self.shard_size = vocab_size // vp_size
+        self.dtype = full_weight.dtype
+        self.device = full_weight.device
+        # A contiguous transpose also avoids the HCU strided-transpose GEMM
+        # issue handled by the existing EAGLE VP implementation.
+        self.weight_shard_t = full_weight.narrow(
+            0, self.vp_rank * self.shard_size, self.shard_size
+        ).T.contiguous()
+        options = dict(device=self.device, dtype=self.dtype)
+        total_rows = max_rows_per_rank * vp_size
+        self.local_hidden = torch.empty(
+            (max_rows_per_rank, self.hidden_size), **options
+        )
+        self.gathered_hidden = torch.empty((total_rows, self.hidden_size), **options)
+        self.shard_logits = torch.empty((total_rows, self.shard_size), **options)
+        self.received_logits = torch.empty_like(self.shard_logits)
+        self.full_logits = torch.empty((max_rows_per_rank, vocab_size), **options)
+        self._cpu_row_count = torch.empty((), dtype=torch.int64, device="cpu")
+
+        # Warm both collective types before capture and memory accounting.
+        warm_send = torch.zeros(vp_size, device=self.device, dtype=self.dtype)
+        warm_recv = torch.empty_like(warm_send)
+        self._all_gather(warm_recv, warm_send[:1])
+        self._all_to_all(warm_recv, warm_send)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    @staticmethod
+    def guard_online_weight_updates(*models) -> None:
+        reason = (
+            "Online weight updates are not supported while DSPARK LM-head VP "
+            "is active: captured forwards retain derived vocabulary shards. "
+            "Restart the service to load new weights."
+        )
+        for model in models:
+            model._dspark_lm_head_vp_active = True
+            model._dspark_vp_weight_update_error = reason
+            if getattr(model, "_derived_weight_cache_error", None) is None:
+                model._derived_weight_cache_error = reason
+
+    def _all_gather(self, output: torch.Tensor, input: torch.Tensor) -> None:
+        if self._pynccl_comm is not None:
+            with self._pynccl_comm.change_state(enable=True):
+                self._pynccl_comm.all_gather(output, input)
+        else:
+            dist.all_gather_into_tensor(output, input, group=self.process_group)
+
+    def _all_to_all(self, output: torch.Tensor, input: torch.Tensor) -> None:
+        if self._pynccl_comm is not None:
+            from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
+                buffer_type,
+                cudaStream_t,
+                ncclDataTypeEnum,
+            )
+
+            with self._pynccl_comm.change_state(enable=True):
+                # The native RCCL collective avoids the additional per-peer
+                # buffers of PyNccl's grouped send/recv implementation.
+                self._pynccl_comm.nccl.ncclAllToAll(
+                    buffer_type(input.data_ptr()),
+                    buffer_type(output.data_ptr()),
+                    input.numel() // self.vp_size,
+                    ncclDataTypeEnum.from_torch(input.dtype),
+                    self._pynccl_comm.comm,
+                    cudaStream_t(torch.cuda.current_stream(self.device).cuda_stream),
+                )
+        else:
+            dist.all_to_all_single(output, input, group=self.process_group)
+
+    @torch.no_grad()
+    def project_logits(
+        self, hidden_states: torch.Tensor, *, padded_rows: int | None = None
+    ) -> torch.Tensor:
+        """Return local full-vocabulary logits, including for uneven/idle DP ranks.
+
+        Graph callers supply their common capture bucket. Eager callers agree
+        on the largest local row count. Every VP rank must call, including idle
+        ranks with zero rows. Returned storage is reused on the next call.
+        """
+        if hidden_states.ndim != 2 or hidden_states.shape[1] != self.hidden_size:
+            raise ValueError("DSPARK VP hidden states have an unexpected shape.")
+        rows = hidden_states.shape[0]
+        if hidden_states.device != self.device:
+            raise ValueError("DSPARK VP hidden states changed device.")
+        if padded_rows is None:
+            if self.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "DSPARK VP capture requires a common padded row count."
+                )
+            # Row counts are host metadata. Agree on the CPU without
+            # reading a GPU scalar; captured calls supply padded_rows.
+            self._cpu_row_count.fill_(rows)
+            dist.all_reduce(
+                self._cpu_row_count, op=dist.ReduceOp.MAX, group=self._cpu_group
+            )
+            padded_rows = int(self._cpu_row_count.item())
+        if not rows <= padded_rows <= self.max_rows_per_rank:
+            raise ValueError(
+                f"DSPARK VP rows={rows}, padded={padded_rows} exceed "
+                f"capacity={self.max_rows_per_rank}."
+            )
+        if padded_rows == 0:
+            return self.full_logits[:0]
+        local = self.local_hidden[:padded_rows]
+        local[:rows].copy_(hidden_states)
+        local[rows:].zero_()
+        total = padded_rows * self.vp_size
+        gathered = self.gathered_hidden[:total]
+        partial = self.shard_logits[:total]
+        received = self.received_logits[:total]
+        self._all_gather(gathered, local)
+        torch.mm(gathered, self.weight_shard_t, out=partial)
+        self._all_to_all(received, partial)
+        self.full_logits[:padded_rows].view(
+            padded_rows, self.vp_size, self.shard_size
+        ).copy_(
+            received.view(self.vp_size, padded_rows, self.shard_size).permute(1, 0, 2)
+        )
+        return self.full_logits[:rows]
