@@ -311,7 +311,8 @@ def fused_sigmoid_mul(
 
     out = attn_output if inplace else torch.empty_like(attn_output)
     block_h = 1024 if num_tokens < 1024 else 2048
-    kwargs = {}
+    # Explicit defaults keep the torch.compile Triton launcher signature aligned.
+    kwargs = {"q_ptr": None, "s_ptr": None, "QUANT": False}
     if quant:  # one block per row; returns per-token FP8 (q, scale [T, 1])
         block_h = triton.next_power_of_2(hidden_dim)
         q = torch.empty_like(attn_output, dtype=torch.float8_e4m3fn)

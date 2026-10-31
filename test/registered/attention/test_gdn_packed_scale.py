@@ -45,5 +45,38 @@ def test_compiled_packed_decode_matches_eager_state_and_output():
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA/HIP device")
+def test_compiled_gated_rms_norm_matches_eager(monkeypatch):
+    from sglang.kernels.ops.attention.fla import layernorm_gated
+
+    monkeypatch.setattr(layernorm_gated, "calc_rows_per_block", lambda m, device: 4)
+    monkeypatch.setattr(layernorm_gated, "is_arch_support_pdl", lambda: False)
+    torch.manual_seed(42)
+    x = torch.randn((1024, 128), device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn_like(x)
+    weight = torch.ones(128, device="cuda", dtype=torch.bfloat16)
+
+    def run(x, gate, weight):
+        return layernorm_gated.rms_norm_gated(
+            x=x, weight=weight, bias=None, z=gate, is_rms_norm=True
+        )
+
+    expected = run(x, gate, weight)
+    actual = torch.compile(run, fullgraph=True)(x, gate, weight)
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA/HIP device")
+def test_compiled_attention_gate_matches_eager():
+    from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+
+    torch.manual_seed(42)
+    attn = torch.randn((32, 4096), device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn((32, 32, 256), device="cuda", dtype=torch.bfloat16)[..., 128:]
+    expected = fused_sigmoid_mul(attn, gate)
+    actual = torch.compile(fused_sigmoid_mul, fullgraph=True)(attn, gate)
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

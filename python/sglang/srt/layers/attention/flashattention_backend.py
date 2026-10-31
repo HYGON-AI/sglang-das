@@ -363,6 +363,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.fa_impl_ver = fa_impl_ver
         if is_hcu():
             self._get_scheduler_metadata = None
+            self._decode_uses_static_max_seqlen_k = False
         elif self.fa_impl_ver == 3:
             from sgl_kernel.flash_attn import (
                 flash_attn_varlen_func,
@@ -442,7 +443,7 @@ class FlashAttentionBackend(AttentionBackend):
         # combine kernel (flash_fwd_combine_launch_template.h:52). Leaving
         # scheduler_metadata unset uses the existing per-layer metadata path.
         self._disable_scheduler_metadata_precompute = (
-            _should_disable_scheduler_metadata_precompute(server_args)
+            _should_disable_scheduler_metadata_precompute()
         )
 
     def _maybe_init_local_attn_builder(
