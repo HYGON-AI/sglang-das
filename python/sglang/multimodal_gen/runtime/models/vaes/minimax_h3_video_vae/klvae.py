@@ -214,6 +214,12 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 setattr(self.processor, key, value)
         else:
             self.processor = VAEProcessor(**processor_kwargs)
+        default_transform, default_transform_inplace = getattr(
+            self, "_default_transforms", (None, None)
+        )
+        self.processor._runtime_owned_transform = (
+            default_transform_inplace if self.transform is default_transform else None
+        )
 
     def split_tiles(self, input_len, is_decoder=False):
         tile_size = self.decoder_tile_size if is_decoder else self.tile_size
@@ -1230,6 +1236,10 @@ class AutoencoderKLLegacy(AutoencoderKL):
             )
 
         self.transform = get_normalize_transform(pixel_norm_type)
+        self._default_transforms = (
+            self.transform,
+            get_normalize_transform(pixel_norm_type, inplace=True),
+        )
         self.transform_rev = get_denormalize_transform(pixel_norm_type)
         self.transform_rev_inplace = get_denormalize_transform(
             pixel_norm_type, inplace=True

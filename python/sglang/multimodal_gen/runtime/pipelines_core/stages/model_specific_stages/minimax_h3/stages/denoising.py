@@ -36,11 +36,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.srt.utils import is_hcu
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.srt.utils import is_hcu
 
 logger = init_logger(__name__)
 
@@ -621,9 +621,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         ctx = _resolve_full_loop_context(batch)
 
-        if not (
-            current_platform.is_cuda() or is_hcu() or current_platform.is_mps()
-        ):
+        if not (current_platform.is_cuda() or is_hcu() or current_platform.is_mps()):
             raise RuntimeError(
                 "MiniMax H3 full-loop denoise requires CUDA, HCU, or MPS"
             )
@@ -712,6 +710,13 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     ),
                 )
         finally:
+            from sglang.multimodal_gen.runtime.layers.usp import (
+                release_a2a_staging_capacity,
+            )
+
+            # Reuse buffers throughout the loop, but let VAE stages and the
+            # next request reuse their storage without pinning split segments.
+            release_a2a_staging_capacity(device)
             self._finish_active_component_use()
         _publish_full_loop_outputs(
             ctx,

@@ -294,4 +294,8 @@ class VAEProcessor:
         if device is not None:
             tensor = tensor.to(device)
         tensor = tensor.permute(0, 3, 1, 2)
-        return tensor.to(torch.float32).div_(255.0)
+        # Cast directly into the processor's layout so transform_tensor does
+        # not need another full-video FP32 copy to make its output contiguous.
+        return tensor.to(torch.float32, memory_format=torch.contiguous_format).div_(
+            255.0
+        )
