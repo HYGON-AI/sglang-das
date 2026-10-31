@@ -47,7 +47,7 @@ from sglang.test.test_utils import CustomTestCase, is_in_amd_ci
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 register_hcu_ci(
-    est_time=120,
+    est_time=180,
     suite="stage-b-test-1-hcu-small",
 )
 
@@ -187,6 +187,70 @@ class TestTritonAttention(CustomTestCase):
     def setUp(self):
         # Set seeds before each test method
         self._set_all_seeds(42)
+
+    def test_gdn_cached_layer_compiled_decode(self):
+        from types import SimpleNamespace
+
+        from sglang.kernels.ops.attention.fla.fused_recurrent import (
+            fused_recurrent_gated_delta_rule_packed_decode,
+        )
+        from sglang.srt.mem_cache.memory_pool import MambaPool
+
+        batch, heads, dim = 4, 4, 128
+        params = SimpleNamespace(
+            shape=SimpleNamespace(conv=[(4, 3)], temporal=(heads, dim, dim)),
+            dtype=SimpleNamespace(conv=torch.bfloat16, temporal=torch.float32),
+            is_kda=False,
+            use_hcu_kda=False,
+        )
+        pool = MambaPool(
+            size=batch,
+            spec_state_size=batch,
+            cache_params=params,
+            mamba_layer_ids=[0, 1],
+            device=get_device(),
+        )
+        layer = pool.mamba2_layer_cache(1)
+        self.assertIs(layer, pool.mamba2_layer_cache(1))
+        self.assertIsNone(layer.temporal._base)
+        self.assertEqual(
+            layer.temporal.data_ptr(), pool.mamba_cache.temporal[1].data_ptr()
+        )
+
+        qkv = (
+            torch.randn(
+                batch, 3 * heads * dim, device=get_device(), dtype=torch.bfloat16
+            )
+            * 0.1
+        )
+        a = torch.randn(batch, heads, device=get_device(), dtype=torch.bfloat16) * 0.1
+        b = torch.randn_like(a) * 0.1
+        A_log = torch.full((heads,), -1.0, device=get_device(), dtype=torch.float32)
+        dt_bias = torch.full((heads,), -1.0, device=get_device(), dtype=torch.bfloat16)
+        indices = torch.arange(1, batch + 1, device=get_device(), dtype=torch.int32)
+        reference_state = torch.randn_like(layer.temporal) * 0.01
+        layer.temporal.copy_(reference_state)
+
+        def decode(state):
+            out = torch.empty(
+                (batch, 1, heads, dim), device=state.device, dtype=qkv.dtype
+            )
+            fused_recurrent_gated_delta_rule_packed_decode(
+                qkv, a, b, A_log, dt_bias, dim**-0.5, state, out, indices, True
+            )
+            return out
+
+        compiled = torch.compile(decode, mode="default")
+        for _ in range(2):
+            expected = decode(reference_state)
+            actual = compiled(layer.temporal)
+            torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-3)
+            torch.testing.assert_close(
+                layer.temporal, reference_state, rtol=1e-5, atol=1e-5
+            )
+            torch.testing.assert_close(
+                pool.mamba_cache.temporal[1], reference_state, rtol=1e-5, atol=1e-5
+            )
 
     def _test_extend_attention_once(self, B, N_CTX, H_Q, H_KV, D):
         dtype = torch.bfloat16

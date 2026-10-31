@@ -785,6 +785,7 @@ jobs:
               --include-file registered/unit/parser/test_jinja_template_utils.py \
               --include-file registered/unit/parser/test_reasoning_parser.py \
               --include-file registered/unit/entrypoints/openai/test_serving_embedding.py \
+              --include-file registered/attention/test_gdn_packed_scale.py \
               --include-file registered/attention/test_triton_attention_kernels.py \
               --include-file registered/layers/mamba/test_mamba_ssm.py \
               --include-file registered/layers/mamba/test_mamba_ssm_ssd.py \
@@ -799,6 +800,9 @@ jobs:
               --include-file registered/unit/managers/test_io_struct.py \
               --include-file registered/unit/managers/test_profile_merger_http_api.py \
               --include-file registered/unit/mem_cache/test_radix_cache_unit.py \
+              --include-file registered/unit/mem_cache/test_mamba_layer_views.py \
+              --include-file registered/unit/mem_cache/test_unified_mamba_views.py \
+              --include-file registered/unit/mem_cache/test_dense_fused_draft_geometry.py \
               --include-file registered/ops/test_repeat_interleave.py \
               --include-file registered/openai_server/basic/test_serving_completions.py \
               --include-file registered/openai_server/validation/test_large_max_new_tokens.py \

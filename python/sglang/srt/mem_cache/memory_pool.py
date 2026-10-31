@@ -672,9 +672,9 @@ class MambaPool:
                 if v is None:
                     kwargs[name] = None
                 elif name in ("conv", "intermediate_conv_window"):
-                    kwargs[name] = [conv[layer] for conv in v]
+                    kwargs[name] = [conv[layer].detach() for conv in v]
                 else:
-                    kwargs[name] = v[layer]
+                    kwargs[name] = v[layer].detach()
 
             return type(self)(**kwargs)
 
@@ -1203,6 +1203,7 @@ class MambaPool:
                 )
             self.mem_usage = mem_usage_bytes / GB
             self.num_mamba_layers = num_mamba_layers
+            self._init_layer_caches()
         # Full (unsharded) conv sub-block dims for PD transfer across different
         # attn_tp_size (GDN: [key_dim, key_dim, value_dim]); None otherwise.
         self.conv_shard_groups = getattr(cache_params.shape, "conv_shard_groups", None)
@@ -1238,8 +1239,17 @@ class MambaPool:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
         return self.mamba_cache
 
+    def _init_layer_caches(self):
+        # Build zero-copy layer views outside torch.compile. Selecting a layer
+        # while tracing an in-place Triton update can cause functionalization
+        # to clone the shared storage for all preceding layers.
+        self._layer_caches = tuple(
+            self.mamba_cache.at_layer_idx(layer)
+            for layer in range(self.num_mamba_layers)
+        )
+
     def mamba2_layer_cache(self, layer_id: int):
-        return self.mamba_cache.at_layer_idx(layer_id)
+        return self._layer_caches[layer_id]
 
     # Pool-stable (conv tensors don't move after allocation) so cached per instance
     # on first use. A cached_property rather than set in __init__ because
