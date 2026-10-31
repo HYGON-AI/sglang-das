@@ -399,6 +399,12 @@ class TestFusedStateHost(unittest.TestCase):
         draft = UnifiedDraftMambaPool(
             unified_buffer=pool, sub_pool_name="mamba", layer_lanes={4: 0}
         )
+        layer = draft.mamba2_layer_cache(0)
+        self.assertIs(layer, draft.mamba2_layer_cache(0))
+        self.assertIsNone(layer.temporal._base)
+        self.assertEqual(
+            layer.temporal.data_ptr(), draft.mamba_cache.temporal[0].data_ptr()
+        )
         draft_conv, _ = pool.build_draft_state_views("mamba")
         self.assertEqual(
             draft.mamba_cache.conv[1].shape, (1, pool.max_slots("mamba"), 2, 4)

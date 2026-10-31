@@ -98,6 +98,27 @@ class TestUnifiedMambaViews(unittest.TestCase):
         temporal_dtype=torch.float32,
     )
 
+    def test_cached_layer_views_alias_unified_storage(self):
+        from sglang.srt.mem_cache.unified_memory_pool import UnifiedMambaPool
+
+        pool, _ = _make_pool(**self.FALCON_KW)
+        state = UnifiedMambaPool(
+            unified_buffer=pool,
+            sub_pool_name="mamba",
+            spec_state_size=2,
+            mamba_layer_ids=list(range(self.FALCON_KW["mamba_layer_num"])),
+        )
+        layer = state.mamba2_layer_cache(2)
+        self.assertIs(layer, state.mamba2_layer_cache(2))
+        self.assertIsNone(layer.temporal._base)
+        self.assertEqual(
+            layer.temporal.data_ptr(), state.mamba_cache.temporal[2].data_ptr()
+        )
+        layer.temporal[1].fill_(7)
+        self.assertTrue(torch.all(state.mamba_cache.temporal[2, 1] == 7))
+        state.clear_slots(torch.tensor([1]))
+        self.assertTrue(torch.all(layer.temporal[1] == 0))
+
     def _fill_and_roundtrip(self, pool, mamba_spec):
         """Write a distinct random tensor to every view, then read all of them
         back: writing all first makes any envelope overlap corrupt an earlier

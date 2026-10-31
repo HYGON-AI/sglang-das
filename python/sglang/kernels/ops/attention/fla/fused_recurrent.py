@@ -250,7 +250,9 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     if USE_QK_L2NORM_IN_KERNEL:
         b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
         b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
-    b_q = b_q * scale
+    # torch.compile can pass Python floats as FP64 Triton arguments. Keep
+    # the recurrent computation in FP32, as in the direct kernel launch.
+    b_q = b_q * tl.cast(scale, tl.float32)
 
     a_val = tl.load(a + i_n * stride_a_tok + i_hv).to(tl.float32)
     b_val = tl.load(b + i_n * stride_b_tok + i_hv).to(tl.float32)

@@ -383,6 +383,7 @@ class UnifiedDraftMambaPool(MambaPool):
             conv=[view[start:stop] for view in conv_views],
             temporal=temporal_view[start:stop],
         )
+        self._init_layer_caches()
         self.mem_usage = 0.0  # fused into the host entries
 
     def clear_slots(self, indices: torch.Tensor):
