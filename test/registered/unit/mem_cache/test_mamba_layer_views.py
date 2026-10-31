@@ -4,9 +4,10 @@ import pytest
 import torch
 
 from sglang.srt.mem_cache import memory_pool
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_hcu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_hcu_ci(est_time=10, suite="stage-b-test-1-hcu-small")
 
 
 def test_cached_layer_views_share_storage_and_follow_slot_lifecycle(monkeypatch):
