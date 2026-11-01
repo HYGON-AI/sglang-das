@@ -105,6 +105,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
+    get_memory,
     get_parallel,
     get_schedule,
 )
@@ -2830,6 +2831,77 @@ class SchedulerDisaggregationPrefillMixin:
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
 
+    def prefetch_disagg_page_indices(self: Scheduler, req: Req) -> None:
+        # Snapshot allocation metadata before the forward/WAR barrier. The KV
+        # payload still follows the sender's original source-completion event.
+        if (
+            not is_hcu()
+            or not self.enable_overlap
+            or self.enable_staging
+            or not get_parallel().enable_cp_cache_layer_split
+            or get_memory().enable_unified_memory
+            or req.pending_bootstrap
+            or req.prefix_len == 0
+            or req.extend_end < len(req.origin_input_ids)
+        ):
+            return
+        pool = self.token_to_kv_pool_allocator.get_kvcache()
+        if (
+            not isinstance(pool, DeepSeekV4TokenToKVPool)
+            or getattr(pool, "request_window", None) is not None
+            or getattr(pool, "_unified_kv", False)
+        ):
+            return
+        page_size = self.token_to_kv_pool_allocator.page_size
+        end = min(req.extend_end, len(req.origin_input_ids))
+        raw = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :end]
+        full = self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(raw)
+        full_pages = full[::page_size] // page_size
+        window_start = max(req.disagg_decode_prefix_len, end - self.sliding_window_size)
+        window_start = window_start // page_size * page_size
+        swa = self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
+            raw[window_start:end]
+        )
+        swa_pages = swa[::page_size] // page_size
+        pages = torch.cat((full_pages, swa_pages))
+        host = torch.empty_like(pages, device="cpu", pin_memory=True)
+        host.copy_(pages, non_blocking=True)
+        ready = self.device_module.Event()
+        ready.record()
+        req.disagg_page_indices = {
+            "slot": req.kv.req_pool_idx,
+            "page_size": page_size,
+            "end": end,
+            "swa_start": window_start,
+            "full_count": full_pages.numel(),
+            "host": host,
+            "device": pages,
+            "ready": ready,
+        }
+
+    def cached_disagg_page_indices(
+        self: Scheduler, req: Req, start: int, end: int, *, swa: bool = False
+    ) -> Optional[np.ndarray]:
+        cached = getattr(req, "disagg_page_indices", None)
+        page_size = self.token_to_kv_pool_allocator.page_size
+        if (
+            cached is None
+            or cached["slot"] != req.kv.req_pool_idx
+            or cached["page_size"] != page_size
+            or start % page_size
+            or end > cached["end"]
+            or end < start
+        ):
+            return None
+        if swa and (start != cached["swa_start"] or end != cached["end"]):
+            return None
+        cached["ready"].synchronize()
+        if swa:
+            return cached["host"][cached["full_count"] :].numpy()
+        return cached["host"][
+            start // page_size : (end + page_size - 1) // page_size
+        ].numpy()
+
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
@@ -2986,6 +3058,11 @@ class SchedulerDisaggregationPrefillMixin:
                     return request_window.page_indices(
                         int(req.kv.req_pool_idx), window_start, seq_len
                     )
+                cached = self.cached_disagg_page_indices(
+                    req, window_start, seq_len, swa=True
+                )
+                if cached is not None:
+                    return cached
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, window_start:seq_len
                 ]
@@ -2997,6 +3074,9 @@ class SchedulerDisaggregationPrefillMixin:
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
 
             def _full_kv_pages_payload():
+                cached = self.cached_disagg_page_indices(req, 0, seq_len)
+                if cached is not None:
+                    return cached
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, :seq_len
                 ]
@@ -3132,17 +3212,18 @@ class SchedulerDisaggregationPrefillMixin:
 
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
-            raw_kv_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, seg_start:seg_end
-            ]
-            # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
-            # physical ones. Per segment, since each is its own gather.
-            kv_indices = (
-                self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
-                    raw_kv_indices
+            page_indices = self.cached_disagg_page_indices(req, seg_start, seg_end)
+            if page_indices is None:
+                raw_kv_indices = self.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, seg_start:seg_end
+                ]
+                # Unified memory requires translating virtual ids at send time.
+                kv_indices = (
+                    self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                        raw_kv_indices
+                    )
                 )
-            )
-            page_indices = kv_to_page_indices(kv_indices, page_size)
+                page_indices = kv_to_page_indices(kv_indices, page_size)
             segment_is_last = last_chunk and is_final_segment
             send_hidden_chunk = (
                 streaming_pd_hidden and has_current_pd_hidden and is_final_segment
