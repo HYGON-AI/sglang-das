@@ -1399,6 +1399,7 @@ class Req(ReqDllmMixin):
         # kv_send(req.input_ids[req.start_send_idx:req.extend_end])
         # start_send_idx = req.extend_end
         self.start_send_idx: int = 0
+        self.disagg_page_indices = None
 
         # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
         # This is because kv is not ready in `process_prefill_chunk`.
@@ -1961,6 +1962,7 @@ class Req(ReqDllmMixin):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1
+        self.disagg_page_indices = None
 
         self.prefix_len = 0
         self.routed_experts = None
