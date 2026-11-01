@@ -1328,6 +1328,13 @@ class UnifiedRadixCache(BasePrefixCache):
                     req, is_finished=is_finished, insert_params=insert_params
                 )
             return
+        # Dedup can adopt canonical pages and release this request's own pages.
+        # A pre-forward transfer snapshot must not retain those old locations.
+        if (
+            getattr(req, "disagg_page_indices", None) is not None
+            and result.prefix_len > req.kv.cache_protected_len
+        ):
+            req.disagg_page_indices = None
         req.kv.cache_inserted_len = max(req.kv.cache_inserted_len, page_aligned_len)
 
         # Split the leaf at the prompt boundary so eviction can drop the output
