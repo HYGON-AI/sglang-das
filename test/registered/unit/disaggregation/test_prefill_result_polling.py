@@ -59,7 +59,7 @@ class _Event:
         self.blocking_synchronizations = 0
         self.records = 0
 
-    def record(self):
+    def record(self, stream=None):
         self.recorded = True
         self.records += 1
 
@@ -1482,7 +1482,7 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
                 self.assertEqual(self._pages(scheduler, req, 2, 4).tolist(), [24])
                 self.assertEqual(self._pages(scheduler, req, 2, 4, swa=True).tolist(), [28])
                 self.assertEqual(req.disagg_page_indices["ready"].records, 1)
-                self.assertEqual(req.disagg_page_indices["ready"].synchronizations, 4)
+                self.assertEqual(req.disagg_page_indices["ready"].synchronizations, 1)
 
     def test_mixed_full_and_swa_dtypes_are_prefetched(self):
         for full_dtype, swa_dtype in (
@@ -1594,6 +1594,120 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
                 else:
                     self.assertIsNotNone(req.disagg_page_indices)
                     self.assertEqual(self._pages(scheduler, req, 0, 4).tolist(), [20, 24])
+
+
+
+    def test_ready_snapshot_does_not_synchronize(self):
+        scheduler, req, raw, pool = self._fixture()
+        self._prefetch(scheduler, req, pool)
+        req.disagg_page_indices["ready"].ready = True
+        self.assertEqual(self._pages(scheduler, req, 0, 4).tolist(), [20, 24])
+        self.assertEqual(req.disagg_page_indices["ready"].synchronizations, 0)
+
+    def test_early_send_readiness_preserves_final_page_coverage(self):
+        mixin = SchedulerDisaggregationPrefillMixin
+        for ready, hcu in (
+            (False, False), (True, False), (None, False),
+            (False, True), (True, True), (None, True),
+        ):
+            with self.subTest(snapshot_ready=ready, hcu=hcu):
+                scheduler, req, raw, pool = self._fixture()
+                req.start_send_idx = 0
+                req.host_hit_length = 0
+                self._prefetch(scheduler, req, pool)
+                event = req.disagg_page_indices["ready"]
+                event.ready = ready
+                if ready is None:
+                    req.disagg_page_indices = None
+                scheduler.forward_stream = object()
+                scheduler.disagg_prefill_pending_chunk_rids = set()
+                scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+                    kv_manager=SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
+                )
+                scheduler.disagg_metadata_buffers = SimpleNamespace(set_buf=Mock())
+                scheduler.cached_disagg_page_indices = lambda *args, **kwargs: (
+                    self._pages(scheduler, *args, **kwargs)
+                )
+                scheduler.send_kv_chunk = lambda *args, **kwargs: (
+                    mixin._send_kv_chunk(scheduler, *args, **kwargs)
+                )
+                sent = []
+                sender = SimpleNamespace(
+                    _source_event=None,
+                    get_max_transfer_tokens=lambda: None,
+                    should_send_kv_chunk=lambda num_pages, last: num_pages > 0 or last,
+                )
+                sender.set_source_event = lambda event: setattr(sender, "_source_event", event)
+
+                def send(pages, states, **kwargs):
+                    sent.append(pages.tolist())
+                    sender._source_event = None
+
+                sender.send = Mock(side_effect=send)
+                req.disagg_kv_sender = sender
+                module = "sglang.srt.disaggregation.prefill."
+                with (
+                    patch.object(envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX, "get", return_value=True),
+                    patch(module + "is_hcu", return_value=hcu),
+                    patch(module + "torch.cuda.Event", side_effect=lambda: Mock()),
+                ):
+                    mixin.maybe_send_cached_prefix_chunk(scheduler, req)
+                    if ready is False or (ready is None and hcu):
+                        self.assertEqual(sent, [])
+                        self.assertEqual(req.start_send_idx, 0)
+                        self.assertEqual(event.synchronizations, 0)
+                    else:
+                        self.assertEqual(sent, [[20]])
+                        self.assertEqual(req.start_send_idx, 2)
+                    scheduler.send_kv_chunk(req, last_chunk=True)
+                self.assertEqual([page for chunk in sent for page in chunk], [20, 24])
+                self.assertEqual(req.start_send_idx, 4)
+                self.assertNotIn(req.rid, scheduler.disagg_prefill_pending_chunk_rids)
+                self.assertEqual(event.blocking_synchronizations, 1 if ready is False else 0)
+
+
+
+    def test_nonblocking_page_lookup_does_not_wait(self):
+        scheduler, req, raw, pool = self._fixture()
+        self._prefetch(scheduler, req, pool)
+        event = req.disagg_page_indices["ready"]
+        self.assertIsNone(self._pages(scheduler, req, 0, 4, wait=False))
+        self.assertEqual(event.synchronizations, 0)
+        event.ready = True
+        self.assertEqual(self._pages(scheduler, req, 0, 4, wait=False).tolist(), [20, 24])
+        self.assertEqual(event.synchronizations, 0)
+
+    def test_hcu_early_send_invalid_snapshot_does_not_fall_back(self):
+        for invalid in ("slot", "page-size", "range"):
+            with self.subTest(invalid=invalid):
+                scheduler, req, raw, pool = self._fixture()
+                self._prefetch(scheduler, req, pool)
+                req.start_send_idx = 0
+                req.host_hit_length = 0
+                cached = req.disagg_page_indices
+                cached["ready"].ready = True
+                scheduler.forward_stream = object()
+                req.disagg_kv_sender = Mock()
+                if invalid == "slot":
+                    cached["slot"] = 1
+                elif invalid == "page-size":
+                    cached["page_size"] = 4
+                else:
+                    cached["end"] = 1
+                scheduler.cached_disagg_page_indices = lambda *args, **kwargs: (
+                    self._pages(scheduler, *args, **kwargs)
+                )
+                scheduler.send_kv_chunk = Mock()
+                module = "sglang.srt.disaggregation.prefill."
+                with (
+                    patch.object(envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX, "get", return_value=True),
+                    patch(module + "is_hcu", return_value=True),
+                    patch(module + "torch.cuda.Event", side_effect=lambda: Mock()),
+                ):
+                    SchedulerDisaggregationPrefillMixin.maybe_send_cached_prefix_chunk(scheduler, req)
+                scheduler.send_kv_chunk.assert_not_called()
+                self.assertEqual(req.start_send_idx, 0)
+                self.assertEqual(cached["ready"].synchronizations, 0)
 
 
 if __name__ == "__main__":
