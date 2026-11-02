@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -65,3 +66,7 @@ def test_unmarked_weights_and_parameter_names_are_unchanged():
         _resolve_weight_param_name("layer.weight_packed", {"layer.weight": param})
         == "layer.weight"
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

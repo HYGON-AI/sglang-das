@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.srt.layers.attention import deepseek_v4_backend as backend
@@ -29,13 +30,19 @@ def test_dense_indexer_excludes_execution_padding():
             index_topk=2,
         )
         layer = SimpleNamespace(
-            layer_id=20, compress_ratio=1, indexer=indexer, freqs_cis=torch.zeros((8, 64))
+            layer_id=20,
+            compress_ratio=1,
+            indexer=indexer,
+            freqs_cis=torch.zeros((8, 64)),
         )
         batch = SimpleNamespace(
             seq_lens_cpu=lengths, req_pool_indices=torch.arange(len(lengths))
         )
         pool = SimpleNamespace(
-            get_low_ratio_index_k_fp4=lambda layer, slots: (torch.zeros((live, 64)), torch.zeros(live))
+            get_low_ratio_index_k_fp4=lambda layer, slots: (
+                torch.zeros((live, 64)),
+                torch.zeros(live),
+            )
         )
         obj = SimpleNamespace(
             token_to_kv_pool=pool,
@@ -55,17 +62,31 @@ def test_dense_indexer_excludes_execution_padding():
             out_indices.fill_(-1)
             out_indices[:, 0] = out_offsets
 
-        positions = torch.tensor([p for n in lengths for p in range(n)] + [0] * (padded-live))
+        positions = torch.tensor(
+            [p for n in lengths for p in range(n)] + [0] * (padded - live)
+        )
         with (
             patch.object(backend, "_is_hcu", True),
-            patch.object(backend, "_hcu_dense_fp4_mqa_logits", side_effect=logits) as native,
+            patch.object(
+                backend, "_hcu_dense_fp4_mqa_logits", side_effect=logits
+            ) as native,
             patch.object(backend, "topk_transform_ragged_v2", side_effect=topk),
         ):
             backend.DeepseekV4AttnBackend._low_ratio_index_topk_dense(
-                obj, layer, torch.zeros((padded, 4)), torch.zeros((padded, 4)),
-                positions, batch, torch.tensor(lengths), lengths,
+                obj,
+                layer,
+                torch.zeros((padded, 4)),
+                torch.zeros((padded, 4)),
+                positions,
+                batch,
+                torch.tensor(lengths),
+                lengths,
             )
         native.assert_called_once()
         assert bool((pages[live:] == -1).all())
         assert bool((raw[live:] == -1).all())
         assert bool((pages[:live, 0] >= 0).all())
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
