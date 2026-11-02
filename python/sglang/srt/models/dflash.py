@@ -306,10 +306,12 @@ class DFlashAttention(nn.Module):
                 and weight.dtype == torch.int8
                 and weight.ndim == 2
                 and weight.shape == (self.hidden_size, self.q_size + 2 * self.kv_size)
+                and weight.stride() == (1, self.hidden_size)
                 and scale is not None
+                and scale.is_contiguous()
                 and scale.numel() == weight.shape[1]
             ):
-                signature = (id(weight), weight._version, id(scale), scale._version)
+                signature = (id(weight), weight.data_ptr(), id(scale), scale.data_ptr())
                 cached = getattr(self, "_hcu_int8_kv_projection", None)
                 if cached is None or cached[0] != signature:
                     kv_slice = slice(self.q_size, self.q_size + 2 * self.kv_size)
