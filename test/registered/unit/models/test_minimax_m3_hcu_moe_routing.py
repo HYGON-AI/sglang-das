@@ -68,3 +68,7 @@ def test_minimax_model_passes_marker_during_deepep_construction(
     assert layer.experts.moe_runner_config.is_minimax_m3
     assert received["layer_id"] == 3
     assert received["num_experts"] == 128
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
