@@ -22,7 +22,7 @@ DSV4_FLASH_MODEL = os.environ.get(
 )
 DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 
-register_cuda_ci(est_time=2700, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=162, stage="extra-b", runner_config="4-gpu-h100")
 
 
 class TestDeepSeekV4FlashUnifiedCacheLinkerKL(
