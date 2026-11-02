@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import logging
+import os
+from types import SimpleNamespace
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -288,6 +290,42 @@ class DFlashAttention(nn.Module):
         This is used by DFlash to materialize ctx tokens into the draft KV cache:
         we only need K/V for the cached tokens; Q is never consumed.
         """
+        if _is_hcu and os.getenv("SGLANG_HCU_DFLASH_KV_ONLY_INT8", "0") == "1":
+            from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8LinearMethod
+
+            proj = self.qkv_proj
+            method = getattr(proj, "quant_method", None)
+            weight = getattr(proj, "weight", None)
+            scale = getattr(proj, "weight_scale", None)
+            # Only this exact method has the post-load [K, N] layout and
+            # independent per-output-channel scales used below. Other quant
+            # formats and all non-HCU paths retain the full-QKV fallback.
+            if (
+                type(method) is W8A8Int8LinearMethod
+                and weight is not None
+                and weight.dtype == torch.int8
+                and weight.ndim == 2
+                and weight.shape == (self.hidden_size, self.q_size + 2 * self.kv_size)
+                and scale is not None
+                and scale.numel() == weight.shape[1]
+            ):
+                signature = (id(weight), weight._version, id(scale), scale._version)
+                cached = getattr(self, "_hcu_int8_kv_projection", None)
+                if cached is None or cached[0] != signature:
+                    kv_slice = slice(self.q_size, self.q_size + 2 * self.kv_size)
+                    # Preserve the original transposed weight layout expected
+                    # by the existing INT8 GEMM. Never alter loaded QKV weights.
+                    kv_layer = SimpleNamespace(
+                        weight=weight.t()[kv_slice].contiguous().t(),
+                        weight_scale=scale.reshape(-1, 1)[kv_slice].contiguous(),
+                    )
+                    cached = (signature, kv_layer)
+                    self._hcu_int8_kv_projection = cached
+                    logger.info("DFLASH HCU W8A8 KV-only projection enabled: q=%d kv=%d", self.q_size, 2 * self.kv_size)
+                bias = proj.bias[self.q_size:] if proj.bias is not None else None
+                kv = method.apply(cached[1], hidden_states, bias)
+                return kv.split([self.kv_size, self.kv_size], dim=-1)
+
         # Fast path for unquantized weights: slice the fused QKV weight and run one GEMM.
         can_slice_qkv_weight, _ = can_dflash_slice_qkv_weight(self.qkv_proj)
         if can_slice_qkv_weight:
