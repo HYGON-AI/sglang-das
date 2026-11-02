@@ -85,7 +85,7 @@ class MooncakeDfsHealthManagerTest(unittest.TestCase):
                     "probe_interval_s": 5,
                     "failure_threshold": 2,
                     "success_threshold": 2,
-                    "probe_timeout_s": 5,
+                    "probe_timeout_s": 25,
                 },
             )
 

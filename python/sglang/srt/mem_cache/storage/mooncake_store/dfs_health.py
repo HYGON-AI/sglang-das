@@ -32,7 +32,7 @@ _HEALTH_CONFIG_SOURCES = {
     "probe_timeout_s": (
         "mooncake_dfs_health_probe_timeout_s",
         "SGLANG_MOONCAKE_DFS_HEALTH_PROBE_TIMEOUT_S",
-        5,
+        25,
     ),
 }
 
