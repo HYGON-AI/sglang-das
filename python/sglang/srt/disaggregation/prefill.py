@@ -2377,7 +2377,13 @@ class SchedulerDisaggregationPrefillMixin:
         }
 
     def cached_disagg_page_indices(
-        self: Scheduler, req: Req, start: int, end: int, *, swa: bool = False
+        self: Scheduler,
+        req: Req,
+        start: int,
+        end: int,
+        *,
+        swa: bool = False,
+        wait: bool = True,
     ) -> Optional[np.ndarray]:
         cached = getattr(req, "disagg_page_indices", None)
         page_size = self.token_to_kv_pool_allocator.page_size
@@ -2392,7 +2398,10 @@ class SchedulerDisaggregationPrefillMixin:
             return None
         if swa and (start != cached["swa_start"] or end != cached["end"]):
             return None
-        cached["ready"].synchronize()
+        if not cached["ready"].query():
+            if not wait:
+                return None
+            cached["ready"].synchronize()
         if swa:
             return cached["host"][cached["full_count"] :].numpy()
         return cached["host"][
@@ -2424,6 +2433,16 @@ class SchedulerDisaggregationPrefillMixin:
             # DCP radix hits can end on a logical cache-page boundary that is
             # not a complete physical DCP page. The regular final send covers
             # the full range; only skip this optional early-send optimization.
+            return
+        cached = getattr(req, "disagg_page_indices", None)
+        if is_hcu() and self.enable_overlap and not self.enable_staging:
+            # Do not let an optional early send fall back to a blocking page
+            # read. The normal send still covers the unchanged send cursor.
+            if self.cached_disagg_page_indices(
+                req, req.start_send_idx, cached_end, wait=False
+            ) is None:
+                return
+        elif cached is not None and not cached["ready"].query():
             return
         # Early-send issues the KV read before this step's forward is enqueued,
         # but under overlap scheduling the PRIOR step's prefill forward may still
