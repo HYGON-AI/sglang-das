@@ -353,6 +353,9 @@ def _run_hcu_encoder_swa_replay(worker, batch):
         replay.prefix_lens = [start]
         replay.extend_lens = [end - start]
         replay.extend_num_tokens = end - start
+        # HCU replay is admitted only for interleave CP; the parent
+        # CP-v2 token counts do not describe this new replay forward.
+        replay.global_cp_num_tokens = None
         if batch.global_num_tokens is not None:
             # Replay is a separate single-request forward. Parent-batch counts
             # can be smaller than its input (negative padding) or much larger.

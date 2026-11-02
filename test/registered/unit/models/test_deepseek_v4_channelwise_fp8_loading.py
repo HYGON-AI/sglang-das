@@ -38,6 +38,7 @@ class TestDeepseekV4ChannelwiseFp8Loading(CustomTestCase):
                     scale.weight_loader = lambda param, value: param.data.copy_(value)
                     params["lm_head.weight_scale_inv"] = scale
                 model = SimpleNamespace(
+                    encoder_only=False,
                     named_parameters=lambda: params.items(),
                     config=SimpleNamespace(n_routed_experts=0, num_hidden_layers=1),
                     num_fused_shared_experts=0,

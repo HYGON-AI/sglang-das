@@ -33,6 +33,7 @@ class TestDeepEPTextRouting(CustomTestCase):
         standard_output = StandardTopKOutput(weights, physical_ids, logits)
         vision_output = StandardTopKOutput(weights, logical_ids, logits)
         topk = Mock(return_value=standard_output)
+        topk.forward_hcu_mega_gate.return_value = None
         experts = Mock(side_effect=lambda **kw: kw["topk_output"].topk_ids.float())
         experts.should_fuse_routed_scaling_factor_in_topk = True
         gate = Mock(return_value=logits)
@@ -40,6 +41,7 @@ class TestDeepEPTextRouting(CustomTestCase):
         hidden = torch.zeros((2, 2))
         batch = SimpleNamespace(
             forward_mode=mode,
+            hcu_moe_valid_token_mask=None,
             contains_image_inputs=lambda: images,
             moe_num_token_non_padded=lambda: torch.tensor(2, dtype=torch.int32),
         )
@@ -48,6 +50,7 @@ class TestDeepEPTextRouting(CustomTestCase):
         moe = SimpleNamespace(
             _fuse_shared_experts_inside_sbo=False,
             is_nextn=False,
+            is_hash=False,
             num_fused_shared_experts=0,
             alt_stream=None,
             gate=gate,

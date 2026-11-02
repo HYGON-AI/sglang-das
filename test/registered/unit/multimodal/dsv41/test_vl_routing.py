@@ -116,12 +116,15 @@ class TestVisionTopKEPLB(CustomTestCase):
             for name, value in {"_is_hip": True, "_is_hcu": True,
                                 "_is_cuda": False, "_use_aiter": False}.items():
                 stack.enter_context(patch.object(topk, name, value))
-            stack.enter_context(patch.object(topk, "_eplb_remap_enabled", return_value=True))
-            stack.enter_context(patch.object(topk, "_can_fuse_padded_region", return_value=False))
+            stack.enter_context(patch.object(topk, "is_expert_remapping_enabled", return_value=True))
+            stack.enter_context(patch.object(topk, "_can_fuse_padded_region", return_value=True))
+            # Emulate only the device fill kernel; keep routing/remapping real.
+            stack.enter_context(patch.object(topk, "_fill_padded_rows",
+                side_effect=lambda tensor, count, value: tensor[int(count):].fill_(value)))
             stack.enter_context(patch.object(topk, "_biased_grouped_topk_postprocess",
                                              side_effect=topk._topk_ids_postprocess_torch.__wrapped__))
             stack.enter_context(patch.object(topk, "get_moe_a2a_backend",
-                return_value=SimpleNamespace(is_deepep=lambda: True)))
+                return_value=SimpleNamespace(is_deepep=lambda: True, is_megamoe=lambda: False)))
             stack.enter_context(patch.object(topk, "get_moe_runner_backend",
                 return_value=SimpleNamespace(is_deep_gemm=lambda: True)))
             stack.enter_context(patch.object(topk.envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY,

@@ -1042,7 +1042,7 @@ class TopK(BaseFusedOp):
             or config.routed_scaling_factor is None
             or not math.isfinite(config.routed_scaling_factor)
             or get_exec().deterministic.enable_deterministic_inference
-            or _eplb_remap_enabled()
+            or is_expert_remapping_enabled()
             or _use_aiter
             or _skip_hip_pad_mask
             or not get_moe_a2a_backend().is_deepep()
@@ -2048,7 +2048,7 @@ def _can_use_lightop_deepep_topk_fusion(
         and topk == 6
         and gating_output.size(1) == 384
         and not routing_overridden
-        and not _eplb_remap_enabled()
+        and not is_expert_remapping_enabled()
     )
 
 

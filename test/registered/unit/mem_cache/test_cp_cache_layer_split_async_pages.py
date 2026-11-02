@@ -38,7 +38,7 @@ def _load_nodes(name, names, namespace, *, methods=False):
         nodes = next(
             node.body for node in nodes
             if isinstance(node, ast.ClassDef)
-            and node.name == "CpCacheLayerSplitDeepSeekV4TokenToKVPool"
+            and node.name in ("CpCacheLayerSplitDeepSeekV4TokenToKVPool", "DeepSeekV4TokenToKVPool")
         )
     chosen = [node for node in nodes if getattr(node, "name", None) in names]
     if {node.name for node in chosen} != set(names):
@@ -193,7 +193,7 @@ class _Harness:
         self.namespace["get_pynccl_broadcast_comm"] = lambda: comm
         _load_nodes("staging.py", ["build_active_pages_mask", "all_reduce_active_pages_mask",
                     "active_pages_for_indices", "contiguous_request_page_capacity",
-                    "remap_indices_to_staging"], self.namespace)
+                    "_staging_page_map", "remap_indices_to_staging"], self.namespace)
         for name, event in (("build_active_pages_mask", "build"),
                             ("remap_indices_to_staging", "remap")):
             function = self.namespace[name]
@@ -203,7 +203,7 @@ class _Harness:
                 return _function(*args, **kwargs)
 
             self.namespace[name] = tracked
-        methods = ["_pool_num_pages", "_active_pages_for_indices",
+        methods = ["_swa_read_pool", "_pool_num_pages", "_active_pages_for_indices",
                    "_compact_broadcast_for_read", "_extra_family_name",
                    "_clear_extra_read_state", "prefetch_low_ratio_extra_layer",
                    "prefetch_swa_layer", "reset_batch_active_pages",
@@ -212,6 +212,9 @@ class _Harness:
                    "get_extra_key_buffer_for_write", "set_extra_key_buffer",
                    "set_extra_key_buffer_fused"]
         _load_nodes("deepseek_v4_pool.py", methods, self.namespace, methods=True)
+        _load_nodes("../deepseek_v4_memory_pool.py", ["get_swa_raw_buffer"],
+                    self.namespace, methods=True)
+        methods.append("get_swa_raw_buffer")
         cls = type("PoolUnderTest", (), {name: self.namespace[name] for name in methods})
         cls._pool_num_pages = staticmethod(self.namespace["_pool_num_pages"])
         self.namespace["_USE_STATIC_CP_LAYER_SPLIT_PAGES"] = enabled
@@ -581,7 +584,11 @@ class TestLayerSplitAsyncPages(CustomTestCase):
         for options in ({"enabled": False}, {"window": 16}, {"legacy": True}):
             with self.subTest(options=options):
                 harness = _Harness(enabled=options.get("enabled", True), peer_pages=(6,))
-                harness.pool.request_window = options.get("window")
+                harness.pool.request_window = (
+                    SimpleNamespace(workspace=harness.pool.swa_kv_pool,
+                                    buffer=lambda _: harness.reference)
+                    if options.get("window") else None
+                )
                 if options.get("legacy"):
                     harness.pool.prefetch_swa_layer(
                         0, torch.tensor([2, 3, 8, 9, -1], dtype=torch.int32)
@@ -674,7 +681,11 @@ class TestLayerSplitAsyncPages(CustomTestCase):
         for options in ({"enabled": False}, {"window": 16}, {"tail": False}):
             with self.subTest(options=options):
                 harness = _Harness(enabled=options.get("enabled", True), peer_pages=(6,))
-                harness.pool.request_window = options.get("window")
+                harness.pool.request_window = (
+                    SimpleNamespace(workspace=harness.pool.swa_kv_pool,
+                                    buffer=lambda _: harness.reference)
+                    if options.get("window") else None
+                )
                 harness.fetch_tail(tail=options.get("tail", True))
                 self.assertIn(("nonzero", "main"), harness.events)
                 torch.testing.assert_close(

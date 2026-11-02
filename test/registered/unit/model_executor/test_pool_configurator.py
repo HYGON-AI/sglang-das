@@ -31,6 +31,9 @@ def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
 
     with (
         patch("torch._utils._element_size", return_value=kv_size),
+        patch("sglang.srt.model_executor.pool_configurator._is_hcu", False),
+        patch("sglang.srt.layers.attention.dsa.hcu_int8_index_k_cache.is_hcu", return_value=False),
+        envs.SGLANG_DSA_HCU_INT8_INDEX_K_CACHE.override(False),
         get_parallel().override(
             tp_size=tp_size,
             attn_tp_size=tp_size,
@@ -1521,6 +1524,9 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg.kv_bytes = 584
         cfg.attn_head_dim = 512
         cfg.num_layers_total = 3
+        cfg.swa_priced_layers = 3
+        cfg.cp_draft_layers = 0
+        cfg.use_cp_cache_layer_split = False
         cfg.stage_owner_layers = {4: [1], 128: [2]}
         cfg.indexer_bytes_per_token = 132
         _publish_config(self, dsv4_attn_backend="flashmla")

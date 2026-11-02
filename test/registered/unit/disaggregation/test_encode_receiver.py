@@ -459,7 +459,7 @@ class TestPoolSlotLifetime(CustomTestCase):
         pool = _make_pool(size_bytes=1024)
         view, _, slot = pool.try_alloc(256)
         item = _image_item(offsets=[(0, 127)], embedding=view.view(torch.bfloat16))
-        original = SimpleNamespace(mm_items=[item])
+        original = MultimodalInputs(mm_items=[item])
 
         request = _make_bound_request(pool, slot, view, lease_pool_slots=True)
         self.assertTrue(request._bind_pool_slot_to_mm_inputs(original))
@@ -479,7 +479,7 @@ class TestPoolSlotLifetime(CustomTestCase):
         pool = _make_pool(size_bytes=1024)
         view, _, slot = pool.try_alloc(256)
         item = _image_item(offsets=[(0, 127)], embedding=view.view(torch.bfloat16))
-        original = SimpleNamespace(mm_items=[item])
+        original = MultimodalInputs(mm_items=[item])
 
         request = _make_bound_request(pool, slot, view, lease_pool_slots=False)
         self.assertTrue(request._bind_pool_slot_to_mm_inputs(original))

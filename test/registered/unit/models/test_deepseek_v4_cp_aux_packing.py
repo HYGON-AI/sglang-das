@@ -72,8 +72,12 @@ class TestDeepseekV4CpAuxPacking(CustomTestCase):
         input_embeds = torch.arange(rows * 4, dtype=dtype).reshape(rows, 4)
         batch = SimpleNamespace(
             attn_cp_metadata=None,
+            encoder_swa_replay=False,
+            prepare_hcu_moe_valid_token_mask=lambda _: None,
             forward_mode=SimpleNamespace(
                 is_extend=lambda: True,
+                is_decode_or_idle=lambda: False,
+                is_target_verify=lambda: False,
                 is_extend_without_speculative=lambda: True,
             ),
         )
@@ -176,7 +180,7 @@ class TestDeepseekV4CpAuxPacking(CustomTestCase):
     def test_model_owned_cp_output_skips_only_unused_pre_hc(self):
         # Execute the production gather block, without loading layers or kernels.
         tree = ast.parse(textwrap.dedent(inspect.getsource(
-            deepseek_v4.DeepseekV4Model.forward.__wrapped__
+            deepseek_v4.DeepseekV4Model._forward_impl.__wrapped__
         )))
         block = next(node for node in ast.walk(tree) if (
             isinstance(node, ast.If) and isinstance(node.test, ast.Name)

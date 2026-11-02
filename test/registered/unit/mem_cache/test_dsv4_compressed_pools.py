@@ -435,10 +435,14 @@ class TestV41KVPoolLayouts(CustomTestCase):
 
 
 class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):
+    """Exercise the CUDA draft-ring contract independently of the test host."""
     RING = 256  # sliding window + the largest draft token count, in whole pages
 
     def setUp(self):
         super().setUp()
+        hip = patch("sglang.srt.mem_cache.deepseek_v4_memory_pool._is_hip", False)
+        hip.start()
+        self.addCleanup(hip.stop)
         override = get_context().override_server_args(
             enable_encoder_swa_bounded_replay=True,
             speculative_algorithm="DSPARK",
@@ -714,6 +718,7 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
         backend.forward_metadata = SimpleNamespace(late_layer_tail=None)
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
+            attn_cp_metadata=None,
             seq_lens=torch.tensor([rows]),
             seq_lens_cpu=torch.tensor([rows]),
             extend_seq_lens=torch.tensor([rows], dtype=torch.int32),

@@ -33,6 +33,7 @@ class TestEncoderSwaReplaySync(CustomTestCase):
             req_pool_indices=torch.arange(len(prefixes)),
             req_pool_indices_cpu=torch.arange(len(prefixes)),
             global_num_tokens=[parent_tokens] if sync else None,
+            global_cp_num_tokens=[parent_tokens] * cp_size if sync else None,
             global_num_tokens_for_logprob=[len(prefixes)] if sync else None,
             dp_spec_prefill_coordination_applied=False,
             can_run_decode_cuda_graph=False,
@@ -89,6 +90,7 @@ class TestEncoderSwaReplaySync(CustomTestCase):
             plans[:] = [plan] * cp_size
 
         with ExitStack() as stack:
+            stack.enter_context(patch("sglang.srt.utils.is_hcu", return_value=True))
             for target, value in [
                 ("sglang.srt.runtime_context.get_parallel", parallel),
                 (
@@ -148,6 +150,7 @@ class TestEncoderSwaReplaySync(CustomTestCase):
 
         self.assertEqual(len(built), sum(n > 0 for n in prefixes))
         for replay, fb in built:
+            self.assertIsNone(replay.global_cp_num_tokens)
             count = min(128, replay.seq_lens_sum)
             self.assertEqual(fb.input_ids.numel(), count)
             torch.testing.assert_close(

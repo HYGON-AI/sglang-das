@@ -507,7 +507,8 @@ class TestHCUW4A8Reference(CustomTestCase):
         torch.nn.Module.__init__(layer)
         layer.scheme = None
         layer.quant_method = Mock(hcu_w4a8_hipc=True)
-        layer.moe_runner_config = SimpleNamespace(activation="silu", swiglu_limit=10.0)
+        layer.moe_runner_config = SimpleNamespace(activation="silu", swiglu_limit=10.0,
+                                                   local_shared_experts_without_dispatch=False)
         layer.use_hcu_w4a8_reference = True
         layer.deprecate_flag = False
         layer.quant_config = self.config
@@ -1384,12 +1385,8 @@ class TestHCUW4A8Reference(CustomTestCase):
                 "sglang.srt.layers.moe.ep_moe.layer._use_w4a8_contiguous_hipc", False
             ),
             patch(
-                "sglang.srt.layers.moe.ep_moe.layer.get_moe_expert_parallel_rank",
-                return_value=3,
-            ),
-            patch(
-                "sglang.srt.layers.moe.ep_moe.layer.get_moe_expert_parallel_world_size",
-                return_value=8,
+                "sglang.srt.layers.moe.ep_moe.layer.get_parallel",
+                return_value=SimpleNamespace(moe_ep_rank=3, moe_ep_size=8),
             ),
             patch(
                 "sglang.srt.layers.quantization.slimquant_w4a8_marlin."
