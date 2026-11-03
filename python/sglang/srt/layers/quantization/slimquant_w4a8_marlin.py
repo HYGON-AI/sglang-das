@@ -15,6 +15,7 @@
 import logging
 import os
 import re
+from copy import copy
 from types import MappingProxyType
 from typing import Dict, Iterable, List, Mapping, Optional
 
@@ -45,6 +46,12 @@ from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizeMethodBase,
+)
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe_marlin import (
+    CompressedTensorsW8A8Int8MarlinMoEMethod,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
@@ -141,6 +148,8 @@ def _ensure_aiter_w4a8_marlin_available() -> None:
         from aiter.moe import get_aiter_moe_config as _get_aiter_moe_config
         from aiter.ops.shuffle import (
             w4a8_moe_layout_shuffle_gemm2 as _w4a8_moe_layout_shuffle_gemm2,
+        )
+        from aiter.ops.shuffle import (
             w4a8_moe_repack_shuffle as _w4a8_moe_repack_shuffle,
         )
     except Exception as e:
@@ -249,8 +258,8 @@ def _patch_moe_c_align_non_cub_to_triton() -> None:
     global _moe_c_align_patched
     if _moe_c_align_patched:
         return
-    import triton
     import aiter.fused_moe_c as fmc
+    import triton
 
     orig = fmc.moe_align_block_size
 
@@ -285,9 +294,7 @@ def _patch_moe_c_align_non_cub_to_triton() -> None:
 
     fmc.moe_align_block_size = moe_align_block_size
     _moe_c_align_patched = True
-    logger.info(
-        "[slimquant_w4a8_marlin] patched moe_c align: non-cub E uses Triton"
-    )
+    logger.info("[slimquant_w4a8_marlin] patched moe_c align: non-cub E uses Triton")
 
 
 def _try_ensure_backend_available(ensure_backend) -> bool:
@@ -315,12 +322,7 @@ def _marlin_w4a8_tp_shapes_ok(
     w13_k = hidden_size
     w2_n = hidden_size
     w2_k = intermediate_size_per_partition
-    return (
-        w13_k % 32 == 0
-        and w13_n % 64 == 0
-        and w2_k % 32 == 0
-        and w2_n % 64 == 0
-    )
+    return w13_k % 32 == 0 and w13_n % 64 == 0 and w2_k % 32 == 0 and w2_n % 64 == 0
 
 
 def _resolve_w4a8_tpmoe_backend(
@@ -500,9 +502,7 @@ def _fit_w4a8_triton_block(block: int, dim: int, *, even: bool = False) -> int:
     return max(b, 2 if even else 1)
 
 
-def _adjust_w4a8_triton_block_config(
-    config: dict, *, n: int, k: int
-) -> dict:
+def _adjust_w4a8_triton_block_config(config: dict, *, n: int, k: int) -> dict:
     cfg = dict(config)
     cfg["BLOCK_SIZE_K"] = _fit_w4a8_triton_block(
         cfg.get("BLOCK_SIZE_K", 64), k, even=True
@@ -737,6 +737,7 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         w8a8_include: Optional[list[str]] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         compressed_tensors_packed: bool = False,
+        mixed_quant_config: Optional[CompressedTensorsConfig] = None,
     ):
         super().__init__()
         self.ignore = ignore
@@ -748,6 +749,9 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         self.w8a8_include = list(w8a8_include or [])
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.compressed_tensors_packed = compressed_tensors_packed
+        self.mixed_quant_config = mixed_quant_config
+        if mixed_quant_config is not None:
+            self.packed_modules_mapping = mixed_quant_config.packed_modules_mapping
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -771,12 +775,19 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         experts_only_linear = any(arch in _QWEN4_EXP_ARCHS for arch in archs)
         mixed = config.get("mixed_precision") or {}
         w8a8 = mixed.get("w8a8_include") or {}
+        mixed_quant_config = None
+        if config.get("quant_method") == "compressed-tensors" and any(
+            (group.get("weights") or {}).get("num_bits") == 8
+            for group in config.get("config_groups", {}).values()
+        ):
+            mixed_quant_config = CompressedTensorsConfig.from_config(config)
         return cls(
             ignore=config.get("ignore"),
             experts_only_linear=experts_only_linear,
             w8a8_include=list(w8a8.get("modules") or []),
             packed_modules_mapping=config.get("packed_modules_mapping") or {},
             compressed_tensors_packed=config.get("format") == "pack-quantized",
+            mixed_quant_config=mixed_quant_config,
         )
 
     @classmethod
@@ -791,7 +802,7 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
                 weight = group.get("weights") or {}
                 activation = group.get("input_activations") or {}
                 if not (
-                    weight.get("num_bits") == 4
+                    weight.get("num_bits") in (4, 8)
                     and weight.get("type") == "int"
                     and weight.get("strategy") == "channel"
                     and weight.get("symmetric") is True
@@ -803,7 +814,10 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
                     and activation.get("dynamic") is True
                 ):
                     return None
-            if groups:
+            if any(
+                (group.get("weights") or {}).get("num_bits") == 4
+                for group in groups.values()
+            ):
                 return cls.get_name()
         if hf_quant_cfg.get("quant_method") == "slimquant_w4a8" and user_quant in (
             "slimquant_w4a8_marlin",
@@ -811,6 +825,21 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         ):
             return cls.get_name()
         return None
+
+    def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
+        super().update_packed_modules_mapping(mapping)
+        if self.mixed_quant_config is not None:
+            self.mixed_quant_config.update_packed_modules_mapping(mapping)
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper) -> None:
+        if self.mixed_quant_config is not None:
+            self.mixed_quant_config.apply_weight_name_mapper(hf_to_sglang_mapper)
+            self.ignore = self.mixed_quant_config.ignore
+
+    def can_fuse_shared_expert(self) -> bool:
+        # Mixed CT checkpoints can keep shared experts at INT8 while routed
+        # experts are INT4. Keep their weights separate.
+        return self.mixed_quant_config is None
 
     def get_quant_method(
         self,
@@ -823,6 +852,17 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
         if isinstance(layer, LinearBase):
+            if self.mixed_quant_config is not None:
+                scheme = self.mixed_quant_config.get_scheme_dict(layer, prefix)
+                if scheme is None:
+                    return UnquantizedLinearMethod()
+                if scheme["weights"].num_bits != 8:
+                    raise NotImplementedError(
+                        f"SlimQuant W4A8 requires INT8 Linear weights: {prefix}"
+                    )
+                # The CT scheme already selects INT8; do not fall through to
+                # the architecture-specific mixed_precision include list.
+                return SlimQuantW4A8Int8LinearMethod(self)
             fused_mapping = getattr(self, "packed_modules_mapping", {}) or {}
             # Kimi-K3 INT4 (from mxfp4_to_int4.py) only quantizes the routed
             # experts; dense layers stay in BF16 and are listed in the
@@ -841,9 +881,7 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
             # that include list, keep Unquant so int8 weights are never run
             # through F.linear as bf16.
             if self.experts_only_linear:
-                if _layer_in_w8a8_include(
-                    prefix, self.w8a8_include, fused_mapping
-                ):
+                if _layer_in_w8a8_include(prefix, self.w8a8_include, fused_mapping):
                     return SlimQuantW4A8Int8LinearMethod(self)
                 return UnquantizedLinearMethod()
             return SlimQuantW4A8Int8LinearMethod(self)
@@ -871,6 +909,25 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
                     getattr(layer, "use_flashinfer_trtllm_moe", False),
                     getattr(layer, "use_deep_gemm", False),
                 )
+            if self.mixed_quant_config is not None:
+                mixed_config = self.mixed_quant_config
+                mixed_config._add_fused_moe_to_target_scheme_map()
+                schemes = [
+                    mixed_config.get_scheme_dict(layer, f"{prefix}.0.{proj}")
+                    for proj in ("gate_proj", "up_proj", "down_proj")
+                ]
+                scheme = schemes[0]
+                if scheme is None or any(s != scheme for s in schemes[1:]):
+                    raise NotImplementedError(
+                        "SlimQuant mixed MoE requires matching quantized "
+                        f"gate/up/down projections: {prefix}"
+                    )
+                if scheme["weights"].num_bits == 8:
+                    # The existing W8A8 Marlin method reads its layer scheme
+                    # from the Linear target; do not mutate the shared config.
+                    layer_config = copy(mixed_config)
+                    layer_config.target_scheme_map = {"Linear": scheme}
+                    return CompressedTensorsW8A8Int8MarlinMoEMethod(layer_config)
             if get_moe_a2a_backend().is_megamoe():
                 return SlimQuantW4A8Int8MarlinMoEMethod(self)
             dspark_backend_override = get_dspark_w4a8_tpmoe_backend_override()
@@ -1748,7 +1805,7 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         layer: torch.nn.Module,
         dispatch_output,
     ):
-        from aiter.moe import MoeQuantType, aiter_moe, get_aiter_moe_config
+        from aiter.moe import MoeQuantType, aiter_moe
 
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 

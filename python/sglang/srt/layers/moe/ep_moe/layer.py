@@ -78,6 +78,9 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_marlin import (
     SlimQuantCompressedTensorsMarlinConfig,
 )
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe_marlin import (
+    CompressedTensorsW8A8Int8MarlinMoEMethod,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW4A16Int4DynamicMoE,
 )
@@ -722,7 +725,9 @@ class DeepEPMoE(FusedMoE):
             self.use_w4a8_marlin = False
             self.use_w8a8_marlin = False
             self.use_bf16_marlin = False
-        elif isinstance(quant_config, SlimQuantW4A8Int8MarlinConfig):
+        elif isinstance(quant_config, SlimQuantW4A8Int8MarlinConfig) and not isinstance(
+            self.quant_method, CompressedTensorsW8A8Int8MarlinMoEMethod
+        ):
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
             self.block_shape = (
                 self.quant_method.quant_config.weight_block_size
@@ -735,7 +740,9 @@ class DeepEPMoE(FusedMoE):
             self.use_w4a8_marlin = True
             self.use_w8a8_marlin = False
             self.use_bf16_marlin = False
-        elif isinstance(quant_config, SlimQuantCompressedTensorsMarlinConfig):
+        elif isinstance(
+            quant_config, SlimQuantCompressedTensorsMarlinConfig
+        ) or isinstance(self.quant_method, CompressedTensorsW8A8Int8MarlinMoEMethod):
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
             self.block_shape = (
                 self.quant_method.quant_config.weight_block_size
