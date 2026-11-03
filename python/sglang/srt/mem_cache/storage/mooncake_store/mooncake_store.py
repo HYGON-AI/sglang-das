@@ -3,6 +3,7 @@
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 
 import ctypes
+import ipaddress
 import json
 import logging
 import os
@@ -28,6 +29,8 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import StorageMetrics
+from sglang.srt.runtime_context import get_server_args
+from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 DEFAULT_LOCAL_BUFFER_SIZE = int(
     __import__("os").environ.get(
@@ -36,6 +39,9 @@ DEFAULT_LOCAL_BUFFER_SIZE = int(
     )
 )
 SETUP_TIMEOUT = 600  # 10min
+DFS_BATCH_PUT_TIMEOUT = -1606
+DFS_BATCH_GET_TIMEOUT = -1607
+DFS_BATCH_GET_ADMISSION_TIMEOUT = -1608
 DEFAULT_TENANT_ID = "default"
 
 logger = logging.getLogger(__name__)
@@ -99,9 +105,29 @@ def _normalize_tenant_id(value) -> str:
     return tenant_id if tenant_id else DEFAULT_TENANT_ID
 
 
+def _get_service_endpoint(server_args) -> str:
+    """Use existing serving/network settings for both direct and HiCache stores."""
+    host = server_args.host or "0.0.0.0"
+    address = ipaddress.ip_address(NetworkAddress.resolve_host(host))
+    if address.is_unspecified:
+        if server_args.nnodes > 1:
+            # All nodes already share the leader address. Never substitute a
+            # worker's local IP in a multi-node service.
+            host = NetworkAddress.parse(server_args.dist_init_addr).host
+            address = ipaddress.ip_address(NetworkAddress.resolve_host(host))
+        else:
+            address = ipaddress.ip_address(get_local_ip_auto())
+    port = int(server_args.port)
+    if address.is_unspecified or not 1 <= port <= 65535:
+        raise ValueError("Cannot resolve a concrete SGLang service IP:business-port")
+    return NetworkAddress(str(address), port).to_host_port_str()
+
+
 def _get_mooncake_client_http_port(dp_rank: Optional[int] = None) -> int:
-    """Return a metrics port unique to this physical scheduler process."""
+    """Let the server bind an OS-assigned port unless a fixed base is configured."""
     base_port = envs.MOONCAKE_CLIENT_METRICS_PORT_BASE.get()
+    if base_port == 0:
+        return 0
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         global_rank = torch.distributed.get_rank()
         if dp_rank is not None:
@@ -417,14 +443,26 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         storage_config: HiCacheStorageConfig = None,
         mem_pool: HostKVCache = None,
         enable_client_http_server: Optional[bool] = None,
+        enable_dfs_prefetch: Optional[bool] = None,
+        dfs_health_config: Optional[dict[str, int]] = None,
     ):
         MooncakeBaseStore.__init__(self)
+        self._dfs_health_manager = None
         MooncakeDistributedStore = self._import_mooncake_store()
         self._replicate_config_cls, self._supports_group_ids = (
             self._import_mooncake_group_semantics()
         )
         try:
             self.store = MooncakeDistributedStore()
+            if enable_dfs_prefetch is True and not callable(
+                getattr(self.store, "disable_dfs_prefetch", None)
+            ):
+                raise RuntimeError(
+                    "Waiting-queue DFS prefetch requires Mooncake with "
+                    "disable_dfs_prefetch to release its arena if startup "
+                    "agreement disables prefetch. Rebuild/install the updated "
+                    "Mooncake package."
+                )
 
             self.config = self._load_config(storage_config)
             extra_config = (
@@ -432,6 +470,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if storage_config
                 else None
             )
+            if dfs_health_config is None and extra_config:
+                dfs_health_config = extra_config.get("_mooncake_dfs_health_config")
             if enable_client_http_server is None:
                 enable_client_http_server = bool(
                     getattr(storage_config, "enable_storage_metrics", False)
@@ -547,6 +587,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     enable_client_http_server,
                     getattr(storage_config, "dp_rank", None),
                 )
+                if enable_dfs_prefetch is False:
+                    # Override the arena environment for this client only.
+                    setup_kwargs["enable_dfs_prefetch"] = False
                 if self.config.enable_ssd_offload:
                     setup_kwargs["enable_ssd_offload"] = True
                 if self.config.ssd_offload_path is not None:
@@ -574,6 +617,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         ]
                         if not unsupported_kwargs:
                             raise
+                        if "enable_dfs_prefetch" in unsupported_kwargs:
+                            raise RuntimeError(
+                                "The installed Mooncake package cannot disable "
+                                "DFS prefetch per client. Rebuild/install the "
+                                "updated Mooncake package to honor the disabled "
+                                "SGLang prefetch flag."
+                            ) from e
                         if "tenant_id" in unsupported_kwargs:
                             raise RuntimeError(
                                 "The installed Mooncake version does not support "
@@ -593,7 +643,62 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 raise RuntimeError(
                     f"Failed to setup Mooncake store, error code: {ret_code}"
                 )
+            try:
+                service_endpoint = _get_service_endpoint(get_server_args())
+            except (TypeError, ValueError) as exc:
+                # Standalone storage users may not have a serving runtime.
+                # Identity discovery must not prevent cache I/O.
+                logger.warning(
+                    "Cannot identify SGLang service for Mooncake metrics: %s", exc
+                )
+                service_endpoint = None
+            if service_endpoint is not None:
+                set_service_endpoint = getattr(self.store, "set_service_endpoint", None)
+                if not callable(set_service_endpoint):
+                    logger.warning(
+                        "Mooncake Master service metrics are disabled: rebuild/install "
+                        "Mooncake with set_service_endpoint support."
+                    )
+                elif set_service_endpoint(service_endpoint) != 0:
+                    logger.warning(
+                        "Failed to register Mooncake Master service metrics for %s; "
+                        "continuing cache initialization. A shared client daemon "
+                        "retains its original endpoint; use separate daemons per "
+                        "service for correct metric attribution.",
+                        service_endpoint,
+                    )
+                else:
+                    logger.info(
+                        "Mooncake Master service metrics endpoint: %s", service_endpoint
+                    )
             logger.info("Mooncake store setup successfully.")
+
+            distributed_dfs = (
+                os.environ.get("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR")
+                == "distributed_storage_backend"
+            )
+            if distributed_dfs:
+                from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
+                    MooncakeDfsHealthManager,
+                )
+
+                # Constructor installs fail-closed read/write policy before
+                # warmup. No setup parameter is used for the initial policy.
+                coordinate_health_policy = (
+                    storage_config is not None
+                    and torch.distributed.is_available()
+                    and torch.distributed.is_initialized()
+                    and (
+                        getattr(storage_config, "tp_size", 1) > 1
+                        or getattr(storage_config, "attn_cp_size", 1) > 1
+                        or getattr(storage_config, "pp_size", 1) > 1
+                    )
+                )
+                self._dfs_health_manager = MooncakeDfsHealthManager(
+                    self.store,
+                    dfs_health_config,
+                    defer_policy_application=coordinate_health_policy,
+                )
 
             self.local_rank = (
                 storage_config.tp_rank if storage_config is not None else 0
@@ -648,6 +753,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.backup_pgs = []
             self.prefetch_bandwidth = []
             self.backup_bandwidth = []
+
+            if self._dfs_health_manager is not None:
+                self._dfs_health_manager.start()
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -1472,7 +1580,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def close(self):
         # MooncakeDistributedStore will automatically call the destructor, so
         # it is unnecessary to close it manually.
-        pass
+        if self._dfs_health_manager is not None:
+            self._dfs_health_manager.close()
+            self._dfs_health_manager = None
+
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        if self._dfs_health_manager is None:
+            return None
+        return self._dfs_health_manager.local_policy()
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        if self._dfs_health_manager is not None:
+            self._dfs_health_manager.apply_effective_policy(allow_read, allow_write)
 
     def clear(self) -> None:
         self.store.remove_all()
@@ -1496,27 +1615,46 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         if self._uses_multi_buffer(buffer_ptrs):
             if config is not None:
-                return self.store.batch_put_from_multi_buffers(
+                results = self.store.batch_put_from_multi_buffers(
                     key_strs, buffer_ptrs, buffer_sizes, config
                 )
-            return self.store.batch_put_from_multi_buffers(
-                key_strs, buffer_ptrs, buffer_sizes
-            )
+            else:
+                results = self.store.batch_put_from_multi_buffers(
+                    key_strs, buffer_ptrs, buffer_sizes
+                )
         elif config is not None:
-            return self.store.batch_put_from(
+            results = self.store.batch_put_from(
                 key_strs, buffer_ptrs, buffer_sizes, config
             )
         else:
-            return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+            results = self.store.batch_put_from(
+                key_strs, buffer_ptrs, buffer_sizes
+            )
+        if any(int(result) == DFS_BATCH_PUT_TIMEOUT for result in results):
+            self._report_dfs_operation_timeout("write", DFS_BATCH_PUT_TIMEOUT)
+        return results
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
         if self._uses_multi_buffer(buffer_ptrs):
-            return self.store.batch_get_into_multi_buffers(
+            results = self.store.batch_get_into_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes
             )
-        return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        else:
+            results = self.store.batch_get_into(
+                key_strs, buffer_ptrs, buffer_sizes
+            )
+        # -1608 is local BatchGet admission backpressure and must not disable
+        # DFS reads. Only -1607 means admitted DFS I/O exceeded its deadline.
+        if any(int(result) == DFS_BATCH_GET_TIMEOUT for result in results):
+            self._report_dfs_operation_timeout("read", DFS_BATCH_GET_TIMEOUT)
+        return results
+
+    def _report_dfs_operation_timeout(self, capability: str, error: int) -> None:
+        manager = self._dfs_health_manager
+        if manager is not None:
+            manager.report_operation_timeout(capability, error)
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)
