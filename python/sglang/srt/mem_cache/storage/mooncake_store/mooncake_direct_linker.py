@@ -34,6 +34,7 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetricsCollector,
     resolve_collector_class,
 )
+from sglang.srt.runtime_context import get_memory, get_model
 from sglang.srt.utils import freeze_gc, get_device_module
 
 logger = logging.getLogger(__name__)
