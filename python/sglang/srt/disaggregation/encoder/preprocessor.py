@@ -23,6 +23,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import parse_content_hash, snapshot_media
+from sglang.srt.multimodal.deepseek_v41_image_processing import num_image_tokens
 from sglang.srt.multimodal.encoder_preprocessing import (
     EncoderMediaProcessorConfig,
     EncoderPreprocessOutput,
@@ -1263,6 +1264,10 @@ class EncoderPreprocessor:
             input_length = self.get_num_patches(grid, modality)
             return self._get_feat_extract_output_lengths(input_length)
         else:
+            if self.model_type == "deepseek_v41" and modality == Modality.IMAGE:
+                # grid = (n_llm_h, n_llm_w), the aligner token grid.
+                h, w = self._kimi_hw_from_patch_grid(grid)
+                return num_image_tokens(h, w)
             if (
                 self.model_type in ["kimi_k25", "kimi_k3", "kimi_vl"]
                 and modality == Modality.IMAGE

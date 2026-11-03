@@ -292,12 +292,25 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             "disabled or breakable"
         )
     if cfg.enable_encoder_swa_bounded_replay:
+        hcu_layer_split_replay = (
+            _is_hcu
+            and cfg.enable_cp_cache_layer_split
+            and cfg.disaggregation_mode == "prefill"
+            and cfg.enable_prefill_cp
+            and cfg.cp_strategy == "interleave"
+        )
+        hcu_pd_replay = (
+            _is_hcu
+            and cfg.disaggregation_mode in ("prefill", "decode")
+            and cfg.disaggregation_transfer_backend == "mooncake"
+        )
         incompatible = (
             (
-                "hardware other than CUDA or gfx950",
+                "hardware other than CUDA, gfx950 or HCU",
                 not (
                     get_platform().is_cuda
                     or (get_platform().is_hip and is_gfx95_supported())
+                    or _is_hcu
                 ),
             ),
             (
@@ -311,18 +324,20 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
                 and get_platform().is_hip,
             ),
-            ("context parallelism", cfg.attn_cp_size > 1),
+            ("context parallelism", cfg.attn_cp_size > 1 and not hcu_layer_split_replay),
             # ROCm replays hits in a forward of their own, which only the hitting
             # attention-DP ranks would enter; CUDA folds them into the extend.
-            ("DP attention on ROCm", get_platform().is_hip and attn_dp_enabled_of(cfg)),
+            ("DP attention on ROCm", get_platform().is_hip and attn_dp_enabled_of(cfg)
+                and not (hcu_pd_replay and cfg.disaggregation_mode == "decode")),
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
             # Decode receives the last SWA window from prefill and never replays.
-            ("PD decode", cfg.disaggregation_mode == "decode"),
+            ("PD decode", cfg.disaggregation_mode == "decode" and not hcu_pd_replay),
             # On ROCm the draft keeps paged SWA, so it cannot share the window's pages.
             (
                 "PD prefill on ROCm",
-                cfg.disaggregation_mode == "prefill" and get_platform().is_hip,
+                cfg.disaggregation_mode == "prefill" and get_platform().is_hip
+                and not hcu_pd_replay,
             ),
             ("mixed prefill/decode", cfg.enable_mixed_chunk),
             ("LoRA", cfg.enable_lora),

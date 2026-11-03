@@ -17,10 +17,12 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
+from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -124,6 +126,8 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
+
+from sglang.srt.utils.custom_op import register_custom_op
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
@@ -401,14 +405,14 @@ if _use_lightop_sqrtsoftplus_v41_gate:
     )
 
 
-_use_lightop_moe_gate_pad_int64_fusion = (
+_use_lightop_deepep_topk_fusion = (
     _use_lightop_sqrtsoftplus_v41_gate
-    and hasattr(op, "moe_fused_gate_sqrtsoftplus_v41_hcu_fused")
+    and hasattr(op, "moe_fused_gate_sqrtsoftplus_v41_hcu_deepep")
 )
 
-if _use_lightop_moe_gate_pad_int64_fusion:
+if _use_lightop_deepep_topk_fusion:
 
-    def moe_fused_gate_sqrtsoftplus_v41_hcu_fused(
+    def moe_fused_gate_sqrtsoftplus_v41_hcu_deepep(
         gating_output: torch.Tensor,
         correction_bias: torch.Tensor,
         topk: int,
@@ -418,13 +422,13 @@ if _use_lightop_moe_gate_pad_int64_fusion:
         apply_routed_scaling_factor_on_output: bool,
         num_token_non_padded: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return op.moe_fused_gate_sqrtsoftplus_v41_hcu_fused(
+        return op.moe_fused_gate_sqrtsoftplus_v41_hcu_deepep(
             gating_output, correction_bias, topk, num_fused_shared_experts,
             renormalize, routed_scaling_factor,
             apply_routed_scaling_factor_on_output, num_token_non_padded,
         )
 
-    def moe_fused_gate_sqrtsoftplus_v41_hcu_fused_fake(
+    def moe_fused_gate_sqrtsoftplus_v41_hcu_deepep_fake(
         gating_output: torch.Tensor,
         correction_bias: torch.Tensor,
         topk: int,
@@ -441,10 +445,10 @@ if _use_lightop_moe_gate_pad_int64_fusion:
         )
 
     direct_register_custom_op(
-        op_name="moe_fused_gate_sqrtsoftplus_v41_hcu_fused",
-        op_func=moe_fused_gate_sqrtsoftplus_v41_hcu_fused,
+        op_name="moe_fused_gate_sqrtsoftplus_v41_hcu_deepep",
+        op_func=moe_fused_gate_sqrtsoftplus_v41_hcu_deepep,
         mutates_args=[],
-        fake_impl=moe_fused_gate_sqrtsoftplus_v41_hcu_fused_fake,
+        fake_impl=moe_fused_gate_sqrtsoftplus_v41_hcu_deepep_fake,
     )
 
 
@@ -781,6 +785,117 @@ def _simulate_balanced_routing(
 # -------------------------------- TopK ---------------------------------------
 
 
+@lru_cache(maxsize=1)
+def _load_hcu_bf16_mega_gate_op() -> Optional[Callable]:
+    """Resolve the public MoE API once; older wheels keep the existing router."""
+    try:
+        from lightop.moe import bf16_mega_gate_hcu
+    except ImportError:
+        return None
+    # Older wheels expose only the two-result DeepGEMM convention. Probe
+    # the needed keyword capabilities instead of a numeric API version.
+    try:
+        parameters = inspect.signature(bf16_mega_gate_hcu).parameters
+    except (TypeError, ValueError):
+        return None
+    if not {"return_logits", "renormalize", "apply_scale"}.issubset(parameters):
+        return None
+    return bf16_mega_gate_hcu
+
+
+def _hcu_mega_gate_inputs_supported(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    valid_token_mask: torch.Tensor,
+    top_k: int,
+) -> bool:
+    """Check the native tensor contract before choosing fusion over fallback."""
+    if not (
+        x.is_cuda
+        and x.ndim == 2
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and weight.ndim == 2
+        and weight.shape[1] == x.shape[1]
+        and weight.dtype == x.dtype
+        and weight.device == x.device
+        and weight.is_contiguous()
+        and bias is not None
+        and bias.shape == (weight.shape[0],)
+        and bias.dtype == torch.float32
+        and bias.device == x.device
+        and bias.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and weight.data_ptr() % 16 == 0
+        and bias.data_ptr() % 32 == 0
+        and valid_token_mask.shape == (x.shape[0],)
+        and valid_token_mask.dtype == torch.bool
+        and valid_token_mask.device == x.device
+        and valid_token_mask.is_contiguous()
+    ):
+        return False
+    # Accept LightOp's supported shapes, independent of
+    # device marketing names or previously benchmarked token counts.
+    m, hidden = x.shape
+    experts = weight.shape[0]
+    if not (
+        hidden > 0
+        and hidden % 256 == 0
+        and 0 < experts <= 512
+        and experts % 4 == 0
+        and 0 < top_k <= min(experts, 32)
+        and max(m * hidden, hidden * experts, m * experts) <= 2**31 - 1
+    ):
+        return False
+    return True
+
+
+def _fake_hcu_bf16_mega_gate(
+    x, weight, bias, topk, renormalize, scale, apply_scale, mask
+):
+    return (
+        x.new_empty((x.shape[0], topk), dtype=torch.float32),
+        x.new_empty((x.shape[0], topk), dtype=torch.int64),
+        x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.float32),
+    )
+
+
+@register_custom_op(mutates_args=[], fake_impl=_fake_hcu_bf16_mega_gate)
+def hcu_bf16_mega_gate(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    scale: float,
+    apply_scale: bool,
+    mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    op = _load_hcu_bf16_mega_gate_op()
+    if op is None:
+        raise RuntimeError("HCU BF16 mega gate requires lightop.moe.bf16_mega_gate_hcu with logits support")
+
+    # Preserve DeepInfer/DeepGEMM's IDs-first convention at the public API,
+    # then adapt to StandardTopKOutput without another GEMM or copy.
+    ids, weights, logits = op(
+        x,
+        weight,
+        num_topk=topk,
+        use_shared_as_routed=False,
+        num_shared_experts=0,
+        routed_scaling_factor=scale,
+        ep_rank=0,  # Unused when shared-as-routed and physical mapping are disabled.
+        scoring_func="sqrtsoftplus",
+        mask=mask,
+        bias=bias,
+        return_logits=True,
+        renormalize=renormalize,
+        apply_scale=apply_scale,
+    )
+    return weights, ids, logits
+
+
 class TopK(BaseFusedOp):
     """
     Parameters:
@@ -867,6 +982,91 @@ class TopK(BaseFusedOp):
             sqrtsoftplus_log1p=sqrtsoftplus_log1p,
             fused_gate_packed_ids=fused_gate_packed_ids,
             allow_routed_experts_capture=allow_routed_experts_capture,
+        )
+
+    def forward_hcu_mega_gate(
+        self,
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> Optional[StandardTopKOutput]:
+        """Try fused GEMM + routing; None selects the existing router.
+
+        The batch prepares its mask once before the layer loop. LightOp emits
+        final INT64 IDs (-1 for padding) and zero padded weights in the kernel.
+        V4.1's fused_gate_packed_ids preference only applies to CUDA/FlashInfer;
+        this HCU/DeepEP path returns standard IDs regardless of that preference.
+        """
+        if not (
+            _is_hcu
+            and _use_lightop
+            and envs.SGLANG_HCU_ENABLE_DSV41_BF16_MEGA_GATE.get()
+            and valid_token_mask is not None
+        ):
+            return None
+        if not self._hcu_mega_gate_routing_supported():
+            return None
+        config = self.topk_config
+        x, bias = hidden_states, config.correction_bias
+        if not _hcu_mega_gate_inputs_supported(
+            x, weight, bias, valid_token_mask, config.top_k
+        ):
+            return None
+        if _load_hcu_bf16_mega_gate_op() is None:
+            return None
+        return StandardTopKOutput(
+            *hcu_bf16_mega_gate(
+                x,
+                weight,
+                bias,
+                config.top_k,
+                config.renormalize,
+                config.routed_scaling_factor,
+                config.apply_routed_scaling_factor_on_output,
+                valid_token_mask,
+            )
+        )
+
+    def _hcu_mega_gate_routing_supported(self) -> bool:
+        """Keep mutable routing settings and runtime overrides live."""
+        config = self.topk_config
+        if (
+            config.scoring_func != "sqrtsoftplus"
+            or not config.sqrtsoftplus_log1p
+            or config.use_grouped_topk
+            or config.num_fused_shared_experts != 0
+            or config.custom_routing_function is not None
+            or config.torch_native
+            or config.output_format not in (None, TopKOutputFormat.STANDARD)
+            or self.enable_waterfill
+            or config.routed_scaling_factor is None
+            or not math.isfinite(config.routed_scaling_factor)
+            or get_exec().deterministic.enable_deterministic_inference
+            or is_expert_remapping_enabled()
+            or _use_aiter
+            or _skip_hip_pad_mask
+            or not get_moe_a2a_backend().is_deepep()
+            or not (get_moe_runner_backend().is_deep_gemm() or _use_deepgemm_moe)
+            or any(
+                flag.get()
+                for flag in (
+                    envs.SGLANG_SIMULATE_UNIFORM_EXPERTS,
+                    envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS,
+                    envs.SGLANG_SIMULATED_EXPERT_BALANCE,
+                )
+            )
+        ):
+            return False
+        return True
+
+    def record_mega_gate_output(self, output: StandardTopKOutput) -> None:
+        # Keep these hooks at the original TopK site, after shared experts have
+        # been scheduled. No padding, remapping or dtype-conversion kernels.
+        capture_routed_experts_if_allowed(
+            self.topk_config, self.layer_id, output.topk_ids
+        )
+        get_global_expert_distribution_recorder().on_select_experts(
+            topk_ids=output.topk_ids
         )
 
     def _apply_waterfill(self, topk_output: TopKOutput, num_tokens: int) -> TopKOutput:
@@ -1828,16 +2028,18 @@ def _can_use_lightop_sqrtsoftplus_gate(
     )
 
 
-def _can_use_lightop_moe_gate_pad_int64_fusion(
+def _can_use_lightop_deepep_topk_fusion(
     gating_output: torch.Tensor,
     topk: int,
     num_fused_shared_experts: int,
     routing_overridden: bool,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
 ) -> bool:
-    # Called only after the existing lightop V4.1 gate eligibility check.
-    # Tensor arguments are validated by the lightop operator entry point.
     return (
-        _use_lightop_moe_gate_pad_int64_fusion
+        _use_lightop_deepep_topk_fusion
+        and _is_hcu
+        and (get_moe_runner_backend().is_deep_gemm() or _use_deepgemm_moe)
+        and expert_location_dispatch_info is None
         and not _use_aiter
         and not _skip_hip_pad_mask
         and get_moe_a2a_backend().is_deepep()
@@ -1846,7 +2048,7 @@ def _can_use_lightop_moe_gate_pad_int64_fusion(
         and topk == 6
         and gating_output.size(1) == 384
         and not routing_overridden
-        and not _eplb_remap_enabled()
+        and not is_expert_remapping_enabled()
     )
 
 
@@ -2072,6 +2274,10 @@ def _mask_topk_ids_padded_region(
         return
     elif _can_fuse_padded_region(topk_ids):
         _fill_padded_rows(topk_ids, num_token_non_padded, fill_value)
+    elif _is_hcu:
+        raise RuntimeError(
+            f"Unsupported top-k id layout for padded-row fill: shape={tuple(topk_ids.shape)}"
+        )
     else:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
         topk_ids[indices >= num_token_non_padded, :] = fill_value
@@ -2086,6 +2292,10 @@ def _zero_topk_weights_padded_region(
     if _can_fuse_padded_region(topk_weights):
         _fill_padded_rows(topk_weights, num_token_non_padded, 0.0)
         return
+    if _is_hcu:
+        raise RuntimeError(
+            f"Unsupported top-k weight layout for padded-row fill: shape={tuple(topk_weights.shape)}"
+        )
     indices = torch.arange(0, topk_weights.shape[0], device=topk_weights.device)
     topk_weights[indices >= num_token_non_padded, :] = 0.0
 
@@ -2745,6 +2955,17 @@ def capture_routed_experts_if_allowed(
         )
 
 
+def _lp_or_static_remap(topk_ids, remap_info, solver, log2phy_prob):
+    """Logical -> physical remap; HIP LPLB solvers dispatch on their compact map."""
+    if log2phy_prob is not None and getattr(solver, "dispatch_map", None) is not None:
+        from sglang.kernels.ops.lplb import cuda_solver
+
+        return cuda_solver.dispatch_probability(
+            topk_ids, log2phy_prob, solver.dispatch_map
+        )
+    return topk_ids_logical_to_physical(topk_ids, remap_info, log2phy_prob)
+
+
 def _post_process_topk_ids(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -2754,6 +2975,7 @@ def _post_process_topk_ids(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     padded_rows_masked: bool = False,
+    deepep_ids_finalized: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_fused_shared_experts = topk_config.num_fused_shared_experts
     use_per_rank_shared_slots = has_per_rank_fused_shared_slots(
@@ -2791,6 +3013,7 @@ def _post_process_topk_ids(
     hip_deepep_postprocessed = False
     _fold_pad_weights_into_append = False
     log2phy_prob = None
+    lplb_solver = None
     dispatch_algorithm = (
         getattr(expert_location_dispatch_info, "ep_dispatch_algorithm", None)
         if expert_location_dispatch_info is not None
@@ -2810,8 +3033,8 @@ def _post_process_topk_ids(
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
         if log2phy_prob is not None:
-            topk_ids = topk_ids_logical_to_physical(
-                topk_ids, expert_location_dispatch_info, log2phy_prob
+            topk_ids = _lp_or_static_remap(
+                topk_ids, expert_location_dispatch_info, lplb_solver, log2phy_prob
             )
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
         elif num_fused_shared_experts > 0:
@@ -2846,10 +3069,16 @@ def _post_process_topk_ids(
         # Regression: skipping this mask when EPLB is disabled caused garbage
         # MoE routing for models like DeepSeek-R1-MXFP4 (accuracy ~0.09 vs 0.94+).
         eplb_remap_enabled = is_expert_remapping_enabled()
-        remap_info = (
-            expert_location_dispatch_info if is_expert_remapping_enabled() else None
-        )
-        if skip_deepep_padded_tokens and not use_per_rank_shared_slots:
+        remap_info = expert_location_dispatch_info if is_expert_remapping_enabled() else None
+        if deepep_ids_finalized:
+            # Only the explicit DeepEP producer contract permits this skip.
+            # Legacy fused gates mask IDs to 0 and still require postprocessing.
+            assert skip_deepep_padded_tokens and not _use_aiter
+            assert num_fused_shared_experts == 0 and topk_config.top_k == 6
+            assert expert_location_dispatch_info is None and not eplb_remap_enabled
+            assert topk_ids.dtype == torch.int64 and router_logits.shape[1] == 384
+            hip_deepep_postprocessed = True
+        elif skip_deepep_padded_tokens and not use_per_rank_shared_slots:
             # DeepEP disables shared-expert fusion by default. On that main HCU
             # path no later operation can introduce another route, so remap and
             # the final -1 padding mask can be compiled into one kernel. Emit
@@ -2876,8 +3105,8 @@ def _post_process_topk_ids(
                         topk_ids, probabilities, solver.static_dispatch_map
                     )
                 else:
-                    topk_ids = topk_ids_logical_to_physical(
-                        topk_ids, remap_info, probabilities
+                    topk_ids = _lp_or_static_remap(
+                        topk_ids, remap_info, solver, probabilities
                     )
                 remap_info = None  # IDs are physical; do not remap a second time.
             topk_ids = _biased_grouped_topk_postprocess(
@@ -2931,7 +3160,7 @@ def _post_process_topk_ids(
             and not hip_deepep_postprocessed
             and not recorder_was_fused
         ):
-            topk_ids = topk_ids_logical_to_physical(topk_ids, remap_info, log2phy_prob)
+            topk_ids = _lp_or_static_remap(topk_ids, remap_info, lplb_solver, log2phy_prob)
         # NOTE (HIP): padded-token routing-weight zeroing is deferred to the
         # single pass at the end of this function (gated by SGLANG_MORI_NO_PAD_MASK).
         # That final pass re-zeros after any shared-expert append/remap, so a
@@ -3091,6 +3320,7 @@ def select_experts(
     packed_topk = None
     # True when the router itself masked rows >= num_token_non_padded.
     padded_rows_masked = False
+    deepep_ids_finalized = False
 
     simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
     simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
@@ -3280,12 +3510,12 @@ def select_experts(
                     topk_config.sqrtsoftplus_log1p,
                 )
             )
-            use_lightop_pad_int64_fusion = (
+            use_lightop_deepep_fusion = (
                 use_lightop_gate
                 and topk_config.sqrtsoftplus_log1p
-                and _can_use_lightop_moe_gate_pad_int64_fusion(
+                and _can_use_lightop_deepep_topk_fusion(
                     router_logits, top_k, num_fused_shared_experts,
-                    routing_overridden,
+                    routing_overridden, expert_location_dispatch_info,
                 )
             )
             if _is_xpu:
@@ -3298,15 +3528,16 @@ def select_experts(
                     if use_jit_fused_gate or _packed_kwargs
                     else biased_topk_impl
                 )
-            if use_lightop_pad_int64_fusion:
+            if use_lightop_deepep_fusion:
                 topk_weights, topk_ids = (
-                    torch.ops.sglang.moe_fused_gate_sqrtsoftplus_v41_hcu_fused(
+                    torch.ops.sglang.moe_fused_gate_sqrtsoftplus_v41_hcu_deepep(
                         router_logits, correction_bias, top_k, 0, renormalize,
                         routed_scaling_factor,
                         bool(apply_routed_scaling_factor_on_output),
                         num_token_non_padded,
                     )
                 )
+                deepep_ids_finalized = True
             else:
                 topk_weights, topk_ids = _biased_topk(
                     hidden_states=hidden_states,
@@ -3322,8 +3553,17 @@ def select_experts(
                     apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                     **_packed_kwargs,
                 )
+                if (
+                    use_lightop_gate
+                    and topk_config.sqrtsoftplus_log1p
+                    and get_moe_a2a_backend().is_deepep()
+                    and not _skip_hip_pad_mask
+                ):
+                    # The ordinary gate has no padding-count input. Preserve
+                    # zero padded weights when the DeepEP fused gate is unused.
+                    _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
             padded_rows_masked = (
-                use_lightop_pad_int64_fusion
+                use_lightop_deepep_fusion
                 or _fused_gate_masks_padded_rows(scoring_func)
             )
         elif (
@@ -3438,6 +3678,7 @@ def select_experts(
                 (balanced_routed_ids, topk_ids[:, num_routed_topk:]), dim=1
             )
         padded_rows_masked = False
+        deepep_ids_finalized = False
     elif routing_overridden:
         # Benchmark-only: override gating with a balanced expert assignment (so
         # dummy/random benchmark tokens don't skew MoE load) via a single fused
@@ -3480,6 +3721,7 @@ def select_experts(
         )
         # The override rewrote every row, including the router-masked ones.
         padded_rows_masked = False
+        deepep_ids_finalized = False
 
     topk_ids, topk_weights, recorder_topk_ids = _post_process_topk_ids(
         topk_ids=topk_ids,
@@ -3490,6 +3732,7 @@ def select_experts(
         layer_id=layer_id,
         expert_location_dispatch_info=expert_location_dispatch_info,
         padded_rows_masked=padded_rows_masked,
+        deepep_ids_finalized=deepep_ids_finalized,
     )
     # if num_fused_shared_experts > 0 and _use_aiter:
     #     M, N = router_logits.shape

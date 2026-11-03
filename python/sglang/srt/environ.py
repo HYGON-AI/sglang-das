@@ -1149,7 +1149,12 @@ class Envs:
     SGLANG_ENABLE_DP_ATTENTION_LOCAL_CONTROL_BROADCAST = EnvBool(False)
     SGLANG_KV_LAYOUT_HCU_FA = EnvBool(True)
     SGLANG_USE_LIGHTOP = EnvBool(False)
+    # Use fused HCU BF16 routing when the backend and inputs are supported.
+    SGLANG_HCU_ENABLE_DSV41_BF16_MEGA_GATE = EnvBool(True)
     SGLANG_HCU_HC_MIX_STATS_OPT = EnvBool(True)
+    # Opt-in: DSV4.1 decode/verify on HCU runs the Triton fused mHC boundary instead of
+    # lightop stats + aiter post + combine; prefill keeps the lightop path.
+    SGLANG_HCU_FUSED_MHC_BOUNDARY = EnvBool(False)
     SGLANG_USE_LIGHTOP_MOE_SUM_MUL_ADD = EnvBool(False)
     SGLANG_USE_OPT_CAT = EnvBool(False)
     SGLANG_USE_FUSED_MLA_CAT = EnvBool(False)
@@ -1164,6 +1169,9 @@ class Envs:
     SGLANG_USE_AITER_LINEAR_ATTN = EnvBool(False)
     SGLANG_USE_FUSED_DPSKV4_SILU_MUL_FP8_QUANT = EnvBool(False)
     SGLANG_USE_LIGHTOP_GROUP_FP8_QUANT = EnvBool(False)
+    # HCU DSV4.1 wo_a/LM/Markov projections: inspect checkpoint headers by
+    # default; "0" retains existing paths and "1" explicitly enables FP8.
+    SGLANG_DSV41_CHANNELWISE_FP8_RUNTIME = EnvStr("auto")
     SGLANG_USE_LINEAR_BF16_FP32_USE_BLASLT = EnvBool(False)
     SGLANG_ROCM_USE_AITER_TILELANG_MHC = EnvBool(False)
     SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM = EnvBool(False)
@@ -1372,6 +1380,11 @@ class Envs:
     SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL = EnvInt(0)
     # Fixed-layout replica probabilities; bypass per-forward LP and all-reduce.
     SGLANG_EXPERIMENTAL_LPLB_STATIC_PROBS = EnvStr(None)
+    # HIP per-batch LPLB: water-filling solver (device | host), its passes, and
+    # the routed (token, expert) pairs per layer below which replicas split evenly.
+    SGLANG_LPLB_HIP_SOLVER = EnvStr("host")  # device kernel fails its unit test (rows do not sum to 1)
+    SGLANG_LPLB_HOST_PASSES = EnvInt(4)
+    SGLANG_LPLB_HOST_MIN_PAIRS = EnvInt(6144)
     # Chunk size for the rebalance expert-weight P2P exchange; set
     # >= num_physical_experts to submit a single batch_isend_irecv.
     SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvIntWithAlias(
@@ -1842,6 +1855,8 @@ class Envs:
 
     # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
     # below) and gather rows from the GPU instead of sharding them over HBM.
+    # The HCU shared allocator requires HSA_USERPTR_FOR_PAGED_MEM=0 in the
+    # launch environment, before HIP/HSA initialization, for IPC export.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
@@ -1854,6 +1869,10 @@ class Envs:
     # anonymous mapping per rank holding only its rows, gathered with the
     # all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
+    # Either enable flag requests host tables. HCU defaults to shared, falling
+    # back to device shards unless HSA_USERPTR_FOR_PAGED_MEM=0 is set at launch.
+    SGLANG_HCU_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(True)
+    SGLANG_HCU_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

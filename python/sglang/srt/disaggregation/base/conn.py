@@ -37,6 +37,9 @@ class StateType(str, enum.Enum):
     # One item per request row (req_pool_idx), sent row to row: the DeepSeek-V4
     # DSpark draft's SWA valid-from.
     REQUEST_ROW = "request_row"
+
+    # A complete request-owned SWA ring plus its absolute-position tags.
+    DSV41_SWA_WINDOW = "dsv41_swa_window"
     # A block-scaled KV dtype keeps its per-block scales in buffers parallel to
     # K/V, one component per sub-pool so each carries the index payload of the
     # KV it describes (whole sequence for full attention, window for SWA).

@@ -460,8 +460,15 @@ class SlimQuantW4A8Int8Config(QuantizationConfig):
 class SlimQuantW4A8Int8LinearMethod(LinearMethodBase):
     def __init__(self, quantization_config: SlimQuantW4A8Int8Config):
         self.quantization_config = quantization_config
+        # Off until a model opts this layer in; see enable_prequantized_input.
+        self.supports_prequantized_input = False
         self.tritonsingleton = W8a8GetCacheJSON()
         self.w8a8_strategy = int(os.getenv("W8A8_SUPPORT_METHODS", "1"))
+
+    def enable_prequantized_input(self, layer: torch.nn.Module) -> bool:
+        # The activation is per-token INT8, the format the fused kernels emit.
+        self.supports_prequantized_input = True
+        return True
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         n = layer.weight.shape[0]
@@ -537,9 +544,16 @@ class SlimQuantW4A8Int8LinearMethod(LinearMethodBase):
         input_quant_args: Optional[list[torch.Tensor]] = None,
         silu_quant_args: Optional[list[torch.Tensor]] = None,
     ):
-        if _use_fused_rms_quant and input_quant_args is not None:
+        # Explicit q/scale must not depend on an unrelated global RMS switch.
+        if input_quant_args is not None:
             assert len(input_quant_args) == 2
             x_q, x_scale = input_quant_args
+            if (x_q.dtype, x_scale.dtype) != (torch.int8, torch.float32):
+                raise ValueError("Expected INT8 input and FP32 per-token scale")
+            if x.ndim != 2 or x_q.shape != x.shape or x_scale.shape != (x.shape[0], 1):
+                raise ValueError("Invalid prequantized INT8 input/scale shape")
+            if x_q.device != x.device or x_scale.device != x.device:
+                raise ValueError("Prequantized input/scale must share the input device")
         elif _use_fused_silu_mul_quant and silu_quant_args is not None:
             x_q, x_scale = silu_quant_args
         else:

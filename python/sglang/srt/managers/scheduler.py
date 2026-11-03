@@ -2773,6 +2773,7 @@ class Scheduler(
                     tokenized_req.mm_inputs = MultimodalInputs.from_processor_output(
                         tokenized_req.mm_inputs,
                         requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
+                        builds_missing_padded_input_ids=self.model_config.builds_missing_mm_padded_input_ids,
                     )
             except Exception as error:
                 local_error = f"{type(error).__name__}: {error}"
@@ -3257,6 +3258,7 @@ class Scheduler(
                     inputs=MultimodalInputs.from_processor_output(
                         raw_mm_inputs,
                         requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
+                        builds_missing_padded_input_ids=self.model_config.builds_missing_mm_padded_input_ids,
                     )
                 )
             except Exception as error:
@@ -3291,6 +3293,7 @@ class Scheduler(
                     inputs=MultimodalInputs.from_processor_output(
                         raw_mm_inputs,
                         requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
+                        builds_missing_padded_input_ids=self.model_config.builds_missing_mm_padded_input_ids,
                     )
                 )
 
@@ -3309,6 +3312,7 @@ class Scheduler(
         return MultimodalInputs.from_processor_output(
             mm_inputs,
             requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
+            builds_missing_padded_input_ids=self.model_config.builds_missing_mm_padded_input_ids,
         )
 
     @staticmethod

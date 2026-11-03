@@ -43,6 +43,17 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestDSV4CompressedPools(CustomTestCase):
+    def test_swa_dtype_uses_request_window_storage(self):
+        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        pool._unified_kv = False
+        pool.swa_kv_pool = None
+        for bf16 in (False, True):
+            with self.subTest(bf16=bf16):
+                pool.request_window = SimpleNamespace(
+                    state=SimpleNamespace(is_bf16_attention_kv_cache=bf16)
+                )
+                self.assertIs(pool.is_bf16_attention_kv_cache, bf16)
+
     def test_swa_key_page_size_uses_physical_paged_size(self):
         pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
         pool.request_window = None
@@ -424,10 +435,14 @@ class TestV41KVPoolLayouts(CustomTestCase):
 
 
 class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):
+    """Exercise the CUDA draft-ring contract independently of the test host."""
     RING = 256  # sliding window + the largest draft token count, in whole pages
 
     def setUp(self):
         super().setUp()
+        hip = patch("sglang.srt.mem_cache.deepseek_v4_memory_pool._is_hip", False)
+        hip.start()
+        self.addCleanup(hip.stop)
         override = get_context().override_server_args(
             enable_encoder_swa_bounded_replay=True,
             speculative_algorithm="DSPARK",
@@ -703,6 +718,7 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
         backend.forward_metadata = SimpleNamespace(late_layer_tail=None)
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
+            attn_cp_metadata=None,
             seq_lens=torch.tensor([rows]),
             seq_lens_cpu=torch.tensor([rows]),
             extend_seq_lens=torch.tensor([rows], dtype=torch.int32),
