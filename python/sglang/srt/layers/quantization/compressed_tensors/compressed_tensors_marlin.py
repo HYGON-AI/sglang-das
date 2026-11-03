@@ -36,6 +36,41 @@ SPARSITY_CONFIG_NAME: Literal["sparsity_config"] = "sparsity_config"
 QUANTIZATION_SCHEME_MAP_TYPE = dict[str, Optional[dict[str, QuantizationArgs]]]
 
 
+def _needs_hcu_deepseek_int8_moe_bypass() -> bool:
+    """True only for DeepSeek arches whose HCU int8-marlin MoE pack is wrong.
+
+    HY3 / other slimquant_marlin INT8 MoE models must keep the lightop
+    ``fused_experts_impl_int8_marlin`` path.
+    """
+    arch = None
+    model_path = ""
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        server_args = get_server_args()
+        model_path = (getattr(server_args, "model_path", None) or "").lower()
+        try:
+            hf_config = server_args.get_model_config().hf_config
+            arches = getattr(hf_config, "architectures", None) or []
+            if arches:
+                arch = arches[0]
+        except Exception:
+            pass
+    except Exception:
+        try:
+            from sglang.srt.server_args import get_global_server_args
+
+            server_args = get_global_server_args()
+            model_path = (getattr(server_args, "model_path", None) or "").lower()
+        except Exception:
+            return False
+
+    if isinstance(arch, str) and arch.startswith("Deepseek"):
+        return True
+    # Fallback before hf_config is ready: DeepSeek checkpoints name the path.
+    return "deepseek" in model_path
+
+
 class SlimQuantCompressedTensorsMarlinConfig(CompressedTensorsConfig):
     def __init__(
         self,
@@ -115,16 +150,21 @@ class SlimQuantCompressedTensorsMarlinConfig(CompressedTensorsConfig):
             layer.scheme = scheme
             return CompressedTensorsLinearMethod(self)
         if isinstance(layer, FusedMoE):
-            # The minimax int8-marlin pack is numerically wrong for DeepSeek
-            # channel W8A8 on HCU. Use the compressed-tensors INT8 MoE path,
-            # which selects the HCU AITER/Triton kernel.
+            # DeepSeek channel W8A8 on HCU: minimax int8-marlin pack is
+            # numerically wrong. Route only that family to compressed-tensors
+            # INT8 MoE (AITER no-shuffle / Triton). Other INT8 MoE models
+            # (e.g. HY3) keep lightop int8-marlin.
             from sglang.srt.utils import is_hcu
 
             use_deepgemm_marlin = (
                 get_moe_runner_backend().is_deep_gemm()
                 or get_moe_a2a_backend().is_deepep()
             )
-            if is_hcu() and not use_deepgemm_marlin:
+            if (
+                is_hcu()
+                and not use_deepgemm_marlin
+                and _needs_hcu_deepseek_int8_moe_bypass()
+            ):
                 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
                     CompressedTensorsFusedMoEMethod,
                 )
