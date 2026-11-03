@@ -3078,6 +3078,10 @@ class SchedulerDisaggregationPrefillMixin:
                     StateType.SWA_RING: _swa_ring_payload,
                     StateType.DSV4_REQUEST_STATE: _request_state_payload,
                     StateType.REQUEST_ROW: _request_row_payload,
+
+                    StateType.DSV41_SWA_WINDOW: lambda: np.asarray(
+                        [int(req.kv.req_pool_idx)], dtype=np.int32
+                    ),
                     StateType.BLOCK_SCALE: _full_kv_pages_payload,
                     StateType.BLOCK_SCALE_SWA: _swa_payload,
                 }

@@ -13,6 +13,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.layers.cp import base, interleave
+from sglang.srt.layers.utils import hcu_cp_utils
 
 register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
 
@@ -20,7 +21,7 @@ register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
 class TestInterleaveCpGatherMemory(CustomTestCase):
     def _gather(self, *, cp_size=4, rows=7, rank=0, dtype=torch.bfloat16,
                 hcu=True, small=False, uneven=False, indexed=False, kv=False,
-                noncontiguous=False, padded=False):
+                noncontiguous=False, padded=False, legacy=False):
         width = 3
         source = torch.arange(cp_size * rows * width, dtype=dtype).reshape(
             rows * cp_size, width
@@ -51,7 +52,7 @@ class TestInterleaveCpGatherMemory(CustomTestCase):
             calls.append((output.numel() * output.element_size(), output.data_ptr()))
             offset += count
 
-        local = rank_inputs[rank][:logical[rank]]
+        local = rank_inputs[rank] if legacy else rank_inputs[rank][:logical[rank]]
         if noncontiguous:
             local = local.t().contiguous().t()
         with ExitStack() as stack:
@@ -82,12 +83,38 @@ class TestInterleaveCpGatherMemory(CustomTestCase):
             stack.enter_context(mock.patch.object(
                 interleave, "attn_cp_all_gather_into_tensor", side_effect=gather
             ))
+            if legacy:
+                stack.enter_context(mock.patch(
+                    "sglang.srt.layers.attention.dsa.utils."
+                    "is_dsa_prefill_cp_round_robin_split", return_value=True
+                ))
+                stack.enter_context(mock.patch.object(
+                    hcu_cp_utils, "get_parallel",
+                    return_value=SimpleNamespace(attn_cp_group=None)
+                ))
+                stack.enter_context(mock.patch.object(
+                    hcu_cp_utils, "use_symmetric_memory",
+                    side_effect=lambda *a, **kw: nullcontext()
+                ))
+                stack.enter_context(mock.patch.object(
+                    hcu_cp_utils, "is_allocation_symmetric", return_value=False
+                ))
+                stack.enter_context(mock.patch.object(
+                    hcu_cp_utils, "attn_cp_all_gather_into_tensor", side_effect=gather
+                ))
             gather_method = (
                 strategy.gather_kv_cache if kv else strategy.gather_hidden_states
             )
-            result = gather_method(local, batch)
+            result = (
+                hcu_cp_utils.cp_all_gather_rerange_output(
+                    local, cp_size, batch, None, chunk_large_output=hcu
+                )
+                if legacy else gather_method(local, batch)
+            )
         if indexed:
             expected = torch.cat(rank_inputs).index_select(0, gather_index)
+        elif legacy:
+            expected = torch.stack(rank_inputs).transpose(0, 1).reshape(-1, width)
         else:
             expected = source[:sum(logical)]
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
@@ -130,6 +157,24 @@ class TestInterleaveCpGatherMemory(CustomTestCase):
                        dict(indexed=True), dict(kv=True)):
             with self.subTest(**kwargs):
                 self.assertEqual(len(self._gather(**kwargs)), 1)
+
+    def test_legacy_output_uses_bounded_scratch_and_preserves_physical_rows(self):
+        for cp_size in (2, 4, 8):
+            for rank in range(cp_size):
+                for padded in (False, True):
+                    with self.subTest(cp_size=cp_size, rank=rank, padded=padded):
+                        calls = self._gather(
+                            legacy=True, cp_size=cp_size, rank=rank,
+                            uneven=True, padded=padded, noncontiguous=True,
+                        )
+                        self.assertGreater(len(calls), 1)
+                        self.assertLessEqual(max(n for n, _ in calls), max(48, cp_size*6))
+                        self.assertEqual(len({ptr for _, ptr in calls}), 1)
+
+    def test_legacy_small_indexed_and_opt_out_keep_original_gather(self):
+        for kwargs in (dict(small=True), dict(indexed=True), dict(hcu=False)):
+            with self.subTest(**kwargs):
+                self.assertEqual(len(self._gather(legacy=True, **kwargs)), 1)
 
 
 if __name__ == "__main__":

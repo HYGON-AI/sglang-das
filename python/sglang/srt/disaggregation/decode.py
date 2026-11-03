@@ -2220,6 +2220,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             def _request_row_payload():
                 return np.array([decode_req.req.kv.req_pool_idx], dtype=np.int32)
 
+            def _swa_window_payload():
+                window = self.token_to_kv_pool.request_window
+                # The entire ring and every tag are overwritten by RDMA.
+                # Do not enqueue a GPU reset that could race the incoming copy.
+                window.prepared = None
+                return np.asarray(
+                    [int(decode_req.req.kv.req_pool_idx)], dtype=np.int32
+                )
+
             state_types = self.kv_manager.kv_args.state_types
             if StateType.DSV4_REQUEST_STATE in state_types:
                 clear_request_state = getattr(
@@ -2239,6 +2248,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,
                 StateType.REQUEST_ROW: _request_row_payload,
+
+                StateType.DSV41_SWA_WINDOW: _swa_window_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
             }

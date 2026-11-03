@@ -273,8 +273,15 @@ class SlimQuantW4A8Int8LinearMethod(LinearMethodBase):
     # Explicit INT8 input + FP32 per-token scale; caller owns fusion routing.
     def __init__(self, quantization_config: SlimQuantW4A8Int8Config):
         self.quantization_config = quantization_config
+        # Off until a model opts this layer in; see enable_prequantized_input.
+        self.supports_prequantized_input = False
         self.tritonsingleton = W8a8GetCacheJSON()
         self.w8a8_strategy = int(os.getenv("W8A8_SUPPORT_METHODS", "1"))
+
+    def enable_prequantized_input(self, layer: torch.nn.Module) -> bool:
+        # The activation is per-token INT8, the format the fused kernels emit.
+        self.supports_prequantized_input = True
+        return True
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         n = layer.weight.shape[0]
@@ -353,6 +360,7 @@ class SlimQuantW4A8Int8LinearMethod(LinearMethodBase):
 
         # Explicit q/scale must not depend on an unrelated global RMS switch.
         if input_quant_args is not None:
+            assert len(input_quant_args) == 2
             x_q, x_scale = input_quant_args
             if (x_q.dtype, x_scale.dtype) != (torch.int8, torch.float32):
                 raise ValueError("Expected INT8 input and FP32 per-token scale")

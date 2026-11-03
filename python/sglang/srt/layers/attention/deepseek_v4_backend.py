@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import enum
 import functools
+import itertools
 import logging
 import os
 from dataclasses import dataclass, field
@@ -45,7 +46,10 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     gather_upconvert_k_cache_paged,
     q8kv8_padded_num_heads,
 )
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    dequant_fp4_index_k,
+    fp4_index_logits_decode,
+)
 from sglang.kernels.ops.attention.dsv4.lightop_indexer import (
     lightop_paged_indexer_available,
     lightop_paired_rows_available,
@@ -196,6 +200,10 @@ from sglang.srt.utils.common import is_sm120_supported
 
 _is_hcu = is_hcu()
 _is_sm120 = is_sm120_supported()
+_use_hcu_index_q_rope_pack = _is_hcu and get_bool_env_var(
+    "SGLANG_HCU_INDEX_Q_ROPE_PACK", default="true"
+)
+
 _use_dpskv4_lightop_quant_k_cache = get_bool_env_var(
     "SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE"
 )
@@ -242,6 +250,16 @@ def _supports_index_q_rope_pack() -> bool:
     is ported; HIP uses the portable query + Triton quantization fallback.
     """
     return torch.cuda.is_available() and torch.version.hip is None
+
+
+@functools.lru_cache(maxsize=1)
+def _has_native_hcu_rope_fake_quant() -> bool:
+    # This fusion matches the Torch fallback; preserve the native AOT path.
+    try:
+        from sgl_kernel import rope_fp4_fake_quant
+    except (ImportError, OSError):
+        return False
+    return callable(rope_fp4_fake_quant)
 
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -557,6 +575,24 @@ def _as_int_list(values) -> Optional[List[int]]:
             return None
         values = values.tolist()
     return [int(v) for v in values]
+
+
+def _extend_k_slots(req_to_token, *, ratio, lc_per_req, req_pool_indices, device):
+    """Per request, the c1/c2 pool slots of its visible compressed positions, and
+    each request's start offset in their concatenation."""
+    starts = [0, *itertools.accumulate(lc_per_req)]
+    total = starts.pop()
+    counts = torch.tensor(lc_per_req, dtype=torch.int64, device=device)
+    req_rows = torch.repeat_interleave(
+        req_pool_indices.to(torch.int64), counts, output_size=total
+    )
+    j = torch.arange(total, device=device) - torch.repeat_interleave(
+        torch.tensor(starts, dtype=torch.int64, device=device),
+        counts,
+        output_size=total,
+    )
+    slots = req_to_token[req_rows, j * ratio].to(torch.int64) // ratio
+    return slots, starts
 
 
 def _low_ratio_compression_metadata(
@@ -1506,6 +1542,9 @@ class DeepseekV4AttnBackend(
         self.has_c128: bool = 128 in self.present_ratios
         cfg = model_runner.model_config.hf_text_config
         self.is_dsv41: bool = getattr(cfg, "model_type", None) == "deepseek_v41"
+        # V4.1 on HCU gathers low-ratio indexer slots with dedicated kernels
+        # instead of HCU's generic index kernel; V4 keeps the upstream path.
+        self.dsv41_hcu_indexer_kernels: bool = _is_hcu and self.is_dsv41
         self.prefill_candidates, self.decode_candidates = make_candidate_indexer(
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
@@ -1883,6 +1922,7 @@ class DeepseekV4AttnBackend(
             dspark_block_size=dspark_block_size,
             dspark_swa_buffers=dspark_swa_buffers,
             num_tokens=num_write_tokens if cp_active else None,
+            window_num_tokens=num_tokens,
             swa_replay_start=swa_replay_start,
             # Captured kernels read the window history by address, so a graph
             # keeps one group per request slot, at most one per row.
@@ -3779,6 +3819,7 @@ class DeepseekV4AttnBackend(
                     pos,
                     projected=(bufs["kv"], bufs.get("score")),
                     fuse_index_store=(x.is_cuda and _supports_index_k_rope_pack()),
+                    fuse_rope_fq_store=True,
                 )
             if run_indexer and layer.indexer is not None:
                 if captured_index:
@@ -3836,6 +3877,7 @@ class DeepseekV4AttnBackend(
                 fuse_index_store=(
                     x_global.is_cuda and _supports_index_k_rope_pack()
                 ),
+                fuse_rope_fq_store=True,
             )
         if run_indexer and layer.indexer is not None:
             if not _is_hcu:
@@ -4032,6 +4074,7 @@ class DeepseekV4AttnBackend(
                         )
                     )
                 ),
+                fuse_rope_fq_store=forward_batch.forward_mode.is_extend(),
             )
 
     def _low_ratio_in_prefill_graph(self) -> bool:
@@ -4201,7 +4244,8 @@ class DeepseekV4AttnBackend(
             )
 
     def _low_ratio_compress_torch(
-        self, layer, x, req, pos, projected=None, *, fuse_index_store=False
+        self, layer, x, req, pos, projected=None, *, fuse_index_store=False,
+        fuse_rope_fq_store=False,
     ) -> None:
         core = self.forward_metadata.core_metadata
         num_tokens = pos.shape[0]
@@ -4215,6 +4259,7 @@ class DeepseekV4AttnBackend(
                 core.c1_out_loc[:num_tokens],
                 pos,
                 fuse_index_store=fuse_index_store,
+                fuse_rope_fq_store=fuse_rope_fq_store,
             )
             return
 
@@ -4226,15 +4271,38 @@ class DeepseekV4AttnBackend(
             pos=pos,
             pad=core.raw_out_loc[:num_tokens] == 0,
         )
-        pooled = layer.compressor.pool_pairs(
-            torch.stack([partner_kv, kv], dim=1),
-            torch.stack([partner_score, score], dim=1),
-        )
+        normalized_latent = None
+        if (
+            fuse_rope_fq_store
+            and _is_hcu
+            and get_parallel().attn_cp_size > 1
+            and os.environ.get("SGLANG_HCU_OPT_DSV41_CP_POOL_NORM", "1") == "1"
+            and kv.is_cuda
+            and kv.dtype == torch.float32
+            and kv.shape[-1] == 512
+            and kv.stride(-1) == 1
+            and layer.compressor.norm.weight.dtype in (torch.float32, torch.bfloat16)
+            and layer.compressor.norm.weight.is_contiguous()
+        ):
+            from lightop import dsv41_pool_pairs_norm
+
+            normalized_latent = dsv41_pool_pairs_norm(
+                partner_kv, kv, partner_score, score,
+                layer.compressor.norm.weight, layer.compressor.norm.eps,
+            )
+            pooled = None
+        else:
+            pooled = layer.compressor.pool_pairs(
+                torch.stack([partner_kv, kv], dim=1),
+                torch.stack([partner_score, score], dim=1),
+            )
         group_pos = torch.where(pos % 2 == 1, pos - 1, pos)
         out_loc = core.c2_out_loc[:num_tokens]
         slots = torch.where(out_loc >= 0, out_loc, torch.zeros_like(out_loc))
         self._low_ratio_write_group(
-            layer, pooled, slots, group_pos, fuse_index_store=fuse_index_store
+            layer, pooled, slots, group_pos, fuse_index_store=fuse_index_store,
+            fuse_rope_fq_store=fuse_rope_fq_store,
+            normalized_latent=normalized_latent,
         )
 
     def _low_ratio_pair_partners(
@@ -4287,9 +4355,15 @@ class DeepseekV4AttnBackend(
         group_pos,
         *,
         fuse_index_store=False,
+        fuse_rope_fq_store=False,
+        normalized_latent=None,
     ) -> None:
         pool = self.token_to_kv_pool
-        latent = layer.compressor.finish(pooled)
+        latent = (
+            layer.compressor.finish(pooled)
+            if normalized_latent is None
+            else normalized_latent
+        )
         freqs = layer.freqs_cis[group_pos]
         # Index keys come from the pre-RoPE latent, so publish them first. Stored
         # as fp4 (per-32 ue8m0, no hadamard), matching the reference indexer.
@@ -4328,6 +4402,26 @@ class DeepseekV4AttnBackend(
             )
             return
         # The fp8 FlashMLA caches requantize the FP4/E4M3 latent into their layout.
+        if (
+            fuse_rope_fq_store
+            and _is_hcu
+            and os.environ.get("SGLANG_HCU_OPT_DSV41_ROPE_FQ_STORE", "1") == "1"
+            and latent.is_cuda
+            and latent.dtype == torch.bfloat16
+            and latent.is_contiguous()
+            and latent.shape[-1] == 512
+            and layer.rope_head_dim == 64
+            and not pool.uniform_fp8
+            and not pool._unified_kv
+            and pool.dtype != torch.bfloat16
+            and pool.get_extra_key_layout(layer.layer_id) is KVLayout.V4
+        ):
+            # Preserve LayerSplit ownership and payload invalidation. Nonowners
+            # skip the fused work as well as the store; latent stays pre-RoPE.
+            pool.set_extra_key_buffer_fused(
+                layer_id=layer.layer_id, loc=slots, cache_k=latent, freqs_cis=freqs
+            )
+            return
         latent = _rope_fq4(latent, freqs, layer.rope_head_dim, compressed_kv=True)
         pool.set_extra_key_buffer_fused(
             layer_id=layer.layer_id, loc=slots, cache_k=latent
@@ -4751,20 +4845,35 @@ class DeepseekV4AttnBackend(
                 layer.layer_id, k_slots, use_hcu_fused_gather=True
             )
         else:
-            req_pool_indices = forward_batch.req_pool_indices.to(torch.int64)
-            slot_chunks, starts, start = [], [], 0
-            for r, lc in enumerate(lc_per_req):
-                starts.append(start)
-                if lc == 0:
-                    continue
-                j = torch.arange(lc, device=device)
-                slot_chunks.append(
-                    self.req_to_token[req_pool_indices[r], j * ratio].to(torch.int64)
-                    // ratio
+            if self.dsv41_hcu_indexer_kernels:
+                k_slots, starts = _extend_k_slots(
+                    self.req_to_token,
+                    ratio=ratio,
+                    lc_per_req=lc_per_req,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    device=device,
                 )
-                start += lc
-            k_slots = torch.cat(slot_chunks)
-            k_fp4, k_sf = pool.get_low_ratio_index_k_fp4(layer.layer_id, k_slots)
+            else:
+                req_pool_indices = forward_batch.req_pool_indices.to(torch.int64)
+                slot_chunks, starts, start = [], [], 0
+                for r, lc in enumerate(lc_per_req):
+                    starts.append(start)
+                    if lc == 0:
+                        continue
+                    j = torch.arange(lc, device=device)
+                    slot_chunks.append(
+                        self.req_to_token[req_pool_indices[r], j * ratio].to(
+                            torch.int64
+                        )
+                        // ratio
+                    )
+                    start += lc
+                k_slots = torch.cat(slot_chunks)
+            k_fp4, k_sf = pool.get_low_ratio_index_k_fp4(
+                layer.layer_id,
+                k_slots,
+                use_hcu_fused_gather=self.dsv41_hcu_indexer_kernels,
+            )
 
         q = indexer.queries(q_lora, layer.freqs_cis[pos])  # [T, H, 128] fp4 grid
         if not use_hcu_prep:
@@ -5181,7 +5290,38 @@ class DeepseekV4AttnBackend(
         # fp4 query as (payload, scale), kernel layout [bs, 1, n_heads, dim]. The
         # kernel sums head scores locally, so the indexer heads must be replicated.
         assert indexer.n_local_heads == indexer.n_heads
-        if (
+        use_hcu_pack = (
+            _use_hcu_index_q_rope_pack
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and q_lora.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and q_lora.is_contiguous()
+            and indexer.n_local_heads in (32, 64)
+            and indexer.index_head_dim == 128
+            and indexer.rope_head_dim == 64
+            and layer.freqs_cis.dtype == torch.complex64
+            and layer.freqs_cis.is_contiguous()
+            and pos.dtype in (torch.int32, torch.int64)
+            and pos.is_contiguous()
+            and not _has_native_hcu_rope_fake_quant()
+        )
+        if use_hcu_pack:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hcu import (
+                index_q_rope_pack_weights_hcu,
+            )
+
+            q, _ = indexer.wq_b(q_lora)
+            q = q.view(q.shape[0], indexer.n_local_heads, indexer.index_head_dim)
+            q_fp4, q_sf, weights = index_q_rope_pack_weights_hcu(
+                q,
+                layer.freqs_cis,
+                pos,
+                indexer.head_weights_raw(x),
+                indexer.head_weight_scale,
+                indexer.rope_head_dim,
+            )
+        elif (
             x.is_cuda
             and _supports_index_q_rope_pack()
             and x.dtype == torch.bfloat16
@@ -5381,9 +5521,21 @@ class DeepseekV4AttnBackend(
                     )
                 continue
             j = torch.arange(lc, device=pos.device)
-            slots_j = self.req_to_token[r, j * ratio].to(torch.int64) // ratio
+            if self.dsv41_hcu_indexer_kernels:
+                row = self.req_to_token[int(r)]
+                slots_j = row[: lc * ratio : ratio].to(torch.int64) // ratio
+            else:
+                slots_j = self.req_to_token[r, j * ratio].to(torch.int64) // ratio
             # Dequantize only this request's visible K rows; the table is pool-sized.
-            index_k = pool.get_low_ratio_index_k_dequant(layer.layer_id, slots_j)
+            if self.dsv41_hcu_indexer_kernels:
+                k_fp4, k_sf = pool.get_low_ratio_index_k_fp4(
+                    layer.layer_id,
+                    slots_j,
+                    use_hcu_fused_gather=True,
+                )
+                index_k = dequant_fp4_index_k(k_fp4, k_sf)
+            else:
+                index_k = pool.get_low_ratio_index_k_dequant(layer.layer_id, slots_j)
             k = min(topk, lc)
             # Every step below is per query row; chunk rows so the [rows, heads, lc]
             # bf16 scores stay under the budget (16 GiB at once for a 16k-token prompt).
@@ -5438,7 +5590,7 @@ class DeepseekV4AttnBackend(
         if self.token_to_kv_pool.request_window is not None:
             layout = metadata.core_attn_metadata.request_window_layout
             self.token_to_kv_pool.request_window.activate(layout)
-            return layout.write_loc
+            return metadata.core_attn_metadata.swa_out_cache_loc
         if isinstance(metadata, DSV4Metadata) and metadata.late_layer_tail is not None:
             # The tail's q rows are a subset of the extend, so the full
             # out_cache_loc below would be the wrong length; the tail owns its own.
@@ -5899,6 +6051,10 @@ class DeepseekV4AttnBackend(
             window is not None
             and not self.is_dspark_draft
             and not forward_batch.forward_mode.is_idle()
+            and (
+                not is_cp_cache_layer_split_deepseek_v4_pool(self.token_to_kv_pool)
+                or self.token_to_kv_pool._owns_swa_layer_id(layer.layer_id)
+            )
         ):
             window.commit(self.token_to_kv_pool._swa_local_layer_id(layer.layer_id))
         return result
@@ -6210,6 +6366,7 @@ class DeepseekV4AttnBackend(
             if forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
                 if (
                     self.forward_metadata.late_layer_tail is None
+                    and token_to_kv_pool.request_window is None
                     and _should_use_sparse_prefill(
                         q, forward_batch, allow_cp=self.is_dsv41
                     )
@@ -6627,6 +6784,7 @@ class DeepseekV4AttnBackend(
         num_groups: Optional[int] = None,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         request_window_live_rows: Optional[int] = None,
+        window_num_tokens: Optional[int] = None,
     ) -> DSV4AttnMetadata:
         small_metadata = (
             not is_prefill
@@ -6664,28 +6822,38 @@ class DeepseekV4AttnBackend(
         if self.token_to_kv_pool.request_window is not None:
             from sglang.srt.mem_cache.dsv41_request_window import window_layout
 
+            # Build the request ring from real GLOBAL rows. CP query tables
+            # are sharded later; execution padding must never commit tags.
+            live = (
+                raw_positions.shape[0]
+                if window_num_tokens is None and request_window_live_rows is None
+                else (window_num_tokens if window_num_tokens is not None
+                      else request_window_live_rows)
+            )
+            window_positions = raw_positions[:live]
+            window_req = req_pool_indices_repeated[:live]
+            window_floor = (
+                swa_replay_start[:live] if swa_replay_start is not None else None
+            )
             if self.encoder_replay:
-                starts = torch.ones_like(raw_positions, dtype=torch.bool)
+                starts = torch.ones_like(window_positions, dtype=torch.bool)
                 starts[1:] = (
-                    req_pool_indices_repeated[1:] != req_pool_indices_repeated[:-1]
+                    window_req[1:] != window_req[:-1]
                 )
                 offset = torch.arange(
-                    raw_positions.numel(), device=raw_positions.device
+                    window_positions.numel(), device=window_positions.device
                 )
                 group_first = torch.cummax(torch.where(starts, offset, 0), dim=0).values
-                swa_replay_start = raw_positions - (offset - group_first)
-            elif swa_replay_start is None and self.encoder_row_floor is not None:
-                # Folded replay: hits floor every row at their replay start;
-                # MLP-sync padding rows follow the real ones with floor 0.
-                swa_replay_start = _pad_rows(
+                window_floor = window_positions - (offset - group_first)
+            if window_floor is None and self.encoder_row_floor is not None:
+                window_floor = _pad_rows(
                     self.encoder_row_floor, num_rows=raw_positions.shape[0]
-                )
-            live = request_window_live_rows
+                )[:live]
             request_layout = window_layout(
-                req_pool_indices_repeated[:live],
-                raw_positions[:live],
+                window_req,
+                window_positions,
                 capacity=self.token_to_kv_pool.request_window.capacity,
-                floor=None if swa_replay_start is None else swa_replay_start[:live],
+                floor=window_floor,
                 num_groups=num_groups,
                 padded_rows=None if live is None else raw_positions.numel(),
             )

@@ -57,6 +57,18 @@ class QuantizeMethodBase(ABC):
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""
 
+    # Whether apply consumes a per-token INT8 (q, scale) ``input_quant_args`` pair.
+    supports_prequantized_input: bool = False
+
+    def enable_prequantized_input(self, layer: torch.nn.Module) -> bool:
+        """Opt ``layer`` into a fused per-token INT8 (q, scale) operand.
+
+        Methods shared across models keep the operand off until a model asks for
+        it, so one model's fusion does not change another's numerics. Returns
+        whether ``layer`` now takes the operand.
+        """
+        return self.supports_prequantized_input
+
     def create_weights(
         self,
         layer: torch.nn.Module,

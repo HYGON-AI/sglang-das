@@ -5,7 +5,7 @@ import ctypes
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -25,33 +25,24 @@ class TestEngramHipRuntime(CustomTestCase):
         self.addCleanup(engram._hip_runtime.cache_clear)
 
     def test_resolves_loaded_runtime_and_caches_binding(self):
-        for amd_path in ("/opt/rocm/lib/libamdhip64.so", None):
-            with self.subTest(amd_path=amd_path):
-                engram._hip_runtime.cache_clear()
-                galaxy_path = "/opt/dtk/lib/libgalaxyhip.so"
-                paths = {"libamdhip64": amd_path, "libgalaxyhip": galaxy_path}
-                library = MagicMock()
-                with (
-                    patch.object(engram, "find_loaded_library", side_effect=paths.get)
-                    as finder,
-                    patch.object(engram.ctypes, "CDLL", return_value=library) as loader,
-                ):
-                    self.assertIs(engram._hip_runtime(), library)
-                    self.assertIs(engram._hip_runtime(), library)
-                    loader.assert_called_once_with(amd_path or galaxy_path)
-                    expected = [call("libamdhip64")]
-                    if amd_path is None:
-                        expected.append(call("libgalaxyhip"))
-                    self.assertEqual(finder.call_args_list, expected)
-                self.assertIs(library.hipHostGetDevicePointer.restype, ctypes.c_int)
-                self.assertEqual(
-                    library.hipHostGetDevicePointer.argtypes,
-                    [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint],
-                )
+        library = MagicMock()
+        with patch.object(
+            engram, "get_loaded_hip_runtime", return_value=library
+        ) as loader:
+            self.assertIs(engram._hip_runtime(), library)
+            self.assertIs(engram._hip_runtime(), library)
+            loader.assert_called_once_with()
+        self.assertIs(library.hipHostGetDevicePointer.restype, ctypes.c_int)
+        self.assertEqual(
+            library.hipHostGetDevicePointer.argtypes,
+            [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint],
+        )
 
     def test_missing_runtime_does_not_load_another_library(self):
         with (
-            patch.object(engram, "find_loaded_library", return_value=None),
+            patch.object(
+                engram, "get_loaded_hip_runtime", side_effect=RuntimeError("not loaded")
+            ),
             patch.object(engram.ctypes, "CDLL") as loader,
         ):
             with self.assertRaisesRegex(RuntimeError, "not loaded"):

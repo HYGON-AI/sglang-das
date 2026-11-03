@@ -252,8 +252,13 @@ class CompressedTensorsConfig(QuantizationConfig):
 
             if (
                 _is_hcu
-                and get_moe_runner_backend().is_deep_gemm()
-                and get_moe_a2a_backend().is_deepep()
+                and (
+                    (
+                        get_moe_runner_backend().is_deep_gemm()
+                        and get_moe_a2a_backend().is_deepep()
+                    )
+                    or get_moe_a2a_backend().is_megamoe()
+                )
                 and self.quant_format == CompressionFormat.pack_quantized.value
             ):
                 scheme = self._get_moe_projection_scheme(layer, prefix)
@@ -275,7 +280,9 @@ class CompressedTensorsConfig(QuantizationConfig):
                             HCUW4A8Int8DeepEPMoEMethod,
                         )
 
-                        return HCUW4A8Int8DeepEPMoEMethod(self)
+                        return HCUW4A8Int8DeepEPMoEMethod(
+                            self, use_mega_moe=get_moe_a2a_backend().is_megamoe()
+                        )
 
             layer.scheme = self.get_moe_scheme(layer=layer, layer_name=prefix)
             if layer.scheme is None:  # ignored layer
@@ -1403,6 +1410,16 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
     def __init__(self, quantization_config: CompressedTensorsConfig):
         self.quantization_config = quantization_config
         self.quant_config = quantization_config
+        # Off until a model opts this layer in; see enable_prequantized_input.
+        self.supports_prequantized_input = False
+
+    def enable_prequantized_input(self, layer: torch.nn.Module) -> bool:
+        # One instance per layer, so the flag mirrors that layer's scheme.
+        if not layer.scheme.prequantized_input_eligible:
+            return False
+        layer.scheme.supports_prequantized_input = True
+        self.supports_prequantized_input = True
+        return True
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)

@@ -1339,12 +1339,20 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.paged_draft_layers = draft_layers - draft_ring_layers
         self.request_window_bytes = 0
         if self.encoder_replay:
-            slots = self.requested_max_running_requests_per_worker + 1
+            # Decode also owns preallocated PD receive slots. They need rings
+            # even before they enter the runnable batch.
+            slots = self._get_num_req_slots(
+                self.requested_max_running_requests_per_worker
+            )
             capacity = ceil_align(
                 self.sliding_window_size + self.online_c128_mtp_max_draft_tokens,
                 self.page_size,
             )
-            layers = self.num_layers_total
+            layers = (
+                self.swa_priced_layers - 1
+                if self.use_cp_cache_layer_split
+                else self.num_layers_total
+            )
             scratch = (
                 max(
                     get_schedule().chunked_prefill_size,

@@ -22,6 +22,13 @@ class CompressedTensorsLinearScheme(BaseLinearScheme):
     of different quantization schemes supported by CompressedTensors.
     """
 
+    # Whether apply_weights can consume a per-token symmetric INT8 (q, scale)
+    # ``input_quant_args`` pair from a fused norm / SwiGLU kernel.
+    prequantized_input_eligible: bool = False
+    # Whether this layer was opted into that pair; see
+    # CompressedTensorsLinearMethod.enable_prequantized_input.
+    supports_prequantized_input: bool = False
+
     @classmethod
     def get_min_capability(cls) -> int:
         """

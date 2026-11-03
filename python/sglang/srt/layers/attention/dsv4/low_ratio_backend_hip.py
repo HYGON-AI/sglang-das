@@ -59,6 +59,7 @@ from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     _as_int_list,
+    _extend_k_slots,
 )
 
 if TYPE_CHECKING:
@@ -473,19 +474,6 @@ def low_ratio_index_topk_hip_decode(
         indexer_metadata.compressed_page_size,
         raw_indices,
     )
-
-
-def _extend_k_slots(req_to_token, *, ratio, lc_per_req, req_pool_indices, device):
-    """Per request, the c1/c2 pool slots of its visible compressed positions, and
-    each request's start offset in their concatenation."""
-    starts = [0, *itertools.accumulate(lc_per_req)][:-1]
-    counts = torch.tensor(lc_per_req, dtype=torch.int64, device=device)
-    req_rows = torch.repeat_interleave(req_pool_indices.to(torch.int64), counts)
-    j = torch.arange(int(counts.sum()), device=device) - torch.repeat_interleave(
-        torch.tensor(starts, dtype=torch.int64, device=device), counts
-    )
-    slots = req_to_token[req_rows, j * ratio].to(torch.int64) // ratio
-    return slots, starts
 
 
 def low_ratio_index_topk_hip_extend(

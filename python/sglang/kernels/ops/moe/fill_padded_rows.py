@@ -17,6 +17,7 @@ def _fill_padded_rows_kernel(
     n_cols,
     fill_value,
     stride_row,
+    stride_col,
     BLOCK_COLS: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -24,15 +25,13 @@ def _fill_padded_rows_kernel(
     if row >= n_valid:
         cols = tl.arange(0, BLOCK_COLS)
         mask = cols < n_cols
-        ptrs = out_ptr + row * stride_row + cols
+        ptrs = out_ptr + row * stride_row + cols * stride_col
         fill = tl.full((BLOCK_COLS,), fill_value, dtype=out_ptr.dtype.element_ty)
         tl.store(ptrs, fill, mask=mask)
 
 
 def _can_fuse_padded_region(x: torch.Tensor) -> bool:
-    # The fused kernel uses one program per row and assumes a row-major 2D
-    # tensor (columns contiguous); fall back to eager for anything else.
-    return x.dim() == 2 and x.stride(1) == 1
+    return x.dim() >= 2
 
 
 def _fill_padded_rows(
@@ -67,12 +66,22 @@ def _fill_padded_rows(
         )
     if num_token_non_padded.device != x.device:
         raise ValueError("num_token_non_padded and x must be on the same device")
-    n_rows, n_cols = x.shape
+    if x.dim() < 2:
+        raise ValueError(
+            f"padded-row fill expects at least 2 dimensions, got {x.dim()}"
+        )
+
+    copy_back = x.dim() != 2 or x.stride(0) <= 0 or x.stride(1) <= 0
+    work = x.contiguous().view(x.shape[0], -1) if copy_back else x
+    n_rows, n_cols = work.shape
     _fill_padded_rows_kernel[(n_rows,)](
-        x,
+        work,
         num_token_non_padded,
         n_cols,
         fill_value,
-        x.stride(0),
+        work.stride(0),
+        work.stride(1),
         BLOCK_COLS=triton.next_power_of_2(n_cols),
     )
+    if copy_back:
+        x.copy_(work.view_as(x))

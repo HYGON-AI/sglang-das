@@ -10,6 +10,7 @@ import ctypes
 import errno
 import functools
 import glob
+import inspect
 import logging
 import mmap
 import os
@@ -36,7 +37,7 @@ from sglang.kernels.ops.embeddings.engram_hash import (
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.cuda_wrapper import (
-    find_loaded_library,
+    get_loaded_hip_runtime,
 )
 from sglang.srt.distributed.parallel_state import inplace_all_reduce
 from sglang.srt.environ import envs
@@ -70,9 +71,48 @@ _use_hcu_fused_engram_gate = is_hcu() and get_bool_env_var(
 )
 
 
+_use_hcu_fused_engram_hash_ids = is_hcu() and get_bool_env_var(
+    "SGLANG_HCU_OPT_ENGRAM_HASH_IDS", default="true"
+)
+
+
 _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 
 _is_hip = is_hip()
+
+_hcu_engram_hash_op = None
+_hcu_engram_hash_op_loaded = False
+_hcu_engram_hash_op_supports_block = False
+
+
+def _load_hcu_engram_hash_op(*, require_block: bool = False):
+    """Load once; older LightOp wheels may support EXTEND but not VERIFY."""
+    global _hcu_engram_hash_op, _hcu_engram_hash_op_loaded
+    global _hcu_engram_hash_op_supports_block
+    if not _hcu_engram_hash_op_loaded:
+        try:
+            from lightop.engram import engram_hash_ids_hcu
+        except (ImportError, AttributeError):
+            pass
+        else:
+            _hcu_engram_hash_op = engram_hash_ids_hcu
+            try:
+                block_param = inspect.signature(engram_hash_ids_hcu).parameters.get(
+                    "block"
+                )
+            except (TypeError, ValueError):
+                block_param = None
+            _hcu_engram_hash_op_supports_block = block_param is not None and (
+                block_param.kind
+                in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                )
+            )
+        _hcu_engram_hash_op_loaded = True
+    if require_block and not _hcu_engram_hash_op_supports_block:
+        return None
+    return _hcu_engram_hash_op
 
 
 def _cuda_kernels(t: torch.Tensor) -> bool:
@@ -477,6 +517,59 @@ class EngramHasher(nn.Module):
         """Non-CUDA fallback of the hash kernel: predecessor table [T, n] and hash ids.
         ``history`` is already the per-request [bs, n - 1] rows of this batch."""
         n = self.max_ngram_size
+        if (
+            _use_hcu_fused_engram_hash_ids
+            and input_ids.is_cuda
+            and kmode in (MODE_EXTEND, MODE_VERIFY)
+            and n == 4
+            and self.multipliers.shape == (2, 4)
+            and self.primes.shape == (2, 3, 8)
+        ):
+            op = _load_hcu_engram_hash_op(require_block=kmode == MODE_VERIFY)
+            if op is not None:
+                if kmode == MODE_VERIFY:
+                    if all(
+                        x.is_contiguous() for x in (input_ids, positions, history)
+                    ):
+                        return op(
+                            input_ids,
+                            positions,
+                            history,
+                            None,
+                            None,
+                            self.token_map,
+                            self.multipliers,
+                            self.primes,
+                            self.offsets,
+                            num_real,
+                            self.pad_id,
+                            self.image_token_id,
+                            MM_PAD_SHIFT_VALUE,
+                            block=block,
+                        )
+                elif (
+                    row is not None
+                    and starts is not None
+                    and all(
+                        x.is_contiguous()
+                        for x in (input_ids, positions, history, row, starts)
+                    )
+                ):
+                    return op(
+                        input_ids,
+                        positions,
+                        history,
+                        row,
+                        starts,
+                        self.token_map,
+                        self.multipliers,
+                        self.primes,
+                        self.offsets,
+                        num_real,
+                        self.pad_id,
+                        self.image_token_id,
+                        MM_PAD_SHIFT_VALUE,
+                    )
         num_tokens = input_ids.shape[0]
         device = input_ids.device
         input_ids = input_ids.to(torch.int64)
@@ -661,15 +754,7 @@ def _hip_runtime() -> ctypes.CDLL:
     torch.cuda.cudart() does not expose hipHostGetDevicePointer, so call it
     through ctypes to map a registered host address to its device address.
     """
-    path = find_loaded_library("libamdhip64")
-    if path is None:
-        # HCU DTK maps the real library name rather than its libamdhip64 symlink.
-        path = find_loaded_library("libgalaxyhip")
-    if path is None:
-        raise RuntimeError(
-            "HIP runtime (libamdhip64 or libgalaxyhip) is not loaded in the current process"
-        )
-    lib = ctypes.CDLL(path)
+    lib = get_loaded_hip_runtime()
     lib.hipHostGetDevicePointer.restype = ctypes.c_int
     lib.hipHostGetDevicePointer.argtypes = [
         ctypes.POINTER(ctypes.c_void_p),
@@ -696,20 +781,35 @@ def _registered_device_ptr(host_ptr: int) -> int:
 class _HostTable:
     """Host-memory backing for one engram table ('shared' or 'per_rank' layout).
 
-    Lives for the whole process: the mapping, the memfd and the cudaHostRegister
-    pin are never released because the table is read by every forward.
+    Lives for the whole process: shared allocations, mappings and registration
+    pins remain alive because the table is read by every forward.
     """
 
     def __init__(self, layout: str, nbytes: int, name: str, group):
         if layout not in ("shared", "per_rank"):
+            layout_env = (
+                envs.SGLANG_HCU_DSV41_ENGRAM_HOST_TABLE_LAYOUT
+                if is_hcu()
+                else envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT
+            )
             raise ValueError(
-                f"Invalid SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT={layout!r}; expected "
+                f"Invalid {layout_env.name}={layout!r}; expected "
                 "'shared' or 'per_rank'"
             )
         self.layout = layout
         self.nbytes = nbytes
         self.group = group
         self.dirty = False
+        self._shared_manager = None
+        if layout == "shared" and is_hcu():
+            from sglang.srt.utils.host_shared_memory import HostSharedMemoryManager
+
+            self._shared_manager = HostSharedMemoryManager(
+                name, group=group, use_hsa_ipc=True
+            )
+            self.bytes = self._shared_manager.malloc(shape=(nbytes,), dtype=torch.uint8)
+            self.device_ptr = self._shared_manager.device_pointer(self.bytes)
+            return
         if layout == "shared":
             self.fd = self._open_shared_fd(nbytes, name)
             self.mm = mmap.mmap(
@@ -794,6 +894,15 @@ class _HostTable:
         self.dirty = False
         if self.layout == "shared":
             self.group.barrier()
+        if self._shared_manager is not None:
+            logger.info(
+                "engram host table %s: layout=shared, backend=hsa_ipc, "
+                "%.0f MiB shared by %d ranks via HostSharedMemoryManager",
+                label,
+                self.nbytes / 2**20,
+                self.group.world_size,
+            )
+            return
         mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
         if self.layout == "per_rank":
             # The loader's own reads refilled the page cache; empty it again so the
@@ -855,11 +964,13 @@ def shard_range(
 class EngramEmbedding(nn.Module):
     """One layer's fp8 hash table with e8m0 block scales, dequantized on lookup.
 
-    Rows are sharded over the TP group in device memory, aligned to the hash
-    columns where they divide evenly (`shard_range`); with
-    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE they live in host memory instead, as
-    one shared copy or one shard per rank (see _HostTable). Loading is sharded
-    in every layout: a rank writes only its own row range.
+    Rows are sharded over TP, aligned to hash columns when divisible; with
+    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE they live in host memory instead.
+    HCU also enables host storage with SGLANG_HCU_ENABLE_DSV41_ENGRAM_HOST_TABLE,
+    which defaults to true, and uses its own layout setting (shared by default).
+    HCU shared storage requires HSA_USERPTR_FOR_PAGED_MEM=0 at startup;
+    otherwise the table remains sharded in device memory.
+    Loading is sharded in every layout: a rank writes only its own row range.
     """
 
     def __init__(
@@ -878,9 +989,13 @@ class EngramEmbedding(nn.Module):
         )
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
-        if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
+        host_table_enabled = (
+            envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get()
+            or (is_hcu() and envs.SGLANG_HCU_ENABLE_DSV41_ENGRAM_HOST_TABLE.get())
+        )
+        if host_table_enabled:
             self._init_host_table(num_embeddings, dim, layer_id)
-        else:
+        if self.host_table is None:
             self.weight = nn.Parameter(
                 torch.empty(self.rows, dim, dtype=torch.float8_e4m3fn),
                 requires_grad=False,
@@ -895,7 +1010,18 @@ class EngramEmbedding(nn.Module):
         self.scale.weight_loader = self._load_rows
 
     def _init_host_table(self, num_embeddings: int, dim: int, layer_id: int):
-        layout = envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
+        hcu = is_hcu()
+        layout = (
+            envs.SGLANG_HCU_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
+            if hcu
+            else envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
+        )
+        if (
+            hcu
+            and layout == "shared"
+            and os.environ.get("HSA_USERPTR_FOR_PAGED_MEM") != "0"
+        ):
+            return
         n = num_embeddings if layout == "shared" else self.rows
         w_bytes = n * dim
         s_bytes = n * (dim // FP8_BLOCK_SIZE)

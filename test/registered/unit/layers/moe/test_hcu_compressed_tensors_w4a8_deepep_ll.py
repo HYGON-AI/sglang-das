@@ -428,6 +428,33 @@ class TestHCUCompressedTensorsW4A8DeepEPLL(CustomTestCase):
 
 
 class TestHCUW4A8Reference(CustomTestCase):
+    def test_hipc_masked_wrapper_returns_output_not_launch_metadata(self):
+        from sglang.srt.layers.moe.ep_moe.layer import (
+            m_grouped_w4a8_gemm_nt_masked_hipc_wrapper,
+        )
+
+        output = torch.zeros((2, 8, 16), dtype=torch.bfloat16)
+        mask = torch.tensor([3, 2], dtype=torch.int32)
+        activations = torch.ones((2, 8, 16), dtype=torch.int8)
+        scales = torch.ones((2, 8, 1))
+
+        def gemm(a, b, d, masked_m, expected_m):
+            self.assertIs(d, output)
+            self.assertIs(masked_m, mask)
+            self.assertEqual(expected_m, 8)
+            d.fill_(7)
+            return (64, 144)
+
+        with patch(
+            "sglang.srt.layers.moe.ep_moe.layer.m_grouped_w4a8_gemm_nt_masked_hipc",
+            side_effect=gemm,
+        ):
+            actual = m_grouped_w4a8_gemm_nt_masked_hipc_wrapper(
+                activations, scales, activations, scales, output, mask, 8
+            )
+        self.assertIs(actual, output)
+        torch.testing.assert_close(output, torch.full_like(output, 7))
+
     def setUp(self):
         for target, value in (
             ("sglang.srt.layers.moe.ep_moe.layer._use_w4a8_contiguous_hipc", True),
@@ -480,7 +507,8 @@ class TestHCUW4A8Reference(CustomTestCase):
         torch.nn.Module.__init__(layer)
         layer.scheme = None
         layer.quant_method = Mock(hcu_w4a8_hipc=True)
-        layer.moe_runner_config = SimpleNamespace(activation="silu", swiglu_limit=10.0)
+        layer.moe_runner_config = SimpleNamespace(activation="silu", swiglu_limit=10.0,
+                                                   local_shared_experts_without_dispatch=False)
         layer.use_hcu_w4a8_reference = True
         layer.deprecate_flag = False
         layer.quant_config = self.config
@@ -524,17 +552,20 @@ class TestHCUW4A8Reference(CustomTestCase):
             hidden_states_scale=torch.ones((2, 1)),
             topk_ids=ids,
             topk_weights=weights,
-            num_recv_tokens_per_expert=[256, 512],
+            num_recv_tokens_per_expert=[256, 512, 0],
         )
         layer = self.make_reference_layer(
-            w13_weight_scale=torch.ones((2, 32, 1)),
-            w2_weight_scale=torch.ones((2, 16, 1)),
+            w13_weight_scale=torch.ones((3, 32, 1)),
+            w2_weight_scale=torch.ones((3, 16, 1)),
             w13_weight=object(),
             w2_weight=object(),
             w4a8_padded_intermediate_size=16,
         )
 
         def scatter(q, scale, topk, counts, output, out_scale, total, **kwargs):
+            torch.testing.assert_close(counts, counts_gpu, atol=0, rtol=0)
+            self.assertEqual(total, 768)
+            self.assertTrue(kwargs["counts_are_aligned"])
             self.assertEqual(output.shape, (768, 16))
             output.zero_()
             out_scale.fill_(1)
@@ -563,7 +594,30 @@ class TestHCUW4A8Reference(CustomTestCase):
                             input[indices[token, slot]] * topk_weights[token, slot]
                         )
 
+        make_tensor = torch.tensor
+        counts_gpu = make_tensor([256, 512, 0], dtype=torch.int32)
+        counts_host = Mock()
+        counts_host.to.return_value = counts_gpu
+
+        def tensor(*args, **kwargs):
+            if kwargs.get("pin_memory"):
+                self.assertEqual(args, ([256, 512, 0],))
+                self.assertEqual(
+                    kwargs,
+                    {"dtype": torch.int32, "pin_memory": True, "device": "cpu"},
+                )
+                return counts_host
+            return make_tensor(*args, **kwargs)
+
         with (
+            patch("torch.tensor", side_effect=tensor),
+            patch(
+                "sglang.srt.layers.moe.ep_moe.layer.get_offloader"
+            ) as offloader,
+            patch(
+                "sglang.srt.layers.moe.ep_moe.layer.copy_list_to_gpu_no_ce",
+                return_value=counts_gpu,
+            ) as copy_no_ce,
             patch(
                 "lightop.quant.per_token_quant_int8",
             ) as quantize,
@@ -580,13 +634,26 @@ class TestHCUW4A8Reference(CustomTestCase):
             ),
             patch("lightop.fuse_silu_mul_clamp_quant", new=activation),
         ):
-            result = layer.run_moe_core(dispatch)
+            for forbid_copy_engine in (False, True):
+                with self.subTest(forbid_copy_engine=forbid_copy_engine):
+                    offloader.return_value.forbid_copy_engine_usage = forbid_copy_engine
+                    counts_host.to.reset_mock()
+                    copy_no_ce.reset_mock()
+                    result = layer.run_moe_core(dispatch)
+                    if forbid_copy_engine:
+                        copy_no_ce.assert_called_once_with([256, 512, 0])
+                        counts_host.to.assert_not_called()
+                    else:
+                        copy_no_ce.assert_not_called()
+                        counts_host.to.assert_called_once_with(
+                            device=x.device, non_blocking=True
+                        )
+                    torch.testing.assert_close(
+                        result.hidden_states, x.to(torch.bfloat16), atol=0, rtol=0
+                    )
+                    self.assertIsInstance(result, DeepEPNormalCombineInput)
+                    self.assertIs(result.topk_ids, ids)
         quantize.assert_not_called()
-        torch.testing.assert_close(
-            result.hidden_states, x.to(torch.bfloat16), atol=0, rtol=0
-        )
-        self.assertIsInstance(result, DeepEPNormalCombineInput)
-        self.assertIs(result.topk_ids, ids)
         layer.quant_method.apply.assert_not_called()
 
     def test_reference_normal_rejects_unaligned_counts(self):
@@ -856,6 +923,146 @@ class TestHCUW4A8Reference(CustomTestCase):
         torch.testing.assert_close(result.hidden_states, expected)
         self.assertIs(result.topk_ids, dispatch.topk_ids)
         layer.dispatcher.record_combine_input_ready_event.assert_called_once_with()
+
+    def test_megamoe_factory_bypasses_old_scheme_for_prefill(self):
+        layer = self.make_layer()
+        with (
+            patch(
+                "sglang.srt.layers.quantization.compressed_tensors.compressed_tensors._is_hcu",
+                True,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.compressed_tensors.compressed_tensors.get_moe_runner_backend",
+                return_value=MoeRunnerBackend.AUTO,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.compressed_tensors.compressed_tensors.get_moe_a2a_backend",
+                return_value=MoeA2ABackend.MEGAMOE,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.slimquant_w4a8_marlin.get_disagg",
+                return_value=SimpleNamespace(disaggregation_mode="prefill"),
+                create=True,
+            ),
+            patch.object(
+                self.config,
+                "get_moe_scheme",
+                side_effect=AssertionError("MegaMoE must not create the old CT scheme"),
+            ),
+        ):
+            method = self.config.get_quant_method(layer, "model.layers.0.mlp.experts")
+        self.assertIsInstance(method, HCUW4A8Int8DeepEPMoEMethod)
+        self.assertTrue(method.use_mega_moe)
+        self.assertIs(method.quant_config, self.config)
+        self.assertIsNone(layer.scheme)
+
+    def test_megamoe_rejects_non_prefill_before_loading(self):
+        for role in ("decode", "null"):
+            with self.subTest(role=role), patch(
+                "sglang.srt.layers.quantization.slimquant_w4a8_marlin.get_disagg",
+                return_value=SimpleNamespace(disaggregation_mode=role),
+                create=True,
+            ):
+                with self.assertRaisesRegex(ValueError, "prefill"):
+                    HCUW4A8Int8DeepEPMoEMethod(self.config, use_mega_moe=True)
+
+    def test_megamoe_keeps_unsupported_quantization_on_original_path(self):
+        self.scheme["weights"].actorder = "group"
+        layer = self.make_layer()
+        sentinel = object()
+        with (
+            patch(
+                "sglang.srt.layers.quantization.compressed_tensors.compressed_tensors._is_hcu",
+                True,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.compressed_tensors.compressed_tensors.get_moe_runner_backend",
+                return_value=MoeRunnerBackend.AUTO,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.compressed_tensors.compressed_tensors.get_moe_a2a_backend",
+                return_value=MoeA2ABackend.MEGAMOE,
+            ),
+            patch.object(self.config, "get_moe_scheme", return_value=sentinel),
+        ):
+            method = self.config.get_quant_method(layer, "model.layers.0.mlp.experts")
+        self.assertNotIsInstance(method, HCUW4A8Int8DeepEPMoEMethod)
+        self.assertIs(layer.scheme, sentinel)
+
+    def test_megamoe_ct_weights_are_packed_once_with_true_channel_scales(self):
+        layer = self.make_layer()
+        with patch(
+            "sglang.srt.layers.quantization.slimquant_w4a8_marlin.get_disagg",
+            return_value=SimpleNamespace(disaggregation_mode="prefill"),
+            create=True,
+        ):
+            method = HCUW4A8Int8DeepEPMoEMethod(self.config, use_mega_moe=True)
+        method.create_weights(layer, 2, 32, 16, torch.float32)
+        layer.dispatcher = Mock()
+        expected_weights = []
+        for prefix, n, k in (("w13", 32, 32), ("w2", 32, 16)):
+            q = ((torch.arange(2 * n * k).reshape(2, n, k) * 7) % 16 - 8).to(
+                torch.int8
+            )
+            unsigned = q.to(torch.uint8) + 8
+            ct = (
+                (unsigned[..., 0::2] | (unsigned[..., 1::2] << 4))
+                .contiguous()
+                .view(torch.int32)
+                .transpose(1, 2)
+                .contiguous()
+            )
+            getattr(layer, prefix + "_weight_packed").data.copy_(ct)
+            getattr(layer, prefix + "_weight_scale").data.fill_(0.5)
+            expected_weights.append(
+                (((q[..., 0::2].to(torch.uint8) & 15) << 4)
+                 | (q[..., 1::2].to(torch.uint8) & 15)).view(torch.int8)
+            )
+        packed_inputs = []
+
+        def pack(weight):
+            torch.testing.assert_close(weight, expected_weights[len(packed_inputs)])
+            packed_inputs.append(weight.clone())
+            return weight + 1
+
+        with (
+            patch("sglang.srt.layers.moe.mega_moe._is_hcu", True),
+            patch(
+                "sglang.srt.layers.moe.mega_moe.get_hcu_mega_moe_runtime",
+                return_value="megamoe",
+            ),
+            patch(
+                "sglang.srt.layers.moe.mega_moe.get_exec",
+                return_value=SimpleNamespace(moe=SimpleNamespace(enable_eplb=False)),
+            ),
+            patch(
+                "sglang.srt.model_executor.cuda_graph_config.cuda_graph_fully_disabled",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.eplb.expert_location.get_global_expert_location_metadata",
+                return_value=None,
+            ),
+            patch("deepgemm.pack_w4a8_moe_hipc_weight", side_effect=pack),
+            patch(
+                "sglang.srt.layers.quantization.slimquant_w4a8_marlin.w4a8_weight_repack_impl",
+                side_effect=AssertionError("Do not perform a DeepEP/Marlin repack first"),
+            ),
+        ):
+            method.process_weights_after_loading(layer)
+            method.process_weights_after_loading(layer)
+        self.assertEqual(len(packed_inputs), 2)
+        for prefix, expected in zip(("w13", "w2"), expected_weights):
+            self.assertFalse(hasattr(layer, prefix + "_weight_packed"))
+            self.assertFalse(hasattr(layer, prefix + "_weight_low_latency"))
+            torch.testing.assert_close(getattr(layer, prefix + "_weight"), expected + 1)
+            scale = getattr(layer, prefix + "_weight_scale")
+            self.assertEqual(scale.dtype, torch.float32)
+            torch.testing.assert_close(scale, torch.full_like(scale, 0.5))
+        self.assertTrue(layer._mega_moe_hcu_w4a8_weights)
+        self.assertIs(layer.mega_l1_weights[0], layer.w13_weight)
+        self.assertIs(layer.mega_l2_weights[1], layer.w2_weight_scale)
+        layer.dispatcher.set_quant_config.assert_not_called()
 
     def test_factory_bypasses_old_scheme_without_hipc_env(self):
         layer = self.make_layer()
@@ -1178,12 +1385,8 @@ class TestHCUW4A8Reference(CustomTestCase):
                 "sglang.srt.layers.moe.ep_moe.layer._use_w4a8_contiguous_hipc", False
             ),
             patch(
-                "sglang.srt.layers.moe.ep_moe.layer.get_moe_expert_parallel_rank",
-                return_value=3,
-            ),
-            patch(
-                "sglang.srt.layers.moe.ep_moe.layer.get_moe_expert_parallel_world_size",
-                return_value=8,
+                "sglang.srt.layers.moe.ep_moe.layer.get_parallel",
+                return_value=SimpleNamespace(moe_ep_rank=3, moe_ep_size=8),
             ),
             patch(
                 "sglang.srt.layers.quantization.slimquant_w4a8_marlin."

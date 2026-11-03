@@ -74,6 +74,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         self._clear_swa_read_state()
         self._clear_extra_read_state()
         self._clear_indexer_read_state()
+        self._extra_full_read_key: Optional[tuple[int, int]] = None
 
         # SWA, C128, and page-table-driven C4/indexer selections are constant
         # within one forward. Sparse C4 indices remain layer-specific.
@@ -223,7 +224,11 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             self._swa_global_to_local,
             key=lambda layer_id: self._swa_global_to_local[layer_id],
         )
-        swa_layers = swa_layers[: len(self.swa_kv_pool.kv_buffer)]
+        swa_layers = (
+            []
+            if self.request_window is not None
+            else swa_layers[: len(self.swa_kv_pool.kv_buffer)]
+        )
         layout.extend((DSV4_TRANSFER_SWA_KV, layer_id) for layer_id in swa_layers)
 
         layout.extend(
@@ -239,6 +244,12 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             and self._owns_indexer_state_layer_id(layer_id)
         )
         return layout
+
+    def get_swa_window_transfer_layout(self) -> list:
+        if self.request_window is None:
+            return []
+        layer_ids = sorted(self._swa_global_to_local, key=self._swa_global_to_local.get)
+        return self.request_window.transfer_layout(layer_ids)
 
     def get_c128_state_transfer_layout(self) -> list:
         """Descriptors parallel to this rank's C128 state buffer list."""
@@ -261,7 +272,11 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         swa_layers_sorted = sorted(
             self._swa_global_to_local.items(), key=lambda kv: kv[1]
         )
-        swa_layers_kept = swa_layers_sorted[: len(self.swa_kv_pool.kv_buffer)]
+        swa_layers_kept = (
+            []
+            if self.request_window is not None
+            else swa_layers_sorted[: len(self.swa_kv_pool.kv_buffer)]
+        )
         swa_map: dict[int, int] = {
             gid - pp_start: local_id for gid, local_id in swa_layers_kept
         }
@@ -401,6 +416,9 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
                 f"active_pages={selected_pages.numel()}, capacity={staging.shape[0]}"
             )
 
+        if broadcast_kind == "extra":
+            # All Extra ratios alias the same staging storage.
+            self._extra_full_read_key = None
         if broadcast_kind == "extra" and not in_broadcast_slot:
             # A zero-query rank can skip attention and leave the previous extra
             # broadcast active. Drain it before the owner's compact copy writes
@@ -422,7 +440,11 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
                 copy_pages = selected_pages
                 if selected_pages_static:
                     copy_pages = selected_pages.clamp_min(0)
-                staging[:active_pages].copy_(source[copy_pages.to(torch.long)])
+                # Pack directly into staging: advanced indexing would allocate
+                # a full payload and then copy it again before the broadcast.
+                torch.index_select(
+                    source, 0, copy_pages.to(torch.long), out=staging[:active_pages]
+                )
             else:
                 staging[:1].copy_(source[:1])
 
@@ -464,6 +486,13 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             )
         return buffer
 
+    def _swa_read_pool(self):
+        if self.request_window is not None:
+            # Stores and reads address this forward's GLOBAL workspace, not
+            # the persistent request ring nor allocator-global paged SWA.
+            return self.request_window.workspace
+        return self.swa_kv_pool
+
     def _allocate_staging_buffers(self) -> None:
         """Allocate the budgeted worst-case read scratch before serving."""
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -472,10 +501,11 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
                 if self.custom_mem_pool
                 else nullcontext()
             ):
+                swa_pool = self._swa_read_pool()
                 self._staging.allocate(
                     "swa",
-                    self._pool_num_pages(self.swa_kv_pool),
-                    lambda n: self.swa_kv_pool.create_buffer(num_pages=n),
+                    self._pool_num_pages(swa_pool),
+                    lambda n: swa_pool.create_buffer(num_pages=n),
                 )
                 # C4 and C128 are mutually exclusive within a layer. Both use
                 # the same "extra" broadcast slot; the eager layer loop consumes
@@ -507,8 +537,14 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
                     )
 
     def reset_batch_active_pages(self) -> None:
-        """Invalidate batch-constant active-page caches."""
-        for cache in self._batch_active_pages.values():
+        """Reset query plans; a full-history payload also covers replay tails."""
+        for family, cache in self._batch_active_pages.items():
+            if (
+                self._extra_full_read_key is not None
+                and family == self._extra_family_name(self._extra_full_read_key[0])
+            ):
+                cache.remapped = None
+                continue
             cache.selected_pages = None
             cache.remapped = None
             cache.static_selected_pages = False
@@ -587,8 +623,9 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         """Start current-layer SWA page broadcast; caller waits before attention."""
         self.wait_layer_transfer(layer_id)
         self._clear_extra_read_state()
-        max_pages = self._pool_num_pages(self.swa_kv_pool)
-        page_size = self.swa_kv_pool.page_size
+        swa_pool = self._swa_read_pool()
+        max_pages = self._pool_num_pages(swa_pool)
+        page_size = swa_pool.page_size
         swa_cache = self._batch_active_pages["swa"]
         if swa_cache.selected_pages is None:
             static_size = None
@@ -623,7 +660,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         owner_cp = self._get_layer_owner_rank(layer_id)
         owner_buf = None
         if self.cp_rank == owner_cp:
-            owner_buf = self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
+            owner_buf = self.get_swa_raw_buffer(layer_id)
         self._compact_broadcast_for_read(
             layer_id,
             indices,
@@ -794,6 +831,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         read_indices: Optional[torch.Tensor] = None,
         num_reqs: Optional[int] = None,
         read_token_capacity: Optional[int] = None,
+        cache_full_read: bool = False,
     ) -> None:
         """Fetch all pages read by attention or sparse-prefill dequantization."""
         ratio = self.compression_ratios[layer_id]
@@ -803,6 +841,16 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         pool = self.kv_pools[ratio]
         assert pool is not None
         max_pages = self._pool_num_pages(pool)
+        source = self.source_layer_of(layer_id)
+        selected_cache = self._batch_active_pages[self._extra_family_name(ratio)]
+        reuse_full_read = (
+            self._extra_full_read_key == (ratio, source)
+            and layer_id > source
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        if reuse_full_read:
+            # A rank with no queries may not have consumed the source's fetch.
+            self._broadcast_slots.clear("extra")
         static_size = None
         if (
             _USE_STATIC_CP_LAYER_SPLIT_PAGES
@@ -817,7 +865,9 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
                 max_pages,
             )
         async_pages = (
-            static_size is not None and not torch.cuda.is_current_stream_capturing()
+            not reuse_full_read
+            and static_size is not None
+            and not torch.cuda.is_current_stream_capturing()
         )
         # Page-mask all-reduce shares the KV communicator. Keep it off the
         # main stream too, otherwise it serializes Q behind the SWA broadcast.
@@ -828,37 +878,43 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             if async_pages
             else nullcontext()
         ):
-            selected_pages = self._active_pages_for_indices(
-                read_indices if read_indices is not None else indices,
-                pool.page_size,
-                max_pages,
-                static_size,
-            )
-            selected_cache = self._batch_active_pages[self._extra_family_name(ratio)]
-            selected_cache.selected_pages = selected_pages
-            selected_cache.static_selected_pages = static_size is not None
-            staging = self._get_staging_buffer(self._extra_family_name(ratio))
-            source = self.source_layer_of(layer_id)
-            owner_buf = None
-            if self._is_layer_owned(source):
-                owner_buf = pool.kv_buffer[self._low_owner_local_by_source[source]]
-            self._compact_broadcast_for_read(
-                layer_id,
-                indices,
-                owner_buf,
-                staging,
-                selected_pages,
-                pool.page_size,
-                max_pages,
-                broadcast_kind="extra",
-                remap_indices=False,
-                selected_pages_static=selected_cache.static_selected_pages,
-                in_broadcast_slot=async_pages,
-            )
+            if not reuse_full_read:
+                selected_cache.selected_pages = self._active_pages_for_indices(
+                    read_indices if read_indices is not None else indices,
+                    pool.page_size,
+                    max_pages,
+                    static_size,
+                )
+                selected_cache.static_selected_pages = static_size is not None
+                staging = self._get_staging_buffer(self._extra_family_name(ratio))
+                owner_buf = None
+                if self._is_layer_owned(source):
+                    owner_buf = pool.kv_buffer[self._low_owner_local_by_source[source]]
+                self._compact_broadcast_for_read(
+                    layer_id,
+                    indices,
+                    owner_buf,
+                    staging,
+                    selected_cache.selected_pages,
+                    pool.page_size,
+                    max_pages,
+                    broadcast_kind="extra",
+                    remap_indices=False,
+                    selected_pages_static=selected_cache.static_selected_pages,
+                    in_broadcast_slot=async_pages,
+                )
+                if (
+                    cache_full_read
+                    and read_indices is not None
+                    and ratio == 1
+                    and layer_id == source
+                    and async_pages
+                ):
+                    self._extra_full_read_key = (ratio, source)
             self._extra_staging_layer_id = layer_id
             self._extra_remapped_indices = remap_indices_to_staging(
                 indices,
-                selected_pages,
+                selected_cache.selected_pages,
                 pool.page_size,
                 max_pages,
                 static_selected_pages=selected_cache.static_selected_pages,
@@ -933,6 +989,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
     def clear_staging_remap_for_read(self) -> None:
         for kind in self._broadcast_slots.kinds():
             self._broadcast_slots.clear(kind)
+        self._extra_full_read_key = None
         self._clear_swa_read_state()
         self._clear_extra_read_state()
         self._clear_indexer_read_state()
@@ -983,7 +1040,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         """
         if family == "swa":
             assert self._swa_remapped_layer_id == layer_id
-            pool = self.swa_kv_pool
+            pool = self._swa_read_pool()
             selected_cache = self._batch_active_pages["swa"]
         else:
             assert self._extra_staging_layer_id == layer_id
@@ -1087,6 +1144,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         return self._get_staging_buffer(self._extra_family_name(item.compress_ratio))
 
     def get_extra_key_buffer_for_write(self, layer_id: int) -> torch.Tensor | None:
+        self._extra_full_read_key = None
         # Read staging is compact and cannot be addressed with global write
         # slots. Non-owners still compute latents and replicated index-K/state.
         if not self._owns_extra_key_layer_id(layer_id):
@@ -1133,6 +1191,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
     ) -> None:
+        self._extra_full_read_key = None
         if not self._owns_extra_key_layer_id(layer_id):
             return
         if self.compression_ratios[layer_id] in (1, 2):
@@ -1188,6 +1247,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         freqs_cis: Optional[torch.Tensor] = None,
         valid_mask: Optional[torch.Tensor] = None,
     ) -> None:
+        self._extra_full_read_key = None
         if not self._owns_extra_key_layer_id(layer_id):
             return
         if self.compression_ratios[layer_id] in (1, 2):

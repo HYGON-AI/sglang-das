@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 import torch
+from torch.profiler import record_function
 
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
@@ -15,21 +16,78 @@ from sglang.srt.layers.attention.hip_flash_mla import (
     hip_attention_needs_head_pad,
     resolve_hip_flashmla_backend,
 )
+from sglang.srt.layers.fused_rms_quant import (
+    is_lightop_rms_fp8_quant_available,
+    is_lightop_sglang_rms_quant_available,
+    linear_takes_fp8_operand,
+    opt_into_int8_operand,
+    rms_norm_fp8_operand,
+    rms_norm_int8_operand,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.models.deepseek_common.amd import deepseek_v4_gfx95_dense as gfx95_dense
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (  # noqa: F401  deepseek_v4 reaches apply_attention_mhc through this module
     apply_attention_mhc,
+    norm_hosting_sinkhorn,
 )
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_hcu
 
 live_rows = gfx95_dense.live_rows
 wo_a_fp8_grid_matmul = gfx95_dense.wo_a_fp8_grid_matmul
 wo_b_emits_mxfp8 = gfx95_dense.wo_b_emits_mxfp8
 
 _is_gfx95_supported = is_gfx95_supported()
+_is_hcu = is_hcu()
+
+
+def _hcu_fusion_on(env) -> bool:
+    """The V4.1 HCU fusions default on; setting ``env`` to false turns one off."""
+    return _is_hcu and (env.get() if env.is_set() else True)
+
+
+def fused_rmsnorm_fp8_operand_eligible(*linears) -> bool:
+    """Whether an RMSNorm may emit a per-token FP8 operand in the LightOp launch.
+
+    The fused op is per-token and per-rank local (no cross-rank reduction), and
+    the channelwise scheme wq_b checks via ``linear_takes_fp8_operand`` is
+    agnostic to shard width, so PD, EP and DP do not change its correctness --
+    only the attn-TP-local layout `linear_takes_fp8_operand` already gates on.
+    """
+    return bool(
+        _hcu_fusion_on(envs.SGLANG_USE_FUSED_RMS_QUANT)
+        and is_lightop_rms_fp8_quant_available()
+        and linears
+        and all(linear_takes_fp8_operand(linear) for linear in linears)
+    )
+
+
+def fused_rmsnorm_int8_operand_eligible(*linears) -> bool:
+    """INT8 sibling of ``fused_rmsnorm_fp8_operand_eligible``, for W8A8-INT8 and
+    SlimQuant W4A8 linears; opts each linear into the operand, which those shared
+    methods keep off for other models."""
+    return bool(
+        _hcu_fusion_on(envs.SGLANG_USE_FUSED_RMS_QUANT)
+        and is_lightop_sglang_rms_quant_available()
+        and linears
+        and all(opt_into_int8_operand(linear) for linear in linears)
+    )
+
+
+def opt_shared_expert_into_fused_silu_mul_quant(mlp) -> None:
+    """Let the shared-expert down_proj take the fused SwiGLU-clamp FP8 / INT8 operand;
+    which one applies is left to its quant scheme."""
+    shared_experts = getattr(mlp, "shared_experts", None)
+    if shared_experts is None:
+        return
+    down_proj = shared_experts.down_proj
+    down_proj.fused_silu_mul_fp8_quant_enabled = _hcu_fusion_on(
+        envs.SGLANG_USE_FUSED_SILU_MUL_FP8_QUANT
+    )
+    if _hcu_fusion_on(envs.SGLANG_USE_FUSED_SILU_MUL_QUANT):
+        down_proj.fused_silu_mul_int8_quant_enabled = opt_into_int8_operand(down_proj)
 
 
 # ---- MqaAttentionBase / MQALayer ----
@@ -42,9 +100,20 @@ def init_mqa_layer(attn, quant_config) -> None:
     attn.fused_rmsnorm_fake_quant = gfx95_dense.fused_rmsnorm_fake_quant_eligible(
         quant_config
     )
+    init_fused_rmsnorm_operand(attn)
     attn._wq_b_native_consumer_checked = False
     attn._wq_b_native_consumer = False
     attn._wo_b_fp8_grid_operand = None
+
+
+def init_fused_rmsnorm_operand(attn) -> None:
+    """Whether q_norm emits wq_b's per-token FP8 / INT8 operand; V4.1 only."""
+    attn.fused_rmsnorm_fp8_operand = attn.is_dsv41 and (
+        fused_rmsnorm_fp8_operand_eligible(attn.wq_b)
+    )
+    attn.fused_rmsnorm_int8_operand = attn.is_dsv41 and (
+        fused_rmsnorm_int8_operand_eligible(attn.wq_b)
+    )
 
 
 def wo_a_emits_fp8_grid(attn) -> bool:
@@ -68,9 +137,24 @@ def use_fused_qk_norm_rope(attn) -> bool:
 
 def q_norm_for_wq_b(attn, q_lora: torch.Tensor) -> Tuple[torch.Tensor, object]:
     """attn.q_norm(q_lora) as (the bf16 norm the indexer reads, the operand wq_b
-    consumes); on the gfx950 32-block route the second is already on the fp8 grid."""
+    consumes); on the gfx950 32-block route the second is already on the fp8 grid, on
+    the HCU channelwise W8A8-FP8 route the per-token fp8 pair normalized in the same
+    launch, on the HCU W8A8-INT8 / W4A8 route the per-token int8 pair likewise."""
     if attn.fused_rmsnorm_fake_quant:
         return gfx95_dense.q_norm_fake_quant(attn, q_lora)
+    if attn.fused_rmsnorm_fp8_operand:
+        # q_lora may be a wqkv_a slice; the in-place launch needs its own rows.
+        q_lora = q_lora.contiguous()
+        with record_function("dsv4_qnorm_fp8_fused"):
+            operand = rms_norm_fp8_operand(q_lora, attn.q_norm)
+        if operand is not None:
+            return q_lora, operand
+    if attn.fused_rmsnorm_int8_operand:
+        q_lora = q_lora.contiguous()
+        with record_function("dsv4_qnorm_int8_fused"):
+            operand = rms_norm_int8_operand(q_lora, attn.q_norm)
+        if operand is not None:
+            return q_lora, operand
     q_lora = attn.q_norm(q_lora)
     return q_lora, q_lora
 
@@ -162,8 +246,28 @@ def init_decoder_layer(layer, quant_config) -> None:
     layer._wqkv_a_native_consumer_checked = False
     layer._wqkv_a_native_consumer = False
     layer.hc_boundary_fused = (
-        _is_gfx95_supported and layer.hc_pre_from_prev_sublayer and layer.hc_mult == 4
+        (_is_gfx95_supported or (_is_hcu and envs.SGLANG_HCU_FUSED_MHC_BOUNDARY.get()))
+        and layer.hc_pre_from_prev_sublayer
+        and layer.hc_mult == 4
     )
+
+
+def fused_boundary_allowed(forward_batch, tail) -> bool:
+    """Whether this forward may take the fused mHC boundary at all.
+
+    Non-HCU is a no-op: it returns True and the caller still gates on ``_is_hip`` and on
+    the per-layer ``hc_boundary_fused``. HCU runs the boundary only on decode / target
+    verify batches 鈥?prefill keeps the lightop path, and so does any forward carrying a
+    late-layer tail.
+
+    The result depends on the batch alone, never on the layer, so the model loop hoists
+    it out of the layer loop. Keep that invariant (or re-hoist it) if a per-layer tail
+    ever has to run the boundary.
+    """
+    if not _is_hcu:
+        return True
+    mode = forward_batch.forward_mode
+    return tail is None and (mode.is_decode_or_idle() or mode.is_target_verify())
 
 
 def hc_post(cfg, x, residual, post, comb) -> Optional[torch.Tensor]:
@@ -222,6 +326,9 @@ def input_norm(
         return hidden_states, x_quant
     if layer.fused_rmsnorm_fake_quant:
         return gfx95_dense.input_norm_fake_quant(layer, hidden_states, coefficients)
+    if _is_hcu and coefficients is not None:
+        norm = norm_hosting_sinkhorn(layer.input_layernorm, hidden_states, coefficients)
+        return norm, None
     if coefficients is not None:
         coefficients.materialize()
     return layer.input_layernorm(hidden_states), None
