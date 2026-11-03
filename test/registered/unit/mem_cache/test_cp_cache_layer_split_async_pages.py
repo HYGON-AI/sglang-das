@@ -191,7 +191,7 @@ class _Harness:
         comm = SimpleNamespace(change_state=change_state, all_reduce=all_reduce,
                                broadcast=broadcast)
         self.namespace["get_pynccl_broadcast_comm"] = lambda: comm
-        _load_nodes("staging.py", ["build_active_pages_mask", "all_reduce_active_pages_mask",
+        _load_nodes("staging.py", ["_staging_page_map", "build_active_pages_mask", "all_reduce_active_pages_mask",
                     "active_pages_for_indices", "contiguous_request_page_capacity",
                     "_staging_page_map", "remap_indices_to_staging"], self.namespace)
         for name, event in (("build_active_pages_mask", "build"),
@@ -206,7 +206,7 @@ class _Harness:
         methods = ["_swa_read_pool", "_pool_num_pages", "_active_pages_for_indices",
                    "_compact_broadcast_for_read", "_extra_family_name",
                    "_clear_extra_read_state", "prefetch_low_ratio_extra_layer",
-                   "prefetch_swa_layer", "reset_batch_active_pages",
+                   "prefetch_swa_layer", "_swa_read_pool", "reset_batch_active_pages",
                    "_clear_swa_read_state", "_clear_indexer_read_state",
                    "clear_staging_remap_for_read", "prepare_forward",
                    "get_extra_key_buffer_for_write", "set_extra_key_buffer",
@@ -231,6 +231,7 @@ class _Harness:
         self.pool.swa_kv_pool = kv_pool
         self.pool.sliding_window = 128
         self.pool._swa_local_layer_id = lambda layer: 1
+        self.pool.get_swa_raw_buffer = lambda layer: self.reference
         self.pool._low_owner_local_by_source = {4: 1, 6: 1}
         self.pool.source_layer_of = lambda layer: {8: 4, 9: 6}[layer]
         self.pool._get_layer_owner_rank = lambda source: {4: 0, 6: 1}.get(source, 0)
@@ -299,9 +300,10 @@ class _Harness:
 
 
 class TestLayerSplitAsyncPages(CustomTestCase):
-    def _cache_source(self, harness, *, cache_full_read=True):
+    def _cache_source(self, harness, *, cache_full_read=True, ratio=1):
         pool = harness.pool
-        pool.compression_ratios[4] = 1
+        pool.compression_ratios[4] = ratio
+        pool.compression_ratios[8] = ratio
         pool.source_layer_of = lambda layer: {4: 4, 8: 4, 9: 6}[layer]
         pool.prefetch_low_ratio_extra_layer(
             4,
@@ -310,6 +312,106 @@ class TestLayerSplitAsyncPages(CustomTestCase):
             num_reqs=1,
             cache_full_read=cache_full_read,
         )
+
+    def test_ratio2_full_source_payload_reuses_consumer_reads(self):
+        for rank in (0, 1):
+            for empty in (False, True):
+                with self.subTest(rank=rank, empty=empty):
+                    harness = _Harness(rank=rank, peer_pages=(6,))
+                    self._cache_source(harness, ratio=2)
+                    pool = harness.pool
+                    self.assertEqual(pool._extra_full_read_key, (2, 4))
+                    selected = pool._batch_active_pages["extra_c2"].selected_pages
+                    storage = harness.staging.value.clone()
+                    pool._clear_extra_read_state()
+                    indices = torch.empty(0, dtype=torch.int32) if empty else torch.tensor(
+                        [8, 12, -1], dtype=torch.int32
+                    )
+                    pool.prefetch_low_ratio_extra_layer(
+                        8, indices, num_reqs=1, read_token_capacity=13
+                    )
+                    expected = torch.empty(0, dtype=torch.int32) if empty else torch.tensor(
+                        [2, 4, -1], dtype=torch.int32
+                    )
+                    torch.testing.assert_close(pool._extra_remapped_indices, expected)
+                    torch.testing.assert_close(harness.staging.value, storage)
+                    self.assertIs(pool._batch_active_pages["extra_c2"].selected_pages, selected)
+                    self.assertEqual(pool._extra_staging_layer_id, 8)
+                    self.assertFalse(pool._broadcast_slots.pending("extra").active)
+                    for operation in ("build", "all_reduce", "broadcast"):
+                        self.assertEqual(sum(e[0] == operation for e in harness.events), 1)
+
+    def test_ratio2_reuse_is_invalidated_by_forward_or_write(self):
+        for rank in (0, 1):
+            for invalidate in ("forward", "write_view", "write", "fused_write"):
+                with self.subTest(rank=rank, invalidate=invalidate):
+                    harness = _Harness(rank=rank)
+                    self._cache_source(harness, ratio=2)
+                    pool = harness.pool
+                    self.assertEqual(pool._extra_full_read_key, (2, 4))
+                    if invalidate == "forward":
+                        pool.prepare_forward(require_prefetched_reads=True)
+                    else:
+                        pool._owns_extra_key_layer_id = lambda layer: False
+                        if invalidate == "write_view":
+                            pool.get_extra_key_buffer_for_write(4)
+                        elif invalidate == "write":
+                            pool.set_extra_key_buffer(4, None, None)
+                        else:
+                            pool.set_extra_key_buffer_fused(4, None, None)
+                    self.assertIsNone(pool._extra_full_read_key)
+                    harness.fetch(layer=8)
+                    self.assertEqual(sum(e[0] == "broadcast" for e in harness.events), 2)
+
+    def test_ratio2_new_source_replaces_shared_staging(self):
+        for rank in (0, 1):
+            with self.subTest(rank=rank):
+                harness = _Harness(rank=rank)
+                self._cache_source(harness, ratio=2)
+                pool = harness.pool
+                pool.compression_ratios[6] = 2
+                pool.source_layer_of = lambda layer: {4: 4, 6: 6, 8: 4, 9: 6}[layer]
+                harness.reference = harness.reference + 100
+                pool.kv_pools[2].kv_buffer[1] = harness.reference
+                ids = torch.tensor([2, 3, 8, 9, 12, -1], dtype=torch.int32)
+                pool.prefetch_low_ratio_extra_layer(
+                    6, ids[:2], read_indices=ids, num_reqs=1, cache_full_read=True
+                )
+                self.assertEqual(pool._extra_full_read_key, (2, 6))
+                harness.fetch(layer=9, indices=ids)
+                self.assertEqual(sum(e[0] == "broadcast" for e in harness.events), 2)
+                torch.testing.assert_close(harness.staging.value[:3], harness.reference[[1, 4, 6]])
+                torch.testing.assert_close(
+                    pool._extra_remapped_indices,
+                    torch.tensor([0, 1, 2, 3, 4, -1], dtype=torch.int32),
+                )
+
+    def test_ratio2_helper_requires_full_histories_on_every_rank(self):
+        for sparse, extends in ((True, [16, 16]), (True, [1, 16]), (True, []), (False, [16])):
+            with self.subTest(sparse=sparse, extends=extends):
+                harness = _Harness()
+                harness.pool.compression_ratios[8] = 2
+                ids = torch.tensor([2, 3, 8, 9, 12, -1], dtype=torch.int32)
+                core = SimpleNamespace(page_table=torch.zeros((1, 8)),
+                                       sparse_page_indices=lambda ratio: ids[:2])
+                metadata = SimpleNamespace(
+                    sparse_prefill_cache=SimpleNamespace(
+                        num_reqs=1,
+                        ensure_compressed=lambda *args: SimpleNamespace(flat_token_ids=ids),
+                    ), core_attn_metadata=core,
+                )
+                harness.namespace["get_attn_backend"] = lambda: SimpleNamespace(forward_metadata=metadata)
+                harness.namespace["_should_sync_cp_cache_layer_split"] = lambda *args: True
+                harness.namespace["envs"].SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get = lambda: sparse
+                _load_nodes("deepseek_v4_helpers.py",
+                            ["_get_core_attn_metadata", "maybe_prefetch_cp_kv_extra"], harness.namespace)
+                captured = {}
+                harness.pool.prefetch_low_ratio_extra_layer = lambda *args, **kwargs: captured.update(kwargs)
+                harness.namespace["maybe_prefetch_cp_kv_extra"](
+                    harness.pool, 8, SimpleNamespace(extend_seq_lens_cpu=extends)
+                )
+                self.assertEqual(captured["cache_full_read"], sparse and bool(extends) and min(extends) >= 2)
+
 
     def test_full_source_payload_reuses_pages_not_in_source_topk(self):
         for rank in (0, 1):
@@ -587,7 +689,7 @@ class TestLayerSplitAsyncPages(CustomTestCase):
                 harness.pool.request_window = (
                     SimpleNamespace(workspace=harness.pool.swa_kv_pool,
                                     buffer=lambda _: harness.reference)
-                    if options.get("window") else None
+                    if options.get("window") is not None else None
                 )
                 if options.get("legacy"):
                     harness.pool.prefetch_swa_layer(
@@ -684,7 +786,7 @@ class TestLayerSplitAsyncPages(CustomTestCase):
                 harness.pool.request_window = (
                     SimpleNamespace(workspace=harness.pool.swa_kv_pool,
                                     buffer=lambda _: harness.reference)
-                    if options.get("window") else None
+                    if options.get("window") is not None else None
                 )
                 harness.fetch_tail(tail=options.get("tail", True))
                 self.assertIn(("nonzero", "main"), harness.events)

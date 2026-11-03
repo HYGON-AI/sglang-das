@@ -906,7 +906,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
                 if (
                     cache_full_read
                     and read_indices is not None
-                    and ratio == 1
+                    and ratio in (1, 2)
                     and layer_id == source
                     and async_pages
                 ):
