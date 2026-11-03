@@ -98,7 +98,7 @@ def maybe_prefetch_cp_kv_extra(pool, layer_id: int, forward_batch=None) -> None:
                 # every rank builds the full-history gather before this source.
                 # Tail metadata may later drop that cache, but not the KV data.
                 cache_full_read = (
-                    ratio == 1
+                    ratio in (1, 2)
                     and envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
                     and min(forward_batch.extend_seq_lens_cpu, default=0) >= pool.cp_size
                 )
