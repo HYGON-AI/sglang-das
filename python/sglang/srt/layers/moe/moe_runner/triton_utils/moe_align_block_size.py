@@ -283,12 +283,8 @@ def moe_align_block_size(
             torch.full_like(topk_ids, invalid_expert),
             topk_ids,
         )
-        # Support both LightOp preallocated-output API names. Keep the
-        # sentinel routing and initialized padding required by the consumer.
-        align_op = getattr(op, "moe_align_block_size_out", None)
-        if align_op is None:
-            align_op = op.moe_align_block_size
-        align_op(
+        # LightOp's count/sort scratch overflows for batched decode shapes.
+        _hcu_moe_align_block_size_triton(
             hcu_topk_ids,
             num_experts + 1,
             block_size,

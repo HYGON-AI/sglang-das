@@ -135,6 +135,19 @@ padding_size = get_moe_padding_size(_use_aiter)
 logger = logging.getLogger(__name__)
 
 
+@functools.lru_cache(maxsize=1)
+def _get_silu_and_mul_clamp():
+    try:
+        from sglang.kernels.ops.moe.dsv4 import silu_and_mul_clamp
+    except ImportError:
+        logger.warning(
+            "Fused silu_and_mul_clamp is unavailable; falling back to "
+            "explicit clamp and silu_and_mul."
+        )
+        return None
+    return silu_and_mul_clamp
+
+
 class _CodePathChecker:
     def __init__(self):
         self.observed = 0
@@ -1197,17 +1210,15 @@ def _fused_moe_kernel_sequence(
             if not filter_expert:
                 if swiglu_limit_for_silu_and_mul_clamp is not None:
                     _clamped = intermediate_cache1.view(-1, N)
-                    try:
-                        from sglang.kernels.ops.moe.dsv4 import silu_and_mul_clamp
-
+                    silu_and_mul_clamp = _get_silu_and_mul_clamp()
+                    if silu_and_mul_clamp is not None:
                         silu_and_mul_clamp(
                             _clamped,
                             intermediate_cache2,
                             swiglu_limit_for_silu_and_mul_clamp,
                         )
-                    except Exception:
-                        # 兜底：显式 clamp 后再普通 silu_and_mul（语义等价：
-                        # gate 截到 <=limit，up 截到 [-limit, limit]）。
+                    else:
+                        # Preserve the asymmetric clamp when fusion is unavailable.
                         _limit = float(swiglu_limit_for_silu_and_mul_clamp)
                         _gate, _up = _clamped.chunk(2, dim=-1)
                         _gate.clamp_(max=_limit)

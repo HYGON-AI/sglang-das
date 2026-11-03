@@ -55,6 +55,8 @@ QUANTIZATION_CHOICES = [
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
     "slimquant_w4a8",  # Channel-wise INT4 experts with BF16 dense layers.
+    "slimquant_w4a8_marlin",
+    "slimquant_marlin",
     "mxfp_w4a8",  # for NPU W4A8 (MXFP4 weights + MXFP8 activations)
     "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
     "quark_int4fp8_moe",

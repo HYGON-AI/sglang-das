@@ -51,9 +51,9 @@ class EBNFComposer:
     )
 
     CALL_RULE_MAP = {
-        "pythonic": 'call_{name} ::= "{name}" "(" {arguments_rule} ")"',
-        "json": 'call_{name} ::= "{{" ws "\\"name\\"" ws ":" ws "\\"{name}\\"" ws "," ws "\\"arguments\\"" ws ":" ws {arguments_rule} ws "}}"',
-        "xml": 'call_{name} ::= "<function={name}>\\n" {arguments_rule} "\\n</function>"',
+        "pythonic": 'call_{namehash} ::= "{name}" "(" {arguments_rule} ")"',
+        "json": 'call_{namehash} ::= "{{" ws "\\"name\\"" ws ":" ws "\\"{name}\\"" ws "," ws "\\"arguments\\"" ws ":" ws {arguments_rule} ws "}}"',
+        "xml": 'call_{namehash} ::= "<function={name}>\\n" {arguments_rule} "\\n</function>"',
     }
 
     ARGUMENTS_RULE_MAP = {
@@ -235,7 +235,7 @@ class EBNFComposer:
             "function_call ::= "
             + " | ".join(
                 [
-                    f"call_{hash_string_to_short_hex(tool.function.name) if call_rule_fmt else tool.function.name}"
+                    f"call_{hash_string_to_short_hex(tool.function.name)}"
                     for tool in tools
                 ]
             ),
@@ -292,7 +292,13 @@ class EBNFComposer:
             for prop_name, prop_schema in properties.items():
                 value_rule = EBNFComposer.get_value_rule(prop_schema, function_format)
                 # Create key=value pair
-                pair = key_value_template.format(key=prop_name, valrule=value_rule)
+                key = prop_name
+                if function_format == "json" and not key_value_rule_fmt:
+                    # The default JSON template already supplies the JSON quotes.
+                    key = json.dumps(key, ensure_ascii=False)[1:-1]
+                pair = key_value_template.format(
+                    key=EBNFComposer._escape_ebnf_string(key), valrule=value_rule
+                )
                 prop_kv_pairs[prop_name] = pair
 
             # Separate into required and optional while preserving order
@@ -341,12 +347,13 @@ class EBNFComposer:
             arguments_rule = arguments_rule or '""'
 
             # Add the function call rule and its arguments rule
-            namehash = (
-                hash_string_to_short_hex(tool_name) if call_rule_fmt else tool_name
-            )
+            namehash = hash_string_to_short_hex(tool_name)
+            name = tool_name
+            if function_format == "json" and not call_rule_fmt:
+                name = json.dumps(name, ensure_ascii=False)[1:-1]
             ebnf_lines.append(
                 call_template.format(
-                    name=tool_name,
+                    name=EBNFComposer._escape_ebnf_string(name),
                     arguments_rule=f"arguments_{namehash}",
                     namehash=namehash,
                 )

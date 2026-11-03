@@ -1548,8 +1548,11 @@ async def benchmark(
                 image_data=test_request.image_data,
                 extra_request_body=extra_request_body,
             )
+            # Share the measured run's concurrency limit across warmup waves.
             warmup_tasks.append(
-                asyncio.create_task(request_func(request_func_input=warmup_input))
+                asyncio.create_task(
+                    limited_request_func(request_func_input=warmup_input, pbar=None)
+                )
             )
         warmup_outputs.extend(await asyncio.gather(*warmup_tasks))
 

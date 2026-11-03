@@ -392,7 +392,7 @@ class Glm5MoeStreamDetector(Glm5MoeDetector):
                     self._buffer = ""
                     break
                 else:
-                    normal_text = self._buffer[:start]
+                    normal_text += self._buffer[:start]
                     self._buffer = self._buffer[start + len(self.bot_token) :]
                     self._state = Glm5MoeToolParsingState.PARSING_FUNCTION_NAME
             # Case 2: parsing function name
@@ -515,7 +515,7 @@ class Glm5MoeStreamDetector(Glm5MoeDetector):
                 if start == -1:
                     start = self._buffer.find(self.eot_token)
                     if start == -1:
-                        self._buffer = ""
+                        # Keep partial markers until the next chunk arrives.
                         break
                     else:
                         self._buffer = self._buffer[start + len(self.eot_token) :]

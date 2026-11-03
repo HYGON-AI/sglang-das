@@ -984,10 +984,15 @@ class EncoderPreprocessor:
                 # Keep those operations off the event loop while preserving
                 # MMEncoder's explicit device and stream affinity.
                 processor_output = await self._gpu_work_runner(invoke)
-            else:
+            elif (
+                self.encoder_media_processor_config.preprocess_off_event_loop
+                or self.model_type == "deepseek_v41"
+            ):
                 processor_output = await asyncio.get_running_loop().run_in_executor(
                     self.preproc_executor, invoke
                 )
+            else:
+                processor_output = invoke()
             if (
                 isinstance(processor_output, EncoderPreprocessOutput)
                 and processor_output.materialize_local_items is not None
