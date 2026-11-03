@@ -5053,104 +5053,123 @@ class DeepseekV4AttnBackend(
 
         topk = indexer.index_topk
         width = ceil_align(max(lc_per_req), 4)
-        publish = [] if indexer.is_candidate_source else None
+        publish = (
+            [
+                torch.empty((count, 0), dtype=torch.int32, device=q.device)
+                for count in q_lens_cpu
+            ]
+            if indexer.is_candidate_source
+            else None
+        )
         consume = (
             published_masks(self.forward_metadata.candidate_metadata)
             if publish is None and indexer.uses_candidates
             else None
         )
-        # Keep request boundaries intact. ks/ke still address the full gathered K,
-        # including CP-global history; only real (non-padded) Q rows are sliced.
+        # Pack the real Q rows across requests; ks/ke still address the full
+        # gathered K, including CP-global history. Only logits are budget-tiled.
+        requests = []
         offset = 0
         for request, (lc, count) in enumerate(zip(lc_per_req, q_lens_cpu)):
-            blocks_out = torch.empty((count, 0), dtype=torch.int32, device=q.device)
-            if lc and count:
-                step = (
-                    min(rows_per_chunk, 65535)
-                    if candidate_blocks is not None
-                    else rows_per_chunk
-                )
-                for start in range(0, count, step):
-                    end = min(start + step, count)
-                    rows = slice(offset + start, offset + end)
-                    blocks = (
-                        [candidate_blocks[request][start:end]]
-                        if candidate_blocks is not None
-                        else None
-                    )
-                    logits = _hcu_dense_fp4_mqa_logits(
-                        (q[rows].contiguous(), None),
-                        kv,
-                        weights[rows].contiguous(),
-                        ks[rows].contiguous(),
-                        ke[rows].contiguous(),
-                        width,
-                        candidate_blocks=blocks,
-                        candidate_query_lens=[end - start]
-                        if blocks is not None
-                        else None,
-                    )
-                    if publish is not None:
-                        scores = logits[:, :lc]
-                        lens = compress_lens[rows, None]
-                        scores.masked_fill_(
-                            torch.arange(lc, device=q.device)[None, :] >= lens,
-                            -torch.inf,
-                        )
-                        mask, ids = select_candidate_blocks(
-                            scores,
-                            lens,
-                            indexer.candidate_topk_blocks,
-                            indexer.candidate_block_size,
-                            return_block_ids=True,
-                        )
-                        if start == 0:
-                            blocks_out = torch.empty(
-                                (count, ids.shape[1]),
-                                dtype=torch.int32,
-                                device=q.device,
-                            )
-                        blocks_out[start:end].copy_(ids)
-                        del scores, mask, ids
-                    elif consume is not None and blocks is None:
-                        logits[:, :lc].masked_fill_(
-                            ~_prefill_candidate_mask(
-                                consume,
-                                request,
-                                slice(start, end),
-                                lc,
-                                indexer.candidate_block_size,
-                            ),
-                            -torch.inf,
-                        )
-                    selected = torch.empty(
-                        (end - start, topk), dtype=torch.int32, device=q.device
-                    )
-                    topk_transform_ragged_v2(
-                        logits,
-                        compress_lens[rows],
-                        out_offsets=ks[rows],
-                        out_indices=selected,
-                    )
-                    dsv41_ragged_topk_postprocess(
-                        logits,
-                        selected,
-                        ks[rows],
-                        k_slots,
-                        page_indices[rows, :topk],
-                        raw_indices[rows, :topk] if raw_indices is not None else None,
-                        indexer.uses_candidates and not indexer.is_candidate_source,
-                    )
-                    # No concatenation of logits; release all views before the
-                    # next RHS allocation (Python assignment alone retains them).
-                    del selected, logits
-            if publish is not None:
-                publish.append(blocks_out)
+            if count:
+                requests.append((request, lc, offset, offset + count))
             offset += count
+        step = (
+            min(rows_per_chunk, 65535)
+            if candidate_blocks is not None
+            else rows_per_chunk
+        )
+        for start in range(0, offset, step):
+            end = min(start + step, offset)
+            rows = slice(start, end)
+            segments = [
+                (request, lc, lo, max(start, lo), min(end, hi))
+                for request, lc, lo, hi in requests
+                if lo < end and hi > start
+            ]
+            blocks = (
+                [
+                    candidate_blocks[request][lo - base : hi - base]
+                    for request, _, base, lo, hi in segments
+                ]
+                if candidate_blocks is not None
+                else None
+            )
+            logits = _hcu_dense_fp4_mqa_logits(
+                (q[rows].contiguous(), None),
+                kv,
+                weights[rows].contiguous(),
+                ks[rows].contiguous(),
+                ke[rows].contiguous(),
+                width,
+                candidate_blocks=blocks,
+                candidate_query_lens=[hi - lo for _, _, _, lo, hi in segments]
+                if blocks is not None
+                else None,
+            )
+            for request, lc, base, lo, hi in segments:
+                if not lc:
+                    continue
+                local_rows = slice(lo - start, hi - start)
+                request_rows = slice(lo - base, hi - base)
+                if publish is not None:
+                    scores = logits[local_rows, :lc]
+                    lens = compress_lens[lo:hi, None]
+                    scores.masked_fill_(
+                        torch.arange(lc, device=q.device)[None, :] >= lens,
+                        -torch.inf,
+                    )
+                    mask, ids = select_candidate_blocks(
+                        scores,
+                        lens,
+                        indexer.candidate_topk_blocks,
+                        indexer.candidate_block_size,
+                        return_block_ids=True,
+                    )
+                    if lo == base:
+                        publish[request] = torch.empty(
+                            (q_lens_cpu[request], ids.shape[1]),
+                            dtype=torch.int32,
+                            device=q.device,
+                        )
+                    publish[request][request_rows].copy_(ids)
+                    del scores, mask, ids
+                elif consume is not None and blocks is None:
+                    logits[local_rows, :lc].masked_fill_(
+                        ~_prefill_candidate_mask(
+                            consume,
+                            request,
+                            request_rows,
+                            lc,
+                            indexer.candidate_block_size,
+                        ),
+                        -torch.inf,
+                    )
+            selected = torch.empty(
+                (end - start, topk), dtype=torch.int32, device=q.device
+            )
+            topk_transform_ragged_v2(
+                logits,
+                compress_lens[rows],
+                out_offsets=ks[rows],
+                out_indices=selected,
+            )
+            dsv41_ragged_topk_postprocess(
+                logits,
+                selected,
+                ks[rows],
+                k_slots,
+                page_indices[rows, :topk],
+                raw_indices[rows, :topk] if raw_indices is not None else None,
+                indexer.uses_candidates and not indexer.is_candidate_source,
+            )
+            # Release all logits views before allocating the next budget tile.
+            del selected, logits
         if publish is not None:
             self.forward_metadata.candidate_metadata = CandidateMasks(
                 request_block_ids=publish
             )
+
 
     # TODO(candidate): dense-prefill level one / level two inline with masks; move
     # into the candidate indexer as publish_prefill / select_prefill.
