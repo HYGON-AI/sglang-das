@@ -1176,7 +1176,7 @@ class LogitsProcessor(nn.Module):
                 hidden_states.is_cuda and torch.cuda.is_current_stream_capturing()
             )
             return target_vp.project_logits(
-                hidden_states.to(lm_head.weight.dtype),
+                hidden_states.to(target_vp.dtype),
                 padded_rows=hidden_states.shape[0] if capturing else None,
             )
         quant_method = getattr(lm_head, "quant_method", None)

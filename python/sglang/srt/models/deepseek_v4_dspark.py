@@ -1002,10 +1002,18 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.markov_head.configure_tp_shard(lm_head=self.lm_head)
 
     def enable_draft_lm_head_vp(
-        self, *, vp_size: int, max_rows_per_rank: int, local_world_size: int
+        self,
+        *,
+        vp_size: int,
+        max_rows_per_rank: int,
+        local_world_size: int,
+        activation_dtype: Optional[torch.dtype] = None,
     ) -> None:
         from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
-        from sglang.srt.speculative.draft_lm_head_vp import DSparkLMHeadVocabParallel
+        from sglang.srt.speculative.draft_lm_head_vp import (
+            DSparkLMHeadVocabParallel,
+            channelwise_fp8_lm_head_scale,
+        )
 
         if self._use_fp32_lm_head:
             raise ValueError(
@@ -1014,14 +1022,21 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             )
         if self.lm_head is None or int(self.lm_head.tp_size) != 1:
             raise ValueError("DSPARK draft VP requires a replicated DP LM-head.")
-        if should_apply_lm_head_quant_method(self.lm_head, self.lm_head.quant_method):
-            raise ValueError("DSPARK draft VP does not support a quantized LM-head.")
+        head_scale = channelwise_fp8_lm_head_scale(self.lm_head)
+        if head_scale is None and should_apply_lm_head_quant_method(
+            self.lm_head, self.lm_head.quant_method
+        ):
+            raise ValueError(
+                "DSPARK draft VP supports only unquantized or channelwise-FP8 LM-heads."
+            )
         self.draft_lm_head_vp = DSparkLMHeadVocabParallel(
             full_weight=self.lm_head.weight,
             vocab_size=int(self.lm_head.org_vocab_size),
             vp_size=vp_size,
             max_rows_per_rank=max_rows_per_rank,
             local_world_size=local_world_size,
+            weight_scale=head_scale,
+            activation_dtype=activation_dtype,
         )
         self.draft_lm_head_vp.guard_online_weight_updates(self, self.lm_head)
 

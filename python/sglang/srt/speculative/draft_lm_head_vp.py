@@ -296,6 +296,18 @@ class DraftLMHeadVocabParallelTop1:
         )
 
 
+def channelwise_fp8_lm_head_scale(lm_head) -> torch.Tensor | None:
+    """Return the per-row scale when ``lm_head`` uses HCU channelwise FP8."""
+    from sglang.srt.layers.quantization import dsv41_channelwise_fp8
+
+    if isinstance(
+        getattr(lm_head, "quant_method", None),
+        dsv41_channelwise_fp8.ChannelwiseFp8Method,
+    ):
+        return lm_head.weight_scale_inv
+    return None
+
+
 class DSparkLMHeadVocabParallel:
     def __init__(
         self,
@@ -308,6 +320,8 @@ class DSparkLMHeadVocabParallel:
         process_group=None,
         weight_shard_t: torch.Tensor | None = None,
         workspace: DSparkLMHeadVocabParallel | None = None,
+        weight_scale: torch.Tensor | None = None,
+        activation_dtype: torch.dtype | None = None,
     ) -> None:
         if vp_size <= 1 or max_rows_per_rank <= 0:
             raise ValueError(
@@ -315,9 +329,22 @@ class DSparkLMHeadVocabParallel:
             )
         if full_weight.ndim != 2 or full_weight.shape[0] != vocab_size:
             raise ValueError("DSPARK VP requires a full, unpadded 2-D LM-head weight.")
-        if full_weight.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        # Channelwise FP8 keeps E4M3 rows plus one FP32 scale per vocabulary
+        # row, so each shard is a row slice of both and reuses the same GEMM.
+        self.is_channelwise_fp8 = weight_scale is not None
+        if self.is_channelwise_fp8:
+            if (
+                full_weight.dtype != torch.float8_e4m3fn
+                or tuple(weight_scale.shape) != (vocab_size, 1)
+                or activation_dtype not in (torch.float16, torch.bfloat16)
+            ):
+                raise ValueError(
+                    "DSPARK VP channelwise FP8 requires E4M3 weights, [vocab, 1] "
+                    "scales and a BF16/FP16 activation dtype."
+                )
+        elif full_weight.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             raise ValueError(
-                "DSPARK VP requires an unquantized floating-point LM-head."
+                "DSPARK VP requires a floating-point or channelwise FP8 LM-head."
             )
         if vocab_size % vp_size:
             raise ValueError("The vocabulary size must be divisible by DSPARK VP size.")
@@ -384,12 +411,33 @@ class DSparkLMHeadVocabParallel:
         self.vocab_size = vocab_size
         self.hidden_size = full_weight.shape[1]
         self.shard_size = vocab_size // vp_size
-        self.dtype = full_weight.dtype
+        self.dtype = activation_dtype or full_weight.dtype
         self.device = full_weight.device
+        if self.is_channelwise_fp8:
+            # Row-major slices, as the full-head channelwise GEMM consumes them.
+            # A shared workspace comes from the same LM-head, so reuse its shard.
+            self.weight_shard_t = None
+            if workspace is not None:
+                if not workspace.is_channelwise_fp8:
+                    raise ValueError("Shared VP workspace has an incompatible layout.")
+                self.weight_shard = workspace.weight_shard
+                self.weight_scale_shard = workspace.weight_scale_shard
+            else:
+                start = self.vp_rank * self.shard_size
+                self.weight_shard = (
+                    full_weight.detach()
+                    .narrow(0, start, self.shard_size)
+                    .clone(memory_format=torch.contiguous_format)
+                )
+                self.weight_scale_shard = (
+                    weight_scale.detach()
+                    .narrow(0, start, self.shard_size)
+                    .clone(memory_format=torch.contiguous_format)
+                )
         # Own the transposed shard storage, even when a one-row/one-column
         # slice is already contiguous, so releasing the full weight frees it.
         # Contiguous layout also avoids the HCU strided-transpose GEMM issue.
-        if weight_shard_t is None:
+        elif weight_shard_t is None:
             self.weight_shard_t = (
                 full_weight.detach()
                 .narrow(0, self.vp_rank * self.shard_size, self.shard_size)
@@ -416,6 +464,7 @@ class DSparkLMHeadVocabParallel:
                 or workspace.vocab_size != self.vocab_size
                 or workspace.device != self.device
                 or workspace.dtype != self.dtype
+                or workspace.is_channelwise_fp8 != self.is_channelwise_fp8
             ):
                 raise ValueError("Shared VP workspace has an incompatible layout.")
             # Initialization only: expand before either target or draft graphs
@@ -545,7 +594,18 @@ class DSparkLMHeadVocabParallel:
         partial = self.shard_logits[:total]
         received = self.received_logits[:total]
         self._all_gather(gathered, local)
-        torch.mm(gathered, self.weight_shard_t, out=partial)
+        if self.is_channelwise_fp8:
+            from sglang.srt.layers.quantization import dsv41_channelwise_fp8
+
+            dsv41_channelwise_fp8.linear(
+                gathered,
+                self.weight_shard,
+                self.weight_scale_shard,
+                output_dtype=self.dtype,
+                out=partial,
+            )
+        else:
+            torch.mm(gathered, self.weight_shard_t, out=partial)
         self._all_to_all(received, partial)
         self.full_logits[:padded_rows].view(
             padded_rows, self.vp_size, self.shard_size

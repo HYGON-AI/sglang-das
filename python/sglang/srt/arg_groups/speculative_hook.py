@@ -383,8 +383,10 @@ def _validate_dspark_target_lm_head_vp(server_args: ServerArgs) -> None:
             "DSPARK LM-head VP does not support --enable-memory-saver; "
             "its vocabulary shards must remain resident."
         )
+    # Standalone ("null") runs the same DP-attention decode topology on one
+    # node; every DP rank still joins each target LM-head projection.
     if (
-        cfg.disaggregation_mode != "decode"
+        cfg.disaggregation_mode not in ("decode", "null")
         or cfg.pp_size != 1
         or cfg.attn_cp_size != 1
         or cfg.attn_dp_size <= 1
@@ -394,8 +396,12 @@ def _validate_dspark_target_lm_head_vp(server_args: ServerArgs) -> None:
         or cfg.enable_fp32_lm_head
     ):
         raise ValueError(
-            "DSPARK target LM-head VP requires decode, PP1/CP1, attention TP1, "
-            "DP LM-head, and no LoRA or FP32 LM-head."
+            "DSPARK target LM-head VP requires PD decode or standalone mode, "
+            "PP1/CP1, attention TP1, DP LM-head, and no LoRA or FP32 LM-head. "
+            f"Got disaggregation_mode={cfg.disaggregation_mode!r}, "
+            f"pp_size={cfg.pp_size}, attn_cp_size={cfg.attn_cp_size}, "
+            f"dp_size={cfg.attn_dp_size}, tp_size={cfg.tp_size}, "
+            f"enable_dp_lm_head={cfg.enable_dp_lm_head}."
         )
     if cfg.speculative_draft_lm_head_vp_size not in (1, target_vp_size):
         raise ValueError("When both DSPARK VP heads are enabled their sizes must match.")
