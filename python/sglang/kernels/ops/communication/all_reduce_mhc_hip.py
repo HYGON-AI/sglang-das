@@ -1,10 +1,18 @@
 """TP4 tiny-row all-reduce/post using AITER's registered peer buffers."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import torch
-from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
 from aiter.jit.core import AITER_CSRC_DIR
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+
+if TYPE_CHECKING:
+    # AITER allocates a CUDA tensor while importing this class. Processor
+    # discovery imports us in CPU tokenizer workers, which need no GPU context.
+    from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
 
 
 @cache_once

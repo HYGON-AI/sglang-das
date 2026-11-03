@@ -3179,8 +3179,6 @@ class MHATokenToKVPool(KVCache):
             cache_v = cache_v.view(self.store_dtype)
 
         if _kv_layout_hcu_fa and not self.use_hnd:
-            from sglang.srt.model_executor.runner import get_is_capture_mode
-
             page_idxs = loc // self.page_size
             offsets = loc % self.page_size
             self.k_buffer[layer_id - self.start_layer][page_idxs, :, offsets, :] = (
@@ -4718,6 +4716,10 @@ class HybridLinearKVPool(KVCache):
     @property
     def index_kpool(self) -> int:
         return getattr(self.full_kv_pool, "index_kpool", 1)
+
+    @property
+    def slots_per_page(self) -> int:
+        return self.full_kv_pool.slots_per_page
 
     @property
     def index_kpool_compress(self) -> bool:

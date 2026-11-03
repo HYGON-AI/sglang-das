@@ -11,6 +11,7 @@ GPU tensor operations remain in :mod:`server.MMEncoder`.
 import asyncio
 import contextlib
 import logging
+import os
 import threading
 import time
 import uuid
@@ -233,7 +234,16 @@ def launch_server(server_args: ServerArgs):
         _register_encoder_url_with_bootstrap()
         atexit.register(_unregister_encoder_url_from_bootstrap)
 
-    uvicorn.run(app, host=get_serving().host, port=get_serving().port)
+    # Keep the historical uvicorn default unless the deployment explicitly
+    # changes it. This is an environment-controlled knob for separating
+    # listener backlog pressure from encoder processing pressure.
+    http_backlog = int(os.environ.get("SGLANG_ENCODER_HTTP_BACKLOG", "2048"))
+    uvicorn.run(
+        app,
+        host=get_serving().host,
+        port=get_serving().port,
+        backlog=http_backlog,
+    )
 
 
 def _summarise_dp_broadcast(results: List[dict]) -> Response:
@@ -379,6 +389,31 @@ async def handle_encode_request(request: dict):
         )
 
 
+@app.post("/abort")
+async def handle_abort_request(request: dict):
+    """Accept exact part IDs for retirement, without claiming RDMA has stopped."""
+    req_ids = request.get("req_ids")
+    if (
+        not isinstance(req_ids, list)
+        or not req_ids
+        or any(not isinstance(req_id, str) or not req_id for req_id in req_ids)
+    ):
+        return ORJSONResponse(
+            status_code=HTTPStatus.BAD_REQUEST,
+            content={"status": "error", "message": "req_ids must be nonempty strings"},
+        )
+    req_ids = list(dict.fromkeys(req_ids))
+    if dp_dispatcher is not None:
+        await dp_dispatcher.abort_requests(req_ids)
+    else:
+        for req_id in req_ids:
+            await encoder.request_abort(req_id)
+    return ORJSONResponse(
+        status_code=HTTPStatus.ACCEPTED,
+        content={"status": "accepted", "req_ids": req_ids},
+    )
+
+
 @app.post("/send")
 async def handle_send_request(request: dict):
     """Mooncake-only: drive the RDMA push of a staged embedding. The zmq
@@ -415,7 +450,11 @@ async def handle_send_request(request: dict):
     except Exception as error:
         logger.error("Mooncake send failed for req_id=%s: %s", req_id, error)
         return ORJSONResponse(
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            status_code=(
+                int(error.code)
+                if isinstance(error, MMError)
+                else HTTPStatus.INTERNAL_SERVER_ERROR
+            ),
             content={
                 "status": "error",
                 "message": str(error),
@@ -474,8 +513,15 @@ async def handle_scheduler_receive_meta_data(request: dict):
             )
     if meta is None or meta.get("error") is not None:
         message = meta["error"] if meta else "encode metadata missing"
+        # Preserve the encoder's real status, e.g. 400 for an undecodable
+        # image, instead of collapsing every failure to 500. The prefill
+        # forwards this code to the client, so a client error must not be
+        # reported as a server fault.
+        error_code = (meta.get("error_code") if meta else None) or int(
+            HTTPStatus.INTERNAL_SERVER_ERROR
+        )
         return ORJSONResponse(
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            status_code=int(error_code),
             content={"status": "error", "message": message, "req_id": req_id},
         )
     return ORJSONResponse(
@@ -593,6 +639,13 @@ async def health_generate():
             "part_idx": 0,
         }
 
+        # If real traffic is already flowing, the encoder is by definition
+        # alive and a dummy forward adds nothing. Check before taking the
+        # dispatch lock: the lock is held for the whole batch (broadcast +
+        # rank-0 forward), so waiting on it would let a busy-but-healthy
+        # encoder look unhealthy to a short client probe and get evicted.
+        if encoder.has_pending_embeddings():
+            return Response(status_code=200)
         # A health encode participates in the same TP collectives as a real
         # request. Serialize its broadcast and rank-0 forward with every other
         # collective dispatch, then recheck whether traffic made the probe

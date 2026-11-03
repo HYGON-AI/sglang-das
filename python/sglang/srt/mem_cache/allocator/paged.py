@@ -29,18 +29,29 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     get_bool_env_var,
     get_num_new_pages,
-    is_hip,
     is_hcu,
+    is_hip,
     next_power_of_2,
 )
 
 _is_hip = is_hip()
 _is_hcu = is_hcu()
 if _is_hcu:
-    from sgl_kernel.kvcacheio import (
-        hcu_alloc_decode_kernel,
-        hcu_alloc_extend_kernel as sgl_kernel_alloc_extend_kernel,
-    )
+    try:
+        from sgl_kernel.kvcacheio import (
+            hcu_alloc_decode_kernel,
+        )
+        from sgl_kernel.kvcacheio import (
+            hcu_alloc_extend_kernel as sgl_kernel_alloc_extend_kernel,
+        )
+    except ImportError:
+        # Older vendor wheels export the same kernels under the DCU name.
+        from sgl_kernel.kvcacheio import (
+            dcu_alloc_decode_kernel as hcu_alloc_decode_kernel,
+        )
+        from sgl_kernel.kvcacheio import (
+            dcu_alloc_extend_kernel as sgl_kernel_alloc_extend_kernel,
+        )
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache

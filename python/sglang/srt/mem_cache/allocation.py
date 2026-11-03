@@ -46,10 +46,13 @@ _is_cpu = is_cpu()
 _is_hcu = is_hcu()
 
 if _is_hcu:
-    from sgl_kernel.kvcacheio import (
-        hcu_assign_req_to_token_pool,
-        hcu_get_last_loc,
-    )
+    try:
+        from sgl_kernel.kvcacheio import hcu_assign_req_to_token_pool, hcu_get_last_loc
+    except ImportError:
+        from sgl_kernel.kvcacheio import (
+            dcu_assign_req_to_token_pool as hcu_assign_req_to_token_pool,
+        )
+        from sgl_kernel.kvcacheio import dcu_get_last_loc as hcu_get_last_loc
 
 if _is_cpu:
     from sgl_kernel import assign_req_to_token_pool_cpu

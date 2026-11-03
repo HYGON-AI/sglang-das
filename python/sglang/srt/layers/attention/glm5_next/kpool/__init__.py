@@ -13,7 +13,6 @@ Public API:
     init_pooled_paged_mqa_metadata, update_pooled_paged_mqa_metadata
 """
 
-from sglang.srt.layers.attention.glm5_next.kpool.indexer import IndexerKPool
 from sglang.srt.layers.attention.glm5_next.kpool.planner import (
     KPoolCpInfo,
     KPoolExtendPlan,
@@ -40,3 +39,13 @@ __all__ = [
     "update_kpool_write_plan_multi_decode",
     "update_pooled_paged_mqa_metadata",
 ]
+
+
+def __getattr__(name):
+    # The indexer imports the backend's TopkTransformMethod. Keep this export
+    # lazy so importing the backend's planner does not form a package cycle.
+    if name == "IndexerKPool":
+        from sglang.srt.layers.attention.glm5_next.kpool.indexer import IndexerKPool
+
+        return IndexerKPool
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

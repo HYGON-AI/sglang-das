@@ -20,7 +20,13 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
 
 import torch
 import triton
-from sgl_kernel.flash_mla import hcu_create_flashmla_kv_indices
+
+try:
+    from sgl_kernel.flash_mla import hcu_create_flashmla_kv_indices
+except ImportError:
+    from sgl_kernel.flash_mla import (
+        dcu_create_flashmla_kv_indices as hcu_create_flashmla_kv_indices,
+    )
 
 from sglang.kernels.ops.attention.utils import (
     create_flashmla_kv_indices_triton,
@@ -53,8 +59,8 @@ try:
             from flash_mla import flash_mla_with_kvcache_fp8  # only support fp8_e4m3
             from flash_mla import (
                 flash_mla_with_kvcache,
-                flash_mla_with_kvcache_quantization,
                 flash_mla_with_kvcache_fp8_with_cat,
+                flash_mla_with_kvcache_quantization,
             )
             from flash_mla import (
                 get_mla_decoding_metadata_dense_fp8 as get_mla_metadata,  # get_mla_metadata,

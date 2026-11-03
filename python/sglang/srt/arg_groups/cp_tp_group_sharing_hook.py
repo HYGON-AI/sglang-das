@@ -12,6 +12,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.utils import is_hcu
 
 # Architectures whose model code implements CP-TP group sharing: the CP group
 # is the TP group, the residual stream / attention / indexer are CP-sharded,
@@ -26,10 +27,20 @@ _SUPPORTED_MODELS: set[str] = {
 
 def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
     cfg, view = resolving_view(server_args), resolved_view(server_args)
+    architecture = (getattr(model.hf_config, "architectures", None) or [None])[0]
+    if is_hcu() and architecture in (
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "Glm5VNextForCausalLM",
+        "Glm5VNextForConditionalGeneration",
+    ):
+        # HCU keeps TX's CP/MHC and LayerSplit path, not the generic shared
+        # CP/TP topology, which excludes disaggregated LayerSplit serving.
+        return
     if (
         not cfg.enable_prefill_cp
         or view.attn_cp_size <= 1
-        or model.hf_config.architectures[0] not in _SUPPORTED_MODELS
+        or architecture not in _SUPPORTED_MODELS
     ):
         return
     # Attention DP or attention TP would leave the CP group narrower than TP.
@@ -39,9 +50,7 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
             f"attn_cp_size={view.attn_cp_size}, tp_size={cfg.tp_size}."
         )
     strategy = (
-        "interleave"
-        if model.hf_config.architectures[0] == "Glm5NextForConditionalGeneration"
-        else "zigzag"
+        "interleave" if architecture == "Glm5NextForConditionalGeneration" else "zigzag"
     )
     if cfg.cp_strategy != strategy:
         raise ValueError(f"CP-TP group sharing requires --cp-strategy {strategy}.")
@@ -51,7 +60,7 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
     # have their own topology and model-boundary contracts. Only GLM-5.3-Flash
     # has its MTP ported.
     if cfg.speculative_algorithm is not None:
-        if model.hf_config.architectures[0] != "Glm5NextForConditionalGeneration":
+        if architecture != "Glm5NextForConditionalGeneration":
             raise ValueError(
                 "--speculative-algorithm is not supported with CP-TP group sharing."
             )
@@ -70,7 +79,7 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         "enable-mixed-chunk": cfg.enable_mixed_chunk,
         "moe-dp-size > 1": cfg.moe_dp_size > 1,
     }
-    if model.hf_config.architectures[0] == "Qwen4ExpForConditionalGeneration":
+    if architecture == "Qwen4ExpForConditionalGeneration":
         unsupported |= {
             # The MoE runs TP experts on rows gathered over the TP group.
             # Waterfill turns on DeepEP and EP after this hook.

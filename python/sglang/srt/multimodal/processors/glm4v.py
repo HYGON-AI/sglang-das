@@ -547,6 +547,9 @@ def _passthrough_video_metadata(video, video_config):
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
     tokenizes_input_text = True
+    # EPD must reuse the request tokenizer output. Re-encoding the escaped GLM
+    # image markers can split them into ordinary tokens with newer tokenizers.
+    prefer_tokenized_input = True
     smart_rgb_conversion = True
     video_preprocessing_device = "cpu"
     models = [
@@ -616,6 +619,8 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         spatial_merge_size = getattr(self, "spatial_merge_size", 1)
         image_start_token_id = getattr(self, "IMAGE_START_TOKEN_ID", None)
         image_end_token_id = getattr(self, "IMAGE_END_TOKEN_ID", None)
+        video_start_token_id = getattr(self, "VIDEO_START_TOKEN_ID", None)
+        video_end_token_id = getattr(self, "VIDEO_END_TOKEN_ID", None)
 
         input_ids = []
         offsets = []
@@ -624,9 +629,35 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
 
         vision_start_indices = []
         for i in range(len(prompt) - 1):
-            if img_token_id is not None and prompt[i + 1] == img_token_id:
+            # A user prompt can contain the raw video special token as ordinary
+            # text (the stress workload generates token IDs directly).  Treat a
+            # visual token as a placeholder only when it has the complete GLM-V
+            # start/token/end structure; otherwise leave it in the text stream.
+            has_image_markers = (
+                image_start_token_id is None or prompt[i] == image_start_token_id
+            ) and (
+                image_end_token_id is None
+                or i + 2 < len(prompt)
+                and prompt[i + 2] == image_end_token_id
+            )
+            has_video_markers = (
+                video_start_token_id is None or prompt[i] == video_start_token_id
+            ) and (
+                video_end_token_id is None
+                or i + 2 < len(prompt)
+                and prompt[i + 2] == video_end_token_id
+            )
+            if (
+                img_token_id is not None
+                and prompt[i + 1] == img_token_id
+                and has_image_markers
+            ):
                 vision_start_indices.append((i, Modality.IMAGE))
-            elif video_token_id is not None and prompt[i + 1] == video_token_id:
+            elif (
+                video_token_id is not None
+                and prompt[i + 1] == video_token_id
+                and has_video_markers
+            ):
                 vision_start_indices.append((i, Modality.VIDEO))
 
         img_idx = 0
@@ -637,6 +668,10 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             input_ids.extend(prompt[cur_idx : mm_start_idx + 1])
 
             if modality == Modality.IMAGE:
+                if img_grid_thw is None or img_idx >= len(img_grid_thw):
+                    raise ValueError(
+                        "GLM-V image placeholder has no matching image grid metadata"
+                    )
                 mm_token_num = int(
                     img_grid_thw[img_idx].prod() // (spatial_merge_size**2)
                 )
@@ -645,8 +680,21 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                 offsets.append((mm_offset_start, len(input_ids) - 1))
                 img_idx += 1
             elif modality == Modality.VIDEO:
+                if video_grid_thw is None or video_idx >= len(video_grid_thw):
+                    raise ValueError(
+                        "GLM-V video placeholder has no matching video grid metadata"
+                    )
+                if video_timestamps is None or video_idx >= len(video_timestamps):
+                    raise ValueError(
+                        "GLM-V video placeholder has no matching video timestamps"
+                    )
                 curr_timestamps = video_timestamps[video_idx]
                 num_frames = int(video_grid_thw[video_idx][0])
+                if len(curr_timestamps) < num_frames:
+                    raise ValueError(
+                        "GLM-V video timestamps are shorter than the video frame count: "
+                        f"got {len(curr_timestamps)} for {num_frames} frames"
+                    )
                 frame_seqlen = int(video_grid_thw[video_idx][1:].prod()) // (
                     spatial_merge_size**2
                 )

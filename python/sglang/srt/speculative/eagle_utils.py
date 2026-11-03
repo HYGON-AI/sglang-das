@@ -29,6 +29,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_pin_memory_available,
     is_xpu,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
@@ -98,7 +99,9 @@ def _sync_eagle_verify_outputs(verify_state: torch.Tensor) -> None:
     from sglang.srt.distributed import get_tp_group
     from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 
-    if not is_dp_attention_enabled() or get_parallel().dp_size == 1:
+    # dp_size counts outer replicas; attention-DP is normalized separately.
+    # Using dp_size here would broadcast unrelated attention-DP requests together.
+    if not is_dp_attention_enabled() or get_parallel().num_dp_ranks == 1:
         # With one DP replica the full TP group contains exactly the ranks
         # whose scheduler state must agree. Reuse its proven fast communicator
         # instead of serializing decode behind the CP attention communicator.
@@ -800,8 +803,6 @@ def eagle_sample(
     Verify and find accepted tokens based on logits output and batch
     (which contains spec decoding information).
     """
-    import torch.nn.functional as F
-
     from sglang.srt.sampling.penaltylib.repetition_penalty import (
         apply_scaling_penalties,
     )
@@ -1146,8 +1147,16 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     for r in batch.reqs:
         r.decode_batch_idx += 1
 
-    cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
-    nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
+    # HIP can block the host while staging a pageable H2D copy even when
+    # non_blocking=True. Pin these scheduler-side lengths so preparation can
+    # reach DP coordination while the preceding forward is still in flight.
+    pin_memory = is_pin_memory_available(batch.device)
+    cur_kv_lens_cpu = torch.tensor(
+        cur_kv_lens, dtype=torch.int32, device="cpu", pin_memory=pin_memory
+    )
+    nxt_kv_lens_cpu = torch.tensor(
+        nxt_kv_lens, dtype=torch.int32, device="cpu", pin_memory=pin_memory
+    )
 
     # Fail fast if the page>1 + topk>1 draft over-allocation
     # (get_alloc_reserve_per_decode) outgrows the req_to_token row: the write below

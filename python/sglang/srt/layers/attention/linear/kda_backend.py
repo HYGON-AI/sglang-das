@@ -39,10 +39,12 @@ _use_hcu_cc1d = is_hcu() and get_bool_env_var(
     "SGLANG_KDA_USE_CAUSAL_CONV1D_HCU", default="true"
 )
 if _use_hcu_cc1d:
-    from causal_conv1d import (
-        causal_conv1d_fn_hcu as _hcu_causal_conv1d_fn,
-        causal_conv1d_update as _hcu_causal_conv1d_update,
-    )
+    try:
+        from causal_conv1d import causal_conv1d_fn_hcu as _hcu_causal_conv1d_fn
+    except ImportError:
+        # Existing DAS wheels expose the same varlen ABI under the DCU name.
+        from causal_conv1d import causal_conv1d_fn_dcu as _hcu_causal_conv1d_fn
+    from causal_conv1d import causal_conv1d_update as _hcu_causal_conv1d_update
 
 if is_npu():
     from sgl_kernel_npu.mamba.causal_conv1d import causal_conv1d_update_npu
@@ -575,6 +577,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
         self.use_hcu_kda = self.req_to_token_pool.mamba_pool.use_hcu_kda
         self.hcu_kernel = None
+        self.hcu_prefill_kernel = None
         if self.use_hcu_kda:
             from sglang.srt.layers.attention.linear.kernels.kda_hcu import HcuKDAKernel
 
@@ -597,13 +600,35 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
         if self.use_hcu_kda:
             if not all(
-                backend.is_triton()
+                backend.is_triton() or backend.is_flashkda()
                 for backend in (decode_backend, prefill_backend, verify_backend)
             ):
                 raise ValueError(
-                    "HCU KDA uses the source Triton decode, prefill and verify kernels"
+                    "HCU KDA uses the source Triton decode, prefill and verify "
+                    "kernels (prefill may additionally select flashkda)"
+                )
+            if not decode_backend.is_triton() or not verify_backend.is_triton():
+                raise ValueError(
+                    "HCU KDA uses the source Triton decode and verify kernels; "
+                    "only prefill may select flashkda"
                 )
             self.kernel_dispatcher = None
+            if prefill_backend.is_flashkda():
+                from sglang.srt.layers.attention.linear.kernels.kda_flashkda import (
+                    FlashKDAKernel,
+                )
+
+                # FlashKDA serves plain extends; inputs and modes its kernel
+                # math cannot take (unsafe gate, draft-extend-v2) are routed
+                # by its wrapper back to the source Triton chunk_kda.
+                # decode / target_verify stay on self.hcu_kernel.
+                self.hcu_prefill_kernel = FlashKDAKernel(
+                    fallback_kernel=self.hcu_kernel
+                )
+                rank0_log(
+                    "HCU KDA prefill: flashkda with Triton chunk_kda fallback; "
+                    "decode and verify stay on Triton."
+                )
         else:
             self.kernel_dispatcher = KDAKernelDispatcher(
                 decode_backend, prefill_backend, verify_backend
@@ -833,7 +858,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 ]
             )
             if (
-                self.kernel_dispatcher.extend_kernel.uses_state_checkpoints
+                self.kernel_dispatcher is not None
+                and self.kernel_dispatcher.extend_kernel.uses_state_checkpoints
                 and forward_batch.forward_mode.is_extend_without_speculative()
                 and self.forward_metadata.track_ssm_h_src is not None
                 and self.forward_metadata.track_ssm_h_src.numel() > 0
@@ -2106,6 +2132,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # on a smaller tensor, then re-pad core_attn_out with zeros so the
         # caller sees the [N_pad, ...] shape it expects.
         n_total = mixed_qkv.shape[0]
+        if n_total == 0:
+            # Idle DP ranks still enter the model for MoE collectives, but have
+            # no local convolution or recurrent state to update.
+            return mixed_qkv.new_empty((1, 0, layer.num_v_heads, layer.head_v_dim))
         n_valid = (
             (
                 sum(forward_batch.extend_seq_lens_cpu)
@@ -2282,25 +2312,50 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 b = b.reshape(1, q.shape[1], -1).float().sigmoid() * getattr(
                     layer, "beta_scale", 1.0
                 )
-            core_attn_out = self.hcu_kernel.extend(
-                q=q,
-                k=k,
-                v=v,
-                g=a,
-                beta=b,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                A_log=layer.A_log,
-                dt_bias=layer.dt_bias,
-                beta_scale=getattr(layer, "beta_scale", 1.0),
-                lower_bound=(
-                    getattr(layer, "lower_bound", None)
-                    if getattr(layer, "safe_gate", True)
-                    else None
-                ),
-                return_intermediate_state=forward_metadata.has_mamba_track_mask,
+            lower_bound = (
+                getattr(layer, "lower_bound", None)
+                if getattr(layer, "safe_gate", True)
+                else None
             )
+            if self.hcu_prefill_kernel is not None:
+                core_attn_out = self.hcu_prefill_kernel.extend(
+                    q,
+                    k,
+                    v,
+                    a,
+                    b,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    A_log=layer.A_log,
+                    dt_bias=layer.dt_bias,
+                    lower_bound=lower_bound,
+                    extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                    # draft_extend_v2 must stay rollback-able and FlashKDA
+                    # commits state in place, so route it to the fallback.
+                    is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
+                    return_intermediate_states=forward_metadata.has_mamba_track_mask,
+                )
+            else:
+                core_attn_out = self.hcu_kernel.extend(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=a,
+                    beta=b,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    A_log=layer.A_log,
+                    dt_bias=layer.dt_bias,
+                    beta_scale=getattr(layer, "beta_scale", 1.0),
+                    lower_bound=(
+                        getattr(layer, "lower_bound", None)
+                        if getattr(layer, "safe_gate", True)
+                        else None
+                    ),
+                    return_intermediate_state=forward_metadata.has_mamba_track_mask,
+                )
 
             if forward_metadata.has_mamba_track_mask:
                 core_attn_out, h = core_attn_out

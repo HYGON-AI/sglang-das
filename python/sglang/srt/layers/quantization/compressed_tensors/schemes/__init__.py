@@ -11,8 +11,10 @@ from .compressed_tensors_w4a4_mxint4_moe import CompressedTensorsMxInt4MoE
 from .compressed_tensors_w4a4_nvfp4 import CompressedTensorsW4A4Fp4
 from .compressed_tensors_w4a4_nvfp4_moe import CompressedTensorsW4A4Nvfp4MoE
 from .compressed_tensors_w4a8_fp8_moe import CompressedTensorsW4AFP8MoE
-from .compressed_tensors_w4a8_int8_moe import (
+from .compressed_tensors_w4a8_int8_hcu_moe import (
     HCUCompressedTensorsW4A8Int8DynamicMoE,
+)
+from .compressed_tensors_w4a8_int8_moe import (
     NPUCompressedTensorsW4A8Int8DynamicMoE,
 )
 from .compressed_tensors_w4a8_mxfp4_moe import NPUCompressedTensorsW4A8mxfp4MoE

@@ -24,7 +24,6 @@ from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_postprocess,
 )
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
-
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -239,6 +238,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
         self._init_dsa_index_share_state()
+        logger.info(
+            "MTP DSA index sharing: enabled=%s, draft_extend_seed=%s, seed_width=%s",
+            self.index_share_for_mtp_iteration,
+            self.seed_dsa_topk_from_draft_extend,
+            self.dsa_seed_topk_width,
+        )
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
         self.tree_mask_mode = default_tree_mask_mode()
@@ -342,9 +347,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             getattr(hf_config, "index_share_for_mtp_iteration", False)
             and self.topk == 1
         )
-        # Carrying draft-extend's indexer top-k into GLM DSA's first draft
-        # step lowers EAGLE acceptance on HCU. Recompute that first top-k and
-        # still share it across the remaining draft steps.
+        # GLM-5.2 MTP IndexShare: seed reused indexer top-k from draft-extend
+        # (last verified token), not draft-decode step 0.
         self.dsa_index_topk = getattr(hf_config, "index_topk", None)
         self.dsa_seed_topk_width = (
             get_dsa_mtp_topk_width(hf_config)
@@ -352,11 +356,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else None
         )
         self.seed_dsa_topk_from_draft_extend = (
-            self.index_share_for_mtp_iteration
-            and self.dsa_seed_topk_width is not None
-            and not (
-                _is_hcu and getattr(hf_config, "model_type", None) == "glm_moe_dsa"
-            )
+            self.index_share_for_mtp_iteration and self.dsa_seed_topk_width is not None
         )
 
     def init_token_map(self):
@@ -639,7 +639,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             from sglang.srt.layers.attention.glm5_next.dsa_backend import (
                 NativeSparseAttnBackend,
             )
-
             from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
                 QwenSparseAttnBackend,
             )

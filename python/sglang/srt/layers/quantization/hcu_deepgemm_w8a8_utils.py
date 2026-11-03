@@ -93,7 +93,12 @@ def prepare_w8a8_int8_deepgemm_weights(layer: torch.nn.Module) -> None:
                 low_memory=True,
             )
 
-        pack_masked_weight = _pack_w8a8_int8_asm_masked_weight
+        from deepgemm import marlin_i8_masked_weight
+
+        def pack_masked_weight(weight: torch.Tensor) -> torch.Tensor:
+            return marlin_i8_masked_weight(
+                weight, shuffle_unique=0, backend="cooperative", low_memory=True
+            )
     elif arch == "gfx936":
         from deepgemm import pack_w8a8_gfx936_weight_to_w6 as pack_weight
     else:

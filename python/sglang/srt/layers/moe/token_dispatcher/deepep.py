@@ -438,11 +438,16 @@ class DeepEPBuffer:
                     incompatible.append(
                         f"hidden size {state.hidden_size} != requested {hidden_size}"
                     )
-                if deepep_mode.enable_normal() and not state.deepep_mode.enable_normal():
+                if (
+                    deepep_mode.enable_normal()
+                    and not state.deepep_mode.enable_normal()
+                ):
                     incompatible.append("existing buffer has no normal-mode allocation")
                 if deepep_mode.enable_low_latency():
                     if not state.deepep_mode.enable_low_latency():
-                        incompatible.append("existing buffer has no low-latency allocation")
+                        incompatible.append(
+                            "existing buffer has no low-latency allocation"
+                        )
                     if (
                         state.num_max_dispatch_tokens_per_rank
                         != num_max_dispatch_tokens_per_rank
@@ -750,6 +755,17 @@ class _DeepEPDispatcherImplBase:
         raise NotImplementedError
 
     def set_quant_config(self, quant_config: dict) -> None:
+        # GLM's mixed checkpoints select a wire format per layer. Normalize
+        # their flags to the shared dispatcher contract without dropping the
+        # HCU/NPU dtype, overlap, or producer-event settings.
+        quant_config = dict(quant_config)
+        if quant_config.get("bf16_dispatch", False):
+            quant_config["preserve_input_dtype"] = True
+            quant_config["dispatcher_output_dtype"] = "bf16"
+            quant_config.pop("hcu_w4a8_int8_dispatch", None)
+        elif _is_hcu and quant_config.get("int8_dispatch", False):
+            quant_config["hcu_w4a8_int8_dispatch"] = True
+            quant_config["dispatcher_output_dtype"] = "int8"
         self.quant_config = quant_config
         self.set_deepep_dispatcher_dtype()
 
@@ -1009,14 +1025,30 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
         _deepep_precompile_tp_barrier()
         npu_quantization_opts = self._get_quantization_kwargs(buffer)
-        needs_256_alignment = _hcu_deepgemm_is_selected() or (
-            use_groupgemm
-            and (
-                get_model().quantization
-                in ("slimquant_marlin", "slimquant_w4a8_marlin")
-                or _use_fp8_w8a8_moe
-                or _use_marlin_w16a16_moe
-                or self.quant_config.get("preserve_input_dtype", False)
+        # GLM uses the legacy grouped HIPC kernels even when the generic
+        # DeepGEMM runner is not selected. Their INT8 rows, and the grouped
+        # BF16 draft path, still require 256-row expert segments.
+        needs_256_alignment = (
+            (
+                _is_hcu
+                and (
+                    self.quant_config.get("bf16_dispatch", False)
+                    or (
+                        self.quant_config.get("int8_dispatch", False)
+                        and get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
+                    )
+                )
+            )
+            or _hcu_deepgemm_is_selected()
+            or (
+                use_groupgemm
+                and (
+                    get_model().quantization
+                    in ("slimquant_marlin", "slimquant_w4a8_marlin")
+                    or _use_fp8_w8a8_moe
+                    or _use_marlin_w16a16_moe
+                    or self.quant_config.get("preserve_input_dtype", False)
+                )
             )
         )
         (
@@ -1253,6 +1285,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 not _hcu_deepgemm_is_selected()
                 # DeepEPMoE kept the HCU groupgemm kernels: vendor quant_type.
                 or self.quant_config.get("hcu_legacy_groupgemm", False)
+                # GLM SlimQuant also consumes vendor INT8 rather than FP8.
+                or self.quant_config.get("int8_dispatch", False)
             )
         ):
             if _is_hcu and self.quant_config.get("hcu_w4a8_int8_dispatch", False):

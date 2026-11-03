@@ -30,6 +30,7 @@ from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.hcu_dspark_aiter_moe_fallback import (
     is_triton_forced_for_dspark_aiter_fallback,
@@ -132,6 +133,19 @@ num_cus = torch.cuda.get_device_properties(
 padding_size = get_moe_padding_size(_use_aiter)
 
 logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=1)
+def _get_silu_and_mul_clamp():
+    try:
+        from sglang.kernels.ops.moe.dsv4 import silu_and_mul_clamp
+    except ImportError:
+        logger.warning(
+            "Fused silu_and_mul_clamp is unavailable; falling back to "
+            "explicit clamp and silu_and_mul."
+        )
+        return None
+    return silu_and_mul_clamp
 
 
 class _CodePathChecker:
@@ -1177,11 +1191,16 @@ def _fused_moe_kernel_sequence(
             swiglu_limit_for_triton: Optional[float] = None
             swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
 
-            if filter_expert:
-                swiglu_limit_for_triton = swiglu_limit
-            elif _is_cuda or _is_xpu:
-                swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
+            if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
+                if filter_expert:
+                    swiglu_limit_for_triton = swiglu_limit
+                else:
+                    assert _is_cuda or _is_xpu, (
+                        "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"
+                    )
+                    swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
             else:
+                # Preserve the asymmetric clamp before the unfused activation.
                 half = N // 2
                 intermediate_cache1[:, :half].clamp_(max=swiglu_limit)
                 intermediate_cache1[:, half:].clamp_(
@@ -1190,13 +1209,21 @@ def _fused_moe_kernel_sequence(
 
             if not filter_expert:
                 if swiglu_limit_for_silu_and_mul_clamp is not None:
-                    from sglang.kernels.ops.moe.dsv4 import silu_and_mul_clamp
-
-                    silu_and_mul_clamp(
-                        intermediate_cache1.view(-1, N),
-                        intermediate_cache2,
-                        swiglu_limit_for_silu_and_mul_clamp,
-                    )
+                    _clamped = intermediate_cache1.view(-1, N)
+                    silu_and_mul_clamp = _get_silu_and_mul_clamp()
+                    if silu_and_mul_clamp is not None:
+                        silu_and_mul_clamp(
+                            _clamped,
+                            intermediate_cache2,
+                            swiglu_limit_for_silu_and_mul_clamp,
+                        )
+                    else:
+                        # Preserve the asymmetric clamp when fusion is unavailable.
+                        _limit = float(swiglu_limit_for_silu_and_mul_clamp)
+                        _gate, _up = _clamped.chunk(2, dim=-1)
+                        _gate.clamp_(max=_limit)
+                        _up.clamp_(min=-_limit, max=_limit)
+                        silu_and_mul(_clamped, intermediate_cache2)
                 else:
                     silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:

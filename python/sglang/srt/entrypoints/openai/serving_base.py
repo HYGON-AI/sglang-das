@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import uuid
@@ -11,6 +10,9 @@ import orjson
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
+from sglang.srt.disaggregation.encoder.prefill_response import (
+    drop_streaming_for_epd_prefill,
+)
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
@@ -88,6 +90,8 @@ class OpenAIServingBase(ABC):
             request_logger = self.tokenizer_manager.request_logger
             if request_logger.log_requests and request_logger.log_requests_level >= 2:
                 request_logger.log_openai_received_request(request, request=raw_request)
+
+            drop_streaming_for_epd_prefill(request)
 
             # Convert to internal format
             (
