@@ -81,7 +81,7 @@ def enabled(quant_config, *, model_path=None):
     return checkpoint_supports_channelwise_fp8(str(model_path))
 
 
-def linear(x, weight, scale, *, output_dtype=None):
+def linear(x, weight, scale, *, output_dtype=None, out=None):
     import deepgemm
     from lightop.quant import per_token_quant_fp8
 
@@ -92,9 +92,13 @@ def linear(x, weight, scale, *, output_dtype=None):
     if x.shape[-1] != weight.shape[-1]:
         raise ValueError("FP8 projection input/weight dimensions differ")
     dtype = output_dtype or x.dtype
-    output = torch.empty(
-        (*x.shape[:-1], weight.shape[-2]), device=x.device, dtype=dtype
-    )
+    output_shape = (*x.shape[:-1], weight.shape[-2])
+    if out is not None:
+        if tuple(out.shape) != output_shape or out.dtype != dtype:
+            raise ValueError("FP8 projection output buffer has an incompatible layout")
+        output = out
+    else:
+        output = torch.empty(output_shape, device=x.device, dtype=dtype)
     if x.numel() == 0:
         return output
     x = x.contiguous()
@@ -124,7 +128,11 @@ def linear(x, weight, scale, *, output_dtype=None):
                 (weight.view(tiles, n, -1), scale.view(tiles, n, 1)),
                 tiled,
             )
-        return tiled.transpose(0, 1).reshape(x.shape[0], weight.shape[0])
+        tiled = tiled.transpose(0, 1).reshape(x.shape[0], weight.shape[0])
+        if out is not None:
+            out.copy_(tiled)
+            return out
+        return tiled
     # DTK 2604's batched GEMM gives incorrect FP32 outputs for batch > 1.
     # Individual FP32 GEMMs and batched BF16 GEMMs pass the same oracle.
     if output.dtype == torch.float32 and weight.ndim == 3:

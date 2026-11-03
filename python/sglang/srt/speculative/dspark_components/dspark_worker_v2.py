@@ -648,33 +648,41 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not self._draft_is_moe or not hasattr(self.draft_model, "enable_draft_lm_head_vp"):
             raise ValueError("DSPARK LM-head VP currently requires a DeepSeek-V4 draft.")
         from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
-        from sglang.srt.speculative.draft_lm_head_vp import DSparkLMHeadVocabParallel
+        from sglang.srt.speculative.draft_lm_head_vp import (
+            DSparkLMHeadVocabParallel,
+            channelwise_fp8_lm_head_scale,
+        )
 
         parallel = get_parallel()
         target_model = self.target_worker.model_runner.model
         target_logits = target_model.logits_processor
         head = target_model.lm_head
+        head_scale = channelwise_fp8_lm_head_scale(head)
         both_vp = vp_size > 1 and target_vp_size > 1
         if target_vp_size > 1:
             if (
                 self._is_pd_prefill
-                or get_disagg().disaggregation_mode != "decode"
+                or get_disagg().disaggregation_mode not in ("decode", "null")
                 or parallel.pp_size != 1
                 or parallel.attn_cp_size != 1
                 or not parallel.enable_dp_lm_head
                 or (both_vp and target_vp_size != vp_size)
             ):
                 raise ValueError(
-                    "Target VP requires decode, PP1/CP1, DP LM-head, and matching sizes when both heads use VP."
+                    "Target VP requires PD decode or standalone, PP1/CP1, DP LM-head, and matching sizes when both heads use VP."
                 )
             if (
                 int(head.tp_size) != 1
                 or target_logits.use_fp32_lm_head
                 or hasattr(head, "set_lora")
-                or should_apply_lm_head_quant_method(head, head.quant_method)
+                or (
+                    head_scale is None
+                    and should_apply_lm_head_quant_method(head, head.quant_method)
+                )
             ):
                 raise ValueError(
-                    "Target VP requires an unquantized replicated LM-head without LoRA or FP32-head mode."
+                    "Target VP requires an unquantized or channelwise-FP8 replicated "
+                    "LM-head without LoRA or FP32-head mode."
                 )
         if both_vp:
             if self.draft_model.lm_head.weight is not head.weight:
@@ -700,6 +708,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 vp_size=vp_size,
                 max_rows_per_rank=max_bs * self.gamma,
                 local_world_size=parallel.tp_size // parallel.nnodes,
+                activation_dtype=self.draft_model_runner.dtype,
             )
         if target_vp_size > 1 and target_logits.target_lm_head_vp is None:
             max_bs = max(
@@ -715,6 +724,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 local_world_size=parallel.tp_size // parallel.nnodes,
                 weight_shard_t=draft_vp.weight_shard_t if both_vp else None,
                 workspace=draft_vp if both_vp else None,
+                weight_scale=head_scale,
+                activation_dtype=self.target_worker.model_runner.dtype,
             )
             if both_vp:
                 # Both paths now use the same GPU shard. Release the complete
