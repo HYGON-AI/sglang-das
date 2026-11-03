@@ -134,9 +134,7 @@ class W8A8Int8Config(QuantizationConfig):
         from sglang.srt.layers.radix_attention import RadixAttention
 
         if isinstance(layer, LinearBase):
-            if should_ignore_layer(
-                prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
-            ):
+            if self._should_ignore_linear(prefix):
                 return UnquantizedEmbeddingMethod()
             return W8A8Int8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
@@ -155,6 +153,21 @@ class W8A8Int8Config(QuantizationConfig):
             else:
                 return Fp8KVCacheMethod(self)
         return None
+
+    def _should_ignore_linear(self, prefix: str) -> bool:
+        if should_ignore_layer(
+            prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+        ):
+            return True
+        # Vision towers (e.g. Qwen2.5-VL) name the fused qkv layer `qkv_proj`,
+        # while HF checkpoints and their ignore lists use `qkv`.
+        if prefix.endswith(".attn.qkv_proj"):
+            return should_ignore_layer(
+                prefix[: -len("_proj")],
+                ignore=self.ignore,
+                fused_mapping=self.packed_modules_mapping,
+            )
+        return False
 
     def is_layer_skipped(
         self, prefix: str, fused_mapping: Mapping[str, List[str]] = MappingProxyType({})
