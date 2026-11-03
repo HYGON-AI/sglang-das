@@ -230,12 +230,18 @@ class TestDSV41MQARowChunking(CustomTestCase):
         result = self.scores(q[0], weights, ks, ke, width)
         blocks = kwargs.get("candidate_blocks")
         if blocks is not None:
-            self.assertEqual(kwargs["candidate_query_lens"], [q[0].shape[0]])
+            counts = kwargs["candidate_query_lens"]
+            self.assertEqual(sum(counts), q[0].shape[0])
+            self.assertEqual([block.shape[0] for block in blocks], counts)
             candidate = Candidates(request_block_ids=blocks)
-            keep = self.ns["_prefill_candidate_mask"](
-                candidate, 0, slice(None), width, self.indexer.candidate_block_size
-            )
-            result.masked_fill_(~keep, -torch.inf)
+            offset = 0
+            for request, count in enumerate(counts):
+                keep = self.ns["_prefill_candidate_mask"](
+                    candidate, request, slice(None), width,
+                    self.indexer.candidate_block_size,
+                )
+                result[offset:offset + count].masked_fill_(~keep, -torch.inf)
+                offset += count
         self.previous = weakref.ref(result)
         return result
 
@@ -313,13 +319,15 @@ class TestDSV41MQARowChunking(CustomTestCase):
                 for got, want in zip(result, expected):
                     torch.testing.assert_close(got, want)
                 self.assertLessEqual(max(self.calls), step)
-                self.assertEqual(sum(self.calls), 8)  # zero-history row stays -1
+                self.assertEqual(sum(self.calls), 9)  # empty K windows stay -inf
+                self.assertEqual(len(self.calls), math.ceil(9 / step))
 
     def test_source_keeps_only_compact_ids_and_releases_logits_views(self):
         self.indexer.is_candidate_source = True
-        result = self.run_chunked(2)
-        for got, want in zip(result, self.expected()):
-            torch.testing.assert_close(got, want)
+        for step in (2, 4, 20):
+            result = self.run_chunked(step)
+            for got, want in zip(result, self.expected()):
+                torch.testing.assert_close(got, want)
         candidate = self.owner.forward_metadata.candidate_metadata
         self.assertIsNone(candidate.request_masks)
         self.assertEqual(len(candidate.request_block_ids), len(self.counts))
@@ -347,8 +355,9 @@ class TestDSV41MQARowChunking(CustomTestCase):
         self.indexer.uses_candidates = True
         expected = self.expected(candidate)
         for blocks in (None, candidate.request_block_ids):
-            for got, want in zip(self.run_chunked(2, blocks), expected):
-                torch.testing.assert_close(got, want)
+            for step in (2, 4, 20):
+                for got, want in zip(self.run_chunked(step, blocks), expected):
+                    torch.testing.assert_close(got, want)
         masks = [
             self.ns["_prefill_candidate_mask"](candidate, b, slice(None), lc, 2)
             if lc and count
@@ -372,6 +381,89 @@ class TestDSV41MQARowChunking(CustomTestCase):
         pages, raw = self.run_chunked(2, raw=False)
         self.assertIsNone(raw)
         torch.testing.assert_close(pages, self.expected()[0])
+
+    def test_trace_shape_packs_eight_requests_into_nine_budgeted_calls(self):
+        counts = [448, 576, 576, 576, 576, 576, 576, 192]
+        self.counts = counts
+        self.lens = [65536] * len(counts)
+        self.q = torch.arange(sum(counts), dtype=torch.float32).view(-1, 1, 1)
+        self.weights = torch.ones(sum(counts), 1)
+        self.ks = torch.repeat_interleave(
+            torch.arange(len(counts), dtype=torch.int32) * 65536,
+            torch.tensor(counts),
+        )
+        self.ke = self.ks + 65536
+        self.compress = torch.full_like(self.ks, 65536)
+        self.slots = torch.empty(0)
+        calls = []
+        previous = None
+
+        def kernel(q, kv, weights, ks, ke, width, **kwargs):
+            nonlocal previous
+            if previous is not None:
+                self.assertIsNone(previous())
+            start = sum(calls)
+            count = q[0].shape[0]
+            torch.testing.assert_close(q[0], self.q[start:start + count])
+            torch.testing.assert_close(ks, self.ks[start:start + count])
+            torch.testing.assert_close(ke, self.ke[start:start + count])
+            self.assertEqual(width, 65536)
+            self.assertLessEqual(count * width * 4, 483 * 65536 * 4)
+            calls.append(count)
+            # Shape-only boundary: avoid a large CPU allocation in this test.
+            result = torch.empty(count, 1).expand(count, width)
+            previous = weakref.ref(result)
+            return result
+
+        self.ns.update(
+            _hcu_dense_fp4_mqa_logits=kernel,
+            topk_transform_ragged_v2=lambda *args, **kwargs: None,
+        )
+        sys.modules["lightop.attention"].dsv41_ragged_topk_postprocess = (
+            lambda *args: None
+        )
+        self.run_chunked(483)
+        self.assertEqual(calls, [483] * 8 + [232])
+
+    def test_candidate_chunks_keep_native_row_limit_across_requests(self):
+        self.indexer.uses_candidates = True
+        self.owner.forward_metadata.candidate_metadata = Candidates()
+        self.counts = [32770, 32770]
+        self.lens = [8, 8]
+        total = sum(self.counts)
+        self.q = torch.empty(total, 1, 1)
+        self.weights = torch.empty(total, 1)
+        self.ks = torch.zeros(total, dtype=torch.int32)
+        self.ke = self.ks
+        self.compress = self.ks
+        blocks = [torch.empty(n, 0, dtype=torch.int32) for n in self.counts]
+        calls = []
+
+        def kernel(q, kv, weights, ks, ke, width, **kwargs):
+            lens = kwargs["candidate_query_lens"]
+            self.assertEqual(sum(lens), q[0].shape[0])
+            self.assertEqual([b.shape[0] for b in kwargs["candidate_blocks"]], lens)
+            calls.append(lens)
+            return torch.empty(q[0].shape[0], width)
+
+        self.ns.update(
+            _hcu_dense_fp4_mqa_logits=kernel,
+            topk_transform_ragged_v2=lambda *args, **kwargs: None,
+        )
+        sys.modules["lightop.attention"].dsv41_ragged_topk_postprocess = (
+            lambda *args: None
+        )
+        self.run_chunked(total, blocks)
+        self.assertEqual(calls, [[32770, 32765], [5]])
+
+    def test_empty_queries_do_not_allocate_logits(self):
+        self.counts = [0] * len(self.lens)
+        self.q = self.q[:0]
+        self.calls.clear()
+        pages, raw = self.run_chunked(2)
+        self.assertEqual(self.calls, [])
+        self.assertTrue(torch.all(pages == -1))
+        self.assertTrue(torch.all(raw == -1))
 
     def test_nonchunked_consumer_accepts_compact_candidate_metadata(self):
         self.indexer.is_candidate_source = True
@@ -451,7 +543,7 @@ class TestDSV41MQARowChunking(CustomTestCase):
         quant = types.ModuleType("sglang.kernels.ops.attention.dsv4.fp4_indexer")
         quant.quantize_fp4_indexer_tensor = lambda *args, **kwargs: None
         for role, mode, budget_rows, expected_calls in (
-            ("prefill", Mode.EXTEND, 2, [2, 2, 1, 2, 1]),
+            ("prefill", Mode.EXTEND, 2, [2, 2, 2, 2, 1]),
             ("prefill", Mode.EXTEND, None, [9]),
             ("decode", Mode.EXTEND, 2, [9]),
             ("prefill", Mode.TARGET_VERIFY, 2, [9]),
@@ -527,6 +619,49 @@ class TestDSV41MQARowChunking(CustomTestCase):
             (blocks[0][-2:], blocks[1], blocks[2][:0]),
         ):
             torch.testing.assert_close(got, want)
+
+    def test_paged_consumer_applies_fraction_budget_before_fused_dispatch(self):
+        ns = dict(torch=torch, INVALID_BLOCK=torch.iinfo(torch.int32).max, SPARSE_BLOCK_KV=8)
+        load_functions(
+            ATTENTION / "dsv4/prefill_sparse_lightop.py",
+            {"consume_prefill_candidate_sparse"}, ns,
+        )
+        calls = []
+        def native(q, weights, freqs, positions, **kwargs):
+            self.assertEqual(kwargs["budget_bytes"], 17 * 8 * 8 * 4)
+        def budget(**kwargs):
+            calls.append(kwargs)
+            return 17
+        utils = types.ModuleType("sglang.srt.layers.attention.mqa_logits_utils")
+        utils.dsv41_mqa_logits_rows_per_chunk = budget
+        ns.update(_lightop_functions=lambda: (None, None, None),
+                  _lightop_fused_consumer=lambda x: native)
+        indexer = SimpleNamespace(
+            uses_candidates=True, is_candidate_source=False,
+            candidate_block_size=8, index_head_dim=128, n_local_heads=32,
+            candidate_topk_blocks=8, index_topk=512,
+            head_weights_raw=lambda x: torch.ones(3, 32),
+            wq_b=lambda q: (torch.zeros(3, 32 * 128), None),
+            head_weight_scale=1., rope_head_dim=64,
+        )
+        pool = SimpleNamespace(
+            get_index_k_page_size=lambda ratio: 64,
+            get_index_k_with_scale_buffer=lambda layer: torch.zeros(1, 64*68, dtype=torch.uint8),
+        )
+        positions = SimpleNamespace(is_cuda=True, device=torch.device("cuda", 2), numel=lambda: 3)
+        with patch.dict(sys.modules, {utils.__name__: utils}):
+            self.assertTrue(ns["consume_prefill_candidate_sparse"](
+                pool=pool, indexer=indexer, layer_id=24,
+                x=torch.zeros(3, 1), q_lora=torch.zeros(3, 1),
+                freqs_cis=torch.zeros(1), positions=positions,
+                req_to_token=torch.zeros(2, 1, dtype=torch.int32),
+                request_pool_indices=torch.tensor([1, 0]),
+                lc_per_request=[64, 128], rows_per_request=[1, 2],
+                candidate_metadata=Candidates(request_block_ids=[torch.zeros(1, 8, dtype=torch.int32), torch.zeros(2, 8, dtype=torch.int32)]),
+                compress_ratio=4, page_indices=torch.empty(3, 512, dtype=torch.int32),
+                raw_indices=None,
+            ))
+        self.assertEqual(calls, [dict(num_rows=3, num_cols=64, device_index=2)])
 
     def test_sparse_consumer_accepts_block_only_source_and_preserves_padding(self):
         ns = dict(torch=torch, INVALID_BLOCK=torch.iinfo(torch.int32).max)

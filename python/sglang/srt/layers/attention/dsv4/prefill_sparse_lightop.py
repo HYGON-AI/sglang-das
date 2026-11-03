@@ -462,6 +462,18 @@ def consume_prefill_candidate_sparse(
     page_size = pool.get_index_k_page_size(compress_ratio)
     if page_size <= 0 or page_size % 8:
         return False
+    if positions.is_cuda:
+        from sglang.srt.layers.attention.mqa_logits_utils import (
+            dsv41_mqa_logits_rows_per_chunk,
+        )
+
+        budget_rows = dsv41_mqa_logits_rows_per_chunk(
+            num_rows=positions.numel(),
+            num_cols=width * SPARSE_BLOCK_KV,
+            device_index=positions.device.index,
+        )
+        if budget_rows is not None:
+            budget_bytes = min(budget_bytes, budget_rows * width * SPARSE_BLOCK_KV * 4)
     k_cache = pool.get_index_k_with_scale_buffer(layer_id)
     if k_cache is None:
         return False
