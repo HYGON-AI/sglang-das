@@ -105,6 +105,8 @@ class SessionSlot:
         req.mamba_last_track_seqlen = None
         req.mamba_branching_seqlen = None
 
+        req.swa_branching_seqlen = None
+
     def restore_to_req(self, req: Req):
         """Restore KV state from this slot into an incoming request."""
         req.req_pool_idx = self.req_pool_idx

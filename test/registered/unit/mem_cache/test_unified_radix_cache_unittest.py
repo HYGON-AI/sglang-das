@@ -51,6 +51,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
+    BackupKV,
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
     FreeDeviceKV,
@@ -4788,6 +4789,230 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(result.host_hit_length, 0)
         self.assertEqual(result.swa_host_hit_length, len(leaf.key))
 
+    def _skip_swa_branching_on_rust(self) -> None:
+        # This release only has the Python tree core.
+        return
+
+    def test_swa_branching_seqlen_uses_device_full_hit(self):
+        self._skip_swa_branching_on_rust()
+        if (
+            not self.cfg.has_swa
+            or self.cfg.has_mamba
+            or self.cfg.page_size not in (1, 4)
+            or self.cfg.sliding_window_size != 4
+        ):
+            self.skipTest("requires Full+SWA with window_size=4")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        window = self.cfg.sliding_window_size
+        window_pages = (window + self.cfg.page_size - 1) // self.cfg.page_size
+        prefix = self._make_seq(1, window_pages)
+        tokens = prefix + self._make_seq(1000, 2)
+        self._insert(cache, allocator, req_to_token_pool, prefix)
+        self._insert(cache, allocator, req_to_token_pool, tokens)
+
+        leaf = cache.resolve_node_handle(
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)))
+            ).last_device_node
+        )
+        device_frees = defaultdict(list)
+        cache.tree_core._evict_component_and_detach_lru(
+            leaf,
+            cache.components[ComponentType.SWA],
+            device_frees=device_frees,
+            host_frees=defaultdict(list),
+            target=EvictLayer.DEVICE,
+        )
+        cache._drain_device_frees(device_frees)
+
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+
+        self.assertEqual(result.full_kv_hit_length, len(tokens))
+        self.assertEqual(result.swa_branching_seqlen, len(tokens))
+        self.assertEqual(result.swa_branching_seqlen % self.cfg.page_size, 0)
+
+        # Simulate forward producing fresh SWA KV at the branching point.
+        self._insert(
+            cache,
+            allocator,
+            req_to_token_pool,
+            tokens[: result.swa_branching_seqlen],
+        )
+
+        rematch = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        )
+        self.assertEqual(len(rematch.device_indices), result.swa_branching_seqlen)
+        self.assertIsNone(rematch.swa_branching_seqlen)
+
+    def test_swa_branching_seqlen_uses_host_full_hit(self):
+        self._skip_swa_branching_on_rust()
+        if (
+            not self.cfg.has_swa
+            or self.cfg.has_mamba
+            or self.cfg.page_size != 1
+            or self.cfg.sliding_window_size != 4
+        ):
+            self.skipTest("requires page_size=1 Full+SWA with window_size=4")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        window = self.cfg.sliding_window_size
+        prefix = self._make_seq(1, window)
+        tokens = prefix + self._make_seq(1000, window + 1)
+        self._insert(cache, allocator, req_to_token_pool, prefix)
+        self._insert(cache, allocator, req_to_token_pool, tokens)
+
+        leaf = cache.resolve_node_handle(
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)))
+            ).last_device_node
+        )
+        parent = leaf.parent
+        self._backup_node(cache, leaf)
+        lock_result = cache.inc_lock_ref(parent.id)
+        try:
+            cache.evict(EvictParams(num_tokens=len(leaf.key)))
+        finally:
+            cache.dec_lock_ref(parent.id, lock_result.to_dec_params())
+        device_frees = defaultdict(list)
+        host_frees = defaultdict(list)
+        cache.components[ComponentType.SWA].evict_component(
+            leaf, device_frees, host_frees, target=EvictLayer.HOST
+        )
+        cache._free_values(device_frees, host_frees)
+        full_host_pool = cache.cache_controller.mem_pool_host
+        swa_host_pool = cache.components[ComponentType.SWA]._swa_kv_pool_host
+        full_available_before = full_host_pool.available_size()
+        swa_available_before = swa_host_pool.available_size()
+
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+
+        self.assertEqual(result.full_kv_hit_length, len(tokens))
+        self.assertEqual(result.swa_branching_seqlen, len(tokens))
+
+        self._insert(
+            cache,
+            allocator,
+            req_to_token_pool,
+            tokens[: result.swa_branching_seqlen],
+        )
+        cache.writing_check(write_back=True)
+        # Full was already backed up, so only the SWA window is allocated.
+        self.assertEqual(full_host_pool.available_size(), full_available_before)
+        self.assertEqual(
+            swa_host_pool.available_size(),
+            swa_available_before - len(leaf.key),
+        )
+
+        rematch = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        )
+        self.assertEqual(len(rematch.device_indices), result.swa_branching_seqlen)
+        self.assertIsNone(rematch.swa_branching_seqlen)
+
+    def test_swa_branching_seqlen_caps_insert_after_forward(self):
+        if (
+            not self.cfg.has_swa
+            or self.cfg.has_mamba
+            or self.cfg.page_size != 1
+            or self.cfg.sliding_window_size != 4
+        ):
+            self.skipTest("requires page_size=1 Full+SWA with window_size=4")
+        cache, _, _ = build_fixture(self.cfg)
+        swa = cache.components[ComponentType.SWA]
+        req = mock.Mock(
+            swa_branching_seqlen=8,
+            cache_protected_len=4,
+            kv=mock.Mock(swa_evicted_seqlen=0),
+        )
+
+        for is_finished in (False, True):
+            params = InsertParams()
+            self.assertEqual(
+                swa.prepare_for_caching_req(req, params, 12, is_finished), 8
+            )
+            self.assertEqual(params.swa_evicted_seqlen, 0)
+
+        self.assertIsNone(swa.prepare_for_caching_req(req, InsertParams(), 7, False))
+        req.cache_protected_len = 8
+        self.assertIsNone(swa.prepare_for_caching_req(req, InsertParams(), 12, False))
+
+        cache.tree_core.is_eagle = True
+        req.cache_protected_len = 4
+        params = InsertParams()
+        self.assertEqual(swa.prepare_for_caching_req(req, params, 12, False), 9)
+        params.key = RadixKey(array("q", range(9)), is_bigram=True)
+        result = mock.Mock(swa_branch_inserted=False)
+        swa.commit_insert_component_data(mock.Mock(), False, params, result, [])
+        self.assertTrue(result.swa_branch_inserted)
+
+    def test_swa_branch_insert_releases_forward_overshoot(self):
+        if (
+            not self.cfg.has_swa
+            or self.cfg.has_mamba
+            or self.cfg.page_size != 1
+            or self.cfg.sliding_window_size != 4
+        ):
+            self.skipTest("requires page_size=1 Full+SWA with window_size=4")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        swa = cache.components[ComponentType.SWA]
+
+        branching_seqlen = 8
+        forward_len = 20
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, forward_len)
+        req.origin_input_ids = tokens
+        req.output_ids = []
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, forward_len)
+        req.cache_protected_len = branching_seqlen
+
+        kv_indices = self._alloc(allocator, forward_len)
+        req_to_token_pool.write(
+            (req.req_pool_idx, slice(0, forward_len)),
+            kv_indices,
+        )
+
+        params = InsertParams(
+            key=RadixKey(array("q", tokens[:branching_seqlen])),
+            swa_branching_seqlen=branching_seqlen,
+        )
+        result = mock.Mock(swa_branch_inserted=False)
+        swa.commit_insert_component_data(
+            mock.Mock(),
+            False,
+            params,
+            result,
+            [],
+        )
+        self.assertTrue(result.swa_branch_inserted)
+
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            swa.cleanup_after_caching_req(
+                req,
+                is_finished=False,
+                insert_result=result,
+            )
+
+        expected_evicted = forward_len - 1 - self.cfg.sliding_window_size
+        self.assertEqual(req.kv.swa_evicted_seqlen, expected_evicted)
+
+        mapping = allocator.full_to_swa_index_mapping
+        self.assertEqual(
+            torch.count_nonzero(mapping[kv_indices[:branching_seqlen]]).item(),
+            branching_seqlen,
+        )
+        self.assertEqual(
+            torch.count_nonzero(
+                mapping[kv_indices[branching_seqlen:expected_evicted]]
+            ).item(),
+            0,
+        )
+        self.assertEqual(
+            torch.count_nonzero(mapping[kv_indices[expected_evicted:]]).item(),
+            forward_len - expected_evicted,
+        )
+
     def test_mamba_branching_seqlen_disabled_under_hicache(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
             self.skipTest("requires page_size=1 Full+Mamba")
@@ -5459,6 +5684,127 @@ class UnifiedRadixCacheSuite:
         # nodes_to_load holds NodeIds; compare against the chain's ids.
         chain = [n.id for n in chain]
         self.assertEqual(xfer.nodes_to_load, chain[-expected_pages:])
+
+    # Known baseline limitation, also present at source commit 298a4c82:
+    # build_load_back_spec does not yet reject a foreign SWA load-back pin.
+    @unittest.expectedFailure
+    def test_hicache_swa_load_back_rejects_foreign_pinned_window(self):
+        """A second load-back must not claim nodes pinned by an in-flight one.
+
+        commit_load_back republishes Full device values before the DMA acks, so
+        a later anchor can claim just the still-host-only SWA window of a
+        pinned node and hit the commit pin assert. The spec build must degrade
+        to an empty spec instead (the caller recomputes).
+        """
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the chain construction simple")
+        if self.cfg.sliding_window_size <= self.cfg.page_size:
+            # A window within one page never reaches the pinned ancestor.
+            self.skipTest("window must span past the leaf to reach the pin")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        # commit_load_back pins its source nodes only under write-back; run the
+        # scenario in that mode so the foreign-pin path is reachable.
+        cache.is_write_back = True
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain collapsed below the two-node suffix being tested")
+        self._simulate_backup_tree(cache)
+
+        # Host-only suffix a -> b under a device-resident ancestor.
+        a, b = chain[-2], chain[-1]
+        for n in (a, b):
+            n.component_data[ComponentType.FULL].value = None
+            n.component_data[ComponentType.SWA].value = None
+            if cache.tree_core.lru_lists[ComponentType.SWA].in_list(n):
+                cache.tree_core.lru_lists[ComponentType.SWA].remove_node(n)
+            cache.tree_core.host_lru_lists[ComponentType.SWA].insert_mru(n)
+
+        # Anchor `a`: a Full-only load whose SWA slice stays host-only.
+        kv_xfer, _comp_xfers = cache.tree_core.build_load_back_spec(a.id)
+        self.assertEqual(kv_xfer.nodes_to_load, [a.id])
+        device_indices = torch.arange(
+            int(kv_xfer.host_indices.numel()), dtype=torch.int64, device=cache.device
+        )
+        cache.tree_core.commit_load_back(a.id, device_indices, kv_xfer, {})
+
+        # Anchor `b` rejects its whole spec: its SWA window claims pinned `a`.
+        kv_xfer, comp_xfers = cache.tree_core.build_load_back_spec(b.id)
+        self.assertEqual(int(kv_xfer.host_indices.numel()), 0)
+        self.assertEqual(kv_xfer.nodes_to_load, [])
+        self.assertEqual(comp_xfers, {})
+
+        # After the ack unpins, the same spec builds fully.
+        cache.tree_core.finish_load_back(a.id)
+        kv_xfer, comp_xfers = cache.tree_core.build_load_back_spec(b.id)
+        self.assertEqual(kv_xfer.nodes_to_load, [b.id])
+        self.assertEqual(comp_xfers[ComponentType.SWA][0].nodes_to_load, [a.id, b.id])
+
+    def test_hicache_swa_backup_window_stops_at_pending_ancestor(self):
+        self._skip_swa_branching_on_rust()
+        if (
+            not self.cfg.has_swa
+            or self.cfg.has_mamba
+            or self.cfg.page_size != 1
+            or self.cfg.sliding_window_size != 4
+        ):
+            self.skipTest("requires page_size=1 Full+SWA with window_size=4")
+
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain collapsed below the pending ancestor test")
+
+        c = chain[-1]
+        c_id = c.id
+        c_swa = _device_value(cache, c, ComponentType.SWA).clone()
+
+        # First transfer: publish Full for C only, leaving SWA dirty while the
+        # write-through ack is still pending.
+        # Raw assignment: this branch has no *_raw setter, and the test must
+        # bypass LRU/accounting bookkeeping.
+        c.component_data[ComponentType.SWA].value = None
+        self.assertGreater(
+            cache._execute_and_commit_kv_backup(BackupKV(node_ids=[c_id])),
+            0,
+        )
+        self.assertEqual(
+            cache.tree_core.node_by_id(c_id).write_through_pending_id,
+            c_id,
+        )
+        self.assertIsNotNone(_host_value(cache, c, ComponentType.FULL))
+        self.assertIsNone(_host_value(cache, c, ComponentType.SWA))
+
+        # Simulate SWA being reconstructed on device before the first ack. The
+        # next incremental SWA backup must treat C as the boundary and back up
+        # only the newly inserted descendant.
+        c.component_data[ComponentType.SWA].value = c_swa
+        tokens = self._match_tokens_for_chain(chain)
+        next_tokens = tokens + self._make_seq(9000, 1)
+        cache.write_through_threshold = 1
+
+        self._insert(cache, allocator, req_to_token_pool, next_tokens)
+
+        d = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", next_tokens)))
+        ).last_device_node
+        d_id = d
+        self.assertEqual(
+            cache.tree_core.node_by_id(c_id).write_through_pending_id,
+            c_id,
+        )
+        self.assertEqual(
+            cache.tree_core.node_by_id(d_id).write_through_pending_id,
+            d_id,
+        )
+        self.assertIsNone(_host_value(cache, c, ComponentType.SWA))
+        self.assertIsNotNone(_host_value(cache, d, ComponentType.SWA))
+
+        cache.writing_check(write_back=True)
+        self.assertIsNone(cache.tree_core.node_by_id(c_id).write_through_pending_id)
+        self.assertIsNone(cache.tree_core.node_by_id(d_id).write_through_pending_id)
 
     def _swa_finalize_setup(self):
         """Build a SWA chain long enough to fill at least the window
@@ -7876,6 +8222,23 @@ class TestFailedLinkerChainWithASecondOwner(CustomTestCase):
             total,
             "available + evictable + protected no longer sums to the pool",
         )
+
+
+def _node(cache, node):
+    """Accept either a node object or a NodeId."""
+    if hasattr(node, "component_data"):
+        return node
+    return cache.tree_core.node_by_id(node)
+
+
+def _device_value(cache, node, component_type):
+    """Device-side component value of a node (helper used by the SWA tests)."""
+    return _node(cache, node).component_data[component_type].value
+
+
+def _host_value(cache, node, component_type):
+    """Host-side component value of a node (helper used by the SWA tests)."""
+    return _node(cache, node).component_data[component_type].host_value
 
 
 if __name__ == "__main__":
