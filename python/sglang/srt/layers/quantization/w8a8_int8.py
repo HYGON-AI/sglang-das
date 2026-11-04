@@ -20,6 +20,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, cast
 
 import torch
+from torch import nn
 from torch.nn.parameter import Parameter
 
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
@@ -532,3 +533,162 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
                 hidden_states=combine_input.hidden_states + bias
             )
         return combine_input
+
+
+# DeepSeek V4.1 channelwise INT8 special projection adapters.
+
+
+def enabled(layer, quant_config, prefix):
+    if quant_config is None or quant_config.get_name() not in (
+        "compressed_tensors",
+        "compressed-tensors",
+    ):
+        return False
+    scheme = quant_config.get_scheme_dict(layer, layer_name=prefix)
+    if scheme is None:
+        return False
+    w, a = scheme.get("weights"), scheme.get("input_activations")
+    if w is None or w.type != "int":
+        return False
+    if not (
+        w.num_bits == 8
+        and w.strategy == "channel"
+        and w.symmetric
+        and not w.dynamic
+        and a is not None
+        and a.num_bits == 8
+        and a.type == "int"
+        and a.strategy == "token"
+        and a.symmetric
+        and a.dynamic
+        and (scheme.get("format") or quant_config.quant_format) == "int-quantized"
+    ):
+        raise ValueError(
+            f"Unsupported INT8 projection scheme for {prefix}; need channel W8/token A8"
+        )
+    from sglang.srt.utils import is_hcu
+
+    if not is_hcu():
+        raise ValueError("DeepSeek V4.1 INT8 projection runtime currently requires HCU")
+    return True
+
+
+def _projection_backend():
+    mode = os.environ.get("SGLANG_DSV41_INT8_PROJECTION_BACKEND", "blaslt")
+    if mode != "blaslt":
+        raise ValueError("INT8 projection backend must be blaslt; legacy GEMM backends are not supported")
+    return mode
+
+
+def _grouped(x, w, s, groups, rank, *, output_dtype=None):
+    if (
+        x.ndim != 3
+        or x.shape[1] != groups
+        or w.dtype != torch.int8
+        or w.shape != (groups * rank, x.shape[-1])
+        or s.shape != (groups * rank, 1)
+        or s.dtype != torch.float32
+        or not w.is_contiguous()
+        or not s.is_contiguous()
+    ):
+        raise ValueError("Invalid grouped INT8 wo_a weight, scale or activation layout")
+    if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError(
+            "INT8 wo_a expects floating-point activations before quantization"
+        )
+    _projection_backend()
+    if x.shape[0] == 0 or rank == 0:
+        return torch.empty(
+            (x.shape[0], groups, rank), device=x.device, dtype=output_dtype or x.dtype
+        )
+    from sglang.kernels.ops.gemm import dsv41_int8 as dsv41_int8_blaslt
+
+    return dsv41_int8_blaslt.project(
+        x, w, s, groups, rank, output_dtype=output_dtype
+    )
+
+
+def grouped(x, layer, groups, rank):
+    return _grouped(x, layer.weight, layer.weight_scale, groups, rank)
+
+
+def linear(x, weight, scale, *, output_dtype=None):
+    """Run a row-major W8A8 projection without dequantizing the weight."""
+    if x.ndim < 2 or weight.ndim != 2:
+        raise ValueError("INT8 projection expects matrix weights and batched inputs")
+    shape = x.shape
+    y = _grouped(
+        x.reshape(-1, 1, shape[-1]),
+        weight,
+        scale,
+        1,
+        weight.shape[0],
+        output_dtype=output_dtype,
+    )
+    return y.view(*shape[:-1], weight.shape[0])
+
+
+class ChannelwiseInt8Method(QuantizeMethodBase):
+    supports_lm_head_lora = False
+
+    def process_weights_after_loading(self, layer):
+        for name in ("weight", "weight_scale"):
+            if not getattr(getattr(layer, name), "_int8_projection_loaded", False):
+                raise ValueError(f"Missing INT8 projection {name}")
+        scale = layer.weight_scale
+        valid_rows = getattr(layer, "_int8_projection_valid_rows", scale.shape[0])
+        if not torch.all(torch.isfinite(scale)) or not torch.all(
+            scale[:valid_rows] > 0
+        ):
+            raise ValueError("INT8 projection requires finite positive channel scales")
+
+        _projection_backend()
+        from sglang.kernels.ops.gemm import dsv41_int8 as dsv41_int8_blaslt
+        dsv41_int8_blaslt.prepare_weight(layer.weight)
+
+    def apply(self, layer, x, bias=None):
+        return self.apply_with_output_dtype(layer, x, bias, output_dtype=x.dtype)
+
+    def apply_with_output_dtype(self, layer, x, bias=None, *, output_dtype):
+        y = linear(x, layer.weight, layer.weight_scale, output_dtype=output_dtype)
+        return y if bias is None else y + bias
+
+
+def install(layer):
+    """Keep the original TP/padded-vocabulary loader for weights and row scales."""
+    from sglang.srt.model_loader.weight_utils import default_weight_loader
+
+    old = layer.weight
+    loader = getattr(old, "weight_loader", default_weight_loader)
+    output_dim = getattr(old, "output_dim", None)
+    shard = getattr(layer, "shard_indices", None)
+    layer._int8_projection_valid_rows = (
+        shard.org_vocab_end_index - shard.org_vocab_start_index
+        if shard is not None
+        else old.shape[0]
+    )
+    for name, shape, dtype in (
+        ("weight", old.shape, torch.int8),
+        ("weight_scale", (old.shape[0], 1), torch.float32),
+    ):
+        param = nn.Parameter(
+            torch.empty(shape, dtype=dtype, device=old.device), requires_grad=False
+        )
+        if output_dim is not None:
+            param.output_dim = output_dim
+        if name == "weight":
+            param.input_dim = 1
+
+        def load(param, value, *, _loader=loader, _name=name):
+            if _name == "weight" and value.dtype != torch.int8:
+                raise ValueError("INT8 projection requires INT8 checkpoint weights")
+            if _name == "weight_scale" and (
+                value.dtype != torch.float32 or value.ndim != 2 or value.shape[1] != 1
+            ):
+                raise ValueError("INT8 projection requires FP32 [N, 1] scales")
+            _loader(param, value)
+            param._int8_projection_loaded = True
+
+        param.weight_loader = load
+        setattr(layer, name, param)
+    layer.quant_method = ChannelwiseInt8Method()

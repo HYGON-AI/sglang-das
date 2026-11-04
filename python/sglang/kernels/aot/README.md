@@ -141,3 +141,29 @@ Use this to identify large kernels and potential template instantiation bloat.
 ## FAQ
 - Q: Segmentation fault with CUDA 12.6
 - A: Update ptxas to 12.8, reference: [segment fault error](https://github.com/Dao-AILab/flash-attention/issues/1453)
+
+## HCU DeepSeek V4.1 INT8 projections
+
+The HCU branch of `csrc/gemm/int8_gemm_kernel.cu` provides hipBLASLt INT8
+projection primitives, activation quantization and FP32 scale epilogues through
+the existing `sgl_kernel.common_ops` extension. The CUDA/CUTLASS implementation
+is retained in its separate platform branch. No independent extension or
+framework-local native build is required.
+
+Build the matching HCU wheel in the DTK/PyTorch environment used for serving:
+
+```bash
+PYTORCH_ROCM_ARCH=gfx936 MAX_JOBS=2 python setup_hip.py bdist_wheel
+```
+
+The single Python entry module is `sglang.kernels.ops.gemm.dsv41_int8`. It owns
+the projection calls, packed-weight and plan caches, and the existing private
+Triton scale helpers. GEMM continues to use hipBLASLt with INT32 accumulation;
+checkpoint INT8 weights and FP32 channel scales remain unchanged. Output dtype
+is selected by the caller. Install the matching kernel wheel before using this
+entry point; an older wheel reports the missing operators without a GEMM fallback.
+
+`SGLANG_DSV41_INT8_SERVICE_OPT=1` selects the validated packed layouts. Their
+default algorithm configuration is embedded in the Python entry module; an
+explicit `SGLANG_DSV41_INT8_SERVICE_ALGO_CONFIG` can still override it. LM-head INT8 and target/draft VP integration are added by the dependent PR.
+This PR connects wo_a and Markov heads to the shared projection primitives.
