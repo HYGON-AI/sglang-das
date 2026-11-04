@@ -3382,7 +3382,11 @@ class DeepseekV4DecoderLayerBase(nn.Module):
                             self.hc_ffn_fn.data
                         )
         if self.hc_pre_from_prev_sublayer:
+            previous_packed = self.ffn_hc.fn_packed
             self._init_hyper_connections()
+            if _is_hcu:
+                packed = mhc.prepare_hcu_mega_weight(self.ffn_hc, previous_packed)
+                self.ffn_hc = self.ffn_hc._replace(fn_packed=packed)
         # The fuse gates and boundaries snapshot load-time facts; weight updates
         # re-run this, so drop them and re-resolve on the next forward.
         self.__dict__.pop("_can_fuse_attn_mhc", None)

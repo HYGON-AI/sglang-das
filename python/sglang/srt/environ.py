@@ -1153,6 +1153,8 @@ class Envs:
     # Use fused HCU BF16 routing when the backend and inputs are supported.
     SGLANG_HCU_ENABLE_DSV41_BF16_MEGA_GATE = EnvBool(True)
     SGLANG_HCU_HC_MIX_STATS_OPT = EnvBool(True)
+    # Enable Mega mHC at supported HCU attention-to-FFN boundaries.
+    SGLANG_HCU_MEGA_MHC_OPT = EnvBool(True)
     # Opt-in: DSV4.1 decode/verify on HCU runs the Triton fused mHC boundary instead of
     # lightop stats + aiter post + combine; prefill keeps the lightop path.
     SGLANG_HCU_FUSED_MHC_BOUNDARY = EnvBool(False)

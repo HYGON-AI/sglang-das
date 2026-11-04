@@ -28,13 +28,16 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.layernorm.mhc_mega import mhc_mega_boundary
+from sglang.kernels.ops.layernorm.mhc_mega import (
+    hcu_mega_mhc_backend,
+    mhc_mega_boundary,
+)
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner import compile_in_capture_mode
 from sglang.srt.models.deepseek_v2 import MoEOutput
 from sglang.srt.runtime_context import get_parallel, get_platform
@@ -93,6 +96,7 @@ class HcSubLayer(NamedTuple):
     norm: RMSNorm
     tf32_parts: Optional[Any] = None
     bf16_parts: Optional[Any] = None
+    fn_packed: Optional[torch.Tensor] = None
 
 
 # ---------------------------------------------------------------------------
@@ -638,6 +642,35 @@ def _compute_triplet(
     return coefficients
 
 
+def prepare_hcu_mega_weight(hc: HcSubLayer, previous: Optional[torch.Tensor]):
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+    from sglang.srt.runtime_context import get_exec
+
+    # Resolve framework policy and BF16 RMSNorm compatibility before capture.
+    # Tensor contracts are checked by the native backend.
+    if not (
+        _is_hcu
+        and envs.SGLANG_HCU_MEGA_MHC_OPT.get()
+        and hc.cfg.pre_from_prev
+        and not hc.cfg.cp_prefill
+        and not hc.norm.cast_x_before_out_mul
+        and hc.norm.variance_size_override is None
+        and hc.norm.weight.dtype == torch.bfloat16
+        and not is_batch_invariant_mode_enabled()
+        and not get_exec().deterministic.enable_deterministic_inference
+    ):
+        return None
+    backend = hcu_mega_mhc_backend()
+    if backend is None:
+        return None
+    packed = backend.mega_mhc_prepare_fn(hc.fn.detach())
+    if previous is not None and previous.device == packed.device:
+        # Captured graphs retain the original address across weight updates.
+        previous.copy_(packed)
+        return previous
+    return packed
+
+
 def _can_use_mega_mhc(cfg: HcConfig) -> bool:
     return (
         envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get()
@@ -652,36 +685,42 @@ def _post_fusion(
     residual: torch.Tensor,
     coefficients: HcTriplet,
     next: Optional[HcNextBoundary],
+    mode: Optional[ForwardMode] = None,
 ) -> HcState:
     """Step 4 without a collective: the wide-tile kernel folds the next combine +
     norm in where it serves this seam, otherwise the pure post runs and the next
     combine computes itself."""
     cfg = hc.cfg
     pre, post_mix, comb = coefficients
-    if (
-        next is not None
-        and next.norm_fusable
-        and next.hc is not None
-        and _can_use_mega_mhc(cfg)
-        and y.shape[0] > 0
-    ):
+    if next is not None and next.hc is not None and y.shape[0] > 0:
         next_hc = next.hc
-        updated, normalized, stats = mhc_mega_boundary(
-            y,
-            residual,
-            pre,
-            post_mix,
-            comb,
-            next_hc.fn,
-            next_hc.scale,
-            next_hc.base,
-            next_hc.norm.weight,
-            next_hc.cfg.rms_eps,
-            next_hc.cfg.eps,
-            next_hc.norm.variance_epsilon,
-            next_hc.cfg.sinkhorn_iters,
-        )
-        return HcState(updated, pre, HcNormed(normalized), stats)
+        packed = None
+        # Only attention boundaries pass a real forward mode. None keeps
+        # cross-layer MoE boundaries on their existing path.
+        if (
+            mode is not None
+            and (mode.is_extend() or mode.is_decode())
+            and y.dtype == residual.dtype == torch.bfloat16
+        ):
+            packed = next_hc.fn_packed
+        if packed is not None or (next.norm_fusable and _can_use_mega_mhc(cfg)):
+            updated, normalized, stats = mhc_mega_boundary(
+                y,
+                residual,
+                pre,
+                post_mix,
+                comb,
+                next_hc.fn,
+                next_hc.scale,
+                next_hc.base,
+                next_hc.norm.weight,
+                next_hc.cfg.rms_eps,
+                next_hc.cfg.eps,
+                next_hc.norm.variance_epsilon,
+                next_hc.cfg.sinkhorn_iters,
+                fn_packed=packed,
+            )
+            return HcState(updated, pre, HcNormed(normalized), stats)
     if (
         next is not None
         and next.norm_fusable
@@ -719,6 +758,7 @@ def run_attn_post(
     next: Optional[HcNextBoundary],
     world_size: int,
     precomputed: Optional[HcTriplet] = None,
+    mode: Optional[ForwardMode] = None,
 ) -> HcState:
     """The attention post. An `AttnOutput` rides the collective kernel (which also
     folds ``next``'s norm); the attention may decline the handover even when asked,
@@ -742,7 +782,7 @@ def run_attn_post(
         )
         return HcState(updated, pre, HcNormed(normalized))
     coefficients = _compute_triplet(hc, residual, stats_stream, precomputed)
-    return _post_fusion(hc, out, residual, coefficients, next)
+    return _post_fusion(hc, out, residual, coefficients, next, mode)
 
 
 def run_moe_post(
