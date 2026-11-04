@@ -450,6 +450,9 @@ class ReplicatedLinear(LinearBase):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
+        if isinstance(x, Int8PerTokenInput):
+            input_quant_args = (x.q, x.scale)
+            x = x.x
         if input_quant_args is not None:
             if not getattr(self.quant_method, "supports_prequantized_input", False):
                 raise TypeError(

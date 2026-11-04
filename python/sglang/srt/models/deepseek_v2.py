@@ -91,6 +91,7 @@ from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
 from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
+from sglang.srt.layers.fused_rms_quant import Int8PerTokenInput
 from sglang.srt.layers.layer_boundary import (
     append_stages,
     declare_attn,
@@ -1913,8 +1914,15 @@ class DeepseekV2MoE(nn.Module):
     ):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
             if pre_quant_input is None and _is_hip:
-                # SGLANG_HIP_FFN_NORM_MXFP8: the FFN norm launch's fp8 + ue8m0 of these rows
+                # The FFN norm launch's operand of these rows: fp8 + ue8m0 under
+                # SGLANG_HIP_FFN_NORM_MXFP8, or HCU's per-token (fp8, scale, dtype)
+                # or Int8PerTokenInput.
                 pre_quant_input = getattr(hidden_states, "_hip_mxfp8_operand", None)
+            if isinstance(pre_quant_input, Int8PerTokenInput):
+                return self.shared_experts(
+                    hidden_states,
+                    input_quant_args=(pre_quant_input.q, pre_quant_input.scale),
+                )
             if pre_quant_input is not None:
                 # SGLANG_OPT_MOE_QUANT_ONCE: (q, s) rows may be padded to a
                 # multiple of 4; the padded rows flow through the MLP (all ops

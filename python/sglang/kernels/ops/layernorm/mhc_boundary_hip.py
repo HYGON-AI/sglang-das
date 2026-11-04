@@ -6,6 +6,7 @@ from typing import Optional, Tuple, Union
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
@@ -458,6 +459,266 @@ def rmsnorm_with_sinkhorn(
         num_warps=_HC_SINKHORN_NUM_WARPS,
     )
     return quant, out_norm
+
+
+@triton.jit
+def _rmsnorm_per_token_quant_row(
+    row,
+    x_ptr,
+    w_ptr,
+    out_norm_ptr,
+    out_q_ptr,
+    out_scale_ptr,
+    K,
+    stride_xm,
+    stride_nm,
+    stride_qm,
+    eps,
+    Q_MAX: tl.constexpr,
+    MIN_SCALE: tl.constexpr,
+    INT8: tl.constexpr,
+    CHUNK: tl.constexpr,
+    NUM_CHUNKS: tl.constexpr,
+):
+    """One row: rmsnorm_fake_quant_row's bf16 RMSNorm, then the per-token fp8 (or int8)
+    quantization of those bf16 values (dequant scale amax / Q_MAX), as a separate
+    per-token quant would."""
+    base = tl.arange(0, CHUNK)
+    x_row = x_ptr + row * stride_xm
+    n_row = out_norm_ptr + row * stride_nm
+
+    acc = tl.zeros((CHUNK,), dtype=tl.float32)
+    for c in tl.static_range(NUM_CHUNKS):
+        offs = c * CHUNK + base
+        x = tl.load(x_row + offs, mask=offs < K, other=0.0).to(tl.float32)
+        acc += x * x
+    rstd = 1.0 / tl.sqrt_rn(tl.sum(acc, axis=0) / K + eps)
+
+    amax = tl.zeros((CHUNK,), dtype=tl.float32)
+    for c in tl.static_range(NUM_CHUNKS):
+        offs = c * CHUNK + base
+        mask = offs < K
+        x = tl.load(x_row + offs, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        y = (x * rstd * w).to(out_norm_ptr.dtype.element_ty)
+        tl.store(n_row + offs, y, mask=mask)
+        amax = tl.maximum(amax, tl.abs(y.to(tl.float32)))
+    row_amax = tl.max(amax, axis=0)
+    if INT8:
+        # per_token_quant_int8's amax floor and multiply-then-round (int8_kernel.py),
+        # so the int8 operand is bitwise the unfused quant of the stored norm
+        row_amax = tl.maximum(row_amax, 1e-10)
+        scale = row_amax / Q_MAX
+        inv_scale = Q_MAX / row_amax
+    else:
+        scale = tl.maximum(row_amax / Q_MAX, MIN_SCALE)
+    tl.store(out_scale_ptr + row, scale)
+
+    # quantize the stored bf16 row itself; the barrier makes every thread's stores visible
+    tl.debug_barrier()
+    for c in tl.static_range(NUM_CHUNKS):
+        offs = c * CHUNK + base
+        mask = offs < K
+        y = tl.load(n_row + offs, mask=mask, other=0.0).to(tl.float32)
+        if INT8:
+            q = libdevice.round(y * inv_scale)
+        else:
+            q = tl.clamp(y / scale, -Q_MAX, Q_MAX)
+        tl.store(
+            out_q_ptr + row * stride_qm + offs,
+            q.to(out_q_ptr.dtype.element_ty),
+            mask=mask,
+        )
+
+
+@triton.jit
+def _rmsnorm_per_token_quant_sinkhorn_kernel(
+    x_ptr,
+    w_ptr,
+    out_norm_ptr,
+    out_q_ptr,
+    out_scale_ptr,
+    K,
+    stride_xm,
+    stride_nm,
+    stride_qm,
+    eps,
+    part_mix_ptr,
+    part_sq_ptr,
+    scratch_ptr,
+    scale_ptr,
+    base_ptr,
+    pre_ptr,
+    post_ptr,
+    comb_ptr,
+    M,
+    m,
+    inv_k,
+    rms_eps,
+    Q_MAX: tl.constexpr,
+    MIN_SCALE: tl.constexpr,
+    INT8: tl.constexpr,
+    CHUNK: tl.constexpr,
+    NUM_CHUNKS: tl.constexpr,
+    MIX: tl.constexpr,
+    HC: tl.constexpr,
+    NUM_SLICES: tl.constexpr,
+    SLICES_PAD: tl.constexpr,
+    ITERS: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    """_rmsnorm_sinkhorn_kernel with _rmsnorm_per_token_quant_row on programs [0, M)."""
+    pid = tl.program_id(0)
+    if pid < M:
+        _rmsnorm_per_token_quant_row(
+            pid.to(tl.int64),
+            x_ptr,
+            w_ptr,
+            out_norm_ptr,
+            out_q_ptr,
+            out_scale_ptr,
+            K,
+            stride_xm,
+            stride_nm,
+            stride_qm,
+            eps,
+            Q_MAX=Q_MAX,
+            MIN_SCALE=MIN_SCALE,
+            INT8=INT8,
+            CHUNK=CHUNK,
+            NUM_CHUNKS=NUM_CHUNKS,
+        )
+    else:
+        _hc_mix_reduce_sinkhorn_row(
+            pid - M,
+            part_mix_ptr,
+            part_sq_ptr,
+            scratch_ptr,
+            scale_ptr,
+            base_ptr,
+            pre_ptr,
+            post_ptr,
+            comb_ptr,
+            m,
+            inv_k,
+            rms_eps,
+            MIX=MIX,
+            HC=HC,
+            NUM_SLICES=NUM_SLICES,
+            SLICES_PAD=SLICES_PAD,
+            ITERS=ITERS,
+            EPS=EPS,
+        )
+
+
+def rmsnorm_per_token_fp8_with_sinkhorn(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    coefficients: HcCoefficients,
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.dtype], torch.Tensor]:
+    """rmsnorm_with_sinkhorn(..., fake_quant=False) that also emits the norm's per-token fp8
+    operand ``(q [M, K], scale [M, 1] fp32, x.dtype)``; returns (operand, norm)."""
+    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, fp8_max
+
+    q, scale, out_norm = _rmsnorm_per_token_quant_with_sinkhorn(
+        x,
+        weight,
+        eps,
+        coefficients,
+        q_dtype=fp8_dtype,
+        q_max=float(fp8_max),
+        # the floor vLLM's dynamic per-token fp8 quant uses; keeps all-zero rows finite
+        min_scale=1.0 / (float(fp8_max) * 512.0),
+    )
+    return (q, scale, x.dtype), out_norm
+
+
+def rmsnorm_per_token_int8_with_sinkhorn(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    coefficients: HcCoefficients,
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """The int8 sibling of rmsnorm_per_token_fp8_with_sinkhorn: the operand is
+    per_token_quant_int8's ``(q [M, K] int8, scale [M, 1] fp32)`` of the norm."""
+    q, scale, out_norm = _rmsnorm_per_token_quant_with_sinkhorn(
+        x,
+        weight,
+        eps,
+        coefficients,
+        q_dtype=torch.int8,
+        q_max=127.0,
+        min_scale=0.0,
+    )
+    return (q, scale), out_norm
+
+
+def _rmsnorm_per_token_quant_with_sinkhorn(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    coefficients: HcCoefficients,
+    *,
+    q_dtype: torch.dtype,
+    q_max: float,
+    min_scale: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2 and x.shape[-1] % 32 == 0, x.shape
+    assert weight.dim() == 1 and weight.shape[0] == x.shape[-1], weight.shape
+    assert weight.dtype == x.dtype, (weight.dtype, x.dtype)
+    x = row_major_2d(x)
+    weight = weight.contiguous()
+    M, K = x.shape
+    assert coefficients.num_rows == M, (
+        f"coefficients hold {coefficients.num_rows} rows, the norm input {M}"
+    )
+    dev = x.device
+    out_norm = torch.empty((M, K), dtype=x.dtype, device=dev)
+    out_q = torch.empty((M, K), dtype=q_dtype, device=dev)
+    out_scale = torch.empty((M, 1), dtype=torch.float32, device=dev)
+    if M == 0:
+        return out_q, out_scale, out_norm
+    m = 0 if coefficients.materialized else M
+    coefficients.materialized = True
+    CHUNK = rmsnorm_row_chunk(K)
+    _rmsnorm_per_token_quant_sinkhorn_kernel[(M + m,)](
+        x,
+        weight,
+        out_norm,
+        out_q,
+        out_scale,
+        K,
+        x.stride(0),
+        out_norm.stride(0),
+        out_q.stride(0),
+        eps,
+        coefficients.part_mix,
+        coefficients.part_sq,
+        coefficients.scratch,
+        coefficients.hc_scale,
+        coefficients.hc_base,
+        coefficients._pre,
+        coefficients._post,
+        coefficients._comb,
+        M,
+        m,
+        1.0 / coefficients.k,
+        coefficients.rms_eps,
+        Q_MAX=q_max,
+        MIN_SCALE=min_scale,
+        INT8=q_dtype == torch.int8,
+        CHUNK=CHUNK,
+        NUM_CHUNKS=triton.cdiv(K, CHUNK),
+        MIX=coefficients.mix,
+        HC=coefficients.hc_mult,
+        NUM_SLICES=coefficients.num_slices,
+        SLICES_PAD=triton.next_power_of_2(coefficients.num_slices),
+        ITERS=coefficients.sinkhorn_iters,
+        EPS=coefficients.hc_eps,
+        num_warps=_HC_SINKHORN_NUM_WARPS,
+    )
+    return out_q, out_scale, out_norm
 
 
 @triton.jit
