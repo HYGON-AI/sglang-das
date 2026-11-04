@@ -469,6 +469,31 @@ def _combine(
     return norm(hc_combine(x_flat, apply_pre, cfg.mult, x.dtype))
 
 
+def combine_operand(
+    hc: HcSubLayer, state: HcState, *, int8: bool
+) -> Tuple[torch.Tensor, Optional[object]]:
+    """`combine` whose norm also emits the rows' per-token operand: the
+    ``(fp8, scale, orig_dtype)`` a ``linear_takes_fp8_operand`` linear reads, or with
+    ``int8`` the Int8PerTokenInput an opted-in INT8 linear reads (HCU); the operand is
+    None where the fused launch declines the rows."""
+    from sglang.kernels.ops.layernorm.mhc import hc_combine
+    from sglang.srt.layers.fused_rms_quant import (
+        rms_norm_fp8_operand,
+        rms_norm_int8_operand,
+    )
+
+    if state.input is not None or state.pre is None:
+        return combine(hc, state), None
+    x = state.residual
+    y = hc_combine(x.flatten(1), state.pre, hc.cfg.mult, x.dtype)
+    # Normalizes y in place: the sublayer still reads the bf16 rows.
+    emit_operand = rms_norm_int8_operand if int8 else rms_norm_fp8_operand
+    operand = emit_operand(y, hc.norm)
+    if operand is None:
+        return hc.norm(y), None
+    return y, operand
+
+
 # ---------------------------------------------------------------------------
 # Step 4 -- rebuild the streams, optionally collapsing the next input too
 # ---------------------------------------------------------------------------

@@ -29,9 +29,11 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 )
 from sglang.srt.models.deepseek_common.amd import deepseek_v4_gfx95_dense as gfx95_dense
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (  # noqa: F401  deepseek_v4 reaches apply_attention_mhc through this module
+    MHC_HIDDEN_SIZE,
     apply_attention_mhc,
     forward_hc_pre_from_prev_fused_boundary,
     norm_hosting_sinkhorn,
+    norm_hosting_sinkhorn_operand,
 )
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_gfx95_supported, is_hcu
@@ -237,7 +239,9 @@ def init_decoder_layer(layer, quant_config) -> None:
     """The ROCm state of DeepseekV4DecoderLayer.__init__. input_layernorm also emits the
     pre-quantized operand of the dense projections (whether wqkv_a consumes native MXFP8
     resolves on first use), and on gfx950 one launch runs hc_post, the pre-collapse and
-    the mixing stats; the kernel only supports hc_mult 4."""
+    the mixing stats; the kernel only supports hc_mult 4. On HCU V4.1 Flash the two
+    hyper-connection norms emit the per-token FP8 (or W4A8 / W8A8-INT8) operand of
+    wqkv_a (or wq_a + wkv) and of the shared experts' gate_up."""
     layer.fused_rmsnorm_fp8_quant = gfx95_dense.fused_rmsnorm_fp8_quant_eligible(
         quant_config
     )
@@ -246,6 +250,26 @@ def init_decoder_layer(layer, quant_config) -> None:
     )
     layer._wqkv_a_native_consumer_checked = False
     layer._wqkv_a_native_consumer = False
+    # Scoped to V4.1 Flash (hidden 5120), the model these HCU operand fusions target.
+    if (
+        layer.config.model_type == "deepseek_v41"
+        and layer.config.hidden_size == MHC_HIDDEN_SIZE
+    ):
+        attn = layer.self_attn
+        attn_linears = [attn.wqkv_a] if attn.fuse_wqa_wkv else [attn.wq_a, attn.wkv]
+        layer.attn_norm_fp8_operand = fused_rmsnorm_fp8_operand_eligible(*attn_linears)
+        layer.attn_norm_int8_operand = (
+            not layer.attn_norm_fp8_operand
+            and fused_rmsnorm_int8_operand_eligible(*attn_linears)
+        )
+        shared_experts = getattr(layer.mlp, "shared_experts", None)
+        if shared_experts is not None:
+            gate_up = shared_experts.gate_up_proj
+            layer.ffn_norm_fp8_operand = fused_rmsnorm_fp8_operand_eligible(gate_up)
+            layer.ffn_norm_int8_operand = (
+                not layer.ffn_norm_fp8_operand
+                and fused_rmsnorm_int8_operand_eligible(gate_up)
+            )
     layer.hc_boundary_fused = (
         (_is_gfx95_supported or (_is_hcu and envs.SGLANG_HCU_FUSED_MHC_BOUNDARY.get()))
         and layer.hc_pre_from_prev_sublayer
@@ -305,6 +329,13 @@ def input_norm(
     if layer.fused_rmsnorm_fake_quant:
         return gfx95_dense.input_norm_fake_quant(layer, hidden_states, coefficients)
     if _is_hcu and coefficients is not None:
+        if layer.attn_norm_fp8_operand or layer.attn_norm_int8_operand:
+            return norm_hosting_sinkhorn_operand(
+                layer.input_layernorm,
+                hidden_states,
+                coefficients,
+                int8=layer.attn_norm_int8_operand,
+            )
         norm = norm_hosting_sinkhorn(layer.input_layernorm, hidden_states, coefficients)
         return norm, None
     if coefficients is not None:
