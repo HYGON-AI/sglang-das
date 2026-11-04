@@ -9,6 +9,7 @@ if TYPE_CHECKING:
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
+from sglang.srt.layers.fused_rms_quant import Int8PerTokenInput
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.utils import should_skip_post_experts_all_reduce
 from sglang.srt.runtime_context import (
@@ -33,6 +34,8 @@ if _is_hip:
     )
     from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
         hc_boundary_fused_deferred,
+        rmsnorm_per_token_fp8_with_sinkhorn,
+        rmsnorm_per_token_int8_with_sinkhorn,
         rmsnorm_with_sinkhorn,
     )
 if _is_gfx95_supported:
@@ -579,11 +582,22 @@ def apply_moe_mhc(x: torch.Tensor, state: MhcPostOperands) -> torch.Tensor:
 
 def _gfx95_dense_post_attention_norm(layer, x: torch.Tensor, coefficients):
     """layer.post_attention_layernorm(x) hosting the pending reduce + sinkhorn where
-    the gfx950 or HCU norm launch can; the module norm plus a standalone reduce +
-    sinkhorn elsewhere."""
+    the gfx950 or HCU norm launch can (on HCU also emitting the shared experts' FP8 or
+    INT8 operand); the module norm plus a standalone reduce + sinkhorn elsewhere."""
     if _is_gfx95_supported:
         return post_attention_norm(layer, x, coefficients)
     if _is_hcu:
+        if layer.ffn_norm_fp8_operand or layer.ffn_norm_int8_operand:
+            out, operand = norm_hosting_sinkhorn_operand(
+                layer.post_attention_layernorm,
+                x,
+                coefficients,
+                int8=layer.ffn_norm_int8_operand,
+            )
+            if operand is not None:
+                # Read by DeepseekV2MoE._forward_shared_experts.
+                out._hip_mxfp8_operand = operand
+            return out
         return norm_hosting_sinkhorn(layer.post_attention_layernorm, x, coefficients)
     coefficients.materialize()
     return layer.post_attention_layernorm(x)
@@ -620,3 +634,24 @@ def norm_hosting_sinkhorn(norm, x: torch.Tensor, coefficients) -> torch.Tensor:
         x, norm.weight.data, norm.variance_epsilon, coefficients, fake_quant=False
     )
     return out
+
+
+def norm_hosting_sinkhorn_operand(
+    norm, x: torch.Tensor, coefficients, *, int8: bool
+) -> Tuple[torch.Tensor, Optional[object]]:
+    """norm_hosting_sinkhorn whose launch also emits the norm's per-token operand: the
+    ``(fp8, scale, orig_dtype)`` a ``linear_takes_fp8_operand`` linear reads, or with
+    ``int8`` the Int8PerTokenInput an opted-in INT8 linear reads (HCU); the operand is
+    None on the shapes that take the module norm."""
+    assert _is_hip, "the sinkhorn-hosting norm is a ROCm kernel"
+    if not norm_can_host_sinkhorn(norm, x, coefficients):
+        return norm_hosting_sinkhorn(norm, x, coefficients), None
+    if int8:
+        (q, scale), out = rmsnorm_per_token_int8_with_sinkhorn(
+            x, norm.weight.data, norm.variance_epsilon, coefficients
+        )
+        return out, Int8PerTokenInput(x=out, q=q, scale=scale)
+    operand, out = rmsnorm_per_token_fp8_with_sinkhorn(
+        x, norm.weight.data, norm.variance_epsilon, coefficients
+    )
+    return out, operand
