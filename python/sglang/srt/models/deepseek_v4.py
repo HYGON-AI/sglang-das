@@ -5086,6 +5086,16 @@ class DeepseekV4ForCausalLM(nn.Module):
                         "Channelwise FP8 LM head does not support tied embeddings"
                     )
                 channelwise_fp8.install(self.lm_head)
+            if (
+                self.pp_group.is_last_rank
+                and getattr(config, "model_type", None) == "deepseek_v41"
+                and channelwise_int8.enabled(
+                    self.lm_head, quant_config, add_prefix("lm_head", prefix)
+                )
+            ):
+                if config.tie_word_embeddings:
+                    raise ValueError("INT8 LM head does not support tied embeddings")
+                channelwise_int8.install(self.lm_head)
             self.logits_processor = LogitsProcessor(config)
 
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
