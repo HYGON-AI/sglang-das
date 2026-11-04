@@ -159,8 +159,18 @@ def benchmark_config(
             )
 
     if use_fp8_w8a8:
-        w1 = w1.to(torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn)
-        w2 = w2.to(torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn)
+        # Match the serving-side fp8 flavor: is_fp8_fnuz() is False on HCU
+        # (native e4m3fn) and True on gfx94* AMD parts (e4m3fnuz).  The
+        # previous hard-coded "fnuz if _is_hip" benchmarked a different
+        # dtype than serving on HCU, and on gfx938 triton-hcu lacks
+        # fp8e4b8 support so the benchmark kernel failed to compile.
+        from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+
+        _w_fp8_dtype = (
+            torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+        )
+        w1 = w1.to(_w_fp8_dtype)
+        w2 = w2.to(_w_fp8_dtype)
 
     input_gating = torch.randn(num_tokens, num_experts, dtype=torch.float32)
     topk_config = TopKConfig(
