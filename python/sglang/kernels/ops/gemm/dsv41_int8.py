@@ -392,3 +392,164 @@ def project(x, w, s, groups, rank, **kwargs):
     if os.environ.get("SGLANG_DSV41_INT8_SERVICE_OPT") == "1":
         return _project_packed(x, w, s, groups, rank, **kwargs)
     return _project_unpacked(x, w, s, groups, rank, **kwargs)
+
+
+@lru_cache(maxsize=4)
+def _read_tuning(path):
+    return json.loads(Path(path).read_text())
+
+
+def _vp_tuning(device, n, k, vp_size):
+    path = os.environ.get("SGLANG_DSV41_INT8_VP_ALGO_CONFIG")
+    if not path:
+        return None
+    config = _read_tuning(path)
+    props = torch.cuda.get_device_properties(device)
+    identity = (props.gcnArchName.split(":")[0], props.multi_processor_count,
+                str(torch.__version__), n, k, vp_size)
+    expected = (config['arch'], config['compute_units'], config['torch_version'],
+                config['n'], config['k'], config['vp_size'])
+    if config.get('format_version') != 1 or identity != expected:
+        raise ValueError("INT8 VP tuning does not match device, runtime or matrix shape.")
+    lda = config['weight_lda']
+    if not isinstance(lda, int) or lda < n or config['quant_warps'] not in (2, 4, 8):
+        raise ValueError("Invalid INT8 VP weight layout or quantization configuration.")
+    for rows, item in config['shapes'].items():
+        pitch, algorithm = item['q_pitch'], item['algorithm']
+        if (int(rows) <= 0 or not isinstance(pitch, int) or pitch < k or pitch % 4
+                or not isinstance(algorithm, str) or len(algorithm) != 32):
+            raise ValueError("Invalid INT8 VP row shape, pitch or algorithm.")
+        try:
+            bytes.fromhex(algorithm)
+        except ValueError as exc:
+            raise ValueError("Invalid INT8 VP algorithm encoding.") from exc
+    return config
+
+
+def require_int8_vp_backend():
+    if os.environ.get("SGLANG_DSV41_INT8_PROJECTION_BACKEND", "blaslt") != "blaslt":
+        raise ValueError("INT8 LM-head VP requires the blaslt projection backend.")
+
+
+class Int8VPProjection:
+    """Own only the vocabulary shard, with fixed quantization/INT32 scratch.
+
+    Activations have already been gathered across VP owners. Quantize each
+    complete hidden row, never a hidden-dimension slice. Preserve the caller's
+    floating output dtype and the existing FP32 scale multiplication order.
+    """
+
+    def __init__(self, weight, scale, *, vp_rank, vp_size, input_dtype):
+        require_int8_vp_backend()
+        if (
+            weight.dtype != torch.int8 or weight.ndim != 2 or not weight.is_cuda
+            or not weight.is_contiguous() or scale.dtype != torch.float32
+            or scale.shape != (weight.shape[0], 1) or not scale.is_contiguous()
+            or scale.device != weight.device or vp_size <= 1
+            or weight.shape[0] % vp_size or not 0 <= vp_rank < vp_size
+            or weight.shape[1] % 4
+            or input_dtype not in (torch.bfloat16, torch.float16, torch.float32)
+        ):
+            raise ValueError("INT8 VP needs CUDA INT8 [N,K], FP32 [N,1] scales and floating activations.")
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Initialize INT8 VP before graph capture.")
+
+        self.device = weight.device
+        self.input_dtype = input_dtype
+        self.k = weight.shape[1]
+        self.n = weight.shape[0] // vp_size
+        self.rank, self.size = vp_rank, vp_size
+        self._tuning = _vp_tuning(self.device, self.n, self.k, vp_size)
+        self.lda = self._tuning['weight_lda'] if self._tuning else self.n
+        self._max_pitch = max([self.k] + [item['q_pitch'] for item in self._tuning['shapes'].values()]) if self._tuning else self.k
+        # Weak references allow the upstream compact target+draft VP path to
+        # release the complete LM-head after both projections are constructed.
+        self._weight_ref = weakref.ref(weight)
+        self._scale_ref = weakref.ref(scale)
+        self._weight_version = self._version(weight)
+        self._scale_version = self._version(scale)
+        start = vp_rank * self.n
+        shard = weight.detach().narrow(0, start, self.n)
+        if self.lda == self.n:
+            self.packed = shard.T.clone(memory_format=torch.contiguous_format).view(1, 1, -1)
+        else:
+            storage = torch.zeros((self.k - 1) * self.lda + self.n,
+                                  device=self.device, dtype=torch.int8)
+            storage.as_strided((self.k, self.n), (self.lda, 1)).copy_(shard.T)
+            self.packed = storage.view(1, 1, -1)
+        self.scales = scale.detach().narrow(0, start, self.n).clone(
+            memory_format=torch.contiguous_format
+        )
+        self.ops = _load()
+        self.capacity = 0
+        self.used = False
+        self.plans = {}
+
+    @staticmethod
+    def _version(tensor):
+        try:
+            return tensor._version
+        except RuntimeError:
+            return -1
+
+    def validate_shared(self, weight, scale, *, vp_rank, vp_size, input_dtype):
+        if (
+            weight is not self._weight_ref() or scale is not self._scale_ref()
+            or (vp_rank, vp_size, input_dtype) != (self.rank, self.size, self.input_dtype)
+            or self._version(weight) != self._weight_version
+            or self._version(scale) != self._scale_version
+        ):
+            raise ValueError("Shared INT8 VP requires the same unchanged weight, scale, shard and dtype.")
+
+    def reserve(self, rows):
+        if rows <= self.capacity:
+            return
+        if self.used or torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("INT8 VP scratch cannot grow after use or during capture.")
+        self._q_storage = torch.empty(rows * self._max_pitch, device=self.device, dtype=torch.int8)
+        self.q = self._q_storage[:rows * self.k].view(rows, 1, self.k)
+        self.xs = torch.empty((rows, 1, 1), device=self.device, dtype=torch.float32)
+        self.raw = torch.empty((rows, 1, self.n), device=self.device, dtype=torch.int32)
+        self.capacity = rows
+
+    def project(self, x, out):
+        from sglang.kernels.ops.quantization import int8_kernel as quant
+
+        m = x.shape[0]
+        if (
+            x.shape != (m, self.k) or x.dtype != self.input_dtype
+            or x.device != self.device or not x.is_contiguous()
+            or out.shape != (m, self.n) or out.dtype != self.input_dtype
+            or out.device != self.device or not out.is_contiguous() or m > self.capacity
+        ):
+            raise ValueError("INT8 VP activation/output layout or capacity mismatch.")
+        if not m:
+            return
+        self.used = True
+        shape = self._tuning['shapes'].get(str(m)) if self._tuning else None
+        pitch = shape['q_pitch'] if shape else self.k
+        plan = self.plans.get(m)
+        if plan is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Warm up each INT8 VP row shape before graph capture.")
+            plan = self.ops.prepare(self.packed, m, 1, self.n, self.k,
+                                    1, self.lda, self.k * self.lda, pitch, False,
+                                    shape['algorithm'] if shape else "")
+            self.plans[m] = plan
+        q = self._q_storage[:m * pitch].view(m, 1, pitch)[:, :, :self.k]
+        xs, raw = self.xs[:m], self.raw[:m]
+        block = triton.next_power_of_2(self.k)
+        quant._per_token_quant_int8[(m,)](
+            x, q, xs, None, stride_x=self.k, stride_xq=pitch, N=self.k,
+            CAL_SUM=False, BLOCK=block, IS_HIP=quant._is_hip,
+            num_warps=self._tuning['quant_warps'] if self._tuning else min(max(block // 256, 1), 8), num_stages=1,
+        )
+        self.ops.gemm(q, self.packed, raw, plan)
+        if out.dtype in (torch.bfloat16, torch.float32):
+            self.ops.scale(raw, xs, self.scales, out.view(m, 1, self.n), 1, 1, False, 0)
+        else:
+
+            _scale_int32[(triton.cdiv(out.numel(), 1024),)](
+                raw, xs, self.scales, out, m, 1, self.n, False, 1024,
+                num_warps=4, enable_fp_fusion=False,
+            )

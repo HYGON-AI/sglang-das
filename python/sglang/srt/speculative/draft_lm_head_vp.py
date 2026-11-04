@@ -308,6 +308,21 @@ def channelwise_fp8_lm_head_scale(lm_head) -> torch.Tensor | None:
     return None
 
 
+def channelwise_lm_head_scale(lm_head) -> torch.Tensor | None:
+    """Recognize supported quantized heads without changing the FP8 contract."""
+    from sglang.srt.layers.quantization import w8a8_int8
+
+    if isinstance(
+        getattr(lm_head, "quant_method", None),
+        w8a8_int8.ChannelwiseInt8Method,
+    ):
+        from sglang.kernels.ops.gemm.dsv41_int8 import require_int8_vp_backend
+
+        require_int8_vp_backend()
+        return lm_head.weight_scale
+    return channelwise_fp8_lm_head_scale(lm_head)
+
+
 class DSparkLMHeadVocabParallel:
     def __init__(
         self,
@@ -331,8 +346,19 @@ class DSparkLMHeadVocabParallel:
             raise ValueError("DSPARK VP requires a full, unpadded 2-D LM-head weight.")
         # Channelwise FP8 keeps E4M3 rows plus one FP32 scale per vocabulary
         # row, so each shard is a row slice of both and reuses the same GEMM.
-        self.is_channelwise_fp8 = weight_scale is not None
-        if self.is_channelwise_fp8:
+        self.is_channelwise_int8 = full_weight.dtype == torch.int8 and weight_scale is not None
+        self.is_channelwise_fp8 = weight_scale is not None and not self.is_channelwise_int8
+        if self.is_channelwise_int8:
+            from sglang.kernels.ops.gemm.dsv41_int8 import require_int8_vp_backend
+
+            require_int8_vp_backend()
+            if (
+                weight_scale.dtype != torch.float32
+                or tuple(weight_scale.shape) != (vocab_size, 1)
+                or activation_dtype not in (torch.bfloat16, torch.float16, torch.float32)
+            ):
+                raise ValueError("INT8 VP requires FP32 [vocab,1] scales and floating activations.")
+        elif self.is_channelwise_fp8:
             if (
                 full_weight.dtype != torch.float8_e4m3fn
                 or tuple(weight_scale.shape) != (vocab_size, 1)
@@ -413,7 +439,24 @@ class DSparkLMHeadVocabParallel:
         self.shard_size = vocab_size // vp_size
         self.dtype = activation_dtype or full_weight.dtype
         self.device = full_weight.device
-        if self.is_channelwise_fp8:
+        if self.is_channelwise_int8:
+            from sglang.kernels.ops.gemm.dsv41_int8 import Int8VPProjection
+
+            self.weight_shard_t = None
+            if workspace is None:
+                self.int8_projection = Int8VPProjection(
+                    full_weight, weight_scale, vp_rank=self.vp_rank,
+                    vp_size=vp_size, input_dtype=self.dtype,
+                )
+            else:
+                if not workspace.is_channelwise_int8:
+                    raise ValueError("Shared VP workspace has an incompatible INT8 layout.")
+                self.int8_projection = workspace.int8_projection
+                self.int8_projection.validate_shared(
+                    full_weight, weight_scale, vp_rank=self.vp_rank,
+                    vp_size=vp_size, input_dtype=self.dtype,
+                )
+        elif self.is_channelwise_fp8:
             # Row-major slices, as the full-head channelwise GEMM consumes them.
             # A shared workspace comes from the same LM-head, so reuse its shard.
             self.weight_shard_t = None
@@ -465,6 +508,7 @@ class DSparkLMHeadVocabParallel:
                 or workspace.device != self.device
                 or workspace.dtype != self.dtype
                 or workspace.is_channelwise_fp8 != self.is_channelwise_fp8
+                or workspace.is_channelwise_int8 != self.is_channelwise_int8
             ):
                 raise ValueError("Shared VP workspace has an incompatible layout.")
             # Initialization only: expand before either target or draft graphs
@@ -549,6 +593,8 @@ class DSparkLMHeadVocabParallel:
         self.gathered_hidden = torch.empty((total_rows, self.hidden_size), **options)
         self.shard_logits = torch.empty((total_rows, self.shard_size), **options)
         self.received_logits = torch.empty_like(self.shard_logits)
+        if self.is_channelwise_int8:
+            self.int8_projection.reserve(total_rows)
         self._workspace_state["rows"] = rows
 
     @torch.no_grad()
@@ -594,7 +640,9 @@ class DSparkLMHeadVocabParallel:
         partial = self.shard_logits[:total]
         received = self.received_logits[:total]
         self._all_gather(gathered, local)
-        if self.is_channelwise_fp8:
+        if self.is_channelwise_int8:
+            self.int8_projection.project(gathered, partial)
+        elif self.is_channelwise_fp8:
             from sglang.srt.layers.quantization import dsv41_channelwise_fp8
 
             dsv41_channelwise_fp8.linear(
