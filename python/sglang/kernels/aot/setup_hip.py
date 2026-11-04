@@ -24,6 +24,7 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 root = Path(__file__).parent.resolve()
 arch = platform.machine().lower()
+dtk_root = Path(os.environ.get("DTK_HOME", "/opt/dtk"))
 
 
 def _get_version():
@@ -38,6 +39,7 @@ include_dirs = [
     root / "include",
     root / "include" / "impl",
     root / "csrc",
+    dtk_root / "include",
     # upstream moved shared kernel headers (e.g. speculative/eagle.cuh) under the
     # JIT include tree; setup_musa.py already carries this entry.
     root.parent / "jit" / "include",
@@ -49,6 +51,7 @@ sources = [
     "csrc/allreduce/quick_all_reduce.cu",
     "csrc/attention/decode_metadata.cu",
     "csrc/common_extension_rocm.cc",
+    "csrc/gemm/int8_gemm_kernel.cu",
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/concat_mla_absorb_q_hcu.cu",
     "csrc/elementwise/deepseek_v4_topk.cu",
@@ -71,8 +74,9 @@ sources = [
 ]
 
 cxx_flags = ["-O3", "-w"]
-libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
-extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
+libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python", "hipblaslt"]
+extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu",
+                   f"-L{dtk_root / 'lib'}", f"-Wl,-rpath,{dtk_root / 'lib'}"]
 
 
 hipcc_flags = [
