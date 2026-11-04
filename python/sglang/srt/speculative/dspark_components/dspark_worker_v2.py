@@ -661,14 +661,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
         from sglang.srt.speculative.draft_lm_head_vp import (
             DSparkLMHeadVocabParallel,
-            channelwise_fp8_lm_head_scale,
+            channelwise_lm_head_scale,
         )
 
         parallel = get_parallel()
         target_model = self.target_worker.model_runner.model
         target_logits = target_model.logits_processor
         head = target_model.lm_head
-        head_scale = channelwise_fp8_lm_head_scale(head)
+        head_scale = channelwise_lm_head_scale(head)
         both_vp = vp_size > 1 and target_vp_size > 1
         if target_vp_size > 1:
             if (
@@ -692,7 +692,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             ):
                 raise ValueError(
-                    "Target VP requires an unquantized or channelwise-FP8 replicated "
+                    "Target VP requires an unquantized, channelwise-FP8 or INT8 replicated "
                     "LM-head without LoRA or FP32-head mode."
                 )
         if both_vp:
@@ -739,6 +739,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 activation_dtype=self.target_worker.model_runner.dtype,
             )
             if both_vp:
+                if getattr(draft_vp, "is_channelwise_int8", False):
+                    from sglang.kernels.ops.gemm.dsv41_int8 import release_weight_cache
+
+                    release_weight_cache(head.weight)
                 # Both paths now use the same GPU shard. Release the complete
                 # weight without a CPU backup; keep only interface metadata.
                 metadata_weight = torch.nn.Parameter(
