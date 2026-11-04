@@ -1172,7 +1172,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
         from sglang.srt.speculative.draft_lm_head_vp import (
             DSparkLMHeadVocabParallel,
-            channelwise_fp8_lm_head_scale,
+            channelwise_lm_head_scale,
         )
 
         if self._use_fp32_lm_head:
@@ -1182,12 +1182,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             )
         if self.lm_head is None or int(self.lm_head.tp_size) != 1:
             raise ValueError("DSPARK draft VP requires a replicated DP LM-head.")
-        head_scale = channelwise_fp8_lm_head_scale(self.lm_head)
+        head_scale = channelwise_lm_head_scale(self.lm_head)
         if head_scale is None and should_apply_lm_head_quant_method(
             self.lm_head, self.lm_head.quant_method
         ):
             raise ValueError(
-                "DSPARK draft VP supports only unquantized or channelwise-FP8 LM-heads."
+                "DSPARK draft VP supports unquantized, channelwise-FP8 or channelwise-INT8 LM-heads."
             )
         self.draft_lm_head_vp = DSparkLMHeadVocabParallel(
             full_weight=self.lm_head.weight,
@@ -1436,7 +1436,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             return draft_vp.project_logits(x, padded_rows=vp_padded_rows)
         if self._use_fp32_lm_head and isinstance(
             getattr(self.lm_head, "quant_method", None),
-            channelwise_fp8.ChannelwiseFp8Method,
+            (
+                channelwise_fp8.ChannelwiseFp8Method,
+                channelwise_int8.ChannelwiseInt8Method,
+            ),
         ):
             local_logits = project_through_lm_head(x.float(), self.lm_head)
         elif self._use_fp32_lm_head and weight.dtype in (

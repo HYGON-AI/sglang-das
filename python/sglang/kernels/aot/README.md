@@ -165,5 +165,8 @@ entry point; an older wheel reports the missing operators without a GEMM fallbac
 
 `SGLANG_DSV41_INT8_SERVICE_OPT=1` selects the validated packed layouts. Their
 default algorithm configuration is embedded in the Python entry module; an
-explicit `SGLANG_DSV41_INT8_SERVICE_ALGO_CONFIG` can still override it. LM-head INT8 and target/draft VP integration are added by the dependent PR.
-This PR connects wo_a and Markov heads to the shared projection primitives.
+explicit `SGLANG_DSV41_INT8_SERVICE_ALGO_CONFIG` can still override it. Target
+and draft VP use the existing `SGLANG_DSPARK_TARGET_LM_HEAD_VP_SIZE` and
+`--speculative-draft-lm-head-vp-size` controls. Optional VP tuning remains off
+unless `SGLANG_DSV41_INT8_VP_ALGO_CONFIG` is explicitly set. Preserve the existing
+FP32 LM-head/compact-VP compatibility guards.

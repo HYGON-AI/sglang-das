@@ -49,7 +49,31 @@ class TestChannelwiseInt8(unittest.TestCase):
             self.assertEqual(y.dtype, dtype)
             self.assertEqual(project.call_args.kwargs["output_dtype"], dtype)
 
+    def test_default_lm_head_preserves_bf16_output(self):
+        layer = self.make_layer()
+        x = torch.ones(2, 8, dtype=torch.bfloat16)
+        with patch.object(runtime, "linear", return_value=torch.zeros(2, 4, dtype=x.dtype)) as project:
+            y = layer.quant_method.apply(layer, x)
+        self.assertEqual(y.dtype, torch.bfloat16)
+        self.assertEqual(project.call_args.kwargs["output_dtype"], torch.bfloat16)
 
+    def test_draft_vp_uses_existing_size_without_extra_switch(self):
+        from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
+
+        layer = self.make_layer()
+        layer.tp_size = 1
+        layer.org_vocab_size = 4
+        draft = SimpleNamespace(_use_fp32_lm_head=False, lm_head=layer)
+        with patch.dict(os.environ), patch("sglang.srt.speculative.draft_lm_head_vp.DSparkLMHeadVocabParallel") as vp:
+            os.environ.pop("SGLANG_DSV41_INT8_VP", None)
+            os.environ.pop("SGLANG_DSV41_INT8_PROJECTION_BACKEND", None)
+            DeepseekV4ForCausalLMDSpark.enable_draft_lm_head_vp(
+                draft, vp_size=8, max_rows_per_rank=64, local_world_size=8,
+                activation_dtype=torch.bfloat16,
+            )
+            self.assertEqual(vp.call_args.kwargs["vp_size"], 8)
+            self.assertIs(vp.call_args.kwargs["weight_scale"], layer.weight_scale)
+            self.assertIs(draft.draft_lm_head_vp, vp.return_value)
 
     def make_layer(self):
         layer = torch.nn.Linear(8, 4, bias=False)
@@ -190,8 +214,23 @@ class TestChannelwiseInt8(unittest.TestCase):
         torch.testing.assert_close(layer.weight_scale[:3], s[4:7])
         self.assertEqual(layer.weight_scale[3].item(), 0)
 
+    def test_quantized_logits_honor_fp32_output(self):
+        from sglang.srt.layers.logits_processor import LogitsProcessor
 
-    def test_markov_head_keeps_quant_dispatch(self):
+        layer = self.make_layer()
+        x = torch.ones(2, 8, dtype=torch.bfloat16)
+
+        def project(x, w, scale, *, output_dtype=None):
+            self.assertEqual(w.dtype, torch.int8)
+            self.assertEqual(output_dtype, torch.float32)
+            return torch.zeros(x.shape[0], w.shape[0], dtype=output_dtype)
+
+        processor = SimpleNamespace(use_fp32_lm_head=True)
+        with patch.object(runtime, "linear", side_effect=project):
+            y = LogitsProcessor._compute_lm_head(processor, x, layer)
+        self.assertEqual(y.dtype, torch.float32)
+
+    def test_markov_and_shared_draft_head_keep_quant_dispatch(self):
         from sglang.srt.models.deepseek_v4_dspark import (
             DeepseekV4ForCausalLMDSpark,
             DSparkV4MarkovHead,
@@ -210,6 +249,14 @@ class TestChannelwiseInt8(unittest.TestCase):
             for flag in (True, False):
                 head._opt_markov_w2_bf16 = flag
                 self.assertEqual(head.project_bias(x).dtype, torch.float32)
+            draft = SimpleNamespace(
+                lm_head=head.markov_w2,
+                stages=[SimpleNamespace(norm=torch.nn.Identity())],
+                _use_fp32_lm_head=True,
+                _opt_markov_w2_tp_shard=True,
+            )
+            y = DeepseekV4ForCausalLMDSpark._logits_from_x_post_hc(draft, x)
+            self.assertEqual(y.dtype, torch.float32)
 
     def test_markov_shard_slices_weight_and_scale_together(self):
         from sglang.srt.models.deepseek_v4_dspark import DSparkV4MarkovHead
