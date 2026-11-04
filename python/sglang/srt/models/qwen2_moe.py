@@ -604,7 +604,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return final_hidden_states
 
-    def _forward_router_experts(self, hidden_states: torch.Tensor):
+    def _forward_router_experts(
+        self,
+        hidden_states: torch.Tensor,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
@@ -612,6 +616,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output
         ):
             topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
+        if pre_quant_input is not None:
+            # SGLANG_ENABLE_DP_GATHER_INT8: the gathered rows were quantized on
+            # the wire with the same per-token int8 scheme the experts use;
+            # hand (codes, scales) through instead of re-quantizing (vLLM PR
+            # 247). Quant methods that do not consume them drop the kwargs.
+            return self.experts(
+                hidden_states,
+                topk_output,
+                i_q=pre_quant_input[0],
+                i_s=pre_quant_input[1],
+            )
         return self.experts(hidden_states, topk_output)
 
     def forward_normal_dual_stream(
@@ -660,6 +675,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -689,7 +705,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             shared_output = self._forward_shared_experts(
                 hidden_states, apply_gate=not use_fused_gate
             )
-            final_hidden_states = self._forward_router_experts(hidden_states)
+            final_hidden_states = self._forward_router_experts(
+                hidden_states, pre_quant_input=pre_quant_input
+            )
 
         if shared_output is not None:
             if use_fused_gate:

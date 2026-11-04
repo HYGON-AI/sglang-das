@@ -95,6 +95,25 @@ def _pin_host_metadata(device: Union[str, torch.device]) -> bool:
     return _is_hcu and is_pin_memory_available(device)
 
 
+def _kv_allocated_upper_bound(batch) -> Optional[int]:
+    """Host bound on positions when spec v2 drops the seq_lens CPU mirror.
+
+    KV slots are allocated on the host before the forward that writes them
+    (committed length plus the double decode reserve), so no position this
+    forward touches lies past the largest allocated length.
+    """
+    reqs = getattr(batch, "reqs", None)
+    if not reqs:
+        return None
+    bound = 0
+    for req in reqs:
+        kv = getattr(req, "kv", None)
+        if kv is None:
+            return None
+        bound = max(bound, kv.kv_allocated_len)
+    return bound
+
+
 def _elastic_should_preserve_local_token_counts(
     *,
     model_runner: ModelRunner,
@@ -480,6 +499,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
     seq_lens_cpu: Optional[torch.Tensor] = None
+    # When seq_lens_cpu is absent (spec v2 GPU-only path): host upper bound of
+    # every position this forward touches, i.e. the KV length allocated ahead
+    # of it.  Lets backends size gathers without reading seq_lens back.
+    seq_lens_cpu_upper_bound: Optional[int] = None
 
     # For logprob
     top_logprobs_nums: Optional[List[int]] = None
@@ -771,23 +794,29 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def materialize_deferred_device_metadata(
         self, device: Union[str, torch.device]
     ) -> None:
-        """Materialize device metadata deferred by a graph-first prepare path."""
+        """Materialize device metadata deferred by a graph-first prepare path.
+
+        Runs right behind the target forward, so a pageable host-to-device copy
+        would block the CPU until that whole forward drains; stage through
+        pinned memory instead, like the non-deferred path above.
+        """
+        pin = _pin_host_metadata(device)
         if (
             self.num_token_non_padded is None
             and self.num_token_non_padded_cpu is not None
             and enable_num_token_non_padded()
         ):
             self.num_token_non_padded = torch.tensor(
-                self.num_token_non_padded_cpu, dtype=torch.int32, device=device
-            )
+                self.num_token_non_padded_cpu, dtype=torch.int32, pin_memory=pin
+            ).to(device, non_blocking=True)
 
         if (
             self.global_num_tokens_cpu is not None
             and self.global_num_tokens_gpu is None
         ):
             self.global_num_tokens_gpu = torch.tensor(
-                self.global_num_tokens_cpu, dtype=torch.int64, device=device
-            )
+                self.global_num_tokens_cpu, dtype=torch.int64, pin_memory=pin
+            ).to(device, non_blocking=True)
         if (
             self.global_num_tokens_for_logprob_cpu is not None
             and self.global_num_tokens_for_logprob_gpu is None
@@ -795,8 +824,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.global_num_tokens_for_logprob_gpu = torch.tensor(
                 self.global_num_tokens_for_logprob_cpu,
                 dtype=torch.int64,
-                device=device,
-            )
+                pin_memory=pin,
+            ).to(device, non_blocking=True)
 
     @classmethod
     def init_new(
@@ -897,6 +926,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             seq_lens_sum=batch.seq_lens_sum,
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,
+            seq_lens_cpu_upper_bound=(
+                _kv_allocated_upper_bound(batch) if seq_lens_cpu is None else None
+            ),
             orig_seq_lens=batch.orig_seq_lens,
             out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
             mamba_track_indices=batch.mamba_track_indices,
@@ -1258,9 +1290,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         seq_positions = seq_positions.view(batch_size, -1)
         # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
         if all(mm_input is None for mm_input in mm_inputs):
-            mrope_delta_tensor = torch.zeros(
-                (batch_size, 1), dtype=torch.int64, device=device
+            # Each axis has the same text position. Copy directly without
+            # allocating a zero delta or launching an addition kernel.
+            self.mrope_positions = (
+                seq_positions.to(dtype=torch.int64)
+                .flatten()
+                .unsqueeze(0)
+                .expand(3, -1)
+                .contiguous()
             )
+            return
         else:
             mrope_deltas = [
                 (
@@ -1270,7 +1309,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
                 for i in range(batch_size)
             ]
-            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0)
+            # Multimodal deltas live on host. Pageable .to() synchronizes the
+            # busy stream on HCU, even though these values are already known.
+            if (
+                _pin_host_metadata(device)
+                and mrope_delta_tensor.device.type == "cpu"
+            ):
+                mrope_delta_tensor = mrope_delta_tensor.pin_memory()
+            mrope_delta_tensor = mrope_delta_tensor.to(
+                device=device, non_blocking=True
+            )
         next_input_positions = (
             (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
         )
@@ -1577,8 +1626,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         self.seq_lens.shape[0] == 0
                     ), "extend-idle conversion expects an empty rank"
                     self.extend_num_tokens = num_tokens
-                    self.extend_seq_lens = torch.tensor(
-                        [num_tokens], dtype=torch.int32, device=dev
+                    self.extend_seq_lens = torch.full(
+                        (1,), num_tokens, dtype=torch.int32, device=dev
                     )
                     self.extend_prefix_lens = torch.zeros(
                         1, dtype=self.seq_lens.dtype, device=dev
@@ -1586,14 +1635,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.extend_start_loc = torch.zeros(
                         1, dtype=torch.int32, device=dev
                     )
-                    self.seq_lens = torch.tensor(
-                        [num_tokens], dtype=self.seq_lens.dtype, device=dev
+                    self.seq_lens = torch.full(
+                        (1,), num_tokens, dtype=self.seq_lens.dtype, device=dev
                     )
                     # orig_seq_lens is not padded by _pad_inputs_to_size, so
                     # fabricate it to match the dummy request (the breakable
                     # prefill CUDA graph runner reads it).
-                    self.orig_seq_lens = torch.tensor(
-                        [num_tokens], dtype=self.orig_seq_lens.dtype, device=dev
+                    self.orig_seq_lens = torch.full(
+                        (1,), num_tokens, dtype=self.orig_seq_lens.dtype, device=dev
                     )
                     self.seq_lens_sum = int(num_tokens)
                     if self.seq_lens_cpu is not None:

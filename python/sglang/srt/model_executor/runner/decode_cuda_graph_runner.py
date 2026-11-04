@@ -1151,6 +1151,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             bs, stream_idx=stream_idx, num_tokens=num_tokens
         )
+        if not hasattr(self, "_dp_buffer_snapshots"):
+            self._dp_buffer_snapshots = {}
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
@@ -1184,6 +1186,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch.global_num_tokens_cpu,
                 )
                 set_is_extend_in_batch(False)
+                # Snapshot the DP buffer geometry captured inside this graph.
+                # During replay no one re-runs prepare_mlp_sync_batch, and eager
+                # forwards between replays overwrite the process-wide sizing
+                # quartet; the graph's gather/scatter then read stale sizes and
+                # mis-shape the DP gather/scatter (token-count mismatch, e.g.
+                # the HC combine crash under DP attention + EAGLE). Replay
+                # restores the snapshot keyed by the graph being replayed.
+                self._pending_dp_snapshot = (
+                    forward_batch.global_dp_buffer_len,
+                    num_tokens,
+                    forward_batch.dp_padding_mode.is_max_len(),
+                    forward_batch.global_num_tokens_cpu,
+                )
+                self._dp_buffer_snapshots.setdefault(
+                    self._make_graph_key(
+                        self._capture_graph_size(bs=bs, num_tokens=num_tokens),
+                        stream_idx,
+                        variant_label,
+                        dsa_variant,
+                    ),
+                    self._pending_dp_snapshot,
+                )
 
                 kwargs = {}
                 if (
@@ -1300,6 +1324,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._replay_graph_key = self._make_graph_key(
                 graph_size_key, stream_idx, variant_label, dsa_variant
             )
+            cap_dp = getattr(self, "_dp_buffer_snapshots", {}).get(
+                self._replay_graph_key
+            )
+            if self.require_mlp_tp_gather and cap_dp is not None:
+                set_dp_buffer_len(*cap_dp)
+                set_is_extend_in_batch(False)
             return
 
         buffers = self.buffers
@@ -1400,6 +1430,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._replay_graph_key = self._make_graph_key(
             graph_size_key, stream_idx, variant_label, dsa_variant
         )
+
+        # Restore the DP buffer geometry captured inside the graph we are about
+        # to replay. Eager forwards overwrite the process-wide sizing quartet
+        # (see _DpGatheredBufferWrapper); without this restore, a replay that
+        # follows an eager forward reads stale sizes and mis-shapes the DP
+        # gather/scatter (token-count mismatch, e.g. the HC combine crash under
+        # DP attention + EAGLE).
+        cap_dp = getattr(self, "_dp_buffer_snapshots", {}).get(
+            self._replay_graph_key
+        )
+        if self.require_mlp_tp_gather and cap_dp is not None:
+            set_dp_buffer_len(*cap_dp)
+            set_is_extend_in_batch(False)
+            import os
+
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
         from sglang.srt.speculative.ragged_verify import round_up_grid

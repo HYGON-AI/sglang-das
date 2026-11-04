@@ -189,8 +189,14 @@ class QSAIndexer(MultiPlatformOp):
             if not get_is_capture_mode() and hasattr(
                 self.rotary_emb, "_ensure_cos_sin_cache_length"
             ):
+                # Pre-size once to the model's max position: the cache starts
+                # at max_position_embeddings, so this is a runtime no-op. The
+                # old positions.max().item() here was a per-layer GPU
+                # max-reduce + 8B D2H host sync (Perfetto signature:
+                # reduce_kernel<MaxNanFunctor<long>> + Memcpy DtoH + a launch
+                # bubble train while the CPU resumes kernel dispatch).
                 self.rotary_emb._ensure_cos_sin_cache_length(
-                    int(positions.max().item())
+                    int(self.rotary_emb.max_position_embeddings)
                 )
             key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
             q = qsa_index_q_norm_rope_store(
@@ -448,10 +454,13 @@ class QSAIndexer(MultiPlatformOp):
         if num_positions != tensor.shape[0]:
             raise ValueError("QSA RoPE positions must match the token dimension")
         if not get_is_capture_mode() and hasattr(self.rotary_emb, "_ensure_cos_sin_cache_length"):
-            max_pos = int(positions.max().item())
-            if max_pos < 0:
-                raise ValueError(f"QSA RoPE positions must be non-negative, got max={max_pos}")
-            self.rotary_emb._ensure_cos_sin_cache_length(max_pos)
+            # Pre-sized once to max_position_embeddings (see the fused-prep
+            # call site): no per-layer GPU max-reduce + D2H sync. Negative
+            # positions are invalid inputs; the clamp below tolerates them
+            # safely on HIP.
+            self.rotary_emb._ensure_cos_sin_cache_length(
+                int(self.rotary_emb.max_position_embeddings)
+            )
             # HIP advanced indexing VMFaults on out-of-range destinations;
             # clamp after the ensure so a stale write plan cannot walk off
             # the cos/sin cache.
@@ -488,6 +497,7 @@ class QSAIndexer(MultiPlatformOp):
         row_ends: torch.Tensor,
         query_positions: torch.Tensor,
         sequence_lengths_for_rows: torch.Tensor,
+        max_span: Optional[int] = None,
     ) -> torch.Tensor:
         rows = q.shape[0]
         output = torch.empty(
@@ -518,6 +528,7 @@ class QSAIndexer(MultiPlatformOp):
                     compressed_keys,
                     row_starts[chunk_slice],
                     row_ends[chunk_slice],
+                    max_span=max_span,
                 )
                 block_indices = qsa_fast_topk(
                     logits,
@@ -689,14 +700,21 @@ class QSAIndexer(MultiPlatformOp):
                 k_cache_fp8,
             )
 
-        compressed_keys, row_starts, row_ends, sequence_lengths = (
-            indexer_metadata.get_prefill_mqa_inputs(
-                self.layer_id, logical_positions
-            )
+        (
+            compressed_keys,
+            row_starts,
+            row_ends,
+            sequence_lengths,
+            max_compressed_len,
+        ) = indexer_metadata.get_prefill_mqa_inputs(
+            self.layer_id, logical_positions
         )
         query_sequence_ids = indexer_metadata.get_token_to_batch_idx()
-        row_sequence_lengths = sequence_lengths.index_select(
-            0, query_sequence_ids.long()
+        prefill = getattr(indexer_metadata, "prefill", None)
+        row_sequence_lengths = (
+            prefill.row_sequence_lengths
+            if prefill is not None
+            else sequence_lengths.index_select(0, query_sequence_ids.long())
         )
         return self.select_prefill_tokens(
             q,
@@ -705,6 +723,7 @@ class QSAIndexer(MultiPlatformOp):
             row_ends,
             logical_positions,
             row_sequence_lengths,
+            max_span=max_compressed_len,
         )
 
 

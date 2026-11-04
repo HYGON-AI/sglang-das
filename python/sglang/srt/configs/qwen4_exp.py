@@ -37,6 +37,18 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
     ):
         if hc_count <= 1:
             raise ValueError(f"Qwen4-Exp requires hc_count > 1, got {hc_count}.")
+        # Optional full-dense fallback, mirroring vLLM's VLLM_HCU_DISABLE_QSA.
+        # Hiding ``indexer_n_heads`` makes ``parse_qsa_profile`` return None, so
+        # every full-attention layer (including the MTP drafter) builds native
+        # dense attention over a regular KV cache.  That is the configuration
+        # vLLM ships for this checkpoint: it removes the QSA indexer entirely.
+        # Requires a dense attention backend (e.g. --attention-backend fa3);
+        # with the QSA backend selected the layers would still be dispatched as
+        # sparse and fail on a missing top-k.  Opt-in only.
+        import os as _os
+
+        if _os.environ.get("SGLANG_DISABLE_QSA", "0") == "1":
+            kwargs["indexer_n_heads"] = None
         # Qwen3.5/Qwen4-Exp checkpoints may provide RoPE settings under
         # rope_parameters. Normalize it before parent init so Qwen3Next shared
         # config logic sees the expected rope_scaling and rope_theta fields.

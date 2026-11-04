@@ -21,12 +21,15 @@ def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
 def prepare_chunk_indices(
     cu_seqlens: torch.LongTensor, chunk_size: int
 ) -> torch.LongTensor:
-    indices = torch.cat(
-        [
-            torch.arange(n)
-            for n in triton.cdiv(prepare_lens(cu_seqlens), chunk_size).tolist()
-        ]
+    # Eager GDN metadata owns a fresh cumulative-length tensor per forward.
+    # Its host lengths let every chunk-size variant avoid a shape readback.
+    lengths_cpu = getattr(cu_seqlens, "_fla_lengths_cpu", None)
+    num_chunks = (
+        [triton.cdiv(length, chunk_size) for length in lengths_cpu]
+        if lengths_cpu is not None
+        else triton.cdiv(prepare_lens(cu_seqlens), chunk_size).tolist()
     )
+    indices = torch.cat([torch.arange(n) for n in num_chunks])
     return (
         torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1)
         .pin_memory()
@@ -38,6 +41,14 @@ def prepare_chunk_indices(
 def prepare_chunk_offsets(
     cu_seqlens: torch.LongTensor, chunk_size: int
 ) -> torch.LongTensor:
+    lengths_cpu = getattr(cu_seqlens, "_fla_lengths_cpu", None)
+    if lengths_cpu is not None:
+        offsets = [0]
+        for length in lengths_cpu:
+            offsets.append(offsets[-1] + triton.cdiv(length, chunk_size))
+        return torch.tensor(
+            offsets, dtype=torch.int64, pin_memory=True
+        ).to(device=cu_seqlens.device, non_blocking=True)
     return torch.cat(
-        [cu_seqlens.new_tensor([0]), triton.cdiv(prepare_lens(cu_seqlens), chunk_size)]
+        [cu_seqlens.new_zeros(1), triton.cdiv(prepare_lens(cu_seqlens), chunk_size)]
     ).cumsum(-1)

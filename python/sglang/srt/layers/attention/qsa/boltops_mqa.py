@@ -54,12 +54,23 @@ def _slice_padded_decode_heads(q: torch.Tensor) -> torch.Tensor:
 
 
 def _effective_key_range(
-    row_starts: torch.Tensor, row_ends: torch.Tensor, keys: int
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    keys: int,
+    host_max_span: Optional[int] = None,
 ) -> Optional[int]:
     """Longest visible compressed-K span. Eager only; CUDA graph must not sync."""
     if get_is_capture_mode() or row_starts.numel() == 0 or keys <= 0:
         return None
-    span = int((row_ends - row_starts).clamp_min(0).max().item())
+    if host_max_span is not None:
+        # ``row_ends - row_starts`` is ``min(visible_blocks, max_blocks)``, so the
+        # largest per-sequence compressed length bounds it from above.  Using the
+        # host value avoids a device ``.item()`` (a full HIP queue drain) on every
+        # full-attention layer; an upper bound is safe because the result is only
+        # a loop bound and is clamped to ``keys``.
+        span = int(host_max_span)
+    else:
+        span = int((row_ends - row_starts).clamp_min(0).max().item())
     if span <= 0:
         return None
     return max(1, min(keys, span))
@@ -71,6 +82,7 @@ def try_boltops_qsa_mqa_prefill(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
+    max_span: Optional[int] = None,
 ) -> Optional[torch.Tensor]:
     """Return BoltOPs prefill logits, or None when BoltOPs cannot run this input."""
     if q.device.type != "cuda":
@@ -87,7 +99,9 @@ def try_boltops_qsa_mqa_prefill(
                 row_starts,
                 row_ends,
                 score_scale,
-                effective_range=_effective_key_range(row_starts, row_ends, k.shape[0]),
+                effective_range=_effective_key_range(
+                    row_starts, row_ends, k.shape[0], host_max_span=max_span
+                ),
             )
     except Exception as exc:
         _warn(f"prefill failed: {exc}")

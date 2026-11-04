@@ -538,11 +538,12 @@ def qsa_mqa_prefill(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
+    max_span: Optional[int] = None,
 ) -> torch.Tensor:
     from sglang.srt.layers.attention.qsa.boltops_mqa import try_boltops_qsa_mqa_prefill
 
     boltops_logits = try_boltops_qsa_mqa_prefill(
-        q, k, row_starts, row_ends, score_scale
+        q, k, row_starts, row_ends, score_scale, max_span=max_span
     )
     if boltops_logits is not None:
         return boltops_logits

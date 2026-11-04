@@ -89,8 +89,15 @@ def fused_experts_impl_w4a8_triton(
     w2_scale: torch.Tensor,
     routed_scaling_factor: float,
     shared_output: Optional[torch.Tensor],
+    i_q: Optional[torch.Tensor] = None,
+    i_s: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Run SlimQuant W4A8 Triton GEMMs without whole-layer LightOp fusion."""
+    """Run SlimQuant W4A8 Triton GEMMs without whole-layer LightOp fusion.
+
+    (i_q, i_s) optionally carries per-token int8 codes + scales that already
+    match `hidden_states` row-for-row (e.g. gathered off the DP all_gatherv
+    wire, vLLM PR 247 style); when given, the per-chunk re-quantization is
+    skipped and the wire codes are consumed directly."""
     assert hidden_states.ndim == 2 and hidden_states.is_contiguous()
     assert hidden_states.shape[1] == w1.shape[2] * 2
     assert topk_weights.shape == topk_ids.shape
@@ -128,7 +135,13 @@ def fused_experts_impl_w4a8_triton(
         sorted_ids, expert_ids, padded_count = w4a8_triton.moe_align_block_size(
             current_ids, config1["BLOCK_SIZE_M"], global_num_experts, expert_map
         )
-        qx, x_scale = per_token_quant_int8(current_x)
+        if i_q is not None and i_s is not None:
+            # Pre-quantized rows handed off from the DP gather wire: slice the
+            # chunk out of the full-buffer codes/scales instead of re-quant.
+            qx = i_q[begin:end]
+            x_scale = i_s[begin:end]
+        else:
+            qx, x_scale = per_token_quant_int8(current_x)
         w4a8_triton.invoke_fused_moe_kernel_w4a8(
             qx,
             w1,
@@ -540,10 +553,16 @@ class SlimQuantW4A8Int8MoEMethod:
         topk_output,
         activation: str,
         shared_output: Optional[torch.Tensor],
+        i_q: Optional[torch.Tensor] = None,
+        i_s: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+        if i_q is not None and self.moe_runner_config.apply_router_weight_on_input:
+            # apply_topk_weights_cpu below would multiply the router weights
+            # into x, so the wire codes no longer match it — re-quantize.
+            i_q = i_s = None
         x, topk_weights = apply_topk_weights_cpu(
             self.moe_runner_config.apply_router_weight_on_input, topk_weights, x
         )
@@ -574,6 +593,8 @@ class SlimQuantW4A8Int8MoEMethod:
             w2_scale=layer.w2_weight_scale,
             routed_scaling_factor=routed_scaling_factor,
             shared_output=shared_output,
+            i_q=i_q,
+            i_s=i_s,
         )
         return output
 
@@ -593,6 +614,8 @@ class SlimQuantW4A8Int8MoEMethod:
             dispatch_output.topk_output,
             layer.moe_runner_config.activation,
             shared_output=None,
+            i_q=i_q,
+            i_s=i_s,
         )
         return StandardCombineInput(hidden_states=output)
 
@@ -608,5 +631,11 @@ class SlimQuantW4A8Int8MoEMethod:
         i_s: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return self._apply_triton(
-            layer, x, topk_output, activation, shared_output=shared_output
+            layer,
+            x,
+            topk_output,
+            activation,
+            shared_output=shared_output,
+            i_q=i_q,
+            i_s=i_s,
         )

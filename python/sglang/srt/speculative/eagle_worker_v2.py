@@ -540,6 +540,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             skip_hip_qwen4_exp_draft_graphs = (
                 "Qwen4ExpForCausalLMMTP" in draft_archs
+                and not envs.SGLANG_QWEN4_EXP_HIP_DRAFT_GRAPHS.get()
             )
         if skip_hip_qwen4_exp_draft_graphs:
             log_info_on_rank0(
@@ -720,6 +721,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner,
             self.topk,
             self.speculative_num_steps,
+            defer_device_metadata=True,
         )
         if (
             can_run_decode_cuda_graph
@@ -746,6 +748,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.cuda_graph_runner.execute(forward_batch)
                 )
             else:
+                # Graph eligibility can be revoked above when the DSA seed is
+                # missing. Materialization is idempotent for the ordinary
+                # eager fallback selected by prepare_for_draft.
+                forward_batch.materialize_deferred_device_metadata(
+                    self.draft_runner.device
+                )
                 if (
                     not forward_batch.forward_mode.is_idle()
                     and self.speculative_num_steps > 1

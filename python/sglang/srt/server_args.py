@@ -4056,6 +4056,7 @@ class ServerArgs:
         # it). Inkling opts into full-graph prefill capture here.
         self._apply_inkling_prefill_cuda_graph_default()
         self._apply_qwen4_exp_hip_ple_decode_cuda_graph_default()
+        self._apply_qwen4_exp_hip_ple_prefill_cuda_graph_default()
         self._apply_muse_glimmer_prefill_cuda_graph_max_bs_default()
 
         # must run before _handle_cuda_graph_config and _handle_data_parallelism
@@ -4969,12 +4970,64 @@ class ServerArgs:
                 cuda_graph_backend_prefill=Backend.FULL,
             )
 
-    def _apply_qwen4_exp_hip_ple_decode_cuda_graph_default(self):
-        """HIP/HCU mapped-host PLE gathers collapse under full decode graphs.
+    def _apply_qwen4_exp_hip_ple_prefill_cuda_graph_default(self):
+        """HIP/HCU Qwen4Exp PLE offload prefill-graph default.
 
-        Force breakable decode graphs so PLE re-runs eagerly between MoE
-        segments. Must run before _handle_cuda_graph_config. Honors an
-        explicit --cuda-graph-backend-decode / --disable-decode-cuda-graph.
+        The PLE preamble builds a ``_PLEBatch`` metadata struct and walks
+        per-token token maps in Python.  torch.dynamo cannot trace that (it
+        cannot instantiate the struct, and marking it ``torch.compiler.disable``
+        is rejected inside a captured region), so capturing a *prefill* graph
+        fails the whole startup whenever EAGLE is off -- with EAGLE the prefill
+        graph is already disabled automatically, which is why this only shows up
+        on the multimodal / plain-generation paths.
+
+        Disable prefill graphs for these checkpoints.  Honors an explicit
+        --cuda-graph-backend-prefill / --disable-prefill-cuda-graph and the
+        SGLANG_PLE_PREFILL_GRAPH=1 opt-in.
+        """
+        if (
+            self.cuda_graph_backend_prefill is not None
+            or self.disable_prefill_cuda_graph
+            or self.disable_cuda_graph
+            or not self.ple_offload_embedding
+            or os.environ.get("SGLANG_PLE_PREFILL_GRAPH", "0") == "1"
+            or parse_connector_type(self.model_path) == ConnectorType.INSTANCE
+        ):
+            return
+        if not (is_hip() or is_hcu()):
+            return
+        arch = self.get_model_config().hf_config.architectures[0]
+        if arch not in (
+            "Qwen4ExpForConditionalGeneration",
+            "Qwen4ExpForCausalLMMTP",
+        ):
+            return
+        logger.info(
+            "Disabling prefill CUDA graphs for Qwen4Exp PLE offload on HIP/HCU "
+            "(the PLE preamble is not dynamo-traceable)."
+        )
+        # Assign directly: ``cuda_graph_backend_prefill`` is already populated
+        # by earlier defaults, so a declarative ``_declare`` would not reach the
+        # effective PhaseConfig built later in the pipeline.
+        self.disable_prefill_cuda_graph = True
+        self.cuda_graph_backend_prefill = None
+
+    def _apply_qwen4_exp_hip_ple_decode_cuda_graph_default(self):
+        """HIP/HCU Qwen4Exp PLE offload decode-graph default.
+
+        Triton ``tl.load`` from a mapped/pinned host pointer collapses to
+        token 0 under FULL decode graphs, which used to force BREAKABLE
+        graphs. INT8/FP8 PLE tables are always pinned and bind a mapped CUDA
+        view whose ATen ``F.embedding`` gather (weight + per-row scale)
+        replays graph-safely, so those tables can restore FULL decode graphs
+        and recover the host-gap spent on breakable replay. BF16 tables rely
+        on hostRegister of a pageable copy, which can fail on GTT exhaustion,
+        so they keep the BREAKABLE default.
+
+        Honors an explicit --cuda-graph-backend-decode /
+        --disable-decode-cuda-graph and the
+        SGLANG_PLE_DECODE_GRAPH_BREAKABLE=1 opt-out. Must run before
+        _handle_cuda_graph_config.
         """
         if (
             self.cuda_graph_backend_decode is not None
@@ -4992,13 +5045,46 @@ class ServerArgs:
             "Qwen4ExpForCausalLMMTP",
         ):
             return
+        if envs.SGLANG_PLE_DECODE_GRAPH_BREAKABLE.get():
+            logger.info(
+                "Using breakable decode CUDA graphs for Qwen4Exp PLE offload "
+                "on HIP/HCU (SGLANG_PLE_DECODE_GRAPH_BREAKABLE=1)."
+            )
+            self._declare(
+                "_apply_qwen4_exp_hip_ple_decode_cuda_graph_default",
+                cuda_graph_backend_decode=Backend.BREAKABLE,
+            )
+            return
+        if self._qwen4_exp_ple_table_is_int8_or_fp8():
+            logger.info(
+                "Using full decode CUDA graphs for Qwen4Exp int8/fp8 PLE "
+                "offload on HIP/HCU (mapped CUDA view gather is graph-safe)."
+            )
+            return
         logger.info(
-            "Using breakable decode CUDA graphs for Qwen4Exp PLE offload on HIP/HCU."
+            "Using breakable decode CUDA graphs for Qwen4Exp BF16 PLE offload "
+            "on HIP/HCU (hostRegister-mapped gather has no GTT-OOM fallback)."
         )
         self._declare(
             "_apply_qwen4_exp_hip_ple_decode_cuda_graph_default",
             cuda_graph_backend_decode=Backend.BREAKABLE,
         )
+
+    def _qwen4_exp_ple_table_is_int8_or_fp8(self) -> bool:
+        """Best-effort static check of the PLE n-gram table storage dtype."""
+        hf_config = self.get_model_config().hf_config
+        text_config = getattr(hf_config, "text_config", hf_config)
+        ple_dtype = getattr(text_config, "ple_embedding_dtype", None)
+        if ple_dtype in ("float8_e4m3fn", "fp8"):
+            return True
+        compression_config = getattr(text_config, "compression_config", None) or {}
+        if isinstance(compression_config, dict):
+            mixed = compression_config.get("mixed_precision") or {}
+            ngram = mixed.get("ngram_embedding") or {}
+            weight_bits = ngram.get("weight_bits")
+            if weight_bits in (8, "8"):
+                return True
+        return False
 
     def _apply_muse_glimmer_prefill_cuda_graph_max_bs_default(self):
         if (

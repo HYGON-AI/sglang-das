@@ -345,12 +345,18 @@ class QwenDSAIndexer(MultiPlatformOp):
         output = torch.full(
             (rows, self.token_topk), -1, dtype=torch.int32, device=q.device
         )
-        for sequence_id in range(sequence_lengths.numel()):
-            seq_len = int(sequence_lengths[sequence_id].item())
-            row_mask = query_sequence_ids == sequence_id
-            if seq_len <= 0 or not bool(row_mask.any()):
+        # One D2H for all per-sequence lengths instead of a ``.item()`` per
+        # request, and ``nonzero`` already reports emptiness via ``numel()``, so
+        # ``bool(row_mask.any())`` (another sync) is not needed.
+        sequence_lengths_list = sequence_lengths.tolist()
+        for sequence_id in range(len(sequence_lengths_list)):
+            seq_len = int(sequence_lengths_list[sequence_id])
+            if seq_len <= 0:
                 continue
+            row_mask = query_sequence_ids == sequence_id
             row_indices = row_mask.nonzero(as_tuple=True)[0]
+            if row_indices.numel() == 0:
+                continue
             slots = table[sequence_id, :seq_len].long()
             k_seq = index_k.index_select(0, slots)
             row_chunk = _qsa_prefill_row_chunk_size(

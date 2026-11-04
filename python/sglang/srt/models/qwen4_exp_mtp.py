@@ -1,5 +1,6 @@
 """Inference-only Qwen4-Exp MTP speculative decoding."""
 
+import os
 import copy
 import logging
 from contextlib import ExitStack
@@ -22,6 +23,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
     eager_on_graph,
 )
+from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_config
 from sglang.srt.models.qwen4_exp import Qwen4ExpModel
 from sglang.srt.runtime_context import get_model, get_parallel
@@ -31,6 +33,30 @@ logger = logging.getLogger(__name__)
 
 
 class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
+    # The draft's quant config takes packed_modules_mapping from this class
+    # (model_loader._get_quantization_config). Without it the fused qkv_proj /
+    # shared_expert.gate_up_proj never match the checkpoint's per-shard
+    # w8a8_include globs, so their int8 weights load as BF16 and the scales
+    # are dropped.
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+
+    # The Qwen4Exp MTP layer is a full decoder layer whose routed experts are
+    # SlimQuant-packed exactly like the backbone, so the checkpoint stores
+    # ``mlp.experts.gate_up_proj(.weight_scale)`` / ``mlp.experts.down_proj(
+    # .weight_scale)`` rather than the BF16 ``w13_weight`` layout the base
+    # class assumes.  Mirror ``Qwen4ExpModel``'s table: scale entries first.
+    fused_expert_params_mapping = [
+        (
+            "experts.w13_weight_scale",
+            "experts.gate_up_proj.weight_scale",
+            0,
+            "w1",
+        ),
+        ("experts.w2_weight_scale", "experts.down_proj.weight_scale", 0, "w2"),
+        ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
+        ("experts.w2_weight", "experts.down_proj", 0, "w2"),
+    ]
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -49,6 +75,17 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         config.layer_types = ["full_attention"]
         config.full_attention_interval = 1
         config.ple_layer_ids = []
+        # The bundled MTP layer ships a QSA indexer, but on HIP the draft's QSA
+        # extend indices are not numerically reliable (the same limitation that
+        # forces ``Skip HIP Qwen4Exp MTP draft CUDA graphs``), and every draft
+        # ends up rejected.  Hiding ``indexer_n_heads`` makes this single layer
+        # build native dense attention instead; the drafter only ever sees
+        # ``num_draft_tokens`` rows, so dense attention costs nothing
+        # measurable, while the indexer weights are simply skipped by the
+        # loader.
+        if os.environ.get("SGLANG_MTP_DENSE_ATTN", "0") == "1":
+            if getattr(config, "indexer_n_heads", None) is not None:
+                config.indexer_n_heads = None
 
         quant_config = _mtp_quant_config(quant_config)
 
@@ -83,7 +120,11 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         # pre_fc_norm_hidden.weight is stored flat (10240,) but the four
         # hidden_size slices have disjoint statistics; RMS over the concatenated
         # 10240-d vector mixes branches and collapses MTP accept rate.
-        if self.hc_count > 1:
+        if self.hc_count > 1 and os.environ.get("SGLANG_MTP_PLAIN_PFC_NORM", "0") == "1":
+            self.pre_fc_norm_hidden = GemmaRMSNorm(
+                self.hc_count * config.hidden_size, eps=config.rms_norm_eps
+            )
+        elif self.hc_count > 1:
             self.pre_fc_norm_hidden = GroupedGemmaRMSNorm(
                 self.hc_count * config.hidden_size,
                 eps=config.rms_norm_eps,

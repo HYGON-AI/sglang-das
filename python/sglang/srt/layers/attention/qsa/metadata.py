@@ -43,6 +43,59 @@ def build_qsa_row_ranges(
     return row_starts, row_ends, compressed_cu_seqlens
 
 
+class QSAPrefillMetadata(msgspec.Struct, frozen=True):
+    """Layer-independent packed-key addressing and query ranges for a forward."""
+
+    compressed_locs: torch.Tensor
+    row_starts: torch.Tensor
+    row_ends: torch.Tensor
+    row_sequence_lengths: torch.Tensor
+    max_compressed_len: int
+
+
+def build_qsa_prefill_metadata(
+    sequence_lengths: torch.Tensor,
+    sequence_lengths_cpu: Tuple[int, ...],
+    token_slot_table: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    positions: torch.Tensor,
+    compress_ratio: int,
+) -> QSAPrefillMetadata:
+    """Build once from host batch lengths, without reading device data back.
+
+    Only addresses are cached: each layer still gathers its own compressed K
+    after its compression writes have completed.
+    """
+    parts = [
+        token_slot_table[
+            i, : (length // compress_ratio) * compress_ratio : compress_ratio
+        ].long()
+        // compress_ratio
+        for i, length in enumerate(sequence_lengths_cpu)
+        if length >= compress_ratio
+    ]
+    compressed_locs = (
+        torch.cat(parts)
+        if parts
+        else token_slot_table.new_empty((0,), dtype=torch.long)
+    )
+    row_starts, row_ends, _ = build_qsa_row_ranges(
+        sequence_lengths,
+        positions[: token_to_batch_idx.numel()],
+        token_to_batch_idx,
+        compress_ratio,
+    )
+    return QSAPrefillMetadata(
+        compressed_locs=compressed_locs,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        row_sequence_lengths=sequence_lengths.index_select(
+            0, token_to_batch_idx.long()
+        ),
+        max_compressed_len=max(sequence_lengths_cpu, default=0) // compress_ratio,
+    )
+
+
 class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     """All per-forward metadata consumed specifically by ``QSAIndexer``.
 
@@ -90,6 +143,7 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     compress_group_ring_locs: Optional[torch.Tensor] = None
     extend_rope_matrix: Optional[torch.Tensor] = None
     graph_ring_group_locs: Optional[torch.Tensor] = None
+    prefill: Optional[QSAPrefillMetadata] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.sequence_lengths.to(torch.int32)
@@ -125,7 +179,7 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         self,
         layer_id: int,
         positions: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """Gather packed compressed K and ragged ranges for prefill MQA.
 
         Compressed slots come straight from the token-slot rows: each
@@ -136,6 +190,15 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         pool = self.token_to_kv_pool
         ratio = self.compress_ratio
         compressed_buffer = pool.get_qsa_compressed_k_buffer(layer_id)
+        if self.prefill is not None:
+            plan = self.prefill
+            return (
+                compressed_buffer.index_select(0, plan.compressed_locs),
+                plan.row_starts,
+                plan.row_ends,
+                self.sequence_lengths,
+                plan.max_compressed_len,
+            )
         parts = []
         sequence_lengths = self.sequence_lengths.to(torch.int32)
         sequence_lengths_list = sequence_lengths.tolist()
@@ -175,7 +238,20 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
             self.token_to_batch_idx.to(sequence_lengths.device),
             self.compress_ratio,
         )
-        return compressed_keys, row_starts, row_ends, sequence_lengths
+        # ``row_ends - row_starts`` is ``min(visible_blocks, max_blocks)``, so the
+        # longest per-sequence compressed length is a host-computable upper bound
+        # on it.  Returning it lets the MQA prefill hint skip a device ``.item()``
+        # (which drains the HIP queue) on every full-attention layer.
+        max_compressed_len = (
+            max(sequence_lengths_list) // ratio if sequence_lengths_list else 0
+        )
+        return (
+            compressed_keys,
+            row_starts,
+            row_ends,
+            sequence_lengths,
+            int(max_compressed_len),
+        )
 
     def get_decode_mqa_inputs(
         self, layer_id: int

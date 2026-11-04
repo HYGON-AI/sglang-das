@@ -291,6 +291,8 @@ def set_dp_buffer_len(
     global_num_tokens: Optional[List[int]] = None,
     global_num_tokens_gpu: Optional[torch.Tensor] = None,
 ):
+    import os
+
     _DpGatheredBufferWrapper.set_dp_buffer_len(
         global_dp_buffer_len,
         local_dp_buffer_len,
@@ -652,6 +654,113 @@ def _get_dp_gather_fp8_bufs(rows: int, hidden: int, device: torch.device):
         _dp_gather_fp8_bufs[key] = bufs
     return bufs[0][:rows], bufs[1][:rows]
 
+# int8-per-token wire variant buffers, keyed by device.
+_dp_gather_int8_bufs: dict = {}
+# Consume-once stash of the wire (codes, scales) pair from the last int8
+# gatherv DP gather, keyed by (device, data_ptr) of the dequantized bf16
+# buffer. The MoE caller (model MLP) picks it up with
+# take_dp_gather_int8_prequant so the expert GEMMs skip their re-quant.
+_dp_gather_int8_stash: dict = {}
+
+
+@functools.lru_cache(maxsize=1)
+def _use_dp_gather_int8() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_ENABLE_DP_GATHER_INT8.get()
+
+
+def _get_dp_gather_int8_bufs(rows: int, hidden: int, scale_tail, device):
+    key = str(device)
+    bufs = _dp_gather_int8_bufs.get(key)
+    if bufs is None or bufs[0].shape[0] < rows:
+        bufs = (
+            torch.empty((rows, hidden), dtype=torch.int8, device=device),
+            torch.empty(
+                (rows,) + tuple(scale_tail), dtype=torch.float32, device=device
+            ),
+        )
+        _dp_gather_int8_bufs[key] = bufs
+    return bufs[0][:rows], bufs[1][:rows]
+
+
+def take_dp_gather_int8_prequant(hidden_states: torch.Tensor):
+    """Return and consume the (codes, scales) wire pair stashed by the last
+    int8 gatherv DP gather that wrote `hidden_states`, or None.
+
+    The stash is keyed by the dequantized buffer's (device, data_ptr), so a
+    mismatched consumer (e.g. the logits gather buffer) simply misses. Under
+    CUDA-graph replay the captured tensor objects are reused, so the stashed
+    views stay valid; the stash only feeds eager/prefill paths (the gatherv
+    gather never runs under MAX_LEN decode padding)."""
+    if not _dp_gather_int8_stash:
+        return None
+    key = (str(hidden_states.device), hidden_states.data_ptr())
+    prequant = _dp_gather_int8_stash.pop(key, None)
+    if prequant is None:
+        return None
+    gq, gs = prequant
+    if (
+        hidden_states.dtype != torch.bfloat16
+        or gq.shape != hidden_states.shape
+        or gs.shape[0] != hidden_states.shape[0]
+    ):
+        return None
+    return gq, gs
+
+
+@triton.jit
+def _dequant_per_token_int8_kernel(
+    q_ptr,
+    s_ptr,
+    out_ptr,
+    HIDDEN: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    s = tl.load(s_ptr + row).to(tl.float32)
+    for start in tl.static_range(0, HIDDEN, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        mask = offs < HIDDEN
+        qv = tl.load(q_ptr + row * HIDDEN + offs, mask=mask, other=0.0).to(tl.float32)
+        tl.store(out_ptr + row * HIDDEN + offs, (qv * s).to(tl.bfloat16), mask=mask)
+
+
+def _dp_gather_via_all_gatherv_int8(
+    global_tokens: torch.Tensor,
+    local_real: torch.Tensor,
+    sizes: List[int],
+):
+    """int8-per-token wire format for the variable-length DP gather: quantize
+    the local rows with the SAME lightop per_token_quant_int8 the w4a8 expert
+    GEMMs apply to their input downstream, gather codes and per-token scales
+    in two output-buffered gatherv calls, then dequantize into the bf16 global
+    buffer (router/shared-expert still read bf16). The gathered (codes,
+    scales) are stashed for take_dp_gather_int8_prequant so the experts skip
+    their own re-quant (vLLM PR 247 INT8 AllGatherv pattern). Zero pad rows
+    quantize to (q=0, s=eps) and dequantize back to exact zeros."""
+    from lightop.quant import per_token_quant_int8
+
+    rows = global_tokens.shape[0]
+    hidden = global_tokens.shape[-1]
+    q, s = per_token_quant_int8(local_real.contiguous())
+    gq, gs = _get_dp_gather_int8_bufs(rows, hidden, s.shape[1:], global_tokens.device)
+    tp_group = get_tp_group()
+    tp_group.all_gatherv(q, sizes=sizes, output=gq)
+    tp_group.all_gatherv(s, sizes=sizes, output=gs)
+    _dp_gather_int8_stash.clear()
+    _dp_gather_int8_stash[(str(global_tokens.device), global_tokens.data_ptr())] = (
+        gq,
+        gs,
+    )
+    _dequant_per_token_int8_kernel[(rows,)](
+        gq,
+        gs,
+        global_tokens,
+        HIDDEN=hidden,
+        BLOCK=2048,
+    )
+
 
 @triton.jit
 def _dequant_per_token_group_fp8_kernel(
@@ -831,6 +940,12 @@ def _dp_gather_via_all_gatherv(
     # already structural: the gatherv path runs only under SUM_LEN padding,
     # which decode-only steps and CUDA-graph capture never select.
     if (
+        _use_dp_gather_int8()
+        and global_tokens.dtype == torch.bfloat16
+    ):
+        _dp_gather_via_all_gatherv_int8(global_tokens, local_real, sizes)
+        return
+    if (
         _use_dp_gather_fp8()
         and global_tokens.dtype == torch.bfloat16
         and global_tokens.shape[-1] % _DP_GATHER_FP8_GROUP == 0
@@ -921,6 +1036,76 @@ def dp_scatter(
         ), "aliasing between local_tokens and global_tokens not allowed"
 
         memcpy(local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True)
+
+
+@functools.lru_cache(maxsize=1)
+def _etp_rs_min_tokens() -> int:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_PLE_ETP_REDUCE_SCATTER_MIN_TOKENS.get()
+
+
+def dp_reduce_scatter_etp(
+    local_tokens: torch.Tensor,  # output
+    global_tokens: torch.Tensor,  # input (unreduced ETP partials)
+    forward_batch: ForwardBatch,
+):
+    """Combine ETP-across-DP partial embeddings (PLE-style sharded lookups).
+
+    Every DP rank gathers its vocab shard for ALL global tokens, producing
+    partial sums; the combine must SUM them and keep this rank's token rows.
+    The legacy pair (``tensor_model_parallel_all_reduce`` + ``dp_scatter``)
+    moves the full buffer twice per rank; a reduce-scatter halves the wire
+    traffic and skips the extra full-buffer copy. Layout must mirror
+    dp_scatter exactly, so fall back to the legacy pair whenever the
+    per-rank sizes are not available or do not match the buffers.
+    """
+    if global_tokens.shape[0] < _etp_rs_min_tokens():
+        # Small-message regime: reduce-scatter (and reduce_scatterv) lose to
+        # the fused all-reduce on tiny payloads; keep the legacy pair.
+        tensor_model_parallel_all_reduce(global_tokens)
+        dp_scatter(local_tokens, global_tokens, forward_batch)
+        return
+    if configured_attn_cp_size() == 1 and _is_etp_reduce_scatter_shape_ok(
+        local_tokens, global_tokens
+    ):
+        if _aiter_reduce_scatter_tensor(local_tokens, global_tokens):
+            return
+        get_tp_group().reduce_scatter_tensor(local_tokens, global_tokens)
+        return
+    # The reduce_scatterv sizes contract (get_dp_global_num_tokens) is only
+    # authoritative under the SUM_LEN/gatherv regime the MoE combine already
+    # uses; everywhere else fall back to the legacy all_reduce + dp_scatter.
+    sizes = get_dp_global_num_tokens() if is_dp_gatherv_active() else None
+    if (
+        sizes is not None
+        and sum(sizes) == global_tokens.shape[0]
+        and local_tokens.is_contiguous()
+        and global_tokens.is_contiguous()
+    ):
+        n = sizes[get_attention_dp_rank()]
+        if 0 < n <= local_tokens.shape[0]:
+            local_tokens.fill_(0)
+            get_tp_group().reduce_scatterv(
+                global_tokens, output=local_tokens[:n], sizes=sizes
+            )
+            return
+    tensor_model_parallel_all_reduce(global_tokens)
+    dp_scatter(local_tokens, global_tokens, forward_batch)
+
+
+def _is_etp_reduce_scatter_shape_ok(
+    local_tokens: torch.Tensor, global_tokens: torch.Tensor
+) -> bool:
+    """Equal-chunk (MAX_LEN) layout check: each DP rank owns one equal slot."""
+    dp_size = get_attention_dp_size()
+    return (
+        get_tensor_model_parallel_world_size() == dp_size
+        and dp_size > 1
+        and global_tokens.shape[0] == local_tokens.shape[0] * dp_size
+        and local_tokens.is_contiguous()
+        and global_tokens.is_contiguous()
+    )
 
 
 def _aiter_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor) -> bool:
