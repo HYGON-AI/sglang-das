@@ -3248,6 +3248,8 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         self.hc_pre_from_prev_sublayer = config.hc_pre_from_prev_sublayer
         if self.hc_pre_from_prev_sublayer:
             self.use_fused_mhc_post_pre = False
+        self.attn_norm_fp8_operand = self.ffn_norm_fp8_operand = False
+        self.attn_norm_int8_operand = self.ffn_norm_int8_operand = False
         if _is_hip:
             _hip.init_decoder_layer(self, quant_config)
         self.hc_cfg = mhc.HcConfig(

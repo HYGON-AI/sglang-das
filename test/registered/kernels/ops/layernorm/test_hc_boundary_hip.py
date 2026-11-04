@@ -219,6 +219,60 @@ class TestRmsnormWithSinkhorn(CustomTestCase):
             else:
                 self.assertTrue(torch.equal(quant.x, quant2.x))
 
+    def test_per_token_fp8_operand_keeps_the_hosted_norm(self):
+        """The per-token fp8 launch leaves the bf16 norm and coefficients bitwise those of the
+        plain hosted norm, and its operand is the per-token quant of that norm."""
+        from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
+            rmsnorm_per_token_fp8_with_sinkhorn,
+        )
+        from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, fp8_max
+
+        for m in (1, 7, 33):
+            _, y, coefficients = self._boundary(self.deferred, m, m)
+            _, norm = self.hosted(y, self.weight, 1e-6, coefficients, fake_quant=False)
+            _, y2, coefficients2 = self._boundary(self.deferred, m, m)
+            (q, scale, dtype), norm2 = rmsnorm_per_token_fp8_with_sinkhorn(
+                y2, self.weight, 1e-6, coefficients2
+            )
+            self.assertTrue(coefficients2.materialized)
+            self.assertTrue(torch.equal(norm, norm2))
+            self.assertTrue(
+                _all_equal(coefficients.tensors(), coefficients2.tensors())
+            )
+            self.assertEqual((q.dtype, scale.shape, dtype), (fp8_dtype, (m, 1), y.dtype))
+            ref_scale = norm.float().abs().amax(-1, keepdim=True) / fp8_max
+            torch.testing.assert_close(scale, ref_scale, rtol=1e-6, atol=0)
+            ref_q = (norm.float() / ref_scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+            # one e4m3 step: 2**-3 relative, 2**-9 in the subnormal range
+            torch.testing.assert_close(
+                q.float(), ref_q.float(), rtol=2**-3, atol=2**-9
+            )
+
+    def test_per_token_int8_operand_is_the_unfused_quant(self):
+        """The per-token int8 launch leaves the bf16 norm and coefficients bitwise those of the
+        plain hosted norm, and its operand is bitwise per_token_quant_int8 of that norm: a
+        divide-then-round or another amax floor would shift q by one at rounding ties."""
+        from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
+            rmsnorm_per_token_int8_with_sinkhorn,
+        )
+        from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
+
+        for m in (1, 7, 33):
+            _, y, coefficients = self._boundary(self.deferred, m, m)
+            _, norm = self.hosted(y, self.weight, 1e-6, coefficients, fake_quant=False)
+            _, y2, coefficients2 = self._boundary(self.deferred, m, m)
+            (q, scale), norm2 = rmsnorm_per_token_int8_with_sinkhorn(
+                y2, self.weight, 1e-6, coefficients2
+            )
+            self.assertTrue(coefficients2.materialized)
+            self.assertTrue(torch.equal(norm, norm2))
+            self.assertTrue(
+                _all_equal(coefficients.tensors(), coefficients2.tensors())
+            )
+            ref_q, ref_scale = per_token_quant_int8(norm)
+            self.assertTrue(torch.equal(q, ref_q))
+            self.assertTrue(torch.equal(scale, ref_scale))
+
 
 def _prefill_available():
     if not is_hip() or not torch.cuda.is_available():
