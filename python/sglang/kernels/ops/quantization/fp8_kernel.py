@@ -82,6 +82,20 @@ if _is_hip:
     except (ImportError, AttributeError):
         _hip_per_token_quant_fp8 = None
 
+    # HIP/HCU sgl_kernel wheels do not register the per-tensor FP8 quant op
+    # (the CUDA-only import above never runs), but scaled_fp8_quant's
+    # per-tensor branch calls it unconditionally.  That branch is reachable
+    # e.g. from benchmark/kernels/fused_moe_triton with a1_scale=None, and
+    # crashes with NameError without this fallback.  The implementation is
+    # dtype-aware so it is correct for both e4m3fn and e4m3fnuz targets.
+    def sgl_per_tensor_quant_fp8(input, output, scale, is_static=True):
+        fp8_max = torch.finfo(output.dtype).max
+        if not is_static:
+            amax = input.detach().abs().amax().float()
+            scale.fill_(amax / fp8_max if amax > 0 else 1.0)
+        q = (input.detach().float() / scale).clamp(-fp8_max, fp8_max)
+        output.copy_(q.to(output.dtype))
+
 
 if _is_hip and _use_aiter:
     try:
