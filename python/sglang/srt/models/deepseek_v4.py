@@ -3094,6 +3094,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.local_boundary = mhc.make_boundary(
             self.post_attention_layernorm,
             accepts_mxfp8=False,
+            hc=self.ffn_hc,
         )
         # MOE[i] -> ATTN[i+1]
         if self._next_layer is not None:
@@ -3168,7 +3169,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                             self.hc_ffn_fn.data
                         )
         if self.hc_pre_from_prev_sublayer:
+            previous_packed = self.ffn_hc.fn_packed
             self._init_hyper_connections()
+            if _is_hcu:
+                packed = mhc.prepare_hcu_mega_weight(self.ffn_hc, previous_packed)
+                self.ffn_hc = self.ffn_hc._replace(fn_packed=packed)
         # The fuse gates and boundaries snapshot load-time facts; weight updates
         # re-run this, so drop them and re-resolve on the next forward.
         self.__dict__.pop("_can_fuse_attn_mhc", None)
@@ -3632,12 +3637,15 @@ class DeepseekV4DecoderLayer(nn.Module):
                 stats_stream=stats_stream,
                 next=self.local_boundary,
                 world_size=world_size,
+                mode=forward_batch.forward_mode,
             )
 
         def run_ffn_hc(state: mhc.HcState) -> mhc.HcState:
             assert self.ffn_hc is not None
             residual = state.residual
-            mhc.fork_stats_stream(stats_stream)
+            precomputed = state.stats
+            if precomputed is None:
+                mhc.fork_stats_stream(stats_stream)
             x = mhc.combine(self.ffn_hc, state)
             state.release()
             del state
@@ -3660,6 +3668,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 stats_stream=stats_stream,
                 next=nxt,
                 world_size=self.mlp.tp_size,
+                precomputed=precomputed,
             )
 
         return run_ffn_hc(run_attn_hc(state))
