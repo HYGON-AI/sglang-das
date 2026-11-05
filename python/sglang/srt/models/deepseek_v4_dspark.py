@@ -643,6 +643,7 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
                 if self._opt_markov_w2_bf16
                 else torch.float32,
             )
+            return bias, state
         elif isinstance(
             getattr(self.markov_w2, "quant_method", None),
             channelwise_fp8.ChannelwiseFp8Method,
