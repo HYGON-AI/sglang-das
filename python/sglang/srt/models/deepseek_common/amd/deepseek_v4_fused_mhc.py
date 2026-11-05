@@ -616,6 +616,8 @@ def forward_hc_pre_from_prev_fused_boundary(
             x_quant=x_quant,
             defer_all_reduce=mhc is not None,
         )
+    # the projections' operand dies with the attention, not with the layer
+    del x_quant
     if mhc is not None:
         # wo_b honors the deferred reduce under attention_mhc_fusion's gates;
         # fail loud rather than fall back to an unfused reduce.
