@@ -6,6 +6,10 @@ import types
 import unittest
 from unittest.mock import Mock, patch
 
+from sglang.test.ci.ci_register import register_hcu_ci
+
+register_hcu_ci(est_time=10, suite="stage-b-test-1-hcu-small")
+
 ROOT = pathlib.Path(__file__).resolve().parents[4]
 
 

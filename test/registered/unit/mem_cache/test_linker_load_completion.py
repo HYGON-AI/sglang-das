@@ -1,13 +1,18 @@
 """Failed loads must drain all writers before request slots can be reused."""
 
 from concurrent.futures import Future, ThreadPoolExecutor
-from unittest.mock import Mock
 from threading import Event
+from unittest.mock import Mock
+
+import pytest
 
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import LayerWiseLoadCounter
+from sglang.test.ci.ci_register import register_hcu_ci
+
+register_hcu_ci(est_time=10, suite="stage-b-test-1-hcu-small")
 
 
 def test_failed_layer_does_not_skip_waiting_for_remaining_writers():
@@ -51,3 +56,7 @@ def test_finish_keeps_worker_completion_registered_until_worker_done():
         assert finish.result(timeout=5) is True
     assert 3 not in linker.batch_load_done
     linker.layer_done_counter.finish.assert_called_once_with(3)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

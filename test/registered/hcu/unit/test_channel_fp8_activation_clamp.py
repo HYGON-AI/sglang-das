@@ -102,3 +102,7 @@ def test_packed_scale_schedule_retains_clamp():
             (restored - ref[e, :count]).abs()
             <= ref[e, :count].abs() * 0.063 + decoded[e, :count, :, None] * 0.01
         )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

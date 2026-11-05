@@ -45,9 +45,10 @@ from sglang.srt.mem_cache.unified_memory_pool import (
 )
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_hcu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_hcu_ci(est_time=30, suite="stage-b-test-1-hcu-small")
 
 _DEV = "cpu"
 _DTYPE = torch.bfloat16
@@ -399,6 +400,12 @@ class TestFusedStateHost(unittest.TestCase):
         draft = UnifiedDraftMambaPool(
             unified_buffer=pool, sub_pool_name="mamba", layer_lanes={4: 0}
         )
+        layer = draft.mamba2_layer_cache(0)
+        self.assertIs(layer, draft.mamba2_layer_cache(0))
+        self.assertIsNone(layer.temporal._base)
+        self.assertEqual(
+            layer.temporal.data_ptr(), draft.mamba_cache.temporal[0].data_ptr()
+        )
         draft_conv, _ = pool.build_draft_state_views("mamba")
         self.assertEqual(
             draft.mamba_cache.conv[1].shape, (1, pool.max_slots("mamba"), 2, 4)
@@ -691,7 +698,10 @@ class TestUnifiedDraftSWAKVPool(unittest.TestCase):
         # at these CPU tensors and raises NotImplementedError. This fixture is
         # CPU by contract (register_cpu_ci), and the subject here is WHERE the
         # bytes land, not which kernel puts them there -- take the naive path.
-        with patch.object(mem_pool, "can_use_store_cache", return_value=False):
+        with (
+            patch.object(mem_pool, "can_use_store_cache", return_value=False),
+            patch.object(mem_pool, "_kv_layout_hcu_fa", False),
+        ):
             dp.set_kv_buffer(layer, KVWriteLoc(loc, swa_loc=loc, physical=True), k, v)
         swa_entry = pool.spec("swa").entry_bytes()
         lo = 6 * swa_entry + pool.spec("swa").draft_offset_in_entry()

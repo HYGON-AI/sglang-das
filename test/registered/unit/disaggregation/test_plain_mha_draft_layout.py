@@ -8,6 +8,10 @@ from types import SimpleNamespace as NS
 
 import pytest
 
+from sglang.test.ci.ci_register import register_hcu_ci
+
+register_hcu_ci(est_time=10, suite="stage-b-test-1-hcu-small")
+
 ROOT = next(
     p for p in Path(__file__).resolve().parents if (p / "python/sglang").is_dir()
 )
@@ -149,3 +153,7 @@ def test_invalid_parallel_metadata_rejected():
     a.kv_item_lens = [1]
     with pytest.raises(ValueError):
         normalize(a, is_mla_backend=False, num_hidden_layers=2)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
