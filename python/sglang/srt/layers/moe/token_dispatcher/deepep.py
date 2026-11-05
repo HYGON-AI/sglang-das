@@ -1253,6 +1253,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 not _hcu_deepgemm_is_selected()
                 # DeepEPMoE kept the HCU groupgemm kernels: vendor quant_type.
                 or self.quant_config.get("hcu_legacy_groupgemm", False)
+                # The W4A8 reference consumes INT8 dispatch; selecting DeepGEMM
+                # must not redirect it to the FP8 compat path.
+                or self.quant_config.get("hcu_w4a8_int8_dispatch", False)
             )
         ):
             if _is_hcu and self.quant_config.get("hcu_w4a8_int8_dispatch", False):

@@ -42,9 +42,9 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_available_gpu_memory,
+    is_hcu,
     is_host_cpu_arm64,
     is_npu,
-    is_hcu,
     monkey_patch_p2p_access_check,
 )
 from sglang.srt.utils.network import NetworkAddress
@@ -332,10 +332,9 @@ def _init_parallel_groups(
         duplicate_tp_group=get_disagg().enable_pdmux,
         duplicate_attn_cp_group=(
             _is_hcu
-            and (
-                get_exec().overlap.enable_two_batch_overlap
-                or getattr(get_parallel(), "enable_cp_cache_layer_split", False)
-            )
+            # Only the comm-stream two-batch-overlap path needs a second CP
+            # communicator. Ordinary interleave/cache-layer-split uses attn_cp.
+            and get_exec().overlap.enable_two_batch_overlap
             and get_parallel().enable_dsa_prefill_context_parallel
         ),
         enable_symm_mem=get_exec().comm.enable_symm_mem,
