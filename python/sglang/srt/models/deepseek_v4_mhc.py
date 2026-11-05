@@ -647,12 +647,12 @@ def prepare_hcu_mega_weight(hc: HcSubLayer, previous: Optional[torch.Tensor]):
     from sglang.srt.runtime_context import get_exec
 
     # Resolve framework policy and BF16 RMSNorm compatibility before capture.
-    # Tensor contracts are checked by the native backend.
+    # Tensor contracts are checked by the native backend. CP shards token rows,
+    # not the hidden dimension: the packed FFN weight is shared across shards.
     if not (
         _is_hcu
         and envs.SGLANG_HCU_MEGA_MHC_OPT.get()
         and hc.cfg.pre_from_prev
-        and not hc.cfg.cp_prefill
         and not hc.norm.cast_x_before_out_mul
         and hc.norm.variance_size_override is None
         and hc.norm.weight.dtype == torch.bfloat16
@@ -700,6 +700,10 @@ def _post_fusion(
         if (
             mode is not None
             and (mode.is_extend() or mode.is_decode())
+            # CP attention returns the same local token rows as its residual
+            # and coefficients. Fuse before MoE transports/reorders those rows.
+            # Keep CP decode/verify on their existing path.
+            and (not cfg.cp_prefill or mode.is_extend_without_speculative())
             and y.dtype == residual.dtype == torch.bfloat16
         ):
             packed = next_hc.fn_packed
