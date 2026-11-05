@@ -3607,17 +3607,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         def run_attn_hc(state: mhc.HcState) -> mhc.HcState:
             assert self.attn_hc is not None
             residual = state.residual
+            quantized = [] if self.self_attn.accepts_mxfp8_swizzled_input() else None
             mhc.fork_stats_stream(stats_stream)
-            if self.attn_norm_fp8_operand or self.attn_norm_int8_operand:
-                x, x_quant = mhc.combine_operand(
-                    self.attn_hc, state, int8=self.attn_norm_int8_operand
-                )
-            else:
-                quantized = (
-                    [] if self.self_attn.accepts_mxfp8_swizzled_input() else None
-                )
-                x = mhc.combine(self.attn_hc, state, quantized)
-                x_quant = quantized[0] if quantized else None
+            x = mhc.combine(self.attn_hc, state, quantized)
             state.release()
             del state
             world_size = self.self_attn.attn_tp_size
@@ -3629,7 +3621,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     x=x,
                     positions=positions,
                     forward_batch=forward_batch,
-                    x_quant=x_quant,
+                    x_quant=quantized[0] if quantized else None,
                     defer_all_reduce=fuse_all_reduce_mhc,
                 )
             del x
@@ -3646,16 +3638,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             assert self.ffn_hc is not None
             residual = state.residual
             mhc.fork_stats_stream(stats_stream)
-            if self.ffn_norm_fp8_operand or self.ffn_norm_int8_operand:
-                x, shared_operand = mhc.combine_operand(
-                    self.ffn_hc, state, int8=self.ffn_norm_int8_operand
-                )
-                if shared_operand is not None:
-                    # Read by DeepseekV2MoE._forward_shared_experts; rows the MoE
-                    # gathers or splits drop it and quantize on their own.
-                    x._hip_mxfp8_operand = shared_operand
-            else:
-                x = mhc.combine(self.ffn_hc, state)
+            x = mhc.combine(self.ffn_hc, state)
             state.release()
             del state
             nxt = self.next_boundary if seam_open else None
