@@ -2841,8 +2841,6 @@ class SchedulerDisaggregationPrefillMixin:
             or not get_parallel().enable_cp_cache_layer_split
             or get_memory().enable_unified_memory
             or req.pending_bootstrap
-            or req.prefix_len == 0
-            or req.extend_end < len(req.origin_input_ids)
         ):
             return
         pool = self.token_to_kv_pool_allocator.get_kvcache()
@@ -2857,13 +2855,18 @@ class SchedulerDisaggregationPrefillMixin:
         raw = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :end]
         full = self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(raw)
         full_pages = full[::page_size] // page_size
-        window_start = max(req.disagg_decode_prefix_len, end - self.sliding_window_size)
-        window_start = window_start // page_size * page_size
-        swa = self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
-            raw[window_start:end]
-        )
-        swa_pages = swa[::page_size] // page_size
-        pages = torch.cat((full_pages, swa_pages))
+        # Intermediate chunks only transfer Full pages; SWA is a final payload.
+        # Each fresh snapshot covers [0, end), including any pending older chunk.
+        pages = full_pages
+        window_start = None
+        if end == len(req.origin_input_ids):
+            window_start = max(req.disagg_decode_prefix_len, end - self.sliding_window_size)
+            window_start = window_start // page_size * page_size
+            swa = self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
+                raw[window_start:end]
+            )
+            swa_pages = swa[::page_size] // page_size
+            pages = torch.cat((full_pages, swa_pages))
         host = torch.empty_like(pages, device="cpu", pin_memory=True)
         host.copy_(pages, non_blocking=True)
         ready = self.device_module.Event()

@@ -1515,15 +1515,91 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
         scheduler, req, raw, pool = self._fixture()
         self.assertIsNone(self._pages(scheduler, req, 0, 4))
 
+    def test_middle_and_cold_chunks_prefetch_only_full_pages(self):
+        for dtype in (torch.int32, torch.int64):
+            for prefix_len in (0, 2):
+                for end in (2, 3):
+                    with self.subTest(dtype=dtype, prefix_len=prefix_len, end=end):
+                        scheduler, req, raw, pool = self._fixture(dtype)
+                        req.prefix_len = prefix_len
+                        req.extend_end = end
+                        swa = Mock(side_effect=AssertionError("SWA before final chunk"))
+                        scheduler.token_to_kv_pool_allocator.translate_swa_indices_for_transfer = swa
+                        self._prefetch(scheduler, req, pool)
+                        self.assertIsNotNone(req.disagg_page_indices)
+                        self.assertEqual(req.disagg_page_indices["end"], end)
+                        self.assertIsNone(req.disagg_page_indices["swa_start"])
+                        self.assertEqual(self._pages(scheduler, req, 0, end).tolist(),
+                                         (raw[0, :end:2] // 2).tolist())
+                        self.assertIsNone(self._pages(scheduler, req, 0, end, swa=True))
+                        swa.assert_not_called()
+
+    def test_newer_snapshot_covers_pending_chunk_and_keeps_host_view(self):
+        scheduler, req, raw, pool = self._fixture()
+        req.origin_input_ids = list(range(8))
+        scheduler.req_to_token_pool.req_to_token = torch.arange(40, 72, 4).reshape(1, 8)
+        self._prefetch(scheduler, req, pool)
+        old = self._pages(scheduler, req, 0, 4)
+        self.assertEqual(old.tolist(), [20, 24])
+        req.extend_end = 6
+        self._prefetch(scheduler, req, pool)
+        self.assertEqual(self._pages(scheduler, req, 0, 4).tolist(), [20, 24])
+        self.assertEqual(self._pages(scheduler, req, 4, 6).tolist(), [28])
+        req.disagg_page_indices["host"].fill_(-1)
+        self.assertEqual(old.tolist(), [20, 24])
+
+    def test_chunk_sequence_sends_all_pages_without_blocking_fallback(self):
+        from sglang.srt.disaggregation.base.conn import StateType
+
+        scheduler, req, raw, pool = self._fixture()
+        req.prefix_len = 0
+        req.origin_input_ids = list(range(8))
+        scheduler.req_to_token_pool.req_to_token = torch.arange(40, 72, 4).reshape(1, 8)
+        scheduler.disagg_prefill_pending_chunk_rids = set()
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            kv_manager=SimpleNamespace(kv_args=SimpleNamespace(state_types=[StateType.SWA]))
+        )
+        scheduler.disagg_metadata_buffers = SimpleNamespace(set_buf=Mock())
+        scheduler.cached_disagg_page_indices = lambda *args, **kwargs: (
+            self._pages(scheduler, *args, **kwargs)
+        )
+        sender = SimpleNamespace(
+            _source_event=object(),
+            set_source_event=Mock(),
+            get_max_transfer_tokens=lambda: None,
+            should_send_kv_chunk=lambda num_pages, last: num_pages > 0 or last,
+            send=Mock(),
+        )
+        req.disagg_kv_sender = sender
+        module = "sglang.srt.disaggregation.prefill."
+        with patch(module + "kv_to_page_indices", side_effect=AssertionError("blocking page fallback")):
+            for end in (3, 6, 8):
+                req.extend_end = end
+                self._prefetch(scheduler, req, pool)
+                self.assertIsNotNone(req.disagg_page_indices)
+                req.disagg_page_indices["ready"].ready = True
+                event = sender._source_event
+                SchedulerDisaggregationPrefillMixin._send_kv_chunk(
+                    scheduler, req, last_chunk=end == 8, end_idx=end
+                )
+                self.assertIs(sender._source_event, event)
+                self.assertEqual(req.disagg_page_indices["ready"].synchronizations, 0)
+        chunks = sender.send.call_args_list
+        self.assertEqual([c.args[0].tolist() for c in chunks], [[20], [24, 28], [32]])
+        self.assertEqual([c.kwargs["num_kv_tokens"] for c in chunks], [2, 4, 2])
+        self.assertIsNone(chunks[0].args[1])
+        self.assertIsNone(chunks[1].args[1])
+        self.assertEqual(chunks[2].args[1][0].tolist(), [36])
+        self.assertEqual(req.start_send_idx, 8)
+        self.assertNotIn(req.rid, scheduler.disagg_prefill_pending_chunk_rids)
+        scheduler.disagg_metadata_buffers.set_buf.assert_called_once_with(req)
+        sender.set_source_event.assert_not_called()
+
     def test_guarded_paths_do_not_allocate(self):
-        for mode in ("cold", "middle-chunk", "staging", "no-overlap", "pending", "unified", "request-window", "unified-kv"):
+        for mode in ("staging", "no-overlap", "pending", "unified", "request-window", "unified-kv"):
             with self.subTest(mode=mode):
                 scheduler, req, raw, pool = self._fixture()
-                if mode == "cold":
-                    req.prefix_len = 0
-                elif mode == "middle-chunk":
-                    req.extend_end = 3
-                elif mode == "staging":
+                if mode == "staging":
                     scheduler.enable_staging = True
                 elif mode == "no-overlap":
                     scheduler.enable_overlap = False
