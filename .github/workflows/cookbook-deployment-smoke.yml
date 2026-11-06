@@ -24,6 +24,9 @@ on:
         type: string
         default: ''
     secrets:
+      MODEL_REPORT_HISTORY_TOKEN:
+        description: Read Actions artifacts in both HYGON-AI framework repositories
+        required: true
       MODEL_SMOKE_REPO_TOKEN:
         required: true
       DASHHUB_CI_TOKEN:
@@ -144,5 +147,5 @@ jobs:
           cookbook-ref: ${{ needs.prepare.outputs.cookbook-ref }}
           controller-ref: ${{ needs.prepare.outputs.controller-ref }}
           dashhub-token: ${{ secrets.DASHHUB_CI_TOKEN }}
-          history-token: ${{ secrets.MODEL_SMOKE_REPO_TOKEN }}
+          history-token: ${{ secrets.MODEL_REPORT_HISTORY_TOKEN }}
           mode: ${{ inputs.mode || 'execute' }}
