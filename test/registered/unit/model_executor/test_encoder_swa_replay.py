@@ -37,6 +37,7 @@ from sglang.srt.model_executor.encoder_swa_replay import (
     _fold_batch,
     drop_folded_rows,
     folded_replay_rows,
+    run_encoder_swa_replay,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -54,6 +55,85 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _ENV_GATE = "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate"
 MAX_CTX = 1024
+
+
+class TestHcuSeparateReplay(CustomTestCase):
+    def _run(self, *, prefix=256, disagree=False):
+        window = SimpleNamespace(reset=MagicMock())
+        runner = SimpleNamespace(
+            device="cpu",
+            token_to_kv_pool=SimpleNamespace(request_window=window),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.arange(4 * MAX_CTX).reshape(4, MAX_CTX)
+            ),
+            model=SimpleNamespace(model=SimpleNamespace(engram_hasher=None)),
+            forward=MagicMock(),
+        )
+        req = SimpleNamespace(
+            rid="cp-replay", full_untruncated_fill_ids=list(range(512))
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            reqs=[req],
+            encoder_swa_reset=[True],
+            prefix_lens=[prefix],
+            req_pool_indices=torch.tensor([3]),
+            req_pool_indices_cpu=[3],
+            global_cp_num_tokens=[999] * 8,
+            global_num_tokens=[512],
+        )
+
+        def gather(plans, plan, group):
+            plans[:] = [plan] * 8
+            if disagree:
+                plans[-1] = (("different-request", True, prefix),)
+
+        def init(replay, model_runner, **kwargs):
+            self.assertIs(model_runner, runner)
+            self.assertTrue(kwargs["encoder_swa_replay"])
+            self.assertIsNone(replay.global_cp_num_tokens)
+            self.assertEqual(replay.global_num_tokens, [128])
+            self.assertEqual(replay.prefix_lens, [prefix - 128])
+            self.assertEqual(
+                replay.input_ids.tolist(), list(range(prefix - 128, prefix))
+            )
+            return SimpleNamespace(replay=replay, **kwargs)
+
+        with (
+            patch("sglang.srt.utils.is_hcu", return_value=True),
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(
+                    attn_cp_size=8,
+                    attn_cp_rank=0,
+                    attn_cp_group=SimpleNamespace(cpu_group=object()),
+                ),
+            ),
+            patch("torch.distributed.all_gather_object", side_effect=gather),
+            patch.object(ForwardBatch, "init_new", side_effect=init),
+        ):
+            run_encoder_swa_replay(SimpleNamespace(model_runner=runner), batch)
+        window.reset.assert_called_once()
+        runner.forward.assert_called_once()
+
+    def test_hcu_dispatch_reaches_synchronized_separate_forward(self):
+        backend = DeepseekV4AttnBackend.__new__(DeepseekV4AttnBackend)
+        with patch("sglang.srt.layers.attention.deepseek_v4_backend._is_hcu", True):
+            self.assertFalse(backend.folds_encoder_swa_replay)
+        self._run()
+
+    def test_cp_disagreement_stops_before_replay_forward(self):
+        with self.assertRaisesRegex(RuntimeError, "plan differs across CP ranks"):
+            self._run(disagree=True)
+
+    def test_odd_prefix_is_not_replayed(self):
+        with self.assertRaisesRegex(ValueError, "even cached-prefix boundary"):
+            self._run(prefix=257)
+
+    def test_cuda_keeps_folded_replay(self):
+        backend = DeepseekV4AttnBackend.__new__(DeepseekV4AttnBackend)
+        with patch("sglang.srt.layers.attention.deepseek_v4_backend._is_hcu", False):
+            self.assertTrue(backend.folds_encoder_swa_replay)
 
 
 def _loc(slot, pos):
@@ -108,6 +188,7 @@ class _Fixture:
             extend_logprob_start_lens=[40, 30, 5],
             engram_history=None,
             global_num_tokens=[self.extend_num_tokens + REPLAY_ROWS],
+            global_cp_num_tokens=None,
             global_num_tokens_for_logprob=[1 + 1 + 15],
             can_run_decode_cuda_graph=False,
             can_run_dp_draft_cuda_graph=False,
@@ -269,6 +350,48 @@ class TestFoldedExtendRows(CustomTestCase):
 class TestFoldWithDecoderSwaTail(CustomTestCase):
     """Encoder SWA bounded replay combined with decoder SWA bounded replay:
     the late layers run only each request's last SWA_WINDOW folded rows."""
+
+    def test_cp_tail_keeps_padding_out_of_window_stores(self):
+        fx = _Fixture()
+        backend = _backend(fx)
+        backend.encoder_replay = True
+        backend.encoder_row_floor = None
+        positions = torch.arange(256, 381)
+        forward_batch = SimpleNamespace(
+            batch_size=1,
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens_cpu=[125],
+            seq_lens_cpu=torch.tensor([381]),
+            seq_lens=torch.tensor([381]),
+            req_pool_indices=torch.tensor([1]),
+            out_cache_loc=fx.req_to_token[1, positions],
+            positions=positions,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            return_logprob=False,
+        )
+        with (
+            patch(
+                "sglang.srt.layers.attention.deepseek_v4_backend.get_parallel",
+                return_value=SimpleNamespace(attn_cp_rank=7, attn_cp_size=8),
+            ),
+            patch.object(DSV4AttnMetadata, "init_compression_metadata"),
+            patch.object(DSV4AttnMetadata, "init_flashmla_related"),
+        ):
+            metadata = backend._build_late_layer_tail_metadata(
+                forward_batch, legacy_cp=True
+            )
+
+        core = metadata.core_attn_metadata
+        layout = core.request_window_layout
+        self.assertEqual(layout.write_loc.numel(), 125)
+        self.assertEqual(layout.commit_mask.numel(), 125)
+        self.assertEqual(core.swa_page_indices.shape[0], 16)
+        self.assertTrue((core.swa_page_indices[-1] == -1).all().item())
+        self.assertEqual(core.swa_topk_lengths[-1].item(), 0)
+        torch.testing.assert_close(core.swa_out_cache_loc, layout.write_loc)
+        torch.testing.assert_close(
+            metadata.late_layer_tail.swa_out_cache_loc, core.swa_out_cache_loc
+        )
 
     def test_tail_keeps_its_own_floor_under_fold(self):
         """A prefix hit with both flags on builds the tail metadata; each tail row
@@ -743,6 +866,7 @@ class TestEncoderReplayDpStartupCheck(CustomTestCase):
             ),
             enable_encoder_swa_bounded_replay=True,
             attn_cp_size=1,
+            enable_cp_cache_layer_split=False,
             attn_dp_size=attn_dp_size,
             ep_join_mode=None,
             enable_unified_cache_external_linker=False,

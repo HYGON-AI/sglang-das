@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from typing import Any
@@ -167,6 +169,7 @@ class DevicePoolGroup:
         page_size: int,
         *,
         rank_replicated: bool = False,
+        storage_layout_tag: str = "",
     ):
         self.entries = list(entries)
         self.entry_map = {entry.name: entry for entry in entries}
@@ -176,6 +179,7 @@ class DevicePoolGroup:
         self.num_layers = num_layers
         self.page_size = page_size
         self.rank_replicated = rank_replicated
+        self.storage_layout_tag = storage_layout_tag
         self.kv_buffer = None
 
     def resolve_transfers(
@@ -260,6 +264,46 @@ def _with_packed_draft_mapping(
     return result
 
 
+def _dsv41_storage_layout_tag(entries, kvcache, page_size):
+    """Identify physical page contents without including allocation addresses.
+
+    Equal CP sizes alone do not imply equal layer ownership or page layouts.
+    Capacity is deliberately excluded so a fresh instance with a different
+    KV budget can reuse a compatible shard.
+    """
+    layout = {
+        "page_size": page_size,
+        "stage": [kvcache._stage_start, kvcache._stage_end],
+        "sources": sorted(kvcache.sources_by_ratio.items()),
+        "pools": [
+            {
+                "name": str(entry.name),
+                "source": str(entry.indices_from_pool),
+                "layers": sorted(entry.layer_mapping.items()),
+                "page_size": entry.page_size,
+                "row_span": entry._row_span,
+                "components": [
+                    [
+                        [
+                            str(buffer.dtype),
+                            list(buffer.shape[1:]),
+                            list(buffer.stride()),
+                            buffer.element_size(),
+                        ]
+                        for buffer in component
+                    ]
+                    for component in entry.components
+                ],
+            }
+            for entry in entries
+        ],
+    }
+    digest = hashlib.sha256(
+        json.dumps(layout, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:24]
+    return f"dsv41_layer_split_v2_p{page_size}_{digest}"
+
+
 def _build_deepseek_v41_device_pool_group(
     kvcache: Any,
     page_size: int,
@@ -273,58 +317,76 @@ def _build_deepseek_v41_device_pool_group(
     if getattr(kvcache, "_unified_kv", False) or any(
         ratio not in (1, 2) for ratio in sources_by_ratio
     ):
-        raise ValueError("V4.1 direct linker requires paged C1/C2 and SWA pools.")
+        raise ValueError("V4.1 direct linker requires paged C1/C2 pools.")
     if page_size <= 0 or page_size != kvcache.page_size:
         raise ValueError("V4.1 tree page size must match the FULL pool page size.")
     if sources_by_ratio.get(2) and page_size % 2:
         raise ValueError("V4.1 C2 direct linker requires an even tree page size.")
 
     num_layers = kvcache._stage_end - kvcache._stage_start
+    all_sources = [
+        source for sources in sources_by_ratio.values() for source in sources
+    ]
+    if len(set(all_sources)) != len(all_sources) or any(
+        not kvcache._stage_start <= source < kvcache._stage_end
+        for source in all_sources
+    ):
+        raise ValueError("V4.1 source layers must be unique and inside the PP stage.")
     owned_layers = getattr(kvcache, "_swa_global_to_local", None)
-    swa_mapping = (
-        {layer - kvcache.start_layer: local for layer, local in owned_layers.items()}
-        if owned_layers is not None
-        else {layer: layer for layer in range(num_layers)}
-    )
-    for pool in (kvcache, *mtp_draft_device_pools):
-        if pool.swa_kv_pool is None:
-            raise ValueError("V4.1 direct linker requires page-addressed SWA storage.")
-        _require_single_row_dsv4_swa_pages(
-            logical_page_size=pool.swa_page_size,
-            physical_page_size=pool.swa_kv_pool.page_size,
-            consumer="DeepSeek-V4.1 direct external linker",
-        )
-        if pool.swa_page_size != page_size:
-            raise ValueError("V4.1 SWA page size must match the tree page size.")
     if any(getattr(pool, "sources_by_ratio", {}) for pool in mtp_draft_device_pools):
         raise ValueError("V4.1 direct linker only supports SWA-only packed drafts.")
-    swa_buffers = kvcache.swa_kv_pool.kv_buffer
-    if set(swa_mapping.values()) != set(range(len(swa_buffers))):
-        raise ValueError("V4.1 SWA ownership does not match its physical buffers.")
-    draft_buffers = [
-        buffer
-        for pool in mtp_draft_device_pools
-        for buffer in pool.swa_kv_pool.kv_buffer
-    ]
-    swa_mapping = _with_packed_draft_mapping(
-        swa_mapping,
-        target_device_layer_num=len(swa_buffers),
-        draft_layer_num=len(draft_buffers),
-        transfer_layer_num=num_layers,
-    )
+
+    # Replay reconstructs the target window. The draft's paged SWA travels
+    # separately over P/D and is not part of the persistent prefix.
+    request_window = getattr(kvcache, "request_window", None)
     entries = []
-    if swa_mapping:
-        entries.append(
-            DevicePoolEntry(
-                name=PoolName.SWA,
-                indices_from_pool=PoolName.SWA,
-                device_pool=kvcache.swa_kv_pool,
-                components=[[*swa_buffers, *draft_buffers]],
-                layer_mapping=swa_mapping,
-                page_size=page_size,
-                rows_are_pages=True,
-            )
+    if request_window is None:
+        swa_mapping = (
+            {
+                layer - kvcache.start_layer: local
+                for layer, local in owned_layers.items()
+            }
+            if owned_layers is not None
+            else {layer: layer for layer in range(num_layers)}
         )
+        for pool in (kvcache, *mtp_draft_device_pools):
+            if pool.swa_kv_pool is None:
+                raise ValueError(
+                    "V4.1 direct linker requires page-addressed SWA storage."
+                )
+            _require_single_row_dsv4_swa_pages(
+                logical_page_size=pool.swa_page_size,
+                physical_page_size=pool.swa_kv_pool.page_size,
+                consumer="DeepSeek-V4.1 direct external linker",
+            )
+            if pool.swa_page_size != page_size:
+                raise ValueError("V4.1 SWA page size must match the tree page size.")
+        swa_buffers = kvcache.swa_kv_pool.kv_buffer
+        if set(swa_mapping.values()) != set(range(len(swa_buffers))):
+            raise ValueError("V4.1 SWA ownership does not match its physical buffers.")
+        draft_buffers = [
+            buffer
+            for pool in mtp_draft_device_pools
+            for buffer in pool.swa_kv_pool.kv_buffer
+        ]
+        swa_mapping = _with_packed_draft_mapping(
+            swa_mapping,
+            target_device_layer_num=len(swa_buffers),
+            draft_layer_num=len(draft_buffers),
+            transfer_layer_num=num_layers,
+        )
+        if swa_mapping:
+            entries.append(
+                DevicePoolEntry(
+                    name=PoolName.SWA,
+                    indices_from_pool=PoolName.SWA,
+                    device_pool=kvcache.swa_kv_pool,
+                    components=[[*swa_buffers, *draft_buffers]],
+                    layer_mapping=swa_mapping,
+                    page_size=page_size,
+                    rows_are_pages=True,
+                )
+            )
 
     def add(name, pool, buffers, mapping):
         if set(mapping.values()) != set(range(len(buffers))):
@@ -408,7 +470,17 @@ def _build_deepseek_v41_device_pool_group(
             add(name, index_pool, views, index_mapping)
     # C2's request-scoped pending pair is empty at even FULL-page boundaries.
     # It must not be addressed or restored using token-page indices.
-    return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
+    return DevicePoolGroup(
+        entries,
+        num_layers,
+        page_size,
+        rank_replicated=True,
+        storage_layout_tag=(
+            _dsv41_storage_layout_tag(entries, kvcache, page_size)
+            if owned_layers is not None
+            else ""
+        ),
+    )
 
 
 def _build_deepseek_v4_device_pool_group(

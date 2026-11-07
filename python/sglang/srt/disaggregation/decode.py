@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tupl
 
 import numpy as np
 import torch
+
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
@@ -109,7 +110,10 @@ from sglang.srt.mem_cache.common import (
     restore_kv_cache,
     suffix_page_indices,
 )
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    DeepSeekV4TokenToKVPool,
+    uses_draft_swa_ring,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.kv_cache_builder import decode_retraction_max_tokens
 from sglang.srt.mem_cache.memory_pool import (
@@ -2156,9 +2160,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ]
 
             def _swa_payload():
-                window_size = self.scheduler.sliding_window_size
+                request_window = getattr(self.token_to_kv_pool, "request_window", None)
+                window_size = (
+                    self.scheduler.sliding_window_size
+                    if request_window is None
+                    else self.token_to_kv_pool.sliding_window
+                )
                 window_start = max(total_prefix_len, seq_len - window_size)
                 window_start = page_align_floor(window_start, page_size)
+                if request_window is not None and uses_draft_swa_ring():
+                    return request_window.page_indices(
+                        int(decode_req.req.kv.req_pool_idx), window_start, seq_len
+                    )
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.kv.req_pool_idx, window_start:seq_len
                 ]
@@ -2225,9 +2238,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # The entire ring and every tag are overwritten by RDMA.
                 # Do not enqueue a GPU reset that could race the incoming copy.
                 window.prepared = None
-                return np.asarray(
-                    [int(decode_req.req.kv.req_pool_idx)], dtype=np.int32
-                )
+                return np.asarray([int(decode_req.req.kv.req_pool_idx)], dtype=np.int32)
 
             state_types = self.kv_manager.kv_args.state_types
             if StateType.DSV4_REQUEST_STATE in state_types:
@@ -2248,7 +2259,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,
                 StateType.REQUEST_ROW: _request_row_payload,
-
                 StateType.DSV41_SWA_WINDOW: _swa_window_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,

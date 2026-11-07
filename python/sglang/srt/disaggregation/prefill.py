@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
 import torch
+
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
@@ -92,7 +93,10 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
     suffix_page_indices,
 )
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    DeepSeekV4TokenToKVPool,
+    uses_draft_swa_ring,
+)
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
@@ -117,7 +121,6 @@ from sglang.srt.utils import is_hcu, is_npu
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
     from sglang.srt.mem_cache.memory_pool import KVCache
-    from torch.distributed import ProcessGroup
 
 _is_hcu = is_hcu()
 
@@ -2860,7 +2863,9 @@ class SchedulerDisaggregationPrefillMixin:
         pages = full_pages
         window_start = None
         if end == len(req.origin_input_ids):
-            window_start = max(req.disagg_decode_prefix_len, end - self.sliding_window_size)
+            window_start = max(
+                req.disagg_decode_prefix_len, end - self.sliding_window_size
+            )
             window_start = window_start // page_size * page_size
             swa = self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
                 raw[window_start:end]
@@ -2944,9 +2949,12 @@ class SchedulerDisaggregationPrefillMixin:
         if is_hcu() and self.enable_overlap and not self.enable_staging:
             # Do not let an optional early send fall back to a blocking page
             # read. The normal send still covers the unchanged send cursor.
-            if self.cached_disagg_page_indices(
-                req, req.start_send_idx, cached_end, wait=False
-            ) is None:
+            if (
+                self.cached_disagg_page_indices(
+                    req, req.start_send_idx, cached_end, wait=False
+                )
+                is None
+            ):
                 return
         elif cached is not None and not cached["ready"].query():
             return
@@ -3076,7 +3084,7 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 window_start = max(req.disagg_decode_prefix_len, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
-                if request_window is not None:
+                if request_window is not None and uses_draft_swa_ring():
                     return request_window.page_indices(
                         int(req.kv.req_pool_idx), window_start, seq_len
                     )
@@ -3180,7 +3188,6 @@ class SchedulerDisaggregationPrefillMixin:
                     StateType.SWA_RING: _swa_ring_payload,
                     StateType.DSV4_REQUEST_STATE: _request_state_payload,
                     StateType.REQUEST_ROW: _request_row_payload,
-
                     StateType.DSV41_SWA_WINDOW: lambda: np.asarray(
                         [int(req.kv.req_pool_idx)], dtype=np.int32
                     ),

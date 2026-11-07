@@ -1633,16 +1633,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             indexer_pool = self.index_pools.get(ratio)
             if indexer_pool is None:
                 continue
-            family = (
-                DSV4_TRANSFER_C4_INDEXER_KV
-                if ratio == 4
-                else f"c{ratio}_indexer"
-            )
+            family = DSV4_TRANSFER_C4_INDEXER_KV if ratio == 4 else f"c{ratio}_indexer"
             layout.extend((family, source) for source in sources)
             if indexer_pool.index_k_with_scale_buffer is None:
-                layout.extend(
-                    (f"c{ratio}_indexer_scale", source) for source in sources
-                )
+                layout.extend((f"c{ratio}_indexer_scale", source) for source in sources)
         return layout
 
     def get_state_transfer_layout(self) -> List[Tuple[str, int]]:
@@ -1760,13 +1754,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         data_lens: List[int] = []
         item_lens: List[int] = []
 
-        # Under encoder replay the target's SWA lives in the request window, whose
-        # pages pair with decode's paged SWA pages (RequestWindow.page_indices).
-        swa_pool = (
-            self.request_window.state
-            if self.request_window is not None
-            else self.swa_kv_pool
-        )
+        # Request windows are registered separately as DSV41_SWA_WINDOW.
+        swa_pool = self.swa_kv_pool
         if swa_pool is not None:
             physical_pages_per_logical_page = self.swa_page_size // swa_pool.page_size
             for buf in swa_pool.kv_buffer:
@@ -2616,9 +2605,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             # dsv41_rope_fake_quant_store, see fused_store_cache).
             assert compress_kv_pool.kv_layout is KVLayout.V41_FP4 or (
                 _is_hcu and compress_kv_pool.kv_layout is KVLayout.V4
-            ), (
-                "in-kernel RoPE is for the fp4 cache; fp8 caches take the finished value"
-            )
+            ), "in-kernel RoPE is for the fp4 cache; fp8 caches take the finished value"
         return compress_kv_pool.set_key_buffer_fused(
             compress_layer_id, loc, cache_k, valid_mask, freqs_cis
         )

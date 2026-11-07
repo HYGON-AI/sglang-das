@@ -4,13 +4,15 @@ The gate is loaded from source with its collaborators mocked; the equivalence
 check replays chunked prefill through the real late_layer_tail_layout. This does
 not replace service-level accuracy validation.
 """
+
 import ast
 import os
+import unittest
 from pathlib import Path
 from types import SimpleNamespace
-import unittest
 
 import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -18,7 +20,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 SOURCE = Path(
     os.environ.get(
-        "SWA_TEST_SOURCE", str(Path(__file__).resolve().parents[4] / "python" / "sglang")
+        "SWA_TEST_SOURCE",
+        str(Path(__file__).resolve().parents[4] / "python" / "sglang"),
     )
 )
 SWA_WINDOW = 128
@@ -51,18 +54,40 @@ def make_gate():
     return load(
         SOURCE / "srt/layers/attention/deepseek_v4_backend.py",
         "_skips_late_layers",
-        dict(SWA_WINDOW=SWA_WINDOW, ForwardMode=_Mode),
+        dict(
+            SWA_WINDOW=SWA_WINDOW,
+            ForwardMode=_Mode,
+            CaptureHiddenMode=SimpleNamespace(FULL="full"),
+        ),
         "DeepseekV4AttnBackend",
     )
 
 
-def decide(gate, orig, seq, *, enabled=True, mode=_Mode.EXTEND, extend=None):
-    backend = SimpleNamespace(skip_mid_chunk_decoder=enabled)
+def decide(
+    gate,
+    orig,
+    seq,
+    *,
+    enabled=True,
+    mode=_Mode.EXTEND,
+    extend=None,
+    return_logprob=False,
+    full_hidden=False,
+    dspark=True,
+):
+    backend = SimpleNamespace(
+        skip_mid_chunk_decoder=enabled,
+        model_runner=SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_dspark=lambda: dspark)
+        ),
+    )
     batch = SimpleNamespace(
         forward_mode=mode,
         orig_seq_lens_cpu=orig,
         extend_seq_lens_cpu=extend if extend is not None else [1] * len(seq),
         seq_lens_cpu=torch.tensor(seq),
+        return_logprob=return_logprob,
+        capture_hidden_mode="full" if full_hidden else "last",
     )
     return gate(backend, batch)
 
@@ -93,6 +118,15 @@ class TestSkipGate(CustomTestCase):
         self.assertFalse(self.decide([100000], [32768], mode=_Mode.DECODE))
         self.assertFalse(self.decide(None, [32768]))
         self.assertFalse(self.decide([100000], [32768], extend=[1, 1]))
+
+    def test_future_prompt_logprob_reader_keeps_rolling_windows(self):
+        self.assertFalse(self.decide([131088], [32768], return_logprob=True))
+        self.assertFalse(self.decide([131088], [65536], return_logprob=True))
+        self.assertFalse(self.decide([131088], [98304], return_logprob=True))
+
+    def test_full_hidden_reader_and_dspark_tail_capture_differ(self):
+        self.assertFalse(self.decide([100000], [32768], full_hidden=True, dspark=False))
+        self.assertTrue(self.decide([100000], [32768], full_hidden=True, dspark=True))
 
 
 class TestEquivalence(CustomTestCase):
@@ -170,6 +204,34 @@ class TestEquivalence(CustomTestCase):
         # Only the final chunk's tail runs.
         self.assertEqual(len(full), 4 * SWA_WINDOW)
         self.assertEqual(sorted(skipped), list(range(100000 - SWA_WINDOW, 100000)))
+
+    def test_logprob_transition_has_previous_chunk_history(self):
+        # The failing GPU request has 131072 prompt + 16 teacher-forced tokens.
+        # Before a prompt reader widens a tail, its first row needs the preceding
+        # window. No chunk may have discarded the late layers' rolling state.
+        for prompt_len, reader_start in ((65552, 32768), (131088, 98304)):
+            written = set()
+            for start in range(0, reader_start, 32768):
+                end = start + 32768
+                if decide(
+                    self.gate,
+                    [prompt_len],
+                    [end],
+                    extend=[32768],
+                    return_logprob=True,
+                ):
+                    continue
+                indices, _, _ = self.layout(
+                    extend_lens_cpu=[32768],
+                    seq_lens_cpu=[end],
+                    tail_len=SWA_WINDOW,
+                    device=torch.device("cpu"),
+                )
+                written.update(start + i for i in indices.tolist())
+            required = set(range(reader_start - SWA_WINDOW, reader_start))
+            self.assertTrue(
+                required.issubset(written), (prompt_len, required - written)
+            )
 
 
 if __name__ == "__main__":

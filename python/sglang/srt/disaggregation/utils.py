@@ -24,6 +24,7 @@ import msgspec
 import numpy as np
 import torch
 import torch.distributed as dist
+
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.distributed.communication_tags import P2PTag
@@ -555,7 +556,7 @@ class PDHiddenTransferPlan(msgspec.Struct):
     row_chunks: List[Dict[str, Any]]
 
     @classmethod
-    def build(cls, row_count: int, item_len: int) -> "PDHiddenTransferPlan":
+    def build(cls, row_count: int, item_len: int) -> PDHiddenTransferPlan:
         row_count = int(row_count)
         item_len = int(item_len)
         if row_count <= 0:
@@ -2271,19 +2272,23 @@ def setup_state_kv_args(
                 raise RuntimeError(
                     "DSV4 target and draft pools must share the SWA index mapping"
                 )
-            # Under encoder replay the target window and the draft ring address SWA
-            # by request slot; equal rows per slot let them share one page list.
-            request_window = token_to_kv_pool.request_window
             target_geometry = (
                 token_to_kv_pool.page_size,
                 token_to_kv_pool.sliding_window,
-                request_window.capacity if request_window is not None else None,
             )
             draft_geometry = (
                 draft_token_to_kv_pool.page_size,
                 draft_token_to_kv_pool.sliding_window,
-                draft_token_to_kv_pool.swa_req_ring_size,
             )
+            # A paged draft uses the shared allocator mapping. Its page list
+            # is independent of the target request window sent via Mooncake.
+            draft_ring_size = draft_token_to_kv_pool.swa_req_ring_size
+            if draft_ring_size is not None:
+                request_window = token_to_kv_pool.request_window
+                target_geometry += (
+                    request_window.capacity if request_window is not None else None,
+                )
+                draft_geometry += (draft_ring_size,)
             if target_geometry != draft_geometry:
                 raise RuntimeError(
                     "DSV4 target and draft pools must share SWA geometry: "

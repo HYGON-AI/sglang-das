@@ -150,6 +150,7 @@ def _cache_for_wrapper(**kwargs):
         "write_through_threshold": 256,
         "pp_size": 1,
         "pp_group": None,
+        "_all_reduce_attn_groups": lambda tensor, op: None,
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
@@ -181,6 +182,23 @@ def test_cache_linker_attachment_is_backend_independent():
     assert cache.tree_core.enable_external_cache_linker
     assert cache.write_through_threshold == 1
     assert cache.linker.layer_done_counter is linker.layer_done_counter
+
+
+@pytest.mark.parametrize("has_swa_pool", [False, True])
+def test_cache_linker_respects_backend_swa_storage(has_swa_pool):
+    full, swa = object(), object()
+    cache = _cache_for_wrapper(
+        _components_tuple=(full, swa),
+        components={ComponentType.FULL: full, ComponentType.SWA: swa},
+        token_to_kv_pool_allocator=_swa_allocator(None),
+        tree_components=(ComponentType.FULL, ComponentType.SWA),
+    )
+    linker = _FakeLinker()
+    linker.pools = {PoolName.SWA: object()} if has_swa_pool else {PoolName.KV: object()}
+
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+
+    assert wrapper._components == ((full, swa) if has_swa_pool else (full,))
 
 
 @pytest.mark.parametrize("component_type", [ComponentType.C128])

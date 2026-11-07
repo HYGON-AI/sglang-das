@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     DevicePoolGroup,
     _build_deepseek_v4_device_pool_group,
+    _build_deepseek_v41_device_pool_group,
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -161,6 +162,50 @@ class TestDevicePoolGroup(CustomTestCase):
 
 
 class TestHybridDevicePoolAssembler(CustomTestCase):
+    def test_v41_layer_split_replay_keeps_only_full_indexed_pools(self):
+        def buffer():
+            return torch.zeros((4, 8), dtype=torch.uint8)
+
+        kvcache = SimpleNamespace(
+            page_size=4,
+            start_layer=2,
+            _stage_start=2,
+            _stage_end=6,
+            _swa_global_to_local={2: 0, 5: 1},
+            _low_owner_local_by_source={2: 0, 5: 0},
+            sources_by_ratio={1: [2, 3], 2: [4, 5]},
+            request_window=object(),
+            swa_kv_pool=None,
+            kv_pools={
+                1: SimpleNamespace(page_size=4, kv_buffer=[buffer()]),
+                2: SimpleNamespace(page_size=2, kv_buffer=[buffer()]),
+            },
+            index_pools={
+                ratio: SimpleNamespace(
+                    page_size=2,
+                    index_k_with_scale_buffer=[buffer(), buffer()],
+                )
+                for ratio in (1, 2)
+            },
+        )
+        draft = SimpleNamespace(swa_kv_pool=SimpleNamespace(kv_buffer=[buffer()]))
+        group = _build_deepseek_v41_device_pool_group(kvcache, 4, (draft,))
+        expected = {
+            PoolName.DEEPSEEK_V4_C1: {0: 0},
+            PoolName.DEEPSEEK_V4_C2: {3: 0},
+            PoolName.DEEPSEEK_V4_C1_INDEXER: {0: 0, 1: 1},
+            PoolName.DEEPSEEK_V4_C2_INDEXER: {2: 0, 3: 1},
+        }
+        self.assertEqual(set(group.entry_map), set(expected))
+        for name, mapping in expected.items():
+            self.assertEqual(group.entry_map[name].layer_mapping, mapping)
+            self.assertEqual(group.sources[name], PoolName.KV)
+        self.assertTrue(group.storage_layout_tag.startswith("dsv41_layer_split_v2_p4_"))
+
+        kvcache.request_window = None
+        with self.assertRaisesRegex(ValueError, "requires page-addressed SWA"):
+            _build_deepseek_v41_device_pool_group(kvcache, 4, (draft,))
+
     def test_deepseek_v4_maps_sparse_sidecars(self):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             DeepSeekV4LayerItem,

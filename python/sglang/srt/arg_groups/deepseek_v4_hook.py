@@ -18,8 +18,8 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
-from sglang.srt.utils.common import is_gfx95_supported, is_npu
 from sglang.srt.utils import is_hcu
+from sglang.srt.utils.common import is_gfx95_supported, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -304,6 +304,12 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             and cfg.disaggregation_mode in ("prefill", "decode")
             and cfg.disaggregation_transfer_backend == "mooncake"
         )
+        hcu_mooncake_linker_replay = (
+            hcu_layer_split_replay
+            and hcu_pd_replay
+            and cfg.attn_cp_size == 8
+            and cfg.unified_cache_external_linker_backend == "mooncake"
+        )
         incompatible = (
             (
                 "hardware other than CUDA, gfx950 or HCU",
@@ -324,19 +330,31 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
                 and get_platform().is_hip,
             ),
-            ("context parallelism", cfg.attn_cp_size > 1 and not hcu_layer_split_replay),
+            (
+                "context parallelism",
+                cfg.attn_cp_size > 1 and not hcu_layer_split_replay,
+            ),
             # ROCm replays hits in a forward of their own, which only the hitting
             # attention-DP ranks would enter; CUDA folds them into the extend.
-            ("DP attention on ROCm", get_platform().is_hip and attn_dp_enabled_of(cfg)
-                and not (hcu_pd_replay and cfg.disaggregation_mode == "decode")),
-            ("external cache linker", cfg.enable_unified_cache_external_linker),
+            (
+                "DP attention on ROCm",
+                get_platform().is_hip
+                and attn_dp_enabled_of(cfg)
+                and not (hcu_pd_replay and cfg.disaggregation_mode == "decode"),
+            ),
+            (
+                "external cache linker",
+                cfg.enable_unified_cache_external_linker
+                and not hcu_mooncake_linker_replay,
+            ),
             ("unified memory", cfg.enable_unified_memory),
             # Decode receives the last SWA window from prefill and never replays.
             ("PD decode", cfg.disaggregation_mode == "decode" and not hcu_pd_replay),
             # On ROCm the draft keeps paged SWA, so it cannot share the window's pages.
             (
                 "PD prefill on ROCm",
-                cfg.disaggregation_mode == "prefill" and get_platform().is_hip
+                cfg.disaggregation_mode == "prefill"
+                and get_platform().is_hip
                 and not hcu_pd_replay,
             ),
             ("mixed prefill/decode", cfg.enable_mixed_chunk),

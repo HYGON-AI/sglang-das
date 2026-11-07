@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import logging
 import hashlib
+import logging
 import math
 import os
 import threading
@@ -23,15 +23,15 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
-from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import (
-    LinkerMLADedupBroadcaster,
-)
 from sglang.srt.mem_cache.unified_cache.linker_fault_injection import (
     arm_load_failure_injection,
 )
+from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import (
+    LinkerMLADedupBroadcaster,
+)
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
-    UnifiedCacheLinker,
     LayerWiseLoadCounter,
+    UnifiedCacheLinker,
 )
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_STORAGE,
@@ -41,8 +41,8 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.runtime_context import (
     get_memory,
     get_model,
-    get_parallel,
     get_observability,
+    get_parallel,
 )
 from sglang.srt.utils import freeze_gc, get_device_module
 
@@ -174,14 +174,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
-        self._load_revalidation_groups = ()
-        if getattr(self.pool_group, "storage_layout_tag", ""):
-            self._load_revalidation_groups = tuple(
-                group
-                for group in (params.attn_cp_cache_group, params.attn_tp_cache_group)
-                if group is not None
-                and torch.distributed.get_world_size(group=group) > 1
-            )
+        storage_layout_tag = getattr(self.pool_group, "storage_layout_tag", "")
+        # The tree wrapper owns collective ordering, including exception paths.
+        self.requires_load_revalidation_consensus = bool(storage_layout_tag)
 
         tp_rank = 0
         tp_size = get_parallel().tp_size
@@ -228,9 +223,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             attn_cp_rank=params.attn_cp_rank,
             pp_rank=params.pp_rank,
         )
-        if getattr(self.pool_group, "storage_layout_tag", ""):
+        if storage_layout_tag:
             storage_suffix = (
-                f"{getattr(self.pool_group, 'storage_layout_tag', '')}_{storage_suffix}"
+                f"{storage_layout_tag}_cp{params.attn_cp_size}_{storage_suffix}"
             )
         self.storage.mla_suffix = storage_suffix
         self.storage.mha_suffix = storage_suffix
@@ -556,18 +551,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return restorable
 
     def revalidate_load(self, transfers: list[PoolTransfer]) -> bool:
-        valid = self._revalidate_load_local(transfers)
-        groups = getattr(self, "_load_revalidation_groups", ())
-        if groups:
-            # LayerSplit shards can be evicted independently after lookup.
-            # All CP ranks must either restore or recompute the same prefix.
-            verdict = torch.tensor([int(valid)], dtype=torch.int)
-            for group in groups:
-                torch.distributed.all_reduce(
-                    verdict, op=torch.distributed.ReduceOp.MIN, group=group
-                )
-            valid = bool(verdict.item())
-        return valid
+        return self._revalidate_load_local(transfers)
 
     def _revalidate_load_local(self, transfers: list[PoolTransfer]) -> bool:
         """Re-check remote existence before the scheduler commits device
@@ -578,9 +562,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         replicas and would fail the layer-wise load fatally. Re-checking here
         lets the caller degrade the request to a plain cache miss instead.
 
-        Failures inside the revalidation itself never propagate: this hook
-        guards a hot scheduling path, so an unexpected error falls back to
-        "validated" and the async load path retains its own semantics.
+        An unavailable or malformed existence response is a cache miss. The
+        tree wrapper agrees on the verdict before any rank enters the load.
         """
         try:
             resolved = self.pool_group.resolve_transfers(
@@ -597,9 +580,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             if not key_strs:
                 return True
             exist = self.storage._batch_exist(key_strs)
-        except BaseException:
+        except Exception:
             logger.exception("Mooncake direct linker load revalidation error")
-            return True
+            return False
+        if exist is None or len(exist) != len(key_strs):
+            logger.warning("Mooncake direct linker existence response length mismatch")
+            return False
         missing = [key for key, state in zip(key_strs, exist) if state != 1]
         if missing:
             logger.warning(

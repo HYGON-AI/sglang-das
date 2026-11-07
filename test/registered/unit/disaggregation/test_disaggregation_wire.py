@@ -41,23 +41,24 @@ from sglang.srt.disaggregation.mooncake.conn import (
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    build_kv_layer_ids,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     get_qsa_pending_state_indices,
+    pack_state_types,
     poll_and_all_reduce,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_with_staging,
+    resolve_state_component_dst_index,
     setup_state_kv_args,
     should_send_replicated_state,
-    build_kv_layer_ids,
-    pack_state_types,
-    resolve_state_component_dst_index,
     unpack_state_types,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.mem_cache.cp_cache_layer_split.transfer import configure_v4_transfer
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
     c4_state_transfer_indices,
@@ -2343,6 +2344,7 @@ def _make_dsv4_target(*, unified, mapping=None):
     pool.page_size = 256
     pool.sliding_window = 128
     pool.full_to_swa_index_mapping = mapping
+    pool.request_window = None
     pool.unified_swa_window = 128
     pool.unified_swa_ring_size = 131
     pool.unified_swa_pages = 524
@@ -2363,6 +2365,7 @@ def _make_dsv4_draft(*, unified, mapping=None, swa_valid_from=None):
     pool.swa_page_size = 256
     pool.sliding_window = 128
     pool.full_to_swa_index_mapping = mapping
+    pool.swa_req_ring_size = None
     pool.unified_swa_window = 128
     pool.unified_swa_ring_size = 131
     pool.unified_swa_pages = 524
@@ -2381,6 +2384,56 @@ def _make_dsv4_draft(*, unified, mapping=None, swa_valid_from=None):
 
 
 class TestDSV4DraftStateRegistration(unittest.TestCase):
+    def test_encoder_window_and_paged_draft_register_separate_state(self):
+        mapping = torch.arange(16)
+        target = _make_dsv4_target(unified=False, mapping=mapping)
+        del target.get_state_buf_infos
+        target.swa_page_size = 256
+        target.swa_kv_pool = None
+        target.compress_state_pools = []
+        target.indexer_compress_state_pools = []
+        target.request_window = SimpleNamespace(
+            capacity=256,
+            state=SimpleNamespace(
+                page_size=256, kv_buffer=[torch.empty((2, 16), dtype=torch.uint8)]
+            ),
+            transfer_buf_infos=lambda: _buf_infos(21),
+            transfer_format="dsv41_swa_window_v1/256/test",
+            transfer_layout=lambda layer_ids: [
+                ("window", layer_id) for layer_id in layer_ids
+            ],
+        )
+        draft = _make_dsv4_draft(unified=False, mapping=mapping)
+        for pool in (target, draft):
+            pool._stage_start = 0
+            pool._stage_end = 1
+            pool.kv_pools = {}
+        kv_args = KVArgs()
+        kv_args.kv_data_ptrs = []
+        kv_args.kv_item_lens = []
+
+        setup_state_kv_args(kv_args, target, draft)
+        configure_v4_transfer(kv_args, target, draft)
+
+        self.assertEqual(
+            kv_args.state_types, [StateType.DSV41_SWA_WINDOW, StateType.SWA]
+        )
+        self.assertEqual(kv_args.state_data_ptrs[0], [21])
+        self.assertEqual(kv_args.state_data_ptrs[1], draft.get_state_buf_infos()[0])
+        self.assertEqual(
+            kv_args.v4_transfer_metadata["states"],
+            [[("window", 0)], [("draft_dsv4_swa_kv", 0)]],
+        )
+
+        draft.sliding_window = 64
+        with self.assertRaisesRegex(RuntimeError, "must share SWA geometry"):
+            setup_state_kv_args(KVArgs(), target, draft)
+
+        draft.sliding_window = 128
+        draft.swa_req_ring_size = 512
+        with self.assertRaisesRegex(RuntimeError, "must share SWA geometry"):
+            setup_state_kv_args(KVArgs(), target, draft)
+
     def test_draft_state_is_a_separate_component(self):
         mapping = torch.arange(16)
         cases = [
