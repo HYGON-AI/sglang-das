@@ -15,6 +15,9 @@
 
 set -euo pipefail
 
+# K8s (ARC) pools: map docker commands onto the current job container.
+source "$(dirname "${BASH_SOURCE[0]}")/hcu_ci_k8s.sh"
+
 # Execute a command inside the HCU CI container with the right env vars.
 # Usage:
 #   hcu_ci_exec.sh [--container-name NAME] [-w WORKDIR] [-e KEY=VAL ...] -- <command>

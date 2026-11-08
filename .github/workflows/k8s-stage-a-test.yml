@@ -1,0 +1,78 @@
+name: HCU K8s Stage A (test branch only)
+
+# Runs the Stage A HCU smoke suite on the ARC K8s pool hygon-bw1100-1card.
+# Same scripts and suite as pr-test-hcu.yml "Stage A HCU smoke"; the job runs
+# inside the CI image and the hcu_ci_* scripts use hcu_ci_k8s.sh
+# (HCU_CI_IN_K8S=1 is injected by the pool's job template).
+# Triggered only by changes to .github/k8s-test/trigger on the test branch.
+
+on:
+  push:
+    branches: [test/k8s-runner-20261108]
+    paths: [.github/k8s-test/trigger]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hcu-k8s-stage-a
+  cancel-in-progress: false
+
+jobs:
+  stage-a:
+    if: github.repository == 'HYGON-AI/sglang-das' && github.ref == 'refs/heads/test/k8s-runner-20261108'
+    name: Stage A HCU smoke (K8s)
+    runs-on: hygon-bw1100-1card
+    timeout-minutes: 60
+    container:
+      image: 10.16.1.152:5000/jenkins/model_test_env/sglang:0.5.18-latest
+    env:
+      HCU_CI_IMAGE: 10.16.1.152:5000/jenkins/model_test_env/sglang:0.5.18-latest
+      HCU_CI_CONTAINER_NAME: ci_sglang_hcu_${{ github.run_id }}_stage_a
+      HCU_CI_SKIP_PULL: ${{ vars.HCU_CI_SKIP_PULL || '' }}
+      HCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.HCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
+      HCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.HCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
+      HCU_CI_SKIP_SGLANG_BUILD: ${{ vars.HCU_CI_SKIP_SGLANG_BUILD || '' }}
+      HCU_CI_VISIBLE_DEVICES: ''
+      HCU_WHEEL_STAGING_ROOT: /ci_public/sglang-das/hcu-wheel-staging
+      HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Show allocation
+        run: |
+          echo "HCU_CI_CHECKOUT_DIR=${GITHUB_WORKSPACE}" >> "${GITHUB_ENV}"
+          echo "node=${NODE_NAME:-} HCU_CI_IN_K8S=${HCU_CI_IN_K8S:-}"
+          ls /dev/dri | grep renderD || true
+          python3 -c "import torch; print('torch', torch.__version__, 'devices', torch.cuda.device_count())"
+
+      - name: Setup HCU container
+        run: |
+          GITHUB_WORKSPACE="${HCU_CI_CHECKOUT_DIR}" \
+            bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_start_container.sh" \
+              --image "${HCU_CI_IMAGE}" \
+              --container-name "${HCU_CI_CONTAINER_NAME}"
+
+      - name: Install dependencies
+        run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_install_dependency.sh"
+
+      - name: Verify HCU external APIs
+        run: |
+          bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" -w /sglang-checkout --container-name "${HCU_CI_CONTAINER_NAME}" -- python3 scripts/ci/hcu/check_hcu_external_api_compat.py
+
+      - name: Run stage-a-test-1-hcu-small
+        timeout-minutes: 30
+        run: |
+          bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" -w /sglang-checkout/test --container-name "${HCU_CI_CONTAINER_NAME}" -- \
+            python3 run_suite.py \
+              --hw hcu \
+              --suite stage-a-test-1-hcu-small \
+              --include-file registered/hcu/interface/test_hcu_smoke.py \
+              --timeout-per-file 120
+
+      - name: Cleanup HCU container
+        if: always()
+        run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_cleanup_container.sh"

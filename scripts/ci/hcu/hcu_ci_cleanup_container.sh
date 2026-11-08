@@ -15,6 +15,9 @@
 
 set -euo pipefail
 
+# K8s (ARC) pools: map docker commands onto the current job container.
+source "$(dirname "${BASH_SOURCE[0]}")/hcu_ci_k8s.sh"
+
 # Normalize ownership of the mounted checkout before removing a HCU CI
 # container. HCU jobs run containers as root, so files created under the
 # bind-mounted checkout can otherwise poison the self-hosted runner workspace

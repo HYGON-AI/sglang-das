@@ -15,6 +15,9 @@
 
 set -euo pipefail
 
+# K8s (ARC) pools: map docker commands onto the current job container.
+source "$(dirname "${BASH_SOURCE[0]}")/hcu_ci_k8s.sh"
+
 # Install sglang + HCU specific dependencies inside the `ci_sglang` container.
 # Assumes hcu_ci_start_container.sh has already created the container with the
 # repo mounted at /sglang-checkout.
