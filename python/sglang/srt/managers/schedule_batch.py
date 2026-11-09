@@ -9,7 +9,6 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_parallel,
-    get_platform,
     get_schedule,
     get_serving,
     get_spec,
@@ -2925,9 +2924,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.loc_tensor = torch.full((1,), -1, dtype=torch.int64, device=self.device)
 
         if get_exec().features.enable_encoder_swa_bounded_replay:
+            from sglang.srt.model_executor.encoder_swa_replay import (
+                supports_encoder_swa_replay_images,
+            )
+
             for req in reqs:
                 if req.multimodal_inputs is not None and (
-                    not get_platform().is_cuda
+                    not supports_encoder_swa_replay_images()
                     or any(
                         item.modality != Modality.IMAGE
                         for item in req.multimodal_inputs.mm_items
@@ -2935,7 +2938,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 ):
                     raise ValueError(
                         "encoder SWA replay supports multimodal inputs only for "
-                        "image requests on CUDA"
+                        "image requests on CUDA or HCU"
                     )
                 if (
                     req.input_embeds is not None

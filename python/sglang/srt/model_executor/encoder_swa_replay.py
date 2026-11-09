@@ -17,6 +17,14 @@ class FoldedExtend(msgspec.Struct, frozen=True):
     num_rows: int
 
 
+def supports_encoder_swa_replay_images() -> bool:
+    """Image replay needs the CUDA fold or the HCU synchronized replay path."""
+    from sglang.srt.runtime_context import get_platform
+    from sglang.srt.utils import is_hcu
+
+    return get_platform().is_cuda or is_hcu()
+
+
 def fold_encoder_swa_replay(worker, batch) -> Optional[FoldedExtend]:
     """Prepend each hit's <=128 replay tokens to its extend instead of replaying."""
     runner = worker.model_runner
@@ -380,19 +388,21 @@ def _run_hcu_encoder_swa_replay(worker, batch):
         replay.spec_info = None
         replay.sampling_info = None
         replay.has_grammar = False
-        replay.multimodal_inputs = [None]
+        # Keep the selected request's absolute image spans and cached features.
+        # The model scatters only [start, end) before CP shards its input rows;
+        # scheduler hash IDs remain intact, as on the CUDA folded path.
+        mm_inputs = getattr(batch, "multimodal_inputs", None)
+        replay.multimodal_inputs = [mm_inputs[i]] if mm_inputs is not None else [None]
         replay.input_embeds = None
         replay.replace_embeds = None
         replay.replace_positions = None
         replay.engram_history = None
         hasher = runner.model.model.engram_hasher
         if hasher is not None:
-            n = hasher.max_ngram_size - 1
-            ids = list(req.full_untruncated_fill_ids[max(0, start - n) : start])
-            replay.engram_history = torch.tensor(
-                [[0] * (n - len(ids)) + ids],
-                dtype=torch.int32,
-                device=runner.device,
+            # The shared CUDA helper normalizes large image hash IDs before
+            # materializing the int32 history, preserving image-token masking.
+            replay.engram_history = _engram_history(
+                reqs=[req], starts=[start], runner=runner
             )
         fb = ForwardBatch.init_new(
             replay,

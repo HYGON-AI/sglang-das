@@ -162,7 +162,6 @@ from sglang.srt.runtime_context import (
     get_model,
     get_observability,
     get_parallel,
-    get_platform,
     get_schedule,
     get_serving,
     get_spec,
@@ -1425,9 +1424,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
         # FIXME: unify the length validation logic with the one in the scheduler.
         if get_exec().features.enable_encoder_swa_bounded_replay:
-            if obj.image_data is not None and not get_platform().is_cuda:
+            from sglang.srt.model_executor.encoder_swa_replay import (
+                supports_encoder_swa_replay_images,
+            )
+
+            if obj.image_data is not None and not supports_encoder_swa_replay_images():
                 raise ValueError(
-                    "encoder SWA replay supports image requests only on CUDA"
+                    "encoder SWA replay supports image requests only on CUDA or HCU"
                 )
             if any(
                 value is not None
