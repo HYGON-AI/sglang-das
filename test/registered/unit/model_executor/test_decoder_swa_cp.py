@@ -50,7 +50,7 @@ class TestDecoderTailCP(CustomTestCase):
             '_late_layer_tail_cp_layout', dict(torch=torch, get_parallel=lambda:
                 SimpleNamespace(attn_cp_rank=rank, attn_cp_size=8),
                 InterleaveContextParallelMetadata=SimpleNamespace), 'DeepseekV4AttnBackend')
-        cp_tail = layout(None, global_batch, global_indices, torch.tensor(tail_lengths))
+        cp_tail = layout(None, global_batch, global_indices, tail_lengths)
         full_len = (total + 7) // 8
         full_metadata = SimpleNamespace(total_seq_lens=total,
             per_rank_actual_token=[full_len] * 8,
@@ -147,6 +147,10 @@ class TestDecoderTailCP(CustomTestCase):
     def test_hcu_tail_uses_window_floors(self):
         class Pool:
             swa_kv_pool = SimpleNamespace(page_size=128)
+            request_window = None
+
+            def get_swa_key_page_size(self):
+                return self.swa_kv_pool.page_size
 
             def get_swa_key_buffer_radix(self, layer_id):
                 return torch.zeros(1, 128 * 528, dtype=torch.uint8)
@@ -272,6 +276,271 @@ class TestDecoderReplayPadding(CustomTestCase):
 
     def test_without_replay_is_unchanged(self):
         self.check_padding([4], replay=False)
+
+
+class TestLateLayerTailUpload(CustomTestCase):
+    def layout(self, torch_module=torch):
+        return load(SOURCE / 'kernels/ops/attention/dsv4_attn_metadata_kernels.py',
+                    'late_layer_tail_layout', dict(torch=torch_module))
+
+    def test_tail_rows_and_request_window_floors(self):
+        cases = ([0], [1], [127], [128], [129], [0, 0], [0, 129, 7],
+                 [1, 128, 32768], [65536, 131072, 1000000])
+        layout = self.layout()
+        for lengths in cases:
+            for limit in (1, 2, 128):
+                with self.subTest(lengths=lengths, limit=limit):
+                    seq = [n + i * 4096 for i, n in enumerate(lengths)]
+                    indices, tails, floors = layout(extend_lens_cpu=list(lengths),
+                        seq_lens_cpu=seq, tail_len=limit, device=torch.device('cpu'))
+                    rows, expected_floors, start = [], [], 0
+                    for n, s in zip(lengths, seq):
+                        t = min(n, limit)
+                        rows.extend(range(start + n - t, start + n))
+                        expected_floors.extend([s - t] * t)
+                        start += n
+                    self.assertEqual(tails, [min(n, limit) for n in lengths])
+                    torch.testing.assert_close(indices, torch.tensor(rows, dtype=torch.int64))
+                    torch.testing.assert_close(floors, torch.tensor(expected_floors, dtype=torch.int32))
+
+    def test_hcu_lengths_upload_uses_private_pinned_nonblocking_copy(self):
+        copies, allocations = [], []
+
+        class HostTensor:
+            def __init__(self, value):
+                self.value = value
+
+            def to(self, device, *, non_blocking=False):
+                self_device.assertEqual(device, torch.device('cuda'))
+                self_device.assertTrue(non_blocking)
+                copies.append(self.value.clone())
+                return self.value
+
+        self_device = self
+
+        def host_tensor(values, **kwargs):
+            self.assertEqual(torch.device(kwargs.get('device', 'cpu')).type, 'cpu')
+            self.assertTrue(kwargs.get('pin_memory', False))
+            value = torch.tensor(values, dtype=kwargs.get('dtype'))
+            allocations.append(value)
+            return HostTensor(value)
+
+        def cpu_arange(*args, **kwargs):
+            kwargs['device'] = 'cpu'
+            return torch.arange(*args, **kwargs)
+
+        proxy = SimpleNamespace(tensor=host_tensor, arange=cpu_arange,
+            cumsum=torch.cumsum, repeat_interleave=torch.repeat_interleave,
+            int64=torch.int64, int32=torch.int32)
+        layout = self.layout(proxy)
+        for seq in ([4096, 8192, 32768], [4127, 8291, 32999]):
+            indices, tails, floors = layout(extend_lens_cpu=[1, 129, 17],
+                seq_lens_cpu=seq, tail_len=128, device=torch.device('cuda'))
+            self.assertEqual(tails, [1, 128, 17])
+            self.assertEqual(indices.numel(), 146)
+            self.assertEqual(floors[0].item(), seq[0] - 1)
+        self.assertEqual(len(copies), 2)
+        self.assertEqual(copies[0].dtype, torch.int64)
+        self.assertNotEqual(allocations[0].data_ptr(), allocations[1].data_ptr())
+        torch.testing.assert_close(copies[0][2], torch.tensor([4096, 8192, 32768]))
+        torch.testing.assert_close(copies[1][2], torch.tensor([4127, 8291, 32999]))
+
+
+class TestLateLayerTailMetadataLengths(CustomTestCase):
+    def test_tail_lengths_reuse_device_extend_lengths(self):
+        kernel = ACTUAL / 'kernels/ops/attention/dsv4_attn_metadata_kernels.py'
+        helper = load(kernel, 'late_layer_tail_layout', dict(torch=torch))
+        backend_path = SOURCE / 'srt/layers/attention/deepseek_v4_backend.py'
+        rows = load(backend_path, '_tail_rows', dict(torch=torch))
+
+        def forbid_host_upload(*args, **kwargs):
+            raise AssertionError('Tail lengths must reuse device extend lengths')
+
+        modes = [(False, False), (True, False), (False, True)]
+        lengths_cases = ([1], [0, 0], [1, 129, 0, 300], [32768] * 8)
+        for lengths in lengths_cases:
+            for dtype in (torch.int32, torch.int64):
+                for legacy_cp, cp_active in modes:
+                    with self.subTest(lengths=lengths, dtype=dtype,
+                                      legacy_cp=legacy_cp, cp_active=cp_active):
+                        expected = torch.tensor([min(n, 128) for n in lengths],
+                                                dtype=torch.int32)
+                        device_lengths = torch.tensor(lengths, dtype=dtype)
+                        before = device_lengths.clone()
+                        seq = torch.tensor([n + 4096 * (i + 1)
+                                            for i, n in enumerate(lengths)], dtype=torch.int32)
+                        batch = SimpleNamespace(extend_seq_lens_cpu=list(lengths),
+                            extend_seq_lens=device_lengths, seq_lens_cpu=seq,
+                            seq_lens=seq, out_cache_loc=torch.arange(sum(lengths)),
+                            req_pool_indices=torch.arange(len(lengths), dtype=torch.int32))
+                        cp_calls = []
+
+                        class Captured(Exception):
+                            pass
+
+                        def cp_layout(forward_batch, indices, tail_lengths):
+                            self.assertIs(forward_batch, batch)
+                            self.assertEqual(tail_lengths, expected.tolist())
+                            cp_calls.append(True)
+                            return {'cp_metadata': 'cp-layout'}
+
+                        def capture(**kwargs):
+                            torch.testing.assert_close(kwargs['extend_seq_lens'], expected)
+                            torch.testing.assert_close(kwargs['extend_start_loc'],
+                                expected.cumsum(0) - expected)
+                            self.assertEqual(kwargs['extend_seq_lens_cpu'], expected.tolist())
+                            self.assertEqual(kwargs['num_tokens'], int(expected.sum()))
+                            self.assertEqual(bool(cp_calls), legacy_cp or cp_active)
+                            self.assertEqual(kwargs['cp_metadata'],
+                                             'cp-layout' if legacy_cp or cp_active else None)
+                            raise Captured
+
+                        namespace = dict(torch=SimpleNamespace(tensor=forbid_host_upload,
+                            int32=torch.int32, cumsum=torch.cumsum), SWA_WINDOW=128,
+                            late_layer_tail_layout=helper, _tail_rows=rows,
+                            is_cp_active=lambda batch: cp_active)
+                        build = load(backend_path, '_build_late_layer_tail_metadata',
+                                     namespace, 'DeepseekV4AttnBackend')
+                        backend = SimpleNamespace(_late_layer_tail_cp_layout=cp_layout,
+                                                  init_forward_metadata_prefill=capture)
+                        with self.assertRaises(Captured):
+                            build(backend, batch, legacy_cp=legacy_cp)
+                        torch.testing.assert_close(device_lengths, before)
+
+
+class TestLateLayerTailRequestIndices(CustomTestCase):
+    def test_repeat_interleave_uses_logical_cpu_output_size(self):
+        helper = load(ACTUAL / 'kernels/ops/attention/dsv4_attn_metadata_kernels.py',
+                      'late_layer_tail_layout', dict(torch=torch))
+        path = SOURCE / 'srt/layers/attention/deepseek_v4_backend.py'
+        rows = load(path, '_tail_rows', dict(torch=torch))
+        cases = ([0], [129], [0, 0], [1, 129, 7], [32768] * 8,
+                 [3, 0, 129, 256, 1])
+        for lengths in cases:
+            for dtype in (torch.int32, torch.int64):
+                for legacy_cp, cp_active in ((False, False), (True, False), (False, True)):
+                    with self.subTest(lengths=lengths, dtype=dtype,
+                                      legacy_cp=legacy_cp, cp_active=cp_active):
+                        tails = [min(n, 128) for n in lengths]
+                        request_ids = torch.arange(len(lengths), dtype=dtype) * 17 + 9
+                        seq = torch.tensor([n + (i + 1) * 4096
+                                            for i, n in enumerate(lengths)], dtype=torch.int32)
+                        batch = SimpleNamespace(extend_seq_lens_cpu=list(lengths),
+                            extend_seq_lens=torch.tensor(lengths, dtype=torch.int32),
+                            seq_lens_cpu=seq, seq_lens=seq,
+                            out_cache_loc=torch.arange(sum(lengths)),
+                            req_pool_indices=request_ids)
+
+                        class Captured(Exception):
+                            pass
+
+                        def repeat(input, repeats, **kwargs):
+                            self.assertEqual(kwargs.get('output_size'), sum(tails))
+                            self.assertIsInstance(kwargs['output_size'], int)
+                            result = torch.repeat_interleave(input, repeats, **kwargs)
+                            expected = torch.tensor([int(req) for req, n in
+                                zip(request_ids, tails) for _ in range(n)], dtype=torch.int64)
+                            torch.testing.assert_close(result, expected)
+                            raise Captured
+
+                        cp_metadata = SimpleNamespace(per_rank_actual_token=[
+                            (sum(tails) + 7) // 8] * 8)
+                        backend = SimpleNamespace(
+                            _late_layer_tail_cp_layout=lambda *args: {'cp_metadata': cp_metadata},
+                            init_forward_metadata_prefill=lambda **kwargs:
+                                SimpleNamespace(core_attn_metadata=SimpleNamespace()),
+                            token_to_kv_pool=SimpleNamespace(request_window=None,
+                                translate_loc_from_full_to_swa=lambda value: value))
+                        proxy = SimpleNamespace(int32=torch.int32, int64=torch.int64,
+                            cumsum=torch.cumsum, repeat_interleave=repeat)
+                        ns = dict(torch=proxy, SWA_WINDOW=128, _tail_rows=rows,
+                            late_layer_tail_layout=helper, is_cp_active=lambda batch: cp_active)
+                        build = load(path, '_build_late_layer_tail_metadata', ns,
+                                     'DeepseekV4AttnBackend')
+                        with self.assertRaises(Captured):
+                            build(backend, batch, legacy_cp=legacy_cp)
+
+
+class TestLateLayerTailCPCounts(CustomTestCase):
+    def test_cpu_counts_match_token_ownership_without_gpu_readback(self):
+        path = SOURCE / 'srt/layers/attention/deepseek_v4_backend.py'
+        cases = ([0], [1], [7], [128], [129], [32768] * 8,
+                 [1, 129, 0, 300, 17], [3, 0, 129, 256, 1])
+        for lengths in cases:
+            for tail_limit in (1, 7, 128):
+                tails = [min(n, tail_limit) for n in lengths]
+                indices_list = []
+                offset = 0
+                for length, tail in zip(lengths, tails):
+                    offset += length
+                    indices_list.extend(range(offset - tail, offset))
+                indices = torch.tensor(indices_list, dtype=torch.int64)
+                positions = torch.arange(sum(lengths) * 2, dtype=torch.int64)[::2]
+                for size in (1, 2, 3, 8):
+                    counts = [sum(i % size == r for i in indices_list)
+                              for r in range(size)]
+                    physical = max(counts)
+                    slot = [0] * size
+                    expected_gather = []
+                    for i in indices_list:
+                        rank = i % size
+                        expected_gather.append(rank * physical + slot[rank])
+                        slot[rank] += 1
+                    for rank in range(size):
+                        with self.subTest(lengths=lengths, tail_limit=tail_limit,
+                                          size=size, rank=rank):
+                            def forbid(*args, **kwargs):
+                                raise AssertionError('CP tail must not use dynamic counts/readback')
+
+                            def static_nonzero(value, *, size):
+                                self.assertEqual(size, counts[rank])
+                                return torch.nonzero_static(value, size=size)
+
+                            proxy = SimpleNamespace(**{
+                                name: getattr(torch, name) for name in
+                                ('argsort', 'tensor', 'int64', 'empty_like', 'arange', 'cat')})
+                            proxy.nonzero_static = static_nonzero
+                            proxy.bincount = forbid
+                            proxy.repeat_interleave = forbid
+                            layout = load(path, '_late_layer_tail_cp_layout',
+                                dict(torch=proxy, get_parallel=lambda:
+                                     SimpleNamespace(attn_cp_rank=rank, attn_cp_size=size),
+                                     InterleaveContextParallelMetadata=SimpleNamespace),
+                                'DeepseekV4AttnBackend')
+                            batch = SimpleNamespace(batch_size=len(lengths),
+                                extend_seq_lens_cpu=list(lengths), positions=positions)
+                            with patch.object(torch.Tensor, 'tolist', side_effect=forbid), \
+                                 patch.object(torch.Tensor, 'item', side_effect=forbid):
+                                out = layout(None, batch, indices, tails)
+                            rows = [j for j, i in enumerate(indices_list) if i % size == rank]
+                            expected_local_lens = []
+                            cursor = 0
+                            for tail in tails:
+                                expected_local_lens.append(sum(cursor <= row < cursor + tail
+                                                               for row in rows))
+                                cursor += tail
+                            pad = physical - len(rows)
+                            pad_start = len(indices_list) + sum(physical - c for c in counts[:rank])
+                            metadata = out['cp_metadata']
+                            self.assertEqual(metadata.per_rank_logical_token, counts)
+                            self.assertEqual(metadata.per_rank_actual_token, [physical] * size)
+                            self.assertEqual(metadata.total_seq_lens, len(indices_list))
+                            self.assertEqual(out['pad_rows'], pad)
+                            self.assertEqual(out['local_lens_cpu'], expected_local_lens)
+                            torch.testing.assert_close(out['local_lens'],
+                                torch.tensor(expected_local_lens, dtype=torch.int64))
+                            torch.testing.assert_close(metadata.gather_index,
+                                torch.tensor(expected_gather, dtype=torch.int64))
+                            torch.testing.assert_close(metadata.local_index,
+                                torch.tensor(rows + list(range(pad_start, pad_start + pad)),
+                                             dtype=torch.int64))
+                            torch.testing.assert_close(out['local_token_indices'],
+                                torch.tensor([(indices_list[j] - rank) // size for j in rows],
+                                             dtype=torch.int64))
+                            expected_positions = [int(positions[indices_list[j]]) for j in rows]
+                            torch.testing.assert_close(out['local_positions'],
+                                torch.tensor(expected_positions + [0] * pad, dtype=torch.int64))
+
 
 
 if __name__ == '__main__':
