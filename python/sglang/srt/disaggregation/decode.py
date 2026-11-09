@@ -90,6 +90,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.common import (
+    dsv4_needs_rebootstrap,
     kv_to_page_indices,
     page_align_floor,
     release_kv_cache,
@@ -763,6 +764,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         dispatch happens later, after preallocation and ``send_metadata`` (see
         ``pop_preallocated``).
         """
+        if is_retracted and dsv4_needs_rebootstrap(self.token_to_kv_pool_allocator):
+            # Match pause_generation's boundary-token replay convention. The
+            # prefill recomputes prompt + output excluding the pending token.
+            if req.output_ids:
+                req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+            req.pd_rebootstrap_in_progress = True
+            req.time_stats.set_retract_time()
+            is_retracted = False
+            is_rebootstrap = True
+
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
@@ -1011,6 +1022,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         self.queue.append(decode_req)
         return decode_req
+
+    def _submit_prefill_recompute(self, decode_req: DecodeRequest) -> None:
+        # A fake transfer has no prefill endpoint; its receiver completes itself.
+        if _is_fake_transfer(decode_req.req):
+            return
+        self.kv_manager.submit_prefill_recompute(
+            decode_req.kv_receiver, decode_req.req.build_rebootstrap_payload()
+        )
 
     def hold_rebootstrap(self, req: Req) -> None:
         """Stage a retracted request for rebootstrap without enqueuing it yet.
@@ -2183,10 +2202,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 spec_metadata=spec_metadata,
             )
             if decode_req.is_rebootstrap:
-                self.kv_manager.submit_prefill_recompute(
-                    decode_req.kv_receiver,
-                    decode_req.req.build_rebootstrap_payload(),
-                )
+                self._submit_prefill_recompute(decode_req)
             self._num_published_destinations += 1
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
@@ -3119,7 +3135,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     : decode_req.req.logprob.top_logprobs_num
                 ].tolist()
             )
-        if decode_req.req.return_sampling_mask:
+        # Replayed tokens already have their original sampling mask/logprob.
+        if decode_req.req.return_sampling_mask and not replayed_boundary:
             assert (
                 output_token_sampling_mask_idx is not None
             ), "sampling mask buffer disabled on decode side"

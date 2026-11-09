@@ -1244,6 +1244,20 @@ class Req(ReqDllmMixin):
         return len(self.origin_input_ids) + len(self.output_ids)
 
     @property
+    def resumable_by_rebootstrap(self) -> bool:
+        """The PD recompute payload carries token IDs only."""
+        return (
+            self.multimodal_inputs is None
+            and self.input_embeds is None
+            and self.positional_embed_overrides is None
+        )
+
+    @property
+    def resumable_by_reprefill(self) -> bool:
+        """Restarting input_embeds generation is safe only before sending output."""
+        return self.input_embeds is None or self.send_token_offset == 0
+
+    @property
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
         # NOTE: when spec is enabled, prefill_only optimizations are disabled
@@ -1822,10 +1836,8 @@ class Req(ReqDllmMixin):
         overrides the sampled handoff with it), so it is intentionally not sent
         to the prefill here.
         """
-        # TODO: multi-modal requests are not supported here. The payload only
-        # carries token ``input_ids`` and drops any image/audio/video inputs, so
-        # the rebootstrap recompute would not reproduce the original prefix KV
-        # for multi-modal requests. Add multi-modal support before enabling it.
+        # TODO: carry multimodal inputs and embeds. Until then, release_req
+        # rejects requests that cannot be rebuilt from token IDs alone.
         sp = self.sampling_params
         return {
             "input_ids": [int(x) for x in self.origin_input_ids]
@@ -1977,6 +1989,18 @@ def set_mamba_track_indices_from_reqs(
     )
 
 
+def unresumable_abort_message() -> str:
+    if get_disagg().disaggregation_mode == "decode":
+        return (
+            "Retracted request aborted: the rebootstrap recomputes KV from token "
+            "IDs, which cannot rebuild multimodal inputs or embeds. Retry later."
+        )
+    return (
+        "Retracted request aborted: an input_embeds request that has sent output "
+        "cannot be recomputed. Retry later."
+    )
+
+
 def release_req(
     *,
     req: Req,
@@ -1988,7 +2012,7 @@ def release_req(
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
 ) -> bool:
-    """Returns False when the KV backup failed and the request cannot be resumed."""
+    """Return whether the released request can be resumed."""
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
 
@@ -1996,15 +2020,18 @@ def release_req(
     # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
     # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
     # pass offload_kv=False to skip the wasteful device->host copy.
-    backup_saved = True
-    if get_disagg().disaggregation_mode == "decode" and offload_kv:
-        backup_saved = retraction_backup(
+    if get_disagg().disaggregation_mode != "decode":
+        resumable = req.resumable_by_reprefill
+    elif offload_kv:
+        resumable = retraction_backup(
             req,
             tree_cache,
             req_to_token_pool,
             token_to_kv_pool_allocator,
             get_disagg().disaggregation_decode_retraction_backup,
         )
+    else:
+        resumable = req.resumable_by_rebootstrap
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, is_insert=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
@@ -2012,7 +2039,7 @@ def release_req(
     evict_from_tree_cache(tree_cache, num_tokens)
 
     req.reset_for_retract()
-    return backup_saved
+    return resumable
 
 
 def retract_all(
@@ -2024,9 +2051,11 @@ def retract_all(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
-) -> None:
+) -> List[Req]:
+    """Return released requests that cannot be resumed."""
+    unresumable = []
     for idx in range(len(reqs)):
-        release_req(
+        if not release_req(
             req=reqs[idx],
             remaing_req_count=len(reqs) - idx,
             server_args=server_args,
@@ -2035,7 +2064,9 @@ def retract_all(
             tree_cache=tree_cache,
             hisparse_coordinator=hisparse_coordinator,
             offload_kv=offload_kv,
-        )
+        ):
+            unresumable.append(reqs[idx])
+    return unresumable
 
 
 def compute_extend_logprob_start_len(
@@ -2920,18 +2951,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if self.release_req(idx, len(sorted_indices), server_args):
                 retracted_reqs.append(req)
             else:
-                # The retraction host pool could not hold the backup and the
-                # device KV is already freed, so the request cannot resume.
-                req.to_finish = FINISH_ABORT(
-                    "Retraction host KV pool exhausted. Aborting the request.",
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
+                # Device KV is freed and neither a backup nor a rebuild is possible.
+                if get_disagg().disaggregation_mode != "decode":
+                    message = unresumable_abort_message()
+                    status_code = HTTPStatus.SERVICE_UNAVAILABLE
+                elif (
+                    get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+                ):
+                    message = "Retraction host KV pool exhausted. Aborting the request."
+                    status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+                else:
+                    message = (
+                        "Retracted under decode memory pressure without a KV "
+                        "backup. Retry later."
+                    )
+                    status_code = HTTPStatus.SERVICE_UNAVAILABLE
+                req.to_finish = FINISH_ABORT(message, status_code=status_code)
                 reqs_to_abort.append(req)
-                logger.warning(
-                    "retract_decode: aborted request %s, retraction host pool "
-                    "exhausted",
-                    req.rid,
-                )
+                logger.warning("retract_decode: aborted request %s: %s", req.rid, message)
 
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
