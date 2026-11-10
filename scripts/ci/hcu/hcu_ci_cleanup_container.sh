@@ -20,6 +20,14 @@ set -euo pipefail
 # bind-mounted checkout can otherwise poison the self-hosted runner workspace
 # and break the next actions/checkout.
 
+# shellcheck disable=SC1091  # sibling helper; run shellcheck -x to follow it
+source "$(dirname "${BASH_SOURCE[0]}")/hcu_ci_k8s.sh"
+
+# K8s job Pods are deleted with their workspace when the job ends.
+if hcu_ci_in_k8s; then
+  exit 0
+fi
+
 CONTAINER="${HCU_CI_CONTAINER:-${HCU_CI_CONTAINER_NAME:-ci_sglang}}"
 CHECKOUT_MOUNT="${HCU_CI_CHECKOUT_MOUNT:-/sglang-checkout}"
 
