@@ -38,6 +38,10 @@ set -euo pipefail
 #   HCU_CI_SHM_SIZE                         Docker shared-memory size. Defaults to 32g.
 #   HCU_CI_ENABLE_RDMA                      Set to 1 to expose RDMA devices, lock memory,
 #                                           and add IPC_LOCK. Defaults to disabled.
+#   HCU_CI_IN_K8S                           Set to 1 by the ARC K8s job template. Skips
+#                                           docker and prepares the current job container.
+
+source "$(dirname "${BASH_SOURCE[0]}")/hcu_ci_k8s.sh"
 
 CUSTOM_IMAGE=""
 CONTAINER="${HCU_CI_CONTAINER:-${HCU_CI_CONTAINER_NAME:-ci_sglang}}"
@@ -81,7 +85,7 @@ echo "Using HCU Docker network mode: ${NETWORK_MODE}"
 echo "Using HCU Docker shared-memory size: ${SHM_SIZE}"
 
 # Pull only if not already present locally, unless explicitly skipped.
-if [[ -z "${HCU_CI_SKIP_PULL:-}" ]] && ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+if ! hcu_ci_in_k8s && [[ -z "${HCU_CI_SKIP_PULL:-}" ]] && ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
   echo "Pulling Docker image: ${IMAGE}"
   docker pull "${IMAGE}"
 fi
@@ -91,6 +95,32 @@ DEVICE_FLAGS="${HCU_DEVICE_FLAGS:-${HCU_CI_DEVICE_FLAGS:---device=/dev/kfd --dev
 VISIBLE_DEVICES="${HCU_CI_VISIBLE_DEVICES:-}"
 DTK_ROOT="${HCU_DTK_ROOT:-/opt/dtk}"
 HCU_LD_LIBRARY_PATH="${HCU_LD_LIBRARY_PATH:-${DTK_ROOT}/hip/lib:${DTK_ROOT}/lib:${DTK_ROOT}/lib64:${DTK_ROOT}/hsa/lib:${DTK_ROOT}/llvm/lib:${DTK_ROOT}/dcc/gcvm/lib:${DTK_ROOT}/.hyhal/lib:${DTK_ROOT}/.hyhal/lib64:${DTK_ROOT}/.hyhal/rocm_smi/lib:${DTK_ROOT}/.hyhal/hydm/lib:/opt/hyhal/lib:/opt/hyhal/lib64}"
+
+if hcu_ci_in_k8s; then
+  # The job already runs in ${IMAGE}; the job template provides the cards,
+  # /opt/hyhal, /dev/shm, /public and /ci_public. Recreate the paths and env
+  # that `docker run` below sets up, so later steps run unchanged.
+  echo "[hcu-ci] HCU_CI_IN_K8S=${HCU_CI_IN_K8S}; using the current job container instead of docker"
+  ln -sfn "${GITHUB_WORKSPACE:-$PWD}" /sglang-checkout
+  WHEEL_STAGING_HOST="${HCU_WHEEL_STAGING_ROOT:-}"
+  WHEEL_STAGING_CONTAINER="${HCU_WHEEL_STAGING_CONTAINER_ROOT:-/hcu-wheel-staging}"
+  if [[ -n "${WHEEL_STAGING_HOST}" && "${WHEEL_STAGING_HOST}" != "${WHEEL_STAGING_CONTAINER}" ]]; then
+    ln -sfn "${WHEEL_STAGING_HOST}" "${WHEEL_STAGING_CONTAINER}"
+  fi
+  mkdir -p /sgl-data/hf-cache /sgl-data/pip-cache
+  {
+    echo "HF_HOME=/sgl-data/hf-cache"
+    echo "HF_HUB_ETAG_TIMEOUT=300"
+    echo "HF_HUB_DOWNLOAD_TIMEOUT=300"
+    echo "ROCM_PATH=${DTK_ROOT}"
+    echo "LD_LIBRARY_PATH=${HCU_LD_LIBRARY_PATH}"
+    echo "SGLANG_IS_IN_CI=1"
+    echo "SGLANG_IS_IN_CI_HCU=1"
+    echo "SGLANG_USE_AITER=0"
+    echo "SGLANG_ROCM_USE_AITER_MOE=0"
+  } >> "${GITHUB_ENV:?GITHUB_ENV is required in K8s mode}"
+  exit 0
+fi
 
 VISIBLE_ENV_ARGS=()
 if [[ -n "${VISIBLE_DEVICES}" ]]; then

@@ -24,6 +24,8 @@ set -euo pipefail
 #   SGLANG_IS_IN_CI=1
 #   SGLANG_IS_IN_CI_HCU=1
 
+source "$(dirname "${BASH_SOURCE[0]}")/hcu_ci_k8s.sh"
+
 CONTAINER="${HCU_CI_CONTAINER:-${HCU_CI_CONTAINER_NAME:-ci_sglang}}"
 WORKDIR="/sglang-checkout/test"
 
@@ -107,7 +109,7 @@ for key in "${!ENV_MAP[@]}"; do
 done
 
 # First attempt: allow HF downloads.
-if docker exec \
+if hcu_ci_container_exec \
   -w "${WORKDIR}" \
   "${ENV_ARGS[@]}" \
   "${CONTAINER}" "$@"; then
@@ -125,7 +127,7 @@ if [[ "${FIRST_EXIT_CODE}" -eq 1 || "${FIRST_EXIT_CODE}" -eq 137 || "${FIRST_EXI
 fi
 
 echo "Retrying with HF_HUB_OFFLINE=1 (use cached HF models)..."
-docker exec \
+hcu_ci_container_exec \
   -w "${WORKDIR}" \
   "${ENV_ARGS[@]}" \
   -e HF_HUB_OFFLINE=1 \
