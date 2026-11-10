@@ -344,7 +344,9 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
         and not is_batch_invariant_mode_enabled()
     ):
         parts, bf16_parts = hc.tf32_parts, hc.bf16_parts
-        use_bf16x3 = 4096 <= x_flat.shape[0] <= 65536
+        use_bf16x3 = (
+            envs.SGLANG_DSV4_HC_BF16X3_MIN_ROWS.get() <= x_flat.shape[0] <= 65536
+        )
         if parts is not None and (not use_bf16x3 or bf16_parts is not None):
             from lightop import (
                 hc_mix_stats_sinkhorn_bf16x3,
