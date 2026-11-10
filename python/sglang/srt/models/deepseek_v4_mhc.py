@@ -231,7 +231,6 @@ def make_boundary(
     return HcNextBoundary(
         norm=norm,
         accepts_mxfp8=accepts_mxfp8,
-        hc=hc,
         norm_fusable=(
             not norm.cast_x_before_out_mul
             and norm.variance_size_override is None
