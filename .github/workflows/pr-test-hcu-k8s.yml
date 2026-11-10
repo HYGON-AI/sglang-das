@@ -386,9 +386,9 @@ jobs:
       - validate-config
       - build-wheels
     if: always() && needs.check-changes.outputs.hcu == 'true' && needs.check-changes.outputs.run_stage_a == 'true' && needs.validate-config.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') && (needs.build-wheels.result == 'success' || needs.build-wheels.result == 'skipped')
-    # Stage A only imports sglang and checks env markers; it needs the CI
-    # image and /opt/hyhal but no card.
-    runs-on: hygon-build
+    # The smoke test needs no card, but "Verify HCU external APIs" loads HCU
+    # ops (lightop, MoE op registration), which fail without a device.
+    runs-on: hygon-bw1100-1card
     timeout-minutes: 60
     container:
       image: ${{ needs.check-changes.outputs.image }}
