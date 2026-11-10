@@ -26,6 +26,9 @@ set -euo pipefail
 #   2. install python deps from requirements_hcu.txt
 #   3. install sglang in editable mode against the checkout
 
+# shellcheck disable=SC1091  # sibling helper; run shellcheck -x to follow it
+source "$(dirname "${BASH_SOURCE[0]}")/hcu_ci_k8s.sh"
+
 CONTAINER="${HCU_CI_CONTAINER:-${HCU_CI_CONTAINER_NAME:-ci_sglang}}"
 SKIP_DEPENDENCY_INSTALL="${HCU_CI_SKIP_DEPENDENCY_INSTALL:-0}"
 SKIP_REQUIREMENTS_INSTALL="${HCU_CI_SKIP_REQUIREMENTS_INSTALL:-0}"
@@ -34,12 +37,12 @@ SKIP_COMPAT_INSTALL="${HCU_CI_SKIP_COMPAT_INSTALL:-0}"
 INSTALL_WHEEL_URLS="${HCU_CI_INSTALL_WHEEL_URLS:-}"
 
 run_in_container() {
-  docker exec "${CONTAINER}" bash -c "$*"
+  hcu_ci_container_exec "${CONTAINER}" bash -c "$*"
 }
 
 print_python_status() {
   echo "[hcu-ci] Python dependency status:"
-  docker exec -i "${CONTAINER}" python - <<'PY_STATUS' || true
+  hcu_ci_container_exec -i "${CONTAINER}" python - <<'PY_STATUS' || true
 import importlib
 import sys
 
@@ -76,17 +79,17 @@ install_required_test_dependencies() {
   # when regular requirements are skipped in favor of the HCU base image.
   source "$(dirname "${BASH_SOURCE[0]}")/../utils/sgl_eval_ref.sh"
   local numpy_version
-  numpy_version="$(docker exec "${CONTAINER}" python3 -c 'import importlib.metadata; print(importlib.metadata.version("numpy"))')"
+  numpy_version="$(hcu_ci_container_exec "${CONTAINER}" python3 -c 'import importlib.metadata; print(importlib.metadata.version("numpy"))')"
   echo "[hcu-ci] Preserving installed NumPy ${numpy_version}"
   echo "[hcu-ci] Installing llguidance==1.7.6 and sgl-eval at ${SGL_EVAL_REF}"
-  install_with_retry docker exec "${CONTAINER}" \
+  install_with_retry hcu_ci_container_exec "${CONTAINER}" \
     python3 -m pip install --cache-dir=/sgl-data/pip-cache --no-deps "llguidance==1.7.6"
-  install_with_retry docker exec "${CONTAINER}" \
+  install_with_retry hcu_ci_container_exec "${CONTAINER}" \
     python3 -m pip install --cache-dir=/sgl-data/pip-cache \
       "${SGL_EVAL_SPEC}" "antlr4-python3-runtime==4.9.3" "numpy==${numpy_version}"
 
   # Check the actual API and CLI used by the tests, not just package metadata.
-  docker exec -i "${CONTAINER}" python3 - <<'PY_TEST_DEPS'
+  hcu_ci_container_exec -i "${CONTAINER}" python3 - <<'PY_TEST_DEPS'
 import importlib.metadata
 import tvm_ffi
 from llguidance.torch import fill_next_token_bitmask_par_with_draft_tokens
@@ -102,15 +105,58 @@ if [[ "${SKIP_COMPAT_INSTALL}" == "1" || "${SKIP_COMPAT_INSTALL}" == "true" ]]; 
   echo "[hcu-ci] HCU_CI_SKIP_COMPAT_INSTALL=${SKIP_COMPAT_INSTALL}; skipping HCU compatibility pins"
 else
   echo "[hcu-ci] Installing HCU compatibility pins"
-  install_with_retry docker exec "${CONTAINER}" \
+  install_with_retry hcu_ci_container_exec "${CONTAINER}" \
     pip install --cache-dir=/sgl-data/pip-cache "kernels<0.15" "apache-tvm-ffi==0.1.11" tabulate
 fi
 
 if [[ -n "${INSTALL_WHEEL_URLS}" ]]; then
   echo "[hcu-ci] Installing HCU wheels from explicit URLs or local paths"
   echo "[hcu-ci] HCU_CI_INSTALL_WHEEL_URLS=${INSTALL_WHEEL_URLS}"
+  hcu_ci_container_exec -i -e HCU_CI_INSTALL_WHEEL_URLS="${INSTALL_WHEEL_URLS}" "${CONTAINER}" python3 - <<'PY_WHEEL_ABI'
+import json
+import os
+import re
+import subprocess
+import zipfile
+from email.parser import Parser
+from pathlib import Path
+
+import torch
+
+actual_torch = torch.__version__.split("+", 1)[0]
+for value in os.environ["HCU_CI_INSTALL_WHEEL_URLS"].split():
+    path = Path(value)
+    # Remote wheel URLs remain supported; this guard covers CI's shared staging.
+    if not path.is_absolute() or "hcu-wheel-staging" not in path.parts:
+        continue
+    manifest = json.loads((path.parent.parent / "manifest.json").read_text())
+    target_sha = subprocess.check_output(
+        ["git", "-c", "safe.directory=/sglang-checkout", "-C", "/sglang-checkout", "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+    if manifest.get("commit_sha") != target_sha:
+        raise SystemExit(f"Wheel SHA mismatch: {path.name}; expected {target_sha}")
+    if manifest.get("torch_version") != actual_torch:
+        raise SystemExit(f"Wheel Torch mismatch: built={manifest.get('torch_version')}, runtime={actual_torch}")
+    with zipfile.ZipFile(path) as archive:
+        names = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+        if len(names) != 1:
+            raise SystemExit(f"Invalid wheel metadata: {path.name}")
+        metadata = Parser().parsestr(archive.read(names[0]).decode("utf-8"))
+    version = metadata.get("Version", "")
+    if path.name.split("-")[1] != version:
+        raise SystemExit(f"Wheel filename/METADATA mismatch: {path.name}")
+    local_version = version.partition("+")[2]
+    torch_tag = "torch" + actual_torch.replace(".", "")
+    if torch_tag not in local_version.split("."):
+        raise SystemExit(f"Wheel Torch tag mismatch: {path.name}; expected {torch_tag}")
+    commits = re.findall(r"(?:^|\.)g([0-9a-f]{6,40})(?:\.|$)", local_version)
+    if len(commits) != 1 or not target_sha.startswith(commits[0]):
+        raise SystemExit(f"Wheel commit tag mismatch: {path.name}; expected {target_sha}")
+    print(f"[hcu-ci] Verified {path.name}: SHA={target_sha}, Torch={actual_torch}")
+PY_WHEEL_ABI
   run_in_container "python3 -m pip uninstall -y sglang sgl-kernel sglang-kernel sgl-model-gateway || true"
-  install_with_retry docker exec "${CONTAINER}" \
+  install_with_retry hcu_ci_container_exec "${CONTAINER}" \
     python3 -m pip install --no-cache-dir --no-deps ${INSTALL_WHEEL_URLS}
   echo "[hcu-ci] Installed wheel import paths:"
   run_in_container "python3 -c 'import sglang; print(\"sglang:\", sglang.__file__)'"
@@ -139,23 +185,23 @@ run_in_container "find /sglang-checkout -name '__pycache__' -type d -exec rm -rf
 
 if [[ "${SKIP_REQUIREMENTS_INSTALL}" == "1" || "${SKIP_REQUIREMENTS_INSTALL}" == "true" ]]; then
   echo "[hcu-ci] HCU_CI_SKIP_REQUIREMENTS_INSTALL=${SKIP_REQUIREMENTS_INSTALL}; skipping requirements_hcu.txt"
-elif docker exec "${CONTAINER}" test -f /sglang-checkout/requirements_hcu.txt; then
+elif hcu_ci_container_exec "${CONTAINER}" test -f /sglang-checkout/requirements_hcu.txt; then
   echo "[hcu-ci] Installing requirements_hcu.txt"
-  install_with_retry docker exec "${CONTAINER}" \
+  install_with_retry hcu_ci_container_exec "${CONTAINER}" \
     pip install --cache-dir=/sgl-data/pip-cache -r /sglang-checkout/requirements_hcu.txt
 else
   echo "[hcu-ci] requirements_hcu.txt not found, skipping"
 fi
 
 echo "[hcu-ci] Installing tabulate"
-install_with_retry docker exec "${CONTAINER}" \
+install_with_retry hcu_ci_container_exec "${CONTAINER}" \
   pip install --cache-dir=/sgl-data/pip-cache tabulate
 
 if [[ "${SKIP_SGLANG_BUILD}" == "1" || "${SKIP_SGLANG_BUILD}" == "true" ]]; then
   echo "[hcu-ci] Skipping editable sglang install; tests will use /sglang-checkout/python via PYTHONPATH"
 else
   echo "[hcu-ci] Installing sglang (editable, srt extras)"
-  install_with_retry docker exec -w /sglang-checkout "${CONTAINER}" \
+  install_with_retry hcu_ci_container_exec -w /sglang-checkout "${CONTAINER}" \
     pip install --cache-dir=/sgl-data/pip-cache --no-deps -e "python[srt]"
 fi
 
