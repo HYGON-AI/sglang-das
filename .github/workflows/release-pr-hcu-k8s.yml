@@ -157,9 +157,9 @@ jobs:
       WHEEL_REF: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
       HCU_WHEEL_STAGING_ROOT: /ci_public/sglang-das/hcu-wheel-staging
 
-    # Workspace ownership and safe.directory steps from release-pr-hcu.yml are
-    # dropped: the job Pod and its workspace are deleted after the job, and the
-    # job template already sets safe.directory.
+    # Workspace ownership normalization from release-pr-hcu.yml is dropped: the
+    # job Pod and its workspace are deleted after the job. safe.directory must
+    # still be configured after checkout to allow git operations inside the build.
     steps:
       - name: Validate manual build target
         if: github.event_name == 'workflow_dispatch'
@@ -197,6 +197,10 @@ jobs:
           ref: ${{ env.WHEEL_REF }}
           submodules: 'recursive'
           persist-credentials: false
+
+      - name: Trust checked-out workspace
+        run: |
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
 
       - name: Resolve wheel commit SHA
         run: |
