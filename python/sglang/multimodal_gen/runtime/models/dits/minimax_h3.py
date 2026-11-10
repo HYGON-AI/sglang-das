@@ -825,6 +825,10 @@ class MiniMaxH3Attention(nn.Module):
 
     def _set_attention_backend(self, backend) -> None:
         impl_cls = backend.get_impl_cls()
+        extra_impl_args = {}
+        if is_hcu() and backend.get_enum() is AttentionBackendEnum.FA2:
+            # HCU FA2 accepts packed QKV views with contiguous head dimensions.
+            extra_impl_args["allow_strided_qkv"] = True
         self._attention_impl = impl_cls(
             num_heads=self.num_heads,
             head_size=self.head_dim,
@@ -832,6 +836,7 @@ class MiniMaxH3Attention(nn.Module):
             softmax_scale=self.softmax_scale,
             num_kv_heads=self.num_heads,
             prefix=self.prefix,
+            **extra_impl_args,
         )
         # Ring only supports FA (see _minimax_h3_attention_core_impl); keep
         # the resolved enum alongside the impl instance instead of a second

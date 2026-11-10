@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_QUANT_FUSION: bool = False
     SGLANG_MINIMAX_H3_INT8_ENABLE: bool = True
     SGLANG_MINIMAX_H3_INT8_FUSION: bool = True
+    SGLANG_MINIMAX_H3_FA2_STRIDED_QKV: bool = False
     SGLANG_MINIMAX_H3_FP8_OPTIMIZE: bool = True
     SGLANG_DIFFUSION_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
@@ -214,6 +215,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_MINIMAX_H3_INT8_FUSION": _lazy_bool(
         "SGLANG_MINIMAX_H3_INT8_FUSION", "true"
+    ),
+    # Let HCU FA2 read packed MiniMax-H3 QKV with contiguous heads.
+    "SGLANG_MINIMAX_H3_FA2_STRIDED_QKV": _lazy_bool(
+        "SGLANG_MINIMAX_H3_FA2_STRIDED_QKV", "false"
     ),
     "SGLANG_MINIMAX_H3_FP8_OPTIMIZE": _lazy_bool(
         "SGLANG_MINIMAX_H3_FP8_OPTIMIZE", "true"
