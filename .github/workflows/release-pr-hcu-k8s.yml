@@ -242,26 +242,13 @@ jobs:
           tar -xzf $(basename $DTK_PKG_URL)
           mv dtk-* dtk
 
-      # =======================================================================
-      # 路径检测: 决定哪些组件需要编译
-      # =======================================================================
-
-      - name: Check changed paths
-        uses: dorny/paths-filter@v3
-        id: changes
-        with:
-          filters: |
-            sgl-kernel:
-              - 'python/sglang/kernels/aot/**'
-            sglang:
-              - 'python/**'
-              - 'rust/**'
-            gateway:
-              - 'sgl-model-gateway/**'
+      # No paths-filter step: it fails inside the job container because
+      # GITHUB_EVENT_PATH is not visible there. Which components get built is
+      # decided by the caller, which passes skip_gateway from the PR file list.
 
       # =======================================================================
-      # 编译阶段: 按检测结果增量编译
-      # workflow_dispatch 时忽略检测结果，全量编译
+      # 编译阶段: sgl-kernel 和 sglang 总是编译; gateway 由调用方传入的
+      # skip_gateway 决定, workflow_dispatch 时总是编译
       # =======================================================================
 
       - name: Build sgl-kernel (HIP)
@@ -276,7 +263,6 @@ jobs:
           ls -lh dist/*.whl
 
       - name: Build sglang python package
-        # if: steps.changes.outputs.sglang == 'true' || github.event_name == 'workflow_dispatch'
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ env.SGLANG_PACKAGE_VERSION }}
         run: |
@@ -293,7 +279,7 @@ jobs:
           ls -lh dist/*.whl
 
       - name: Build sgl-model-gateway
-        if: ${{ env.SKIP_GATEWAY != 'true' && (steps.changes.outputs.gateway == 'true' || github.event_name == 'workflow_dispatch') }}
+        if: env.SKIP_GATEWAY != 'true' || github.event_name == 'workflow_dispatch'
         run: |
           source /opt/dtk/env.sh
           source $HOME/.cargo/env
