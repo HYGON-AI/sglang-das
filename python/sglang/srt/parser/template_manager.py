@@ -152,6 +152,26 @@ class TemplateManager:
             if self._chat_template_name is None:
                 # Try HuggingFace template first
                 hf_template = self._resolve_hf_chat_template(tokenizer_manager)
+
+                # Some model repositories store the HF template in a JSON wrapper.
+                if not hf_template:
+                    template_path = os.path.join(model_path, "chat_template.json")
+                    if os.path.isfile(template_path):
+                        with open(template_path, encoding="utf-8") as filep:
+                            template_config = json.load(filep)
+                        hf_template = (
+                            template_config.get("chat_template")
+                            if isinstance(template_config, dict)
+                            else None
+                        )
+                        if not isinstance(hf_template, str) or not hf_template.strip():
+                            raise ValueError(
+                                f"{template_path} must contain a non-empty string "
+                                "chat_template"
+                            )
+                        logger.info(
+                            f"Loaded HuggingFace chat template from {template_path}"
+                        )
                 if hf_template:
                     # override the chat template
                     if tokenizer_manager.tokenizer:
