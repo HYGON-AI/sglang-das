@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from itertools import accumulate
 from typing import List
 
+import functools
+
 import torch
 import torch.nn.functional as F
 
@@ -318,15 +320,39 @@ def cp_all_gather_rerange_launch(input_tensor, cp_size, comm_stream, event_key):
     return (output_tensor, input_tensor, event, cp_size)
 
 
-def _use_inplace_cp_output(tensor):
+@functools.lru_cache(maxsize=4096)
+def _cp_interleave_cycle_within(rows, cp_size, limit):
+    """True when no cycle of the rank-major -> token-major row permutation
+    exceeds ``limit`` rows.
+
+    The permutation maps row i to i * (rows // cp_size) mod (rows - 1), so its
+    longest cycle is the multiplicative order of cp_size modulo rows - 1.
+    """
+    modulus = rows - 1
+    if modulus <= 1:
+        return True
+    value = cp_size % modulus
+    for _ in range(limit):
+        if value == 1:
+            return True
+        value = value * cp_size % modulus
+    return False
+
+
+def _use_inplace_cp_output(tensor, rows=None, cp_size=None):
     from sglang.srt.environ import envs
     from sglang.srt.utils import is_hcu
 
-    return (
+    if not (
         envs.SGLANG_DSV4_CP_OUTPUT_INPLACE.get()
         and is_hcu()
         and not (tensor.is_cuda and torch.cuda.is_current_stream_capturing())
-    )
+    ):
+        return False
+    limit = envs.SGLANG_DSV4_CP_OUTPUT_INPLACE_MAX_CYCLE.get()
+    if limit > 0 and rows is not None and cp_size:
+        return _cp_interleave_cycle_within(int(rows), int(cp_size), int(limit))
+    return True
 
 
 def _interleave_cp_output(output_tensor, cp_size):
@@ -337,7 +363,7 @@ def _interleave_cp_output(output_tensor, cp_size):
     original rank-major layout. Only the ordinary equal-share interleave path
     uses this helper. Bounded-replay gather_index retains its compact selection.
     """
-    if _use_inplace_cp_output(output_tensor):
+    if _use_inplace_cp_output(output_tensor, output_tensor.shape[0], cp_size):
         from lightop.attention.cp_output import interleave_cp_output_
 
         return interleave_cp_output_(output_tensor, cp_size)
@@ -395,7 +421,9 @@ def cp_all_gather_rerange_output(
             chunk_large_output
             and input_tensor.ndim == 2
             and gather_index is None
-            and not _use_inplace_cp_output(input_tensor)
+            and not _use_inplace_cp_output(
+                input_tensor, input_tensor.shape[0] * cp_size, cp_size
+            )
         ):
             from sglang.srt.layers.cp.interleave import (
                 _gather_interleaved_tensor_chunked,

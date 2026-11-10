@@ -1744,6 +1744,14 @@ class Envs:
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
     SGLANG_DSV4_FUSE_MHC_REPEAT_CP_SPLIT = EnvBool(True)
     SGLANG_DSV4_CP_OUTPUT_INPLACE = EnvBool(True)
+    # >0: only reorder the CP gather in place when the longest cycle of the row
+    # permutation is at most this many rows (the LightOp kernel walks each cycle
+    # serially, ~3.6us/row); longer cycles use the out-of-place copy. 0 keeps the
+    # unconditional in-place path.
+    SGLANG_DSV4_CP_OUTPUT_INPLACE_MAX_CYCLE = EnvInt(128)
+    # Smallest row count that takes the compensated BF16x3 mHC projection
+    # instead of the TF32 one on HCU. LightOp's kernel also accepts fewer rows.
+    SGLANG_DSV4_HC_BF16X3_MIN_ROWS = EnvInt(128)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     # Store the DSV4 C4 indexer K cache as signed INT8 plus one FP32 scale
     # per token on HCU gfx936. The packed page ABI remains 132 bytes/token.
