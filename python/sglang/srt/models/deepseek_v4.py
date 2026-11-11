@@ -207,15 +207,15 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
-from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
+from sglang.srt.models.deepseek_v41_vit import Aligner, ViT, split_vit_pack_groups
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
     GPU_PLAN_KEY,
-    image_token_types,
     materialize_image_gpu,
     num_image_tokens,
     patchify_for_vit,
     resolve_patchify_backend,
 )
+from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
@@ -4987,6 +4987,29 @@ def _should_disable_v41_vision_for_hcu(config: DeepSeekV4Config) -> bool:
     )
 
 
+@functools.lru_cache(maxsize=128)
+def _get_image_span_indices(
+    n_llm_h: int,
+    n_llm_w: int,
+    device_type: str,
+    device_index: Optional[int],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    device = (
+        torch.device(device_type)
+        if device_index is None
+        else torch.device(device_type, device_index)
+    )
+    row_starts = 1 + torch.arange(n_llm_h, device=device, dtype=torch.long) * (
+        n_llm_w + 1
+    )
+    image_indices = (
+        row_starts[:, None]
+        + torch.arange(n_llm_w, device=device, dtype=torch.long)[None, :]
+    ).reshape(-1)
+    newline_indices = row_starts + n_llm_w
+    return image_indices, newline_indices
+
+
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
 
@@ -5291,26 +5314,85 @@ class DeepseekV4ForCausalLM(nn.Module):
                 "deploy an encoder node and retry."
             )
 
+        patches, h, w, borrowed_proxy = self._load_image_patches(
+            item, allow_ipc_borrow=True
+        )
+        try:
+            features = self.aligner(self.vision(patches, h, w), h, w)
+            return self._assemble_image_span(features, h=h, w=w)
+        finally:
+            if borrowed_proxy is not None:
+                borrowed_proxy.release_borrowed_on_current_stream()
+
+    def _load_image_patches(
+        self, item, *, allow_ipc_borrow: bool = False
+    ) -> Tuple[torch.Tensor, int, int, Optional[CudaIpcTensorTransportProxy]]:
         device, dtype = self.image_start.device, self.image_start.dtype
-        item.reconstruct(device.index, ipc_consumer_count=self.tp_size)
+        borrowed_proxy = None
+        device_index = device.index
+        pixels = None
+        if (
+            allow_ipc_borrow
+            and self.tp_size == 1
+            and isinstance(item.feature, CudaIpcTensorTransportProxy)
+        ):
+            pixels = item.feature.borrow_on_target_device(device_index)
+            if pixels is not None:
+                borrowed_proxy = item.feature
+        if borrowed_proxy is None:
+            item.reconstruct(device_index, ipc_consumer_count=self.tp_size)
+            pixels = item.feature
+
         h, w = int(item.n_vit_h), int(item.n_vit_w)
-        pixels = torch.as_tensor(item.feature, device=device)
-        plan = item.model_specific_data.get(GPU_PLAN_KEY)
-        patches = (
-            materialize_image_gpu(pixels, plan).to(dtype)
-            if plan is not None
-            else pixels.to(dtype)
-        )
-        features = self.aligner(self.vision(patches, h, w), h, w)
+        try:
+            pixels = torch.as_tensor(pixels, device=device)
+            plan = item.model_specific_data.get(GPU_PLAN_KEY)
+            patches = (
+                materialize_image_gpu(pixels, plan).to(dtype)
+                if plan is not None
+                else pixels.to(dtype)
+            )
+        except Exception:
+            if borrowed_proxy is not None:
+                borrowed_proxy.release_borrowed_on_current_stream()
+            raise
+        return patches, h, w, borrowed_proxy
+
+    def _assemble_image_span(
+        self, features: torch.Tensor, h: int, w: int, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        device, dtype = self.image_start.device, self.image_start.dtype
         r = self.config.vision_downsample_ratio
-        types = image_token_types((h + r - 1) // r, (w + r - 1) // r).to(device)
-        span = torch.empty(
-            (len(types), self.config.hidden_size), device=device, dtype=dtype
+        n_llm_h = (h + r - 1) // r
+        n_llm_w = (w + r - 1) // r
+        span = (
+            torch.empty(
+                (n_llm_h * (n_llm_w + 1) + 2, self.config.hidden_size),
+                device=device,
+                dtype=dtype,
+            )
+            if out is None
+            else out
         )
-        span[types == 0] = self.image_start
-        span[types == 1] = features.to(dtype)
-        span[types == 2] = self.image_newline
-        span[types == 3] = self.image_end
+        image_indices, newline_indices = _get_image_span_indices(
+            n_llm_h,
+            n_llm_w,
+            device.type,
+            device.index,
+        )
+        assert span.shape[0] == n_llm_h * (n_llm_w + 1) + 2, (
+            span.shape,
+            n_llm_h,
+            n_llm_w,
+        )
+        span[0].copy_(self.image_start)
+        span[-1].copy_(self.image_end)
+        span.index_copy_(0, image_indices, features.to(dtype))
+        span.index_copy_(
+            0,
+            newline_indices,
+            self.image_newline.expand(newline_indices.numel(), -1),
+        )
         return span
 
     def get_image_feature_for_encoder(self, items):
@@ -5320,7 +5402,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         the multimodal embedding cache can own each image independently.
 
         Encoder-side contract: items are always materialized from the local
-        vision tower and never carry precomputed_embeddings.
+        vision tower and never carry precomputed_embeddings. Images are packed
+        into varlen ViT forwards, bounded by ``MAX_PACKED_VIT_PATCHES``.
         """
         items = list(items)
         if not items:
@@ -5337,19 +5420,42 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
 
         device, dtype = self.image_start.device, self.image_start.dtype
-        total_tokens = 0
-        for item in items:
-            h, w = int(item.n_vit_h), int(item.n_vit_w)
-            r = self.config.vision_downsample_ratio
-            total_tokens += num_image_tokens((h + r - 1) // r, (w + r - 1) // r)
+        r = self.config.vision_downsample_ratio
+        grids = [(int(item.n_vit_h), int(item.n_vit_w)) for item in items]
+        span_lens = [
+            num_image_tokens((h + r - 1) // r, (w + r - 1) // r) for h, w in grids
+        ]
+        total_tokens = sum(span_lens)
 
         output = torch.empty((total_tokens, self.config.hidden_size), device=device, dtype=dtype)
         offset = 0
-        for item in items:
-            span = self._get_image_feature_span(item)
-            end = offset + span.shape[0]
-            output[offset:end].copy_(span)
-            offset = end
+        for group in split_vit_pack_groups(grids):
+            group_grids = [grids[index] for index in group]
+            patches = []
+            borrowed_proxies = []
+            try:
+                for index in group:
+                    image_patches, _, _, borrowed_proxy = self._load_image_patches(
+                        items[index], allow_ipc_borrow=True
+                    )
+                    patches.append(image_patches)
+                    if borrowed_proxy is not None:
+                        borrowed_proxies.append(borrowed_proxy)
+                vit_out = self.vision.forward_packed(
+                    patches[0] if len(patches) == 1 else torch.cat(patches),
+                    grids=group_grids,
+                )
+                features = self.aligner.forward_packed(vit_out, grids=group_grids)
+                for index, image_features in zip(group, features):
+                    h, w = grids[index]
+                    end = offset + span_lens[index]
+                    self._assemble_image_span(
+                        image_features, h=h, w=w, out=output[offset:end]
+                    )
+                    offset = end
+            finally:
+                for borrowed_proxy in borrowed_proxies:
+                    borrowed_proxy.release_borrowed_on_current_stream()
         # The upfront size must match the spans, or the tail stays uninitialized.
         assert offset == total_tokens, (offset, total_tokens)
         return output
@@ -5702,6 +5808,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
+        # Startup-only work; runs before serving traffic reaches the vision
+        # tower, so capture cannot race the GPU image preprocessing threads.
+        if self.vision is not None and not is_nextn:
+            self.vision.warmup_cuda_graphs()
         if self.encoder_only:
             # Vision-only encoder node: no decoder layers to hot-fix.
             return
