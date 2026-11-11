@@ -1126,6 +1126,7 @@ class VisionAttention(nn.Module):
         customized_position_embedding_applier: Callable[
             [torch.Tensor, torch.Tensor, Any, Any], Tuple[torch.Tensor, torch.Tensor]
         ] = None,
+        customized_position_embedding_applier_supports_strided_qkv: bool = False,
         use_data_parallel: bool = False,
         use_dp_attention_reduce: bool = False,
         allow_tp_reduce_mismatch: bool = False,
@@ -1209,13 +1210,21 @@ class VisionAttention(nn.Module):
         # saves copying the whole projection output once per layer. Two consumers
         # sitting between the projection and the backend need a dense layout and
         # so opt out: the internvl qk-norm, which normalizes q/k in place, and the
-        # model-supplied position embedding appliers, which reshape q/k freely.
+        # model-supplied position embedding appliers, unless they explicitly
+        # declare support for strided q/k views.
         self.pass_strided_qkv = (
             use_qkv_parallel
             and self.qkv_backend_name in STRIDED_QKV_BACKENDS
             and not qk_normalization
-            and customized_position_embedding_applier is None
+            and (
+                customized_position_embedding_applier is None
+                or customized_position_embedding_applier_supports_strided_qkv
+            )
         )
+        # `v` is never mutated between the projection and the backend, so it can
+        # follow the same gate as q/k: callers that opt into strided q/k views
+        # get a strided `v` too, and every other caller keeps the dense copy.
+        self.pass_strided_v = self.pass_strided_qkv
         if use_qkv_parallel:
             self.qkv_proj = QKVParallelLinear(
                 hidden_size=embed_dim,
@@ -1475,6 +1484,7 @@ class VisionAttention(nn.Module):
         if not self.pass_strided_qkv:
             q = q.contiguous()
             k = k.contiguous()
+        if not self.pass_strided_v:
             v = v.contiguous()
         if self.qk_normalization_by_head_size:
             q, k = self._apply_qk_norm_head_size(q, k)

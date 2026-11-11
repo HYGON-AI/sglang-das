@@ -2088,6 +2088,24 @@ class Envs:
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
+    # DeepSeek-V4.1 ViT: lightop RMSNorm / fused SiLU-mul / Triton fp32 rotary.
+    # Set False to fall back to the native torch ops.
+    SGLANG_DSV41_VIT_FUSED_KERNELS = EnvBool(True)
+    # DeepSeek-V4.1 ViT CUDA graphs (enabled by SGLANG_VIT_ENABLE_CUDA_GRAPH):
+    # inputs are padded up to a multiple of BUCKET_PATCHES so nearby image sizes
+    # share one graph; packs above MAX_PATCHES run eagerly. Graphs are captured
+    # only at server startup from WARMUP_PACKS (entries "num_images:padded_patches",
+    # e.g. "1:1536,2:3072"); shapes outside the warmup set run eagerly. Defaults
+    # are arbitrary; small images are launch-bound, large ones GPU-bound.
+    # MAX_PATCHES and the two largest WARMUP_PACKS entries are the 8192-patch
+    # bucket, the top of the range seen from real 4K-ish images.
+    SGLANG_DSV41_VIT_CUDA_GRAPH_BUCKET_PATCHES = EnvInt(256)
+    SGLANG_DSV41_VIT_CUDA_GRAPH_MAX_PATCHES = EnvInt(8192)
+    SGLANG_DSV41_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(24)
+    SGLANG_DSV41_VIT_CUDA_GRAPH_WARMUP_PACKS = EnvStr(
+        "1:1536,1:1792,1:2048,1:2304,1:2560,1:2816,1:3072,1:3328,1:3584,1:3840,"
+        "1:4096,1:4608,1:5120,1:6144,1:7168,1:8192,2:1536,2:2304,2:3072,3:2048,3:3584"
+    )
 
     # ===================================================================
     # Symmetric memory
