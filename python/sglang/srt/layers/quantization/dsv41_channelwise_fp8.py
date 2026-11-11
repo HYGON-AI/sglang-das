@@ -81,7 +81,10 @@ def enabled(quant_config, *, model_path=None):
     return checkpoint_supports_channelwise_fp8(str(model_path))
 
 
-def linear(x, weight, scale, *, output_dtype=None, out=None):
+def linear(x, weight, scale, *, output_dtype=None, out=None, quantized=None):
+    """FP8 projection. ``quantized=(xq, xs)`` supplies activations that are
+    already per-token quantized in the layout of ``x`` (``x`` then only
+    carries the shape), so the caller controls where the quantization runs."""
     import deepgemm
     from lightop.quant import per_token_quant_fp8
 
@@ -101,8 +104,11 @@ def linear(x, weight, scale, *, output_dtype=None, out=None):
         output = torch.empty(output_shape, device=x.device, dtype=dtype)
     if x.numel() == 0:
         return output
-    x = x.contiguous()
-    xq, xs = per_token_quant_fp8(x)
+    if quantized is None:
+        x = x.contiguous()
+        xq, xs = per_token_quant_fp8(x)
+    else:
+        xq, xs = quantized
     # The installed hipBLASLt dispatch is extremely slow for full-vocabulary
     # N=129280. Tile output channels within this device, without changing TP.
     tiles = (weight.shape[-2] + 16383) // 16384
@@ -147,11 +153,38 @@ def linear(x, weight, scale, *, output_dtype=None, out=None):
     return output
 
 
+def _swap01_contiguous(t):
+    """``t.transpose(0, 1).contiguous()`` for a contiguous 3-D tensor.
+
+    The strided copy runs on torch's generic elementwise kernel, whose cost
+    follows the element count rather than the byte count. Reinterpreting the
+    contiguous last dimension as 8-byte words moves the same bytes with 4x
+    (bf16) or 8x (fp8) fewer elements; the result is bit-identical.
+    """
+    wide = 8 // t.element_size()
+    if t.dim() == 3 and wide > 1 and t.is_contiguous() and t.shape[-1] % wide == 0:
+        return t.view(torch.int64).transpose(0, 1).contiguous().view(t.dtype)
+    return t.transpose(0, 1).contiguous()
+
+
 def grouped(x, layer, groups, rank):
     weight = layer.weight.view(groups, rank, -1)
     scale = layer.weight_scale_inv.view(groups, rank, 1)
-    y = linear(x.transpose(0, 1).contiguous(), weight, scale)
-    return y.transpose(0, 1).contiguous()
+    if x.dim() == 3 and x.is_contiguous() and x.numel() > 0:
+        # x is [tokens, groups, dim]; the batched GEMM wants [groups, tokens,
+        # dim]. Per-token scales depend only on each (token, group) row, so
+        # quantize in the native layout and transpose the 1-byte FP8 result
+        # instead of the 2-byte BF16 input.
+        from lightop.quant import per_token_quant_fp8
+
+        tokens, n_groups, dim = x.shape
+        xq, xs = per_token_quant_fp8(x.view(tokens * n_groups, dim))
+        xq = _swap01_contiguous(xq.view(tokens, n_groups, dim))
+        xs = xs.view(tokens, n_groups, 1).transpose(0, 1).contiguous()
+        y = linear(xq, weight, scale, output_dtype=x.dtype, quantized=(xq, xs))
+    else:
+        y = linear(x.transpose(0, 1).contiguous(), weight, scale)
+    return _swap01_contiguous(y)
 
 
 class ChannelwiseFp8Method(QuantizeMethodBase):
