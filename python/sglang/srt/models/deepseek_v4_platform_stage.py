@@ -5,6 +5,7 @@ The mixins own platform mHC state, fusion, and TBO operations.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from functools import cached_property
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
@@ -38,8 +39,10 @@ from sglang.srt.models.deepseek_common.moe_transport import (
 )
 from sglang.srt.models.deepseek_v2 import MoEOutput
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE, AttnOutput
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.srt.utils import is_gfx95_supported, is_hcu
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -157,14 +160,23 @@ class NonCudaDecoderMixin:
             fuse_all_reduce_mhc = self._can_fuse_attn_mhc and can_fuse_all_reduce(
                 x.shape[0], self.hc_cfg.hidden
             )
-            with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
-                y = self.self_attn(
-                    x=x,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    x_quant=quantized[0] if quantized else None,
-                    defer_all_reduce=fuse_all_reduce_mhc,
+            tail_graph_runner = get_forward().dsv41_tail_graph_runner
+            if tail_graph_runner is not None:
+                from sglang.srt.models.deepseek_v4 import _hcu_tail_graph_attention
+
+                y = _hcu_tail_graph_attention(
+                    tail_graph_runner, self.self_attn, x, positions,
+                    quantized[0] if quantized else None, fuse_all_reduce_mhc,
                 )
+            else:
+                with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+                    y = self.self_attn(
+                        x=x,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        x_quant=quantized[0] if quantized else None,
+                        defer_all_reduce=fuse_all_reduce_mhc,
+                    )
             del x
             return mhc.run_attn_post(
                 self.attn_hc,
@@ -342,7 +354,25 @@ class NonCudaDecoderMixin:
             input_ids_global,
             cp_return_contiguous=self.config.model_type == "deepseek_v41",
         )
-        with prepared.scope():
+        tail_moe_context = nullcontext()
+        if (
+            is_hcu()
+            and prepared._use_cp
+            and envs.SGLANG_HCU_DSV41_TAIL_MOE_LOW_LATENCY.get()
+            and get_moe_a2a_backend().is_deepep()
+        ):
+            tail = get_attn_backend().forward_metadata.late_layer_tail
+            # CP metadata carries the same physical row bound on every rank.
+            # Do not select a collective mode from this rank's row count alone.
+            tail_max_tokens = (
+                max(tail.cp_metadata.per_rank_actual_token)
+                if tail is not None and tail.cp_metadata is not None
+                else None
+            )
+            tail_moe_context = get_forward().scoped(
+                deepep_tail_max_tokens=tail_max_tokens
+            )
+        with prepared.scope(), tail_moe_context:
             return_moe_output = (
                 return_moe_output
                 and not prepared._use_cp

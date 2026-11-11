@@ -14,6 +14,7 @@ from unittest.mock import patch
 import torch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.srt.runtime_context import ForwardFlags
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -541,6 +542,181 @@ class TestLateLayerTailCPCounts(CustomTestCase):
                             torch.testing.assert_close(out['local_positions'],
                                 torch.tensor(expected_positions + [0] * pad, dtype=torch.int64))
 
+
+
+class TestTailMoEDispatchScope(CustomTestCase):
+    def exercise(self, *, enabled=True, hcu=True, cp=True, deepep=True,
+                 tail_rows=(128,) * 8, fail=False):
+        flags = ForwardFlags()
+        seen = []
+        output = torch.empty((1, 8))
+
+        def mlp(*args, **kwargs):
+            seen.append(flags.deepep_tail_max_tokens)
+            if fail:
+                raise RuntimeError("MLP failed")
+            return output
+
+        backend = SimpleNamespace(
+            is_none=lambda: False, is_deepep=lambda: deepep,
+            is_megamoe=lambda: not deepep, is_mori=lambda: False)
+        tail = (SimpleNamespace(cp_metadata=SimpleNamespace(
+            per_rank_actual_token=tail_rows)) if tail_rows is not None else None)
+        namespace = dict(
+            torch=torch, _is_hcu=hcu, dsa_use_prefill_cp=lambda batch: cp,
+            is_cp_active=lambda batch: cp,
+            get_parallel=lambda: SimpleNamespace(attn_dp_size=1, attn_tp_size=1),
+            get_moe_a2a_backend=lambda: backend, _SHARED_EXPERT_LOCAL=False,
+            envs=SimpleNamespace(
+                SGLANG_DP_USE_REDUCE_SCATTER=SimpleNamespace(get=lambda: False),
+                SGLANG_HCU_DSV41_TAIL_MOE_LOW_LATENCY=SimpleNamespace(get=lambda: enabled)),
+            nullcontext=contextlib.nullcontext, get_forward=lambda: flags,
+            get_attn_backend=lambda: SimpleNamespace(forward_metadata=SimpleNamespace(
+                late_layer_tail=tail)))
+        method = load(SOURCE / 'srt/models/deepseek_v4.py', '_run_moe_ffn_dp_sync',
+                      namespace, 'DeepseekV4DecoderLayer')
+        call = lambda: method(SimpleNamespace(mlp=mlp), output, SimpleNamespace(),
+                              input_ids=None, input_ids_global=None)
+        if fail:
+            with self.assertRaisesRegex(RuntimeError, "MLP failed"):
+                call()
+        else:
+            self.assertIs(call(), output)
+        self.assertIsNone(flags.deepep_tail_max_tokens)
+        self.assertFalse(flags.is_extend_in_batch)
+        return seen
+
+    def test_tail_uses_cp_wide_bound_not_local_tensor_rows(self):
+        self.assertEqual(self.exercise(tail_rows=(16, 128, 48, 64, 0, 80, 96, 112)), [128])
+
+    def test_full_prefill_and_other_paths_do_not_select_tail(self):
+        for kwargs in (dict(enabled=False), dict(hcu=False), dict(cp=False),
+                       dict(deepep=False), dict(tail_rows=None)):
+            with self.subTest(**kwargs):
+                self.assertEqual(self.exercise(**kwargs), [None])
+
+    def test_tail_scope_restores_after_exception(self):
+        self.assertEqual(self.exercise(fail=True), [128])
+
+
+
+
+class TestHcuTailGraphLiveState(CustomTestCase):
+    def runner(self):
+        tree = ast.parse((SOURCE / 'srt/model_executor/runner/prefill_cuda_graph_runner.py').read_text())
+        node = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                    and n.name == 'HcuDSV41TailGraphRunner')
+        ns = dict(torch=torch)
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])),
+                     '<tail graph>', 'exec'), ns)
+        ll = SimpleNamespace(num_max_dispatch_tokens_per_rank=128,
+                             quant_config={"hcu_w4a8_int8_dispatch": True},
+                             _get_buffer=lambda: None)
+        layer = SimpleNamespace(engram=None, self_attn=SimpleNamespace(attn_tp_size=1),
+            mlp=SimpleNamespace(experts=SimpleNamespace(
+                dispatcher=SimpleNamespace(_low_latency_dispatcher=ll))))
+        model = SimpleNamespace(late_layer_start=0, end_layer=1, layers=[layer])
+        with patch.object(torch.cuda, 'graph_pool_handle', return_value=(0, 0)):
+            return ns['HcuDSV41TailGraphRunner'](model)
+
+    def invoke(self, runner, *, rows=16, pre=None, cp=True):
+        metadata = SimpleNamespace(per_rank_actual_token=[rows] * 8,
+            per_rank_logical_token=[rows] * 8)
+        tail = SimpleNamespace(cp_metadata=metadata if cp else None,
+                               extend_seq_lens_cpu=[128])
+        hidden = torch.ones(rows, 2)
+        state = SimpleNamespace(streams=hidden, residual=hidden, pre=pre, input=None)
+        batch = SimpleNamespace(request_id=object())
+        import sys
+        modules = {
+            'sglang.srt.layers.moe.token_dispatcher.deepep': ModuleType('deepep'),
+            'sglang.srt.models': ModuleType('models'),
+        }
+        modules['sglang.srt.layers.moe.token_dispatcher.deepep'].DeepEPBuffer = object()
+        modules['sglang.srt.models'].deepseek_v4_mhc = SimpleNamespace(
+            HcState=lambda residual, pre: SimpleNamespace(residual=residual, pre=pre))
+        ids = torch.arange(rows)
+        with patch.dict(sys.modules, modules), \
+             patch.object(torch.cuda, 'is_current_stream_capturing', return_value=False):
+            return runner.run(state, ids, ids, ids, batch, tail, False, None)
+
+    def test_warmup_and_oversized_layout_stay_eager(self):
+        runner = self.runner()
+        self.assertIsNone(self.invoke(runner))
+        self.assertEqual(len(runner._warmed), 1)
+        self.assertIsNone(self.invoke(runner, rows=129))
+        self.assertEqual(len(runner._warmed), 1)
+        self.assertIsNone(self.invoke(runner, cp=False))
+        self.assertIsNone(runner.forward_batch)
+
+    def test_capture_stub_does_not_write_attention_caches(self):
+        fn = load(SOURCE / 'srt/models/deepseek_v4.py',
+                  '_hcu_tail_graph_attention_stub', dict(torch=torch))
+        x = torch.ones(4, 8)
+        layer = SimpleNamespace(maybe_use_decode_attn_tp=lambda _: self.fail('cache write'))
+        out = fn(None, layer, x, None, None, False)
+        self.assertEqual(out.shape, x.shape)
+        self.assertEqual(out.dtype, x.dtype)
+        self.assertNotEqual(out.data_ptr(), x.data_ptr())
+
+    def test_single_dispatcher_wrapper_is_supported(self):
+        runner = self.runner()
+        experts = runner.model.layers[0].mlp.experts
+        experts.dispatcher = SimpleNamespace(_inners=[experts.dispatcher])
+        self.assertIsNone(self.invoke(runner))
+        self.assertEqual(len(runner._warmed), 1)
+
+    def test_sbo_wrapper_stays_eager(self):
+        runner = self.runner()
+        experts = runner.model.layers[0].mlp.experts
+        experts.dispatcher = SimpleNamespace(_inners=[experts.dispatcher] * 2)
+        self.assertIsNone(self.invoke(runner))
+        self.assertFalse(runner._warmed)
+
+    def test_non_int8_dispatch_stays_eager(self):
+        runner = self.runner()
+        runner.model.layers[0].mlp.experts.dispatcher._low_latency_dispatcher.quant_config = {}
+        self.assertIsNone(self.invoke(runner))
+        self.assertFalse(runner._warmed)
+
+    def test_graph_capacity_falls_back_before_capture(self):
+        runner = self.runner()
+        runner._entries = {n: object() for n in range(4)}
+        self.assertIsNone(self.invoke(runner))
+        self.assertFalse(runner._warmed)
+
+    def test_exception_releases_live_batch_reference(self):
+        runner = self.runner()
+        self.invoke(runner)
+        ll = runner.model.layers[0].mlp.experts.dispatcher._low_latency_dispatcher
+        def fail():
+            self.assertIsNotNone(runner.forward_batch)
+            raise RuntimeError('layout prepare failed')
+        ll._get_buffer = fail
+        with self.assertRaisesRegex(RuntimeError, 'layout prepare failed'):
+            self.invoke(runner)
+        self.assertIsNone(runner.forward_batch)
+
+    def test_attention_break_reads_each_live_batch(self):
+        fn = load(SOURCE / 'srt/models/deepseek_v4.py',
+                  '_hcu_tail_graph_attention', {})
+        seen = []
+        class Layer:
+            def maybe_use_decode_attn_tp(self, batch):
+                seen.append(('context', batch))
+                return contextlib.nullcontext()
+            def __call__(self, **kwargs):
+                seen.append(('forward', kwargs['forward_batch']))
+                return kwargs['x']
+        runner = SimpleNamespace(forward_batch=object())
+        first = runner.forward_batch
+        x = torch.ones(2, 4)
+        self.assertIs(fn(runner, Layer(), x, None, None, False), x)
+        runner.forward_batch = object()
+        fn(runner, Layer(), x, None, None, False)
+        self.assertEqual(seen, [('context', first), ('forward', first),
+                               ('context', runner.forward_batch),
+                               ('forward', runner.forward_batch)])
 
 
 if __name__ == '__main__':

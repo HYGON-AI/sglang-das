@@ -1033,6 +1033,24 @@ bcg_deepseek_v4_exit_late_layer_tail = eager_on_graph(True)(
     deepseek_v4_exit_late_layer_tail
 )
 
+def _hcu_tail_graph_attention_stub(runner, layer, x, positions, x_quant, defer_all_reduce):
+    # Captured segments have not executed yet. Do not write their uninitialized
+    # Q/K into live caches or mark LayerSplit staging as valid during capture.
+    assert not defer_all_reduce
+    return torch.empty_like(x)
+
+
+@eager_on_graph(capture_stub=_hcu_tail_graph_attention_stub)
+def _hcu_tail_graph_attention(runner, layer, x, positions, x_quant, defer_all_reduce):
+    # Read the live batch at every replay, never the capture request's KV layout.
+    batch = runner.forward_batch
+    with layer.maybe_use_decode_attn_tp(batch):
+        return layer(
+            x=x, positions=positions, forward_batch=batch,
+            x_quant=x_quant, defer_all_reduce=defer_all_reduce,
+        )
+
+
 
 class MqaAttentionBase(nn.Module):
     # Class-level default for subclasses that read it without running __init__.
@@ -4295,6 +4313,28 @@ class DeepseekV4Model(nn.Module):
                     residual_batch.clear(forward_batch)
                     attn_backend.exit_late_layer_tail(saved_full, forward_batch)
                     return residual, pre, tail
+                if (
+                    _is_hcu
+                    and envs.SGLANG_HCU_DSV41_TAIL_MOE_CUDA_GRAPH.get()
+                    and envs.SGLANG_HCU_DSV41_TAIL_MOE_LOW_LATENCY.get()
+                    and get_moe_a2a_backend().is_deepep()
+                ):
+                    from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+                        HcuDSV41TailGraphRunner,
+                    )
+
+                    runner = getattr(self, "_hcu_tail_graph_runner", None)
+                    if runner is None:
+                        runner = self._hcu_tail_graph_runner = HcuDSV41TailGraphRunner(self)
+                    result = runner.run(
+                        state, positions, input_ids, input_ids_global, forward_batch,
+                        tail, capture_dspark, dspark_layers_to_capture,
+                    )
+                    if result is not None:
+                        state, aux = result
+                        for value in aux:
+                            dspark_aux_hidden_states.append(value)
+                        break
             if late_dp_counts is not None and i == self.late_layer_start:
                 saved_dp = enter_late_layer_dp(forward_batch, late_dp_counts)
                 if get_moe_a2a_backend().is_none():
