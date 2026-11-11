@@ -16,24 +16,39 @@ def manager():
         kv_cache_layout=None,
         kv_cache_dtype_str="fp8_e4m3",
         dsv41_spec_layout={"kv_layer_ids": [20, 20, 2, 8, 14, 2, 8, 14]},
-        attn_tp_size=1, attn_cp_size=1, attn_cp_rank=0,
-        pp_size=1, pp_rank=0, dcp_size=1,
-        is_mla_backend=True, is_hybrid_mla_backend=False,
+        attn_tp_size=1,
+        attn_cp_size=1,
+        attn_cp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        dcp_size=1,
+        is_mla_backend=True,
+        is_hybrid_mla_backend=False,
         enable_all_cp_ranks_for_transfer=False,
     )
-    obj._resolve_rank_mapping = lambda info: CommonKVManager._resolve_rank_mapping(obj, info)
+    obj._resolve_rank_mapping = lambda info: CommonKVManager._resolve_rank_mapping(
+        obj, info
+    )
     return obj
 
 
 def fetch(obj, **changes):
     data = dict(
-        attn_tp_size=1, attn_cp_size=8, dp_size=1, pp_size=1,
-        page_size=256, kv_cache_dtype="fp8_e4m3", follow_bootstrap_room=True,
-        cp_cache_layer_split=True, dsv41_spec_layout=obj.dsv41_spec_layout.copy(),
+        attn_tp_size=1,
+        attn_cp_size=8,
+        dp_size=1,
+        pp_size=1,
+        page_size=256,
+        kv_cache_dtype="fp8_e4m3",
+        follow_bootstrap_room=True,
+        cp_cache_layer_split=True,
+        dsv41_spec_layout=obj.dsv41_spec_layout.copy(),
     )
     data.update(changes)
-    with patch("sglang.srt.disaggregation.common.conn.requests.get",
-               return_value=Mock(status_code=200, json=lambda: data)):
+    with patch(
+        "sglang.srt.disaggregation.common.conn.requests.get",
+        return_value=Mock(status_code=200, json=lambda: data),
+    ):
         return CommonKVManager.try_ensure_parallel_info(obj, "prefill:8998")
 
 
@@ -65,3 +80,7 @@ def test_layout_mismatch_remains_rejected():
 def test_existing_cp1_mla_path_preserved():
     obj = manager()
     assert fetch(obj, attn_cp_size=1, attn_tp_size=8, cp_cache_layer_split=False)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

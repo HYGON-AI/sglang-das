@@ -6,6 +6,9 @@ import pytest
 import torch
 
 from sglang.srt.layers.quantization import fp8_utils
+from sglang.test.ci.ci_register import register_hcu_ci
+
+register_hcu_ci(est_time=10, suite="stage-b-test-1-hcu-small")
 
 
 @pytest.mark.parametrize("is_hcu", [False, True])
@@ -45,3 +48,7 @@ def test_hipblaslt_no_solution_fallback_is_hcu_only_and_cached(is_hcu):
             with pytest.raises(RuntimeError, match="hipblaslt solution"):
                 fp8_utils._apply_fallback_scaled_mm(**kwargs)
             fallback.assert_not_called()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

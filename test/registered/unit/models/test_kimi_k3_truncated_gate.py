@@ -2,8 +2,13 @@
 
 import ast
 from pathlib import Path
+
 import pytest
 import torch
+
+from sglang.test.ci.ci_register import register_hcu_ci
+
+register_hcu_ci(est_time=10, suite="stage-b-test-1-hcu-small")
 
 SOURCE = (
     next(p for p in Path(__file__).resolve().parents if (p / "python/sglang").is_dir())
@@ -53,3 +58,7 @@ def test_loader_applies_truncation_before_loading():
     text = SOURCE.read_text()
     start = text.index("loaded_weight = _truncate_moe_gate_for_config(")
     assert text.index("weight_loader(param, loaded_weight, **kwargs)", start) > start
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
