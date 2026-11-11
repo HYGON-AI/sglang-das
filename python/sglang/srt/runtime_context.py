@@ -685,6 +685,9 @@ class ForwardFlags:
         # Sticky across forwards: every ForwardBatch construction writes it;
         # graph runners force False around capture.
         "is_extend_in_batch": False,
+        # Eager HCU bounded-tail MoE: a CP-wide row bound, not a decode mode.
+        "deepep_tail_max_tokens": None,
+        "dsv41_tail_graph_runner": None,
         # Per-layer MLP collective control (set by decoder via scoped()
         # around the MLP / MoE / hybrid mixer call).
         # mlp_reduce_scatter: postprocess will reduce-scatter (skip MLP AR).

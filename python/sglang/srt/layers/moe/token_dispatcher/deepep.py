@@ -45,7 +45,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
     is_tbo_enabled,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
@@ -1379,6 +1379,7 @@ class DeepEPDispatcher(BaseDispatcher):
             )
 
         self._stage = _Stage.INITIAL
+        self._active_dispatcher = None
         self._deepep_dispatch_hooks = DeepEPPDispatchHooks()
 
         # DeepEP/Mooncake/Nixl mark invalid topk slots with -1; the AITER
@@ -1411,7 +1412,8 @@ class DeepEPDispatcher(BaseDispatcher):
         topk_output: TopKOutput,
     ):
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
-        inner_state = self._get_impl().dispatch_a(
+        self._active_dispatcher = self._get_impl()
+        inner_state = self._active_dispatcher.dispatch_a(
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
@@ -1450,11 +1452,30 @@ class DeepEPDispatcher(BaseDispatcher):
         self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
         inner_state = self._combine_intermediate_state
         del self._combine_intermediate_state
-        return self._get_impl().combine_b(*inner_state)
+        try:
+            return self._get_impl().combine_b(*inner_state)
+        finally:
+            self._active_dispatcher = None
 
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
+        if self._active_dispatcher is not None:
+            return self._active_dispatcher
         is_extend_in_batch = get_is_extend_in_batch()
         resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
+        if (
+            _is_hcu
+            and is_extend_in_batch
+            and self.deepep_mode.is_auto()
+            and envs.SGLANG_HCU_DSV41_TAIL_MOE_LOW_LATENCY.get()
+        ):
+            tail_max_tokens = get_forward().deepep_tail_max_tokens
+            ll = self._low_latency_dispatcher
+            if (
+                tail_max_tokens is not None
+                and tail_max_tokens <= ll.num_max_dispatch_tokens_per_rank
+                and ll.quant_config.get("hcu_w4a8_int8_dispatch", False)
+            ):
+                resolved_deepep_mode = DeepEPMode.LOW_LATENCY
         if resolved_deepep_mode == DeepEPMode.NORMAL:
             return self._normal_dispatcher
         elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:

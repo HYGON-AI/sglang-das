@@ -33,6 +33,7 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
 )
 from sglang.srt.layers.moe.utils import (
+    DeepEPMode,
     W4A8_TPMOE_BACKEND_AITER,
     W4A8_TPMOE_BACKEND_AUTO,
     W4A8_TPMOE_BACKEND_LIGHTOP,
@@ -620,6 +621,13 @@ class HCUW4A8Int8DeepEPMoEMethod(FusedMoEMethodBase):
         self.quant_config = quant_config
         self.use_mega_moe = use_mega_moe
 
+    def get_deepep_mode(self):
+        mode = get_deepep_mode()
+        if mode.is_normal() and envs.SGLANG_HCU_DSV41_TAIL_MOE_LOW_LATENCY.get():
+            # Prepare both layouts/dispatchers; full prefill remains normal.
+            return DeepEPMode.AUTO
+        return mode
+
     def create_weights(
         self,
         layer,
@@ -719,7 +727,7 @@ class HCUW4A8Int8DeepEPMoEMethod(FusedMoEMethodBase):
             _use_w4a8_masked_hipc,
         )
 
-        mode = get_deepep_mode()
+        mode = self.get_deepep_mode()
         normal_layout = "hipc" if _use_w4a8_contiguous_hipc else "marlin"
         ll_layout = "hipc" if _use_w4a8_masked_hipc else "marlin_masked"
         layout = normal_layout if mode.enable_normal() else ll_layout

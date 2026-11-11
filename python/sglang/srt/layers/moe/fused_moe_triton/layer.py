@@ -227,6 +227,13 @@ def create_moe_dispatcher(
         or a2a_backend.is_nixl()
         or a2a_backend.is_pplx()
     ):
+        deepep_mode = get_deepep_mode()
+        if (
+            a2a_backend.is_deepep()
+            and is_hcu()
+            and getattr(quant_method, "hcu_w4a8_hipc", False)
+        ):
+            deepep_mode = quant_method.get_deepep_mode()
         return MaybeTboDeepEPDispatcher(
             group=_get_deepep_comm_group(a2a_backend),
             router_topk=moe_runner_config.top_k,
@@ -235,7 +242,7 @@ def create_moe_dispatcher(
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
             params_dtype=moe_runner_config.params_dtype,
-            deepep_mode=get_deepep_mode(),
+            deepep_mode=deepep_mode,
             async_finish=True,
             return_recv_hook=(not is_hcu()) or is_tbo_enabled() or is_sbo_enabled(),
         )
