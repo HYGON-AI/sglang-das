@@ -11,14 +11,19 @@ from compressed_tensors.quantization import QuantizationArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_module
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
+    DeepEPDispatcher,
     DeepEPLLCombineInput,
     DeepEPLLDispatchOutput,
     DeepEPNormalCombineInput,
     DeepEPNormalDispatchOutput,
     _DeepEPDispatcherImplLowLatency,
     _DeepEPDispatcherImplNormal,
+    _Stage,
 )
+from sglang.srt.layers.moe.token_dispatcher import deepep as deepep_module
+from sglang.srt.runtime_context import ForwardFlags
 from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
@@ -1384,12 +1389,8 @@ class TestHCUW4A8Reference(CustomTestCase):
                 "sglang.srt.layers.moe.ep_moe.layer._use_w4a8_contiguous_hipc", False
             ),
             patch(
-                "sglang.srt.layers.moe.ep_moe.layer.get_moe_expert_parallel_rank",
-                return_value=3,
-            ),
-            patch(
-                "sglang.srt.layers.moe.ep_moe.layer.get_moe_expert_parallel_world_size",
-                return_value=8,
+                "sglang.srt.layers.moe.ep_moe.layer.get_parallel",
+                return_value=SimpleNamespace(moe_ep_rank=3, moe_ep_size=8),
             ),
             patch(
                 "sglang.srt.layers.quantization.slimquant_w4a8_marlin."
@@ -1559,6 +1560,114 @@ class TestHCUW4A8Reference(CustomTestCase):
         self.assertIs(result[0], packed)
         self.assertIs(result[1], masked_m)
         self.assertEqual(buffer.low_latency_dispatch.call_args.kwargs["quant_type"], 1)
+
+
+class TestHCUW4A8TailDispatchMode(CustomTestCase):
+    def setUp(self):
+        self.flags = ForwardFlags()
+        self.dispatcher = DeepEPDispatcher.__new__(DeepEPDispatcher)
+        self.dispatcher.deepep_mode = DeepEPMode.AUTO
+        self.dispatcher._stage = _Stage.INITIAL
+        self.dispatcher._active_dispatcher = None
+        self.normal = Mock()
+        self.ll = Mock()
+        self.ll.num_max_dispatch_tokens_per_rank = 128
+        self.ll.quant_config = {"hcu_w4a8_int8_dispatch": True}
+        self.dispatcher._normal_dispatcher = self.normal
+        self.dispatcher._low_latency_dispatcher = self.ll
+        for impl in (self.normal, self.ll):
+            impl.dispatch_a.return_value = ("dispatch-state",)
+            impl.combine_a.return_value = ("combine-state",)
+        for p in (
+            patch.object(deepep_module, "_is_hcu", True),
+            patch.object(deepep_module, "get_forward", return_value=self.flags),
+            patch.object(deepep_module, "get_is_extend_in_batch", return_value=True),
+            patch.dict("os.environ", {"SGLANG_HCU_DSV41_TAIL_MOE_LOW_LATENCY": "1"}),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_tail_capacity_boundary_uses_group_bound(self):
+        for rows, expected in ((0, self.ll), (16, self.ll), (128, self.ll),
+                               (176, self.normal), (512, self.normal), (None, self.normal)):
+            with self.subTest(rows=rows), self.flags.scoped(deepep_tail_max_tokens=rows):
+                self.assertIs(self.dispatcher._get_impl(), expected)
+
+    def test_gate_and_explicit_modes_preserve_original_dispatch(self):
+        with self.flags.scoped(deepep_tail_max_tokens=128):
+            with patch.dict("os.environ", {"SGLANG_HCU_DSV41_TAIL_MOE_LOW_LATENCY": "0"}):
+                self.assertIs(self.dispatcher._get_impl(), self.normal)
+            with patch.object(deepep_module, "_is_hcu", False):
+                self.assertIs(self.dispatcher._get_impl(), self.normal)
+            self.ll.quant_config = {}
+            self.assertIs(self.dispatcher._get_impl(), self.normal)
+            self.ll.quant_config = {"hcu_w4a8_int8_dispatch": True}
+            self.dispatcher.deepep_mode = DeepEPMode.NORMAL
+            self.assertIs(self.dispatcher._get_impl(), self.normal)
+            self.dispatcher.deepep_mode = DeepEPMode.LOW_LATENCY
+            self.assertIs(self.dispatcher._get_impl(), self.ll)
+
+    def test_decode_auto_is_unchanged(self):
+        with patch.object(deepep_module, "get_is_extend_in_batch", return_value=False):
+            self.assertIs(self.dispatcher._get_impl(), self.ll)
+
+    def test_normal_cli_mode_prepares_both_paths_only_for_qualified_hcu(self):
+        config = SimpleNamespace(top_k=6, num_experts=384, num_local_experts=48,
+                                 hidden_size=5120, params_dtype=torch.bfloat16)
+        method = HCUW4A8Int8DeepEPMoEMethod.__new__(HCUW4A8Int8DeepEPMoEMethod)
+        for enabled, hcu, qualified, mode, expected in (
+            (False, True, True, DeepEPMode.NORMAL, DeepEPMode.NORMAL),
+            (True, True, True, DeepEPMode.NORMAL, DeepEPMode.AUTO),
+            (True, True, True, DeepEPMode.AUTO, DeepEPMode.AUTO),
+            (True, True, True, DeepEPMode.LOW_LATENCY, DeepEPMode.LOW_LATENCY),
+            (True, False, True, DeepEPMode.NORMAL, DeepEPMode.NORMAL),
+            (True, True, False, DeepEPMode.NORMAL, DeepEPMode.NORMAL),
+        ):
+            with self.subTest(enabled=enabled, hcu=hcu, qualified=qualified, mode=mode):
+                with (
+                    patch.dict("os.environ", {"SGLANG_HCU_DSV41_TAIL_MOE_LOW_LATENCY": str(int(enabled))}),
+                    patch.object(fused_moe_module, "is_building_neighbour_layer", return_value=False),
+                    patch.object(fused_moe_module, "get_moe_a2a_backend", return_value=MoeA2ABackend.DEEPEP),
+                    patch.object(fused_moe_module, "_get_deepep_comm_group", return_value=Mock()),
+                    patch.object(fused_moe_module, "get_deepep_mode", return_value=mode),
+                    patch("sglang.srt.layers.quantization.slimquant_w4a8_marlin.get_deepep_mode", return_value=mode),
+                    patch.object(fused_moe_module, "is_hcu", return_value=hcu),
+                    patch.object(fused_moe_module, "is_tbo_enabled", return_value=False),
+                    patch.object(fused_moe_module, "is_sbo_enabled", return_value=False),
+                    patch.object(fused_moe_module, "MaybeTboDeepEPDispatcher") as constructor,
+                ):
+                    fused_moe_module.create_moe_dispatcher(config, method if qualified else SimpleNamespace())
+                    self.assertIs(constructor.call_args.kwargs["deepep_mode"], expected)
+
+    def test_selected_mode_survives_context_exit_until_combine(self):
+        # The staged API may outlive its selection scope. Both a small tail and
+        # an over-capacity tail must keep their original implementation.
+        for rows, impl, other in ((128, self.ll, self.normal), (176, self.normal, self.ll)):
+            with self.subTest(rows=rows):
+                for mock in (self.normal, self.ll):
+                    mock.reset_mock()
+                with self.flags.scoped(deepep_tail_max_tokens=rows):
+                    self.dispatcher.dispatch_a(torch.empty((0, 8)), Mock())
+                with self.flags.scoped(deepep_tail_max_tokens=128 if rows > 128 else None):
+                    self.dispatcher.dispatch_b()
+                    self.dispatcher.combine_a((Mock(), Mock(), Mock()))
+                    self.dispatcher.combine_b()
+                for name in ("dispatch_a", "dispatch_b", "combine_a", "combine_b"):
+                    getattr(impl, name).assert_called_once()
+                    getattr(other, name).assert_not_called()
+                self.assertIsNone(self.dispatcher._active_dispatcher)
+                self.assertEqual(self.dispatcher._stage, _Stage.INITIAL)
+                self.assertIs(self.dispatcher._get_impl(), self.normal)
+
+    def test_combine_error_releases_selected_mode(self):
+        self.ll.combine_b.side_effect = RuntimeError("combine failed")
+        with self.flags.scoped(deepep_tail_max_tokens=128):
+            self.dispatcher.dispatch_a(torch.empty((0, 8)), Mock())
+        self.dispatcher.dispatch_b()
+        self.dispatcher.combine_a((Mock(), Mock(), Mock()))
+        with self.assertRaisesRegex(RuntimeError, "combine failed"):
+            self.dispatcher.combine_b()
+        self.assertIsNone(self.dispatcher._active_dispatcher)
 
 
 if __name__ == "__main__":

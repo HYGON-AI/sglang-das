@@ -1136,6 +1136,9 @@ class Envs:
     SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
     SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC = EnvBool(False)
     SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA = EnvBool(False)
+    # HCU W4A8 normal/auto: use low-latency MoE for CP bounded tails that fit.
+    SGLANG_HCU_DSV41_TAIL_MOE_LOW_LATENCY = EnvBool(False)
+    SGLANG_HCU_DSV41_TAIL_MOE_CUDA_GRAPH = EnvBool(False)
     # With --enable-decoder-swa-bounded-replay: a chunked-prefill step in which every
     # request still has at least SWA_WINDOW prompt tokens after this chunk stops at
     # the last kv_source layer. Nothing reads the later layers' rows of such a chunk.

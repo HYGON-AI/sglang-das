@@ -961,6 +961,25 @@ def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor
 bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_ids)
 
 
+def _hcu_tail_graph_attention_stub(runner, layer, x, positions, x_quant, defer_all_reduce):
+    # Captured segments have not executed yet. Do not write their uninitialized
+    # Q/K into live caches or mark LayerSplit staging as valid during capture.
+    assert not defer_all_reduce
+    return torch.empty_like(x)
+
+
+@eager_on_graph(capture_stub=_hcu_tail_graph_attention_stub)
+def _hcu_tail_graph_attention(runner, layer, x, positions, x_quant, defer_all_reduce):
+    # Read the live batch at every replay, never the capture request's KV layout.
+    batch = runner.forward_batch
+    with layer.maybe_use_decode_attn_tp(batch):
+        return layer(
+            x=x, positions=positions, forward_batch=batch,
+            x_quant=x_quant, defer_all_reduce=defer_all_reduce,
+        )
+
+
+
 class MqaAttentionBase(nn.Module):
     # Class-level default for subclasses that read it without running __init__.
     wo_a_fp8: bool = False
@@ -3621,14 +3640,21 @@ class DeepseekV4DecoderLayer(nn.Module):
             fuse_all_reduce_mhc = self._can_fuse_attn_mhc and can_fuse_all_reduce(
                 x.shape[0], self.hc_cfg.hidden
             )
-            with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
-                y = self.self_attn(
-                    x=x,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    x_quant=quantized[0] if quantized else None,
-                    defer_all_reduce=fuse_all_reduce_mhc,
+            tail_graph_runner = get_forward().dsv41_tail_graph_runner
+            if tail_graph_runner is not None:
+                y = _hcu_tail_graph_attention(
+                    tail_graph_runner, self.self_attn, x, positions,
+                    quantized[0] if quantized else None, fuse_all_reduce_mhc,
                 )
+            else:
+                with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+                    y = self.self_attn(
+                        x=x,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        x_quant=quantized[0] if quantized else None,
+                        defer_all_reduce=fuse_all_reduce_mhc,
+                    )
             del x
             return mhc.run_attn_post(
                 self.attn_hc,
@@ -3790,9 +3816,28 @@ class DeepseekV4DecoderLayer(nn.Module):
             if _use_cp and get_moe_a2a_backend().is_none()
             else nullcontext()
         )
+        tail_moe_context = nullcontext()
+        if (
+            _is_hcu
+            and _use_cp
+            and envs.SGLANG_HCU_DSV41_TAIL_MOE_LOW_LATENCY.get()
+            and get_moe_a2a_backend().is_deepep()
+        ):
+            tail = get_attn_backend().forward_metadata.late_layer_tail
+            # CP metadata carries the same physical row bound on every rank.
+            # Do not select a collective mode from this rank's row count alone.
+            tail_max_tokens = (
+                max(tail.cp_metadata.per_rank_actual_token)
+                if tail is not None and tail.cp_metadata is not None
+                else None
+            )
+            tail_moe_context = get_forward().scoped(
+                deepep_tail_max_tokens=tail_max_tokens
+            )
         with (
             get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter),
             gathered_rows,
+            tail_moe_context,
         ):
             return_moe_output = (
                 return_moe_output
@@ -4439,6 +4484,28 @@ class DeepseekV4Model(nn.Module):
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
+                if (
+                    _is_hcu
+                    and envs.SGLANG_HCU_DSV41_TAIL_MOE_CUDA_GRAPH.get()
+                    and envs.SGLANG_HCU_DSV41_TAIL_MOE_LOW_LATENCY.get()
+                    and get_moe_a2a_backend().is_deepep()
+                ):
+                    from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+                        HcuDSV41TailGraphRunner,
+                    )
+
+                    runner = getattr(self, "_hcu_tail_graph_runner", None)
+                    if runner is None:
+                        runner = self._hcu_tail_graph_runner = HcuDSV41TailGraphRunner(self)
+                    result = runner.run(
+                        state, positions, input_ids, input_ids_global, forward_batch,
+                        tail, capture_dspark, dspark_layers_to_capture,
+                    )
+                    if result is not None:
+                        state, aux = result
+                        for value in aux:
+                            dspark_aux_hidden_states.append(value)
+                        break
             engram = self.layers[i].engram
             if engram is not None:
                 before_engram = state.residual
