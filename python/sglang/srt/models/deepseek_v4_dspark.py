@@ -30,6 +30,7 @@ from sglang.srt.layers.quantization import dsv41_channelwise_fp8 as channelwise_
 from sglang.srt.layers.quantization import w8a8_int8 as channelwise_int8
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     inverse_transform_scale_ue8m0,
     transform_scale_ue8m0,
@@ -1579,6 +1580,35 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
+        )
+
+        self._maybe_prepack_bf16_main_proj()
+
+    def _maybe_prepack_bf16_main_proj(self) -> None:
+        if not (
+            _is_hcu
+            and envs.SGLANG_HCU_DSV41_BF16_MAIN_PROJ_PREPACK.get()
+            and get_disagg().disaggregation_mode == "prefill"
+        ):
+            return
+        main_proj = self.stages[0].main_proj
+        weight = main_proj.weight
+        if not (
+            isinstance(main_proj.quant_method, UnquantizedLinearMethod)
+            and weight.is_cuda
+            and weight.dtype == torch.bfloat16
+            and weight.ndim == 2
+            and weight.is_contiguous()
+        ):
+            return
+        # Keep the logical [out, in] parameter and loader attributes, replacing
+        # its storage once before KV allocation. F.linear then uses an NN GEMM
+        # without a per-forward transpose or a second persistent weight copy.
+        weight.data = weight.data.t().contiguous().t()
+        logger.info(
+            "DSV4.1 BF16 main_proj prepacked: shape=%s stride=%s bytes=%d",
+            tuple(weight.shape), tuple(weight.stride()),
+            weight.numel() * weight.element_size(),
         )
 
     def _assert_confidence_head_loaded(
