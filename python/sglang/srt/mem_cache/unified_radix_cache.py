@@ -121,6 +121,10 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 logger = logging.getLogger(__name__)
 
+_DFS_POLICY_RETRY_INITIAL_S = 1.0
+_DFS_POLICY_RETRY_MAX_S = 30.0
+_DFS_POLICY_WARNING_INTERVAL_S = 30.0
+
 
 class _OngoingWriteThrough(NamedTuple):
     """Tracks an in-flight D→H write-through operation."""
@@ -252,6 +256,11 @@ class UnifiedRadixCache(BasePrefixCache):
         # one rid, but the owner that releases it last is the one that makes it
         # free-able, and that is not necessarily the same request.
         self._stranded_linker_nodes: list[NodeId] = []
+        self._dfs_policy_failed_target: tuple[bool, bool] | None = None
+        self._dfs_policy_consecutive_failures = 0
+        self._dfs_policy_next_retry_at = 0.0
+        self._dfs_policy_last_warning_at = float("-inf")
+        self._dfs_policy_suppressed_warnings = 0
         # Buffer-only host memory mode (host RAM as transient GPU↔storage
         # staging, not an L2 tier); resolved in init_hicache, which also
         # constructs the pipeline collaborator (None = cache mode).
@@ -426,6 +435,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 server_args.hicache_storage_backend_extra_config
             )
 
+            if storage_backend == "mooncake":
+                from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
+                    inject_dfs_health_config,
+                )
+
+                # Carry the same resolved CLI/env/default values through the
+                # HiCache backend factory to MooncakeStore.
+                storage_extra_config = inject_dfs_health_config(
+                    storage_extra_config, server_args=server_args
+                )
+
         attach_hybrid_pool_to_unified_cache(
             self,
             params,
@@ -543,12 +563,12 @@ class UnifiedRadixCache(BasePrefixCache):
         """Rank-consistent switch resolved when the linker was built."""
         return (
             self.linker is not None
-            and self.linker.cache_linker.waiting_queue_prefetch_enabled()
+            and self.linker.waiting_queue_prefetch_enabled()
         )
 
     def disable_waiting_queue_prefetch(self) -> None:
         if self.linker is not None:
-            self.linker.cache_linker.disable_waiting_queue_prefetch()
+            self.linker.disable_waiting_queue_prefetch()
 
     def prefetch_external_linker_to_host(self, req) -> bool:
         if self.linker is None:
@@ -2782,6 +2802,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        self._sync_dfs_health_policy()
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [
@@ -2861,14 +2882,106 @@ class UnifiedRadixCache(BasePrefixCache):
             storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
 
-    def drain_linker_loads(self) -> list[str]:
+    def _sync_dfs_health_policy(self) -> None:
+        """Apply one conservative DFS policy across all attention ranks."""
+        owner = self.linker
+        if owner is None and self.cache_controller is not None:
+            owner = self.cache_controller.storage_backend
+        getter = getattr(owner, "get_local_dfs_health_policy", None)
+        apply_policy = getattr(owner, "apply_dfs_health_policy", None)
+        if not callable(getter) or not callable(apply_policy):
+            return
+        local_policy = getter()
+        if local_policy is None:
+            return
+        effective = torch.tensor(local_policy, dtype=torch.int, device="cpu")
+        self._all_reduce_attn_groups(effective, torch.distributed.ReduceOp.MIN)
+        # Attention groups are local to one PP stage. Reduce their already
+        # conservative result once more across corresponding PP ranks so every
+        # stage enables DFS only when every stage can use it.
+        pp_group = getattr(self, "pp_group", None)
+        if getattr(self, "pp_size", 1) > 1 and pp_group is not None:
+            torch.distributed.all_reduce(
+                effective, op=torch.distributed.ReduceOp.MIN, group=pp_group
+            )
+        effective_values = effective.tolist()
+        allow_write = bool(effective_values[1])
+        target = (bool(effective_values[0]) and allow_write, allow_write)
+
+        # Every rank must participate in the collective above on every step.
+        # Only the rank-local storage RPC is throttled after a failure.
+        now = time.monotonic()
+        failed_target = getattr(self, "_dfs_policy_failed_target", None)
+        next_retry_at = getattr(self, "_dfs_policy_next_retry_at", 0.0)
+        if failed_target == target and now < next_retry_at:
+            return
+
+        try:
+            apply_policy(*target)
+        except Exception as exc:
+            failures = (
+                getattr(self, "_dfs_policy_consecutive_failures", 0) + 1
+                if failed_target == target
+                else 1
+            )
+            retry_delay = min(
+                _DFS_POLICY_RETRY_INITIAL_S * (2 ** min(failures - 1, 30)),
+                _DFS_POLICY_RETRY_MAX_S,
+            )
+            self._dfs_policy_failed_target = target
+            self._dfs_policy_consecutive_failures = failures
+            self._dfs_policy_next_retry_at = now + retry_delay
+
+            last_warning_at = getattr(
+                self, "_dfs_policy_last_warning_at", float("-inf")
+            )
+            if now - last_warning_at >= _DFS_POLICY_WARNING_INTERVAL_S:
+                suppressed = getattr(self, "_dfs_policy_suppressed_warnings", 0)
+                logger.warning(
+                    "Mooncake DFS policy application failed; retaining the "
+                    "previous policy: target_read=%s target_write=%s "
+                    "failures=%d retry_in_s=%.1f suppressed=%d error=%r",
+                    target[0],
+                    target[1],
+                    failures,
+                    retry_delay,
+                    suppressed,
+                    exc,
+                )
+                self._dfs_policy_last_warning_at = now
+                self._dfs_policy_suppressed_warnings = 0
+            else:
+                self._dfs_policy_suppressed_warnings = (
+                    getattr(self, "_dfs_policy_suppressed_warnings", 0) + 1
+                )
+            return
+
+        failures = getattr(self, "_dfs_policy_consecutive_failures", 0)
+        if failures:
+            logger.info(
+                "Mooncake DFS policy application recovered: "
+                "target_read=%s target_write=%s failures=%d",
+                target[0],
+                target[1],
+                failures,
+            )
+        self._dfs_policy_failed_target = None
+        self._dfs_policy_consecutive_failures = 0
+        self._dfs_policy_next_retry_at = 0.0
+        self._dfs_policy_last_warning_at = float("-inf")
+        self._dfs_policy_suppressed_warnings = 0
+
+    def drain_linker_loads(self, *, wait_for_completion: bool = False) -> list[str]:
         """Retire finished linker loads and return the rids that must abort.
 
         The batch count is MIN-reduced first because a load failure is
-        rank-local: unreduced, one rank aborts a request the others keep.
+        rank-local: unreduced, one rank aborts a request the others keep. The
+        optional wait covers only loads already issued to the backend worker.
         """
         if self.linker is None:
             return []
+        if wait_for_completion:
+            self.linker.wait_for_pending_loads()
         finish_count = torch.tensor(
             [self.linker.num_completed_loads()], dtype=torch.int, device="cpu"
         )

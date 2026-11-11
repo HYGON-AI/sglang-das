@@ -154,9 +154,9 @@ def match_prefix_for_req(
     reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
     key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
 
-    # Keep cache-aware admission consistent with the canonical boundary found
-    # by PP0. This must not be implemented in the cache's generic match path:
-    # cache_unfinished_req rematches immediately after inserting newly computed KV.
+    # Keep cache-aware admission consistent with the canonical boundary agreed
+    # by every PP stage. This must not live in the cache's generic match path:
+    # cache_unfinished_req rematches after inserting newly computed KV.
     if (
         include_req
         and req.external_cache_hit_length is not None

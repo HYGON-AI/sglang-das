@@ -26,6 +26,8 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.disaggregation_mode = disaggregation_mode
         scheduler.enable_priority_scheduling = True
+        scheduler.enable_waiting_queue_dfs_prefetch = False
+        scheduler.enable_hicache_storage = False
         scheduler.schedule_low_priority_values_first = False
         scheduler.abort_on_priority_when_disabled = False
         scheduler.waiting_queue = []
@@ -54,6 +56,16 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         self.assertEqual(req.priority, -sys.maxsize - 1)
         scheduler.disagg_prefill_bootstrap_queue.add.assert_called_once_with(req, 8)
         req.time_stats.set_prefill_bootstrap_queue_entry_time.assert_called_once()
+        scheduler._prefetch_kvcache.assert_not_called()
+
+    def test_null_mode_skips_optional_prefetch_when_disabled(self):
+        scheduler = self._new_scheduler(DisaggregationMode.NULL)
+        req = self._new_req(priority=None)
+
+        scheduler._add_request_to_queue(req)
+
+        scheduler._prefetch_kvcache.assert_not_called()
+        self.assertEqual(scheduler.waiting_queue, [req])
 
     def test_decode_mode_assigns_default_priority_before_prealloc_queue(self):
         scheduler = self._new_scheduler(DisaggregationMode.DECODE)

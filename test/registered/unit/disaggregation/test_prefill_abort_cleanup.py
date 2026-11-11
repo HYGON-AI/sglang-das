@@ -21,6 +21,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 class TestPrefillAbortCleanup(unittest.TestCase):
     def setUp(self):
         self.scheduler = prefill.SchedulerDisaggregationPrefillMixin()
+        self.scheduler.disaggregation_mode = prefill.DisaggregationMode.PREFILL
         self.req = SimpleNamespace(
             rid="failed-request",
             to_finish=None,
@@ -34,6 +35,7 @@ class TestPrefillAbortCleanup(unittest.TestCase):
             mamba_pool_idx=None,
             bootstrap_room=7,
             bootstrap_host="peer",
+            prefill_transfer_failure_reported=False,
             time_stats=Mock(),
             disagg_kv_sender=Mock(),
         )
@@ -61,7 +63,6 @@ class TestPrefillAbortCleanup(unittest.TestCase):
         )
         s = self.scheduler
         s._external_kv_abort_rids = set()
-        s._external_kv_cleanup_rids = set()
         s._pending_chunked_abort_req = None
         s.disagg_prefill_pending_chunk_rids = {self.req.rid}
         s.disagg_prefill_inflight_queue = []
@@ -80,6 +81,13 @@ class TestPrefillAbortCleanup(unittest.TestCase):
 
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
+        self.stack.enter_context(
+            patch.object(
+                prefill,
+                "all_reduce_min_attn_cp_tp_group",
+                side_effect=lambda values, *_groups: list(values),
+            )
+        )
         self.metadata = self.stack.enter_context(
             patch.object(prefill, "maybe_release_metadata_buffer")
         )
@@ -307,6 +315,20 @@ class TestPrefillAbortCleanup(unittest.TestCase):
         self.req.disagg_kv_sender.abort.assert_called_once()
         self.scheduler.output_streamer.stream_output.assert_called_once()
         self.scheduler.metrics_collector.increment_transfer_failed_reqs.assert_called_once()
+
+    def test_retried_failure_handler_reports_each_request_once(self):
+        with patch.object(
+            self.scheduler, "abort_external_kv_request", side_effect=[False, True]
+        ) as finalizer:
+            self.scheduler.handle_inflight_transfer_failure(
+                self.req, sender_terminal=False
+            )
+            self.scheduler.handle_inflight_transfer_failure(
+                self.req, sender_terminal=True
+            )
+        self.assertEqual(finalizer.call_count, 2)
+        self.scheduler.metrics_collector.increment_transfer_failed_reqs.assert_called_once()
+        self.req.time_stats.trace_ctx.abort.assert_called_once()
 
     def test_remote_failure_and_pending_bootstrap_do_not_prove_local_terminal(self):
         self.scheduler.disagg_prefill_inflight_queue = [self.req]
