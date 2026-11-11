@@ -1,7 +1,13 @@
+import ast
+import json
+import logging
+import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Optional
 from unittest.mock import Mock, patch
 
 from sglang.srt.parser.template_detection import (
@@ -949,6 +955,132 @@ class TestResolveAutoParsers(unittest.TestCase):
 
         self.assertEqual(args.reasoning_parser, "deepseek-v3")
         self.assertEqual(args.tool_call_parser, "deepseekv32")
+
+
+class TestTemplateManagerJsonFallback(unittest.TestCase):
+    """Exercise the real loader method without importing tokenizer workers."""
+
+    @classmethod
+    def setUpClass(cls):
+        source = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/parser/template_manager.py"
+        )
+        module = ast.parse(source.read_text(encoding="utf-8"))
+        manager_class = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.ClassDef) and node.name == "TemplateManager"
+        )
+        method = next(
+            node
+            for node in manager_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "load_chat_template"
+        )
+        namespace = {
+            "json": json,
+            "os": os,
+            "logger": logging.getLogger(__name__),
+            "Optional": Optional,
+            "TokenizerManager": object,
+            "detect_jinja_template_content_format": lambda _: "openai",
+        }
+        exec(
+            compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"),
+            namespace,
+        )
+        cls.load_template = staticmethod(namespace["load_chat_template"])
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.model_path = Path(self.temp.name)
+        self.template_file = self.model_path / "chat_template.json"
+        self.tokenizer_manager = SimpleNamespace(tokenizer=_DummyTokenizer([]))
+        self.manager = SimpleNamespace(
+            _chat_template_name=None,
+            _jinja_template_content_format=None,
+            _reasoning_config=None,
+            _suggested_reasoning_parser=None,
+            _suggested_tool_call_parser=None,
+            guess_chat_template_from_model_path=Mock(),
+            _resolve_hf_chat_template=Mock(return_value=None),
+            _load_explicit_chat_template=Mock(),
+            _run_template_detection=Mock(),
+        )
+
+    def _load(self, explicit_template=None):
+        self.load_template(
+            self.manager,
+            self.tokenizer_manager,
+            explicit_template,
+            str(self.model_path),
+        )
+
+    def test_loads_model_directory_json_without_explicit_argument(self):
+        template = "{{ messages[0].content }}中文"
+        self.template_file.write_text(
+            json.dumps({"chat_template": template}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        self._load()
+
+        self.assertEqual(self.tokenizer_manager.tokenizer.chat_template, template)
+        self.assertEqual(self.manager._jinja_template_content_format, "openai")
+        self.manager._run_template_detection.assert_called_once_with(
+            template, self.tokenizer_manager.tokenizer
+        )
+
+    def test_existing_hf_template_takes_precedence(self):
+        self.template_file.write_text("invalid JSON", encoding="utf-8")
+        self.manager._resolve_hf_chat_template.return_value = "existing HF template"
+
+        self._load()
+
+        self.assertEqual(
+            self.tokenizer_manager.tokenizer.chat_template, "existing HF template"
+        )
+
+    def test_explicit_argument_takes_precedence(self):
+        self.template_file.write_text("invalid JSON", encoding="utf-8")
+
+        self._load("explicit.jinja")
+
+        self.manager._load_explicit_chat_template.assert_called_once_with(
+            self.tokenizer_manager, "explicit.jinja"
+        )
+        self.manager._resolve_hf_chat_template.assert_not_called()
+
+    def test_builtin_template_takes_precedence(self):
+        self.template_file.write_text("invalid JSON", encoding="utf-8")
+        self.manager.guess_chat_template_from_model_path.side_effect = (
+            lambda _: setattr(self.manager, "_chat_template_name", "builtin")
+        )
+
+        self._load()
+
+        self.assertEqual(self.manager._chat_template_name, "builtin")
+        self.manager._resolve_hf_chat_template.assert_not_called()
+
+    def test_absent_json_preserves_missing_template_behavior(self):
+        self._load()
+
+        self.assertIsNone(self.tokenizer_manager.tokenizer.chat_template)
+        self.assertEqual(self.manager._jinja_template_content_format, "string")
+
+    def test_malformed_json_reports_error(self):
+        self.template_file.write_text("{broken", encoding="utf-8")
+
+        with self.assertRaises(json.JSONDecodeError):
+            self._load()
+
+    def test_invalid_template_value_reports_error(self):
+        for value in ({}, [], {"chat_template": []}, {"chat_template": "  "}):
+            with self.subTest(value=value):
+                self.template_file.write_text(json.dumps(value), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "non-empty string"):
+                    self._load()
 
 
 if __name__ == "__main__":
