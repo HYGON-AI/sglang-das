@@ -75,6 +75,23 @@ class TestGenerateContract(CustomTestCase):
         self.assertIsNotNone(error)
         self.assertIn("unknown field", error)
 
+    def test_long_input_ids_do_not_disable_the_rest_of_the_contract(self):
+        """The gate skips input_ids (already checked by PlainValidator in a C
+        loop), which must not turn off the checks for the remaining fields."""
+        error = generate_contract_error(
+            {
+                "input_ids": list(range(4096)),
+                "image_data": [{"url": "u", "max_dynamic_patc": 4}],  # codespell:ignore patc
+            }
+        )
+        self.assertIsNotNone(error)
+        self.assertIn("unknown field", error)
+        self.assertIsNotNone(
+            generate_contract_error(
+                {"input_ids": list(range(4096)), "sampling_params": {"temperatur": 1}}
+            )
+        )
+
 
 class TestGenerateRouteGate(CustomTestCase):
     def test_route_checks_the_contract_and_serve_does_not(self):
