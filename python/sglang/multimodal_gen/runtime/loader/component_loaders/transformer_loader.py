@@ -160,13 +160,6 @@ def _server_args_for_transformer_component(
     return component_server_args
 
 
-def _should_use_streaming_state_dict_load(server_args: ServerArgs) -> bool:
-    tp_size = getattr(server_args, "tp_size", 1) or 1
-    sp_degree = getattr(server_args, "sp_degree", 1) or 1
-    ulysses_degree = getattr(server_args, "ulysses_degree", 1) or 1
-    return bool(tp_size > 1 or (sp_degree > 1 and ulysses_degree > 1))
-
-
 class TransformerLoader(OnlineQuantizationComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
@@ -590,9 +583,6 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                 component_starts_on_cpu=component_starts_on_cpu,
                 dtype=quant_spec.param_dtype,
                 weight_load_plan=weight_load_plan,
-                streaming_state_dict_load=_should_use_streaming_state_dict_load(
-                    component_server_args
-                ),
                 checkpoint_key_filter=checkpoint_key_filter,
                 weights_iterator=(
                     gguf_weights_iterator(
