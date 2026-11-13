@@ -197,6 +197,11 @@ class PrefillRankInfo:
         self.rank_port = int(self.rank_port)
 
 
+def _build_prefill_recompute_headers() -> dict[str, str]:
+    api_key = get_serving().api_key
+    return {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+
 class CommonKVManager(BaseKVManager):
     def __init__(
         self,
@@ -346,6 +351,7 @@ class CommonKVManager(BaseKVManager):
             ] = None
             self._prefill_recompute_executor_lock = threading.Lock()
             self._prefill_recompute_sessions = threading.local()
+            self._prefill_recompute_headers = _build_prefill_recompute_headers()
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -688,7 +694,10 @@ class CommonKVManager(BaseKVManager):
         try:
             response = self._get_prefill_recompute_session().post(
                 prefill_url.rstrip("/") + "/generate",
-                json=payload,
+                # Prefill may still be retiring the previous HTTP request for
+                # this Decode rid. Allocate a new Prefill rid for each POST.
+                json={**payload, "rid": None},
+                headers=self._prefill_recompute_headers,
                 timeout=self.waiting_timeout,
             )
             if response.status_code >= 400:

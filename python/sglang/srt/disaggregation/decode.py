@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import math
+import secrets
 import time
 from collections import deque
 from concurrent.futures import Future
@@ -71,6 +72,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
@@ -377,6 +379,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.max_total_num_tokens = max_total_num_tokens
         self.pp_rank = pp_rank
         self.pp_size = scheduler.ps.pp_size
+        new_room_requested = envs.SGLANG_PD_REBOOTSTRAP_NEW_ROOM.get()
+        ps = scheduler.ps
+        self.use_new_rebootstrap_room = new_room_requested and (
+            self._supports_new_rebootstrap_room(ps, token_to_kv_pool_allocator)
+        )
+        if new_room_requested and ps.tp_rank == 0 and ps.pp_rank == 0:
+            if self.use_new_rebootstrap_room:
+                logger.info("PD rebootstrap new room enabled")
+            else:
+                logger.warning(
+                    "SGLANG_PD_REBOOTSTRAP_NEW_ROOM requires DeepSeek-V4 PD Decode "
+                    "with TP16/DP16/CP1/PP1 and DP attention; retaining the original room"
+                )
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
@@ -777,6 +792,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
+        if (
+            is_rebootstrap
+            and self.use_new_rebootstrap_room
+            and not _is_fake_transfer(req)
+            and not self._assign_rebootstrap_room(req)
+        ):
+            return
+
         if is_retracted:
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
@@ -794,10 +817,44 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             prefill_dp_rank = self._resolve_prefill_dp_rank(req)
             logger.debug(f"prefill_dp_rank: {prefill_dp_rank}")
             if prefill_dp_rank is not None:
-                decode_req.kv_receiver.init(prefill_dp_rank)
+                self._init_receiver(decode_req, prefill_dp_rank)
                 return
 
             self.pending_reqs.append(decode_req)
+
+    @staticmethod
+    def _supports_new_rebootstrap_room(
+        ps: ParallelState, allocator: BaseTokenToKVPoolAllocator
+    ) -> bool:
+        return (
+            (ps.tp_size, ps.dp_size, ps.attn_cp_size, ps.pp_size) == (16, 16, 1, 1)
+            and ps.attn_dp_size == 16
+            and ps.attn_tp_size == 1
+            and dsv4_needs_rebootstrap(allocator)
+        )
+
+    def _init_receiver(self, decode_req: DecodeRequest, prefill_dp_rank: int) -> None:
+        decode_req.kv_receiver.init(prefill_dp_rank)
+        if self.use_new_rebootstrap_room:
+            decode_req.req.pd_bound_prefill_dp_rank = prefill_dp_rank
+
+    def _assign_rebootstrap_room(self, req: Req) -> bool:
+        prefill_dp_rank = req.pd_bound_prefill_dp_rank
+        if prefill_dp_rank is None:
+            message = "PD rebootstrap could not recover the original prefill DP rank."
+            logger.error("%s rid=%s room=%s", message, req.rid, req.bootstrap_room)
+            prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+            return False
+
+        # One D attention rank owns this request. Allocate a nonzero room in
+        # the router's signed-int64 range before constructing the receiver.
+        new_room = secrets.randbits(63)
+        while new_room == 0 or new_room == req.bootstrap_room:
+            new_room = secrets.randbits(63)
+        req.bootstrap_room = new_room
+        req.disagg_prefill_dp_rank = prefill_dp_rank
+        return True
 
     def _abort_one_prealloc(
         self, decode_req: DecodeRequest, *, handshake_failed: bool = False
@@ -1027,9 +1084,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # A fake transfer has no prefill endpoint; its receiver completes itself.
         if _is_fake_transfer(decode_req.req):
             return
-        self.kv_manager.submit_prefill_recompute(
-            decode_req.kv_receiver, decode_req.req.build_rebootstrap_payload()
-        )
+        payload = decode_req.req.build_rebootstrap_payload()
+        if self.use_new_rebootstrap_room:
+            payload["bootstrap_room"] = decode_req.kv_receiver.bootstrap_room
+            payload["routed_dp_rank"] = decode_req.req.pd_bound_prefill_dp_rank
+        self.kv_manager.submit_prefill_recompute(decode_req.kv_receiver, payload)
 
     def hold_rebootstrap(self, req: Req) -> None:
         """Stage a retracted request for rebootstrap without enqueuing it yet.
@@ -1397,7 +1456,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.pending_reqs = remaining
 
         for decode_req, prefill_dp_rank in resolved:
-            decode_req.kv_receiver.init(prefill_dp_rank)
+            self._init_receiver(decode_req, prefill_dp_rank)
 
     def pop_preallocated(
         self,

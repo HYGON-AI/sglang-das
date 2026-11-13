@@ -1182,6 +1182,8 @@ class Req(ReqDllmMixin):
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
+        # Decode's resolved rank may differ from the original router hint.
+        self.pd_bound_prefill_dp_rank: Optional[int] = None
         # Decode-local: the already-emitted boundary token to replay when a
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.

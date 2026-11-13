@@ -284,6 +284,7 @@ class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
         mgr._prefill_recompute_executor = None
         mgr._prefill_recompute_executor_lock = threading.Lock()
         mgr._prefill_recompute_sessions = threading.local()
+        mgr._prefill_recompute_headers = {}
         mgr.waiting_timeout = 300
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
@@ -406,11 +407,46 @@ class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
         mgr._prefill_recompute_sessions.session = session
         receiver = MagicMock(bootstrap_room=7)
 
+        payload = {**self._payload(), "bootstrap_room": 7}
+        mgr._run_prefill_recompute(receiver, "http://prefill", payload)
+
+        session.post.assert_called_once_with(
+            "http://prefill/generate",
+            json={**self._payload(), "bootstrap_room": 7, "rid": None},
+            headers={},
+            timeout=300,
+        )
+        self.assertEqual(payload["rid"], "rid-0")
+        receiver.abort.assert_not_called()
+        self.assertEqual(mgr.failure_records, {})
+
+    def _prefill_recompute_request_headers(self, api_key):
+        from sglang.srt.disaggregation.common.conn import (
+            _build_prefill_recompute_headers,
+        )
+
+        mgr = self._new_manager()
+        session = MagicMock()
+        session.post.return_value.status_code = 200
+        mgr._prefill_recompute_sessions.session = session
+        with get_context().override_server_args(api_key=api_key):
+            mgr._prefill_recompute_headers = _build_prefill_recompute_headers()
+
+        receiver = MagicMock(bootstrap_room=7)
         mgr._run_prefill_recompute(receiver, "http://prefill", self._payload())
 
         session.post.assert_called_once()
         receiver.abort.assert_not_called()
-        self.assertEqual(mgr.failure_records, {})
+        return session.post.call_args.kwargs.get("headers", {})
+
+    def test_run_sends_bearer_auth_with_api_key(self):
+        """Recompute must authenticate to Prefill when PD shares an API key."""
+        headers = self._prefill_recompute_request_headers("test-only-key")
+        self.assertEqual(headers.get("Authorization"), "Bearer test-only-key")
+
+    def test_run_omits_bearer_auth_without_api_key(self):
+        headers = self._prefill_recompute_request_headers(None)
+        self.assertNotIn("Authorization", headers)
 
 
 class TestDecodePrebuilt(unittest.TestCase):
