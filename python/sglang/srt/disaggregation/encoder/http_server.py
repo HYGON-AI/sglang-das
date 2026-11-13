@@ -56,6 +56,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
+    CLIENT_MEDIA_EXCEPTIONS,
     add_prometheus_middleware,
     configure_logger,
 )
@@ -316,7 +317,7 @@ async def handle_encode_request(request: dict):
             # `or` (not `dict.get(key, default)`) so explicit None falls back too.
             status_code = result.get("_error_code") or (
                 HTTPStatus.BAD_REQUEST
-                if error_type == "ValueError"
+                if error_type in ("ValueError", "UnidentifiedImageError")
                 else HTTPStatus.INTERNAL_SERVER_ERROR
             )
             logger.error(f"DP worker error for req_id={req_id}: {result['_error']}")
@@ -364,6 +365,15 @@ async def handle_encode_request(request: dict):
         return ORJSONResponse(
             status_code=int(e.code),
             content={"status": "error", "message": str(e), "req_id": req_id},
+        )
+    except CLIENT_MEDIA_EXCEPTIONS as e:
+        # Client-supplied media that failed to load/decode escaped the
+        # preprocessor's BadRequestError wrap; it is still a caller error.
+        error_msg = str(e)
+        logger.warning(f"Invalid media in encoder request {req_id}: {error_msg}")
+        return ORJSONResponse(
+            status_code=HTTPStatus.BAD_REQUEST,
+            content={"status": "error", "message": error_msg, "req_id": req_id},
         )
     except Exception as e:
         error_msg = str(e)
@@ -474,7 +484,9 @@ async def handle_scheduler_receive_meta_data(request: dict):
     if meta is None or meta.get("error") is not None:
         message = meta["error"] if meta else "encode metadata missing"
         return ORJSONResponse(
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            status_code=meta.get("error_code")
+            if meta and meta.get("error_code")
+            else HTTPStatus.INTERNAL_SERVER_ERROR,
             content={"status": "error", "message": message, "req_id": req_id},
         )
     return ORJSONResponse(

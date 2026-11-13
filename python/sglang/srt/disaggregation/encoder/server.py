@@ -227,10 +227,16 @@ class EncoderMetaRegistry:
         embedding_len: int,
         embedding_dim: int,
         error: Optional[str] = None,
+        error_code: Optional[int] = None,
     ) -> None:
         """Publish per-part metadata (or an error), wake waiters, arm the sweep."""
         meta = (
-            {"error": error}
+            {
+                "error": error,
+                # The pull endpoints echo this back as the HTTP status, so a
+                # client error stays a client error instead of collapsing to 500.
+                "error_code": int(error_code or HTTPStatus.INTERNAL_SERVER_ERROR),
+            }
             if error is not None
             else {
                 "embedding_size": nbytes,

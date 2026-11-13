@@ -1104,7 +1104,13 @@ class WaitingMMRequestBase(ABC):
     def _fail_and_release(self, error_msg, error_code=None) -> None:
         """Terminal failure: record the error, free buffers, close the socket."""
         self.error_msg = error_msg
-        self.error_code = error_code
+        # The encoder always publishes a code; keep a defined fallback so a
+        # missing code cannot silently degrade into whatever the abort path does.
+        self.error_code = (
+            int(error_code)
+            if error_code is not None
+            else int(HTTPStatus.INTERNAL_SERVER_ERROR)
+        )
         self.status = WaitingMMRequestStatus.FAIL
         self.release_resources()
         self.close_recv_socket()
