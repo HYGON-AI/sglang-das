@@ -86,6 +86,39 @@ jobs:
     uses: ./.github/workflows/cookbook-deployment-smoke.yml
     with:
       image: ${{ needs.build.outputs.docker_image }}
+      bw1100-daily-cases: |
+        deepseek-r1-distill-qwen-32b-ifb-bw1100-2x-sglang-0518
+        deepseek-r1-channel-fp8-w8a8-ifb-bw1100-8x-sglang-0518
+        deepseek-v32-channel-int8-w8a8-ifb-bw1100-8x-sglang-0518
+        deepseek-v4-flash-0731-channel-fp8-w8a8-ifb-bw1100-8x-sglang-0518
+        deepseek-v4-flash-0731-w4a8-int4-channel-attn-w8a8-int8-channel-ifb-bw1100-8x-sglang-0518
+        glm-51-channel-fp8-w8a8-ifb-bw1100-8x-sglang-0518-tp8ep8cp8
+        glm-52-channel-fp8-w8a8-ifb-bw1100-8x-sglang-0518-tp8ep8
+        glm-52-channel-int4-w4a8-ifb-bw1100-4x-sglang-0518
+        glm-53-channel-fp8-w8a8-ifb-bw1100-8x-sglang-0518-tp8
+        glm-53-channel-fp8-w8a8-ifb-bw1100-8x-sglang-0518-dp8ep8
+        glm-53-channel-int8-w8a8-ifb-bw1100-8x-sglang-0518
+        hy3-channel-fp8-w8a8-ifb-bw1100-8x-sglang-0518-tp8
+        kimi-k27-code-ifb-bw1100-8x-sglang-0518
+        mimo-v2-flash-channel-fp8-w8a8-ifb-bw1100-8x-sglang-0518
+        minimax-m25-channel-int8-w8a8-ifb-bw1100-8x-sglang-0518
+        minimax-m27-channel-fp8-w8a8-ifb-bw1100-8x-sglang-0518
+        minimax-m3-channel-fp8-w8a8-ifb-bw1100-8x-sglang-0518
+        qwen25-vl-32b-instruct-ifb-bw1100-2x-sglang-0518
+        qwen3-vl-30b-a3b-thinking-ifb-bw1100-1x-sglang-0518
+        qwen35-35b-a3b-ifb-bw1100-2x-sglang-0518
+        qwen35-122b-a10b-ifb-bw1100-4x-sglang-0518
+        qwen35-397b-a17b-channel-int8-w8a8-ifb-bw1100-8x-sglang-0518
+        qwen36-27b-channel-int8-w8a8-ifb-bw1100-2x-sglang-0518
+        qwen36-35b-a3b-ifb-bw1100-2x-sglang-0518
+        qwen38-27b-ifb-bw1100-2x-sglang-0518
+        qwen38-flash-next-ifb-bw1100-8x-sglang-0518
+        qwen38-flash-next-channel-fp8-ifb-bw1100-4x-sglang-0518
+        qwen3-4b-thinking-2507-ifb-bw1100-1x-sglang-0518
+        qwen3-8b-ifb-bw1100-1x-sglang-0518
+        qwen3-30b-a3b-ifb-bw1100-1x-sglang-0518
+        qwen3-235b-a22b-instruct-2507-ifb-bw1100-8x-sglang-0518
+        qwq-32b-ifb-bw1100-2x-sglang-0518
       mode: execute
     secrets: inherit
 

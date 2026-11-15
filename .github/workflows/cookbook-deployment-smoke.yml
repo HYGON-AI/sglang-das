@@ -23,6 +23,10 @@ on:
         description: Exact Cookbook sections; select one hardware for hardware-specific sections
         type: string
         default: ''
+      bw1100-daily-cases:
+        description: Exact Cookbook sections for scheduled BW1100 tests
+        type: string
+        default: ''
     secrets:
       MODEL_REPORT_HISTORY_TOKEN:
         description: Read Actions artifacts in both HYGON-AI framework repositories
@@ -115,7 +119,7 @@ jobs:
           cookbook-ref: ${{ needs.prepare.outputs.cookbook-ref }}
           controller-ref: ${{ needs.prepare.outputs.controller-ref }}
           hardware: ${{ matrix.hardware }}
-          cases: ${{ inputs.cases || '' }}
+          cases: ${{ inputs.cases || (github.event_name == 'schedule' && matrix.hardware == 'BW1100' && inputs.bw1100-daily-cases) || '' }}
           mode: ${{ inputs.mode || 'execute' }}
           collect-only: 'true'
 
