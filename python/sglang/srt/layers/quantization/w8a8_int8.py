@@ -24,10 +24,12 @@ from torch import nn
 from torch.nn.parameter import Parameter
 
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
+from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
 )
+from sglang.srt.layers.fused_rms_quant import Int8QuantizedInput
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
@@ -206,6 +208,7 @@ class W8A8Int8Config(QuantizationConfig):
 
 class W8A8Int8LinearMethod(LinearMethodBase):
     supports_prequantized_input = True
+    supports_int8_quantized_input = True
 
     def __init__(self, quantization_config: W8A8Int8Config):
         self.quantization_config = quantization_config
@@ -264,7 +267,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         input_quant_args=None,
     ):
         if use_intel_amx_backend(layer) or _is_cpu_arm64:
-            if input_quant_args is not None:
+            if input_quant_args is not None or isinstance(x, Int8QuantizedInput):
                 raise NotImplementedError(
                     "Prequantized W8A8 input is only supported by the GPU path"
                 )
@@ -276,9 +279,17 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 x.dtype,
                 True,  # is_vnni
             )
-        if input_quant_args is None:
+        if isinstance(x, Int8QuantizedInput):
+            if input_quant_args is not None:
+                raise ValueError(
+                    "Specify either a quantized operand or input_quant_args"
+                )
+            x_q, x_scale, output_dtype = x.unpack()
+        elif input_quant_args is None:
+            output_dtype = x.dtype
             x_q, x_scale = per_token_quant_int8(x)
         else:
+            output_dtype = x.dtype
             if (
                 not isinstance(input_quant_args, (tuple, list))
                 or len(input_quant_args) != 2
@@ -313,7 +324,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 layer.weight,
                 scale_a=x_scale_2d,
                 scale_b=layer.weight_scale,
-                out_dtype=x.dtype,
+                out_dtype=output_dtype,
                 bias=None,
             )
             if bias is not None:
@@ -325,7 +336,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 layer.weight,
                 x_scale_2d,
                 layer.weight_scale,
-                out_dtype=x.dtype,
+                out_dtype=output_dtype,
                 bias=bias,
             )
 
@@ -580,7 +591,17 @@ def _projection_backend():
     return mode
 
 
-def _grouped(x, w, s, groups, rank, *, output_dtype=None):
+def _grouped(
+    x,
+    w,
+    s,
+    groups,
+    rank,
+    *,
+    output_dtype=None,
+    input_quant_args=None,
+    quantize_output=False,
+):
     if (
         x.ndim != 3
         or x.shape[1] != groups
@@ -604,12 +625,92 @@ def _grouped(x, w, s, groups, rank, *, output_dtype=None):
     from sglang.kernels.ops.gemm import dsv41_int8 as dsv41_int8_blaslt
 
     return dsv41_int8_blaslt.project(
-        x, w, s, groups, rank, output_dtype=output_dtype
+        x,
+        w,
+        s,
+        groups,
+        rank,
+        output_dtype=output_dtype,
+        input_quant_args=input_quant_args,
+        quantize_output=quantize_output,
     )
 
 
-def grouped(x, layer, groups, rank):
-    return _grouped(x, layer.weight, layer.weight_scale, groups, rank)
+def grouped(x, layer, groups, rank, *, input_quant_args=None, quantize_output=False):
+    result = _grouped(
+        x,
+        layer.weight,
+        layer.weight_scale,
+        groups,
+        rank,
+        input_quant_args=input_quant_args,
+        quantize_output=quantize_output,
+    )
+    if quantize_output and x.shape[0]:
+        _, quantized, scales = result
+        return Int8QuantizedInput(quantized, scales, x.dtype)
+    return result
+
+
+def transform_quant_available(groups, rank, width):
+    # These projection adapters are calibrated against the packed service ABI.
+    if torch.version.hip is None or not envs.SGLANG_DSV41_INT8_SERVICE_OPT.get():
+        return False
+    from sglang.kernels.ops.gemm.dsv41_int8 import grouped_input_pitch
+
+    if grouped_input_pitch(1, groups, rank, width) is None:
+        return False
+    try:
+        from lightop.quant.transforms_int8 import is_transform_quant_available
+    except (ImportError, OSError, RuntimeError):
+        return False
+    return is_transform_quant_available()
+
+
+def rope_grouped_input(x, frequencies, positions, groups, rank, rope_dim):
+    """Prepare the existing service GEMM's pitched INT8 input without a RoPE copy."""
+    from sglang.kernels.ops.gemm.dsv41_int8 import grouped_input_pitch
+
+    if (
+        not x.is_cuda
+        or x.ndim != 3
+        or x.dtype != torch.bfloat16
+        or groups <= 0
+        or x.shape[1] <= 0
+        or x.shape[1] % groups
+        or x.shape[2] <= 0
+        or x.stride(2) != 1
+        or x.stride(1) < x.shape[2]
+        or x.stride(0) < x.shape[1] * x.stride(1)
+        or positions.dtype not in (torch.int32, torch.int64)
+        or positions.shape != (x.shape[0],)
+        or not positions.is_contiguous()
+        or positions.device != x.device
+        or frequencies.dtype != torch.complex64
+        or frequencies.ndim != 2
+        or frequencies.shape[0] <= 0
+        or frequencies.shape[1] * 2 != rope_dim
+        or not frequencies.is_contiguous()
+        or frequencies.device != x.device
+    ):
+        return None
+    width = x.shape[1] // groups * x.shape[2]
+    if not transform_quant_available(groups, rank, width):
+        return None
+    pitch = grouped_input_pitch(x.shape[0], groups, rank, width)
+    if (
+        pitch is None
+        or not 0 < width <= 16384
+        or x.shape[2] % 2
+        or not 0 < rope_dim <= x.shape[2]
+        or rope_dim % 2
+    ):
+        return None
+    from lightop.quant import rope_per_token_quant_int8
+
+    return rope_per_token_quant_int8(
+        x, frequencies, positions, groups, rope_dim, inverse=True, output_pitch=pitch
+    )
 
 
 def linear(x, weight, scale, *, output_dtype=None):

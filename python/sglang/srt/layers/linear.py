@@ -34,7 +34,11 @@ from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
-from sglang.srt.layers.fused_rms_quant import Int8PerTokenInput
+from sglang.srt.layers.fused_rms_quant import (
+    Int8PerTokenInput,
+    Int8QuantizedInput,
+    supports_int8_quantized_input,
+)
 from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
@@ -47,7 +51,14 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hcu, is_hip, is_npu, set_weight_attrs
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cpu,
+    is_hcu,
+    is_hip,
+    is_npu,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -117,7 +128,7 @@ if (
             pass
 
 if _use_fused_bailing_silu_mul_fp8_quant or _use_fused_dpskv4_silu_mul_fp8_quant:
-    import deepgemm
+    import deepgemm  # noqa: F401 -- validate the selected optional backend.
 
 logger = logging.getLogger(__name__)
 
@@ -1941,6 +1952,22 @@ class RowParallelLinear(LinearBase):
         output_tensor=None,
     ):
         tp_rank, tp_size = get_group_rank_size(self.tp_group)
+        if isinstance(input_, Int8QuantizedInput):
+            if (
+                not self.input_is_parallel
+                or output_tensor is not None
+                or get_forward().sp_active
+                or use_fused_silu_mul_quant
+                or use_fused_silu_mul_fp8_quant
+                or not supports_int8_quantized_input(self)
+            ):
+                raise ValueError(
+                    "This row-parallel path requires a materialized floating input"
+                )
+            if input_.q.shape[-1] != self.input_size_per_partition:
+                raise ValueError(
+                    "Quantized input width does not match the local linear partition"
+                )
         if self.input_is_parallel:
             input_parallel = input_
         else:

@@ -23,6 +23,8 @@ from sglang.srt.layers.fused_rms_quant import (
     opt_into_int8_operand,
     rms_norm_fp8_operand,
     rms_norm_int8_operand,
+    rms_norm_strided_fp8_operand,
+    rms_norm_strided_int8_operand,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -146,6 +148,11 @@ def q_norm_for_wq_b(attn, q_lora: torch.Tensor) -> Tuple[torch.Tensor, object]:
     if attn.fused_rmsnorm_fake_quant:
         return gfx95_dense.q_norm_fake_quant(attn, q_lora)
     if attn.fused_rmsnorm_fp8_operand:
+        if envs.SGLANG_OPT_DSV41_SMALL_OP_FUSION.get() and not q_lora.is_contiguous():
+            with record_function("dsv4_qnorm_strided_fp8_fused"):
+                result = rms_norm_strided_fp8_operand(q_lora, attn.q_norm)
+            if result is not None:
+                return result
         # q_lora may be a wqkv_a slice; the in-place launch needs its own rows.
         q_lora = q_lora.contiguous()
         with record_function("dsv4_qnorm_fp8_fused"):
@@ -153,6 +160,11 @@ def q_norm_for_wq_b(attn, q_lora: torch.Tensor) -> Tuple[torch.Tensor, object]:
         if operand is not None:
             return q_lora, operand
     if attn.fused_rmsnorm_int8_operand:
+        if envs.SGLANG_OPT_DSV41_SMALL_OP_FUSION.get() and not q_lora.is_contiguous():
+            with record_function("dsv4_qnorm_strided_int8_fused"):
+                operand = rms_norm_strided_int8_operand(q_lora, attn.q_norm)
+            if operand is not None:
+                return operand.x, operand
         q_lora = q_lora.contiguous()
         with record_function("dsv4_qnorm_int8_fused"):
             operand = rms_norm_int8_operand(q_lora, attn.q_norm)

@@ -17,6 +17,44 @@ class Int8PerTokenInput(msgspec.Struct, frozen=True):
     scale: torch.Tensor  # [M, 1] fp32, per token
 
 
+class Int8QuantizedInput(msgspec.Struct, frozen=True):
+    """Contiguous GPU [M,K] INT8 activations with no floating carrier."""
+
+    q: torch.Tensor
+    scale: torch.Tensor
+    orig_dtype: torch.dtype
+
+    def unpack(self):
+        if (
+            self.q.ndim != 2
+            or not self.q.is_cuda
+            or self.q.dtype != torch.int8
+            or not self.q.is_contiguous()
+            or self.scale.shape != (*self.q.shape[:-1], 1)
+            or self.scale.dtype != torch.float32
+            or self.scale.device != self.q.device
+            or not self.scale.is_contiguous()
+            or self.orig_dtype not in (torch.bfloat16, torch.float16, torch.float32)
+        ):
+            raise ValueError(
+                "Expected contiguous INT8 activations, FP32 per-token scales and floating output dtype"
+            )
+        return self.q, self.scale, self.orig_dtype
+
+
+def supports_int8_quantized_input(linear) -> bool:
+    """Whether an opted-in linear consumes INT8 without a floating carrier."""
+    return bool(
+        getattr(linear.quant_method, "supports_prequantized_input", False)
+        and (
+            getattr(linear.quant_method, "supports_int8_quantized_input", False)
+            or getattr(
+                getattr(linear, "scheme", None), "supports_int8_quantized_input", False
+            )
+        )
+    )
+
+
 @lru_cache(maxsize=1)
 def is_lightop_sglang_rms_quant_available() -> bool:
     """Return whether the audited LightOp entry point can run on this host."""
@@ -174,14 +212,16 @@ def rms_norm_fp8_operand(
     return q, scale, x.dtype
 
 
-def opt_into_int8_operand(linear) -> bool:
+def opt_into_int8_operand(linear, *, quantized_only=False) -> bool:
     """Opt linear into a per-token INT8 ``input_quant_args`` pair (W8A8-INT8,
     SlimQuant W4A8) and return whether it now takes one."""
     from sglang.srt.layers.quantization.base_config import LinearMethodBase
 
-    return isinstance(
-        linear.quant_method, LinearMethodBase
-    ) and linear.quant_method.enable_prequantized_input(linear)
+    return (
+        isinstance(linear.quant_method, LinearMethodBase)
+        and linear.quant_method.enable_prequantized_input(linear)
+        and (not quantized_only or supports_int8_quantized_input(linear))
+    )
 
 
 def rms_norm_int8_operand(x: torch.Tensor, norm) -> Optional[Int8PerTokenInput]:
@@ -271,3 +311,81 @@ def fused_mla_qkv_a_rms_norm_per_token_quant(
         q_epsilon=q_epsilon,
         kv_epsilon=kv_epsilon,
     )
+
+
+def rms_norm_strided_int8_operand(x: torch.Tensor, norm) -> Optional[Int8PerTokenInput]:
+    """Normalize sliced/padded rows without materializing an input copy.
+
+    This entry point owns independent outputs and leaves the packed projection
+    (including its KV segment) unchanged. Older LightOp installations fall back
+    to the existing contiguous path.
+    """
+    if not (
+        torch.version.hip is not None
+        and x.is_cuda
+        and x.ndim == 2
+        and x.shape[0] > 0
+        and x.stride(0) <= 2147483647
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and 0 < x.shape[1] <= 8192
+        and x.shape[1] % 16 == 0
+        and x.stride(1) == 1
+        and x.stride(0) >= x.shape[1]
+        and x.stride(0) % 8 == 0
+        and x.data_ptr() % 16 == 0
+        and norm.weight.device == x.device
+        and norm.weight.dtype == x.dtype
+        and norm.weight.shape == (x.shape[1],)
+        and norm.weight.is_contiguous()
+        and norm.weight.data_ptr() % 16 == 0
+    ):
+        return None
+    try:
+        from lightop.norm.strided_int8 import (
+            is_strided_rms_quant_available,
+            rms_norm_strided_per_token_quant,
+        )
+    except (ImportError, OSError, RuntimeError):
+        return None
+    if not is_strided_rms_quant_available():
+        return None
+    return Int8PerTokenInput(
+        *rms_norm_strided_per_token_quant(x, norm.weight, norm.variance_epsilon)
+    )
+
+
+def rms_norm_strided_fp8_operand(x: torch.Tensor, norm):
+    """Read padded QNorm rows once, preserving the packed Q/KV producer storage."""
+    if (
+        torch.version.hip is None
+        or not x.is_cuda
+        or x.ndim != 2
+        or x.numel() == 0
+        or x.dtype not in (torch.bfloat16, torch.float16)
+        or x.shape[1] % 16
+        or x.shape[1] > 16384
+        or x.stride(1) != 1
+        or x.stride(0) < x.shape[1]
+        or x.stride(0) % 8
+        or x.stride(0) > 2147483647
+        or x.data_ptr() % 16
+        or norm.weight.data_ptr() % 16
+        or norm.weight.dtype != x.dtype
+        or norm.weight.device != x.device
+        or norm.weight.shape != (x.shape[1],)
+        or not norm.weight.is_contiguous()
+    ):
+        return None
+    try:
+        from lightop.norm.strided_fp8 import (
+            is_strided_rms_fp8_quant_available,
+            rms_norm_strided_per_token_fp8_quant,
+        )
+    except (ImportError, OSError, RuntimeError):
+        return None
+    if not is_strided_rms_fp8_quant_available():
+        return None
+    normalized, q, scale = rms_norm_strided_per_token_fp8_quant(
+        x, norm.weight, norm.variance_epsilon
+    )
+    return normalized, (q, scale, x.dtype)

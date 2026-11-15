@@ -319,7 +319,9 @@ def _auto_dispatch_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             and k == _HCU_AUTO_N256_SGL_PROFILE_K
         )
     ):
-        from sglang.kernels.ops.attention.dsv4.hcu_linear_bf16_fp32 import hcu_linear_bf16_fp32_supported
+        from sglang.kernels.ops.attention.dsv4.hcu_linear_bf16_fp32 import (
+            hcu_linear_bf16_fp32_supported,
+        )
 
         sgl_supported = hcu_linear_bf16_fp32_supported(x, y)
 
@@ -342,7 +344,9 @@ def _auto_dispatch_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     backend = select(aiter is not None)
     if backend == "sgl":
         try:
-            from sglang.kernels.ops.attention.dsv4.hcu_linear_bf16_fp32 import hcu_linear_bf16_fp32
+            from sglang.kernels.ops.attention.dsv4.hcu_linear_bf16_fp32 import (
+                hcu_linear_bf16_fp32,
+            )
 
             return hcu_linear_bf16_fp32(x, y)
         except (OSError, RuntimeError):
@@ -361,7 +365,9 @@ def _auto_dispatch_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             backend = select(False, aiter_shape_supported=False)
             if backend == "sgl":
                 try:
-                    from sglang.kernels.ops.attention.dsv4.hcu_linear_bf16_fp32 import hcu_linear_bf16_fp32
+                    from sglang.kernels.ops.attention.dsv4.hcu_linear_bf16_fp32 import (
+                        hcu_linear_bf16_fp32,
+                    )
 
                     return hcu_linear_bf16_fp32(x, y)
                 except (OSError, RuntimeError):
@@ -381,7 +387,9 @@ def prewarm_auto_bf16_fp32() -> None:
     if _get_aiter_tgemm() is None:
         _AUTO_AITER_DISABLED = True
     try:
-        from sglang.kernels.ops.attention.dsv4.hcu_linear_bf16_fp32 import _jit_linear_bf16_fp32_module
+        from sglang.kernels.ops.attention.dsv4.hcu_linear_bf16_fp32 import (
+            _jit_linear_bf16_fp32_module,
+        )
 
         _jit_linear_bf16_fp32_module()
     except (OSError, RuntimeError):
@@ -403,7 +411,9 @@ def linear_bf16_fp32(
     if _linear_bf16_fp32_algo == "auto":
         return _auto_dispatch_bf16_fp32(x, y)
     if _linear_bf16_fp32_algo == "sgl":
-        from sglang.kernels.ops.attention.dsv4.hcu_linear_bf16_fp32 import hcu_linear_bf16_fp32
+        from sglang.kernels.ops.attention.dsv4.hcu_linear_bf16_fp32 import (
+            hcu_linear_bf16_fp32,
+        )
 
         return hcu_linear_bf16_fp32(x, y)
     if _linear_bf16_fp32_algo == "aiter" and y.dtype == torch.bfloat16:
@@ -422,6 +432,21 @@ def linear_bf16_fp32(
         deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, y, z)
         return z
     elif _linear_bf16_fp32_algo == "lightop":
+        # The LightOp MMAC kernel consumes contiguous [M,K] / [N,K]
+        # reduced-precision operands with a full 32-element K tile.
+        if not (
+            x.ndim == y.ndim == 2
+            and x.is_cuda
+            and x.device == y.device
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and y.dtype == x.dtype
+            and x.is_contiguous()
+            and y.is_contiguous()
+            and x.shape[1] == y.shape[1]
+            and x.shape[1] > 0
+            and x.shape[1] % 32 == 0
+        ):
+            return _linear_bf16_fp32_cublas(x, y)
         from lightop import gemm_ops
 
         return gemm_ops.gemm(x, y, out_dtype=torch.float32)

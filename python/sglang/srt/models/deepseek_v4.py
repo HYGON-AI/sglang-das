@@ -1162,6 +1162,39 @@ class MqaAttentionBase(nn.Module):
             parallel_group="attn_tp",
         )
 
+        self.fuse_int8_small_ops = bool(
+            _is_hcu
+            and self.wo_a_int8
+            and envs.SGLANG_OPT_DSV41_SMALL_OP_FUSION.get()
+            and channelwise_int8.transform_quant_available(
+                self.n_local_groups,
+                self.o_lora_rank,
+                self.n_local_heads // self.n_local_groups * self.head_dim,
+            )
+        )
+        self.fuse_wo_b_int8 = False
+        if self.fuse_int8_small_ops:
+            from sglang.srt.layers.fused_rms_quant import opt_into_int8_operand
+
+            self.fuse_wo_b_int8 = self.wo_b.input_is_parallel and opt_into_int8_operand(
+                self.wo_b, quantized_only=True
+            )
+
+        self.fuse_fp8_small_ops = bool(
+            _is_hcu
+            and self.is_dsv41
+            and self.wo_a_channelwise_fp8
+            and envs.SGLANG_OPT_DSV41_SMALL_OP_FUSION.get()
+            and channelwise_fp8.transform_quant_available()
+        )
+        self.fuse_wo_b_fp8 = False
+        if self.fuse_fp8_small_ops:
+            from sglang.srt.layers.fused_rms_quant import linear_takes_fp8_operand
+
+            self.fuse_wo_b_fp8 = (
+                self.wo_b.input_is_parallel and linear_takes_fp8_operand(self.wo_b)
+            )
+
         from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 
         rope_theta, rope_scaling = get_rope_config(config)
@@ -2744,6 +2777,25 @@ class MQALayer(MqaAttentionBase):
                 self.use_fused_wo_a and 0 < o.shape[0] <= _FUSED_WO_A_MAX_TOKENS
             )
 
+            input_quant_args = None
+            fp8_input_quant_args = None
+            if self.fuse_fp8_small_ops and inv_rope is None and not fuse_rope_wo_a:
+                fp8_input_quant_args = channelwise_fp8.rope_grouped_input(
+                    o,
+                    self.freqs_cis,
+                    positions,
+                    self.n_local_groups,
+                    self.qk_rope_head_dim,
+                )
+            if self.fuse_int8_small_ops and inv_rope is None and not fuse_rope_wo_a:
+                input_quant_args = channelwise_int8.rope_grouped_input(
+                    o,
+                    self.freqs_cis,
+                    positions,
+                    self.n_local_groups,
+                    self.o_lora_rank,
+                    self.qk_rope_head_dim,
+                )
             if _is_npu:
                 cos4, sin4 = self._get_npu_rope_position_cache(
                     forward_batch, positions, o.dtype, inverse=True
@@ -2755,7 +2807,12 @@ class MQALayer(MqaAttentionBase):
                     sin4,
                     qk_nope_dim=self.qk_nope_head_dim,
                 )
-            elif inv_rope is None and not fuse_rope_wo_a:
+            elif (
+                inv_rope is None
+                and not fuse_rope_wo_a
+                and input_quant_args is None
+                and fp8_input_quant_args is None
+            ):
                 # The fused path folds this in; it must not run twice.
                 fused_rope_inplace(
                     o[..., -self.qk_rope_head_dim :],
@@ -2769,7 +2826,16 @@ class MQALayer(MqaAttentionBase):
 
             if self.wo_a_int8:
                 o = channelwise_int8.grouped(
-                    o, self.wo_a, self.n_local_groups, self.o_lora_rank
+                    o,
+                    self.wo_a,
+                    self.n_local_groups,
+                    self.o_lora_rank,
+                    input_quant_args=input_quant_args,
+                    quantize_output=(
+                        self.fuse_wo_b_int8
+                        and o.dtype == torch.bfloat16
+                        and not get_forward().sp_active
+                    ),
                 )
             elif fuse_rope_wo_a:
                 wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
@@ -2783,7 +2849,14 @@ class MQALayer(MqaAttentionBase):
                 o = Mxfp8SwizzledInput(*out) if fuse_mxfp8_quant else out[0]
             elif self.wo_a_channelwise_fp8:
                 o = channelwise_fp8.grouped(
-                    o, self.wo_a, self.n_local_groups, self.o_lora_rank
+                    o,
+                    self.wo_a,
+                    self.n_local_groups,
+                    self.o_lora_rank,
+                    quantized=fp8_input_quant_args,
+                    quantize_output=(
+                        self.fuse_wo_b_fp8 and not get_forward().sp_active
+                    ),
                 )
             elif self.use_npu_arch35_mxfp8_wo_a:
                 o, o_scale = torch_npu.npu_dynamic_mx_quant(
