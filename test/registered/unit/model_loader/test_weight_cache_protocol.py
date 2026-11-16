@@ -379,7 +379,7 @@ class TestIpcQuantAllowlist(CustomTestCase):
 
     def test_allowlist_registry_shape(self):
         # Guard against accidentally widening the allowlist without review.
-        self.assertEqual(set(IPC_QUANT_ALLOWLIST), {"", "fp8"})
+        self.assertEqual(set(IPC_QUANT_ALLOWLIST), {"", "fp8", "compressed-tensors"})
 
 
 class TestCleanupStaleDaemonFiles(CustomTestCase):

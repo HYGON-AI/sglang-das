@@ -63,9 +63,11 @@ from .protocol import (
     CacheConfig,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
+    collect_layout_env,
     compute_env_stamp,
     compute_global_rank,
     compute_local_gpu_id,
+    compute_weight_layout_stamp,
     get_quant_method_name,
     get_ready_path,
     get_socket_path,
@@ -188,6 +190,8 @@ class WeightCacheDaemon:
         self.state_entries: Dict[str, Dict[str, Any]] = {}
         self.preloaded_weights_bytes = 0
         self.transport_backend = None
+        # Load-time state outside state_dict (see weight_cache.extra_state).
+        self.extra_state: Optional[Dict[str, Any]] = None
 
     def _init_distributed(self, server_args, model_config):
         """Initialize the distributed backend required for model loading.
@@ -338,20 +342,23 @@ class WeightCacheDaemon:
             pp_size=self.pp_size,
             pp_rank=self.pp_rank,
             dp_size=get_parallel().dp_size,
-            ep_size=self.ep_size,
-            moe_dp_size=self.moe_dp_size,
+            # Resolved widths, as the engine states them: the raw CLI values
+            # do not reflect topologies that derive EP from CP (megamoe).
+            ep_size=get_parallel().moe_ep_size,
+            moe_dp_size=get_parallel().moe_dp_size,
             moe_dp_rank=moe_dp_rank,
             moe_ep_rank=moe_ep_rank,
             attn_dp_size=get_parallel().attn_dp_size,
             enable_dp_lm_head=self.enable_dp_lm_head,
             attn_cp_size=self.attn_cp_size,
-            moe_dense_tp_size=self.moe_dense_tp_size,
+            moe_dense_tp_size=get_parallel().moe_dense_tp_size,
             moe_a2a_backend=self.moe_a2a_backend,
             quant_method=quant_method,
             quant_config_hash=hash_quant_config(quant_config),
             dtype=str(model_config.dtype),
             revision=self.revision or "",
             **compute_env_stamp(),
+            weight_layout_stamp=compute_weight_layout_stamp(),
         )
 
         current_platform.empty_cache()
@@ -447,13 +454,44 @@ class WeightCacheDaemon:
         # Also export non-persistent buffers (not in state_dict but needed
         # for inference, e.g. rotary embedding cos_sin_cache)
         non_persistent_count = 0
-        for name, buf in self.model.named_buffers():
+        # remove_duplicate=False: a buffer object shared by several modules
+        # (e.g. one rotary table for all layers) is needed under every name.
+        for name, buf in self.model.named_buffers(remove_duplicate=False):
             if name not in state_dict_names:
                 state_tensors[name] = (buf.data, False)
                 non_persistent_count += 1
 
+        from .extra_state import export_extra_state, export_host_state
+
+        # Modules that keep weights in shareable host memory hand those out
+        # themselves; their tensors must not go through device IPC.
+        host_state, host_covered = export_host_state(self.model)
+        for name in host_covered:
+            state_tensors.pop(name, None)
+        on_cpu = [n for n, (t, _) in state_tensors.items() if t.device.type == "cpu"]
+        if on_cpu:
+            raise RuntimeError(
+                f"[WeightCacheDaemon] {len(on_cpu)} state tensor(s) live in host "
+                f"memory and no module exports them (export_ipc_host_state): "
+                f"{on_cpu[:10]}. Device IPC cannot share them."
+            )
+
         self.transport_backend = choose_daemon_transport_backend(state_tensors)
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
+
+        self.extra_state = export_extra_state(
+            self.model, self.transport_backend.export_extra_tensor
+        )
+        self.extra_state["host"] = host_state
+        self.extra_state["env"] = collect_layout_env()
+        logger.info(
+            f"[WeightCacheDaemon gpu={self.gpu_id}] Extra (non state_dict) state: "
+            f"{len(self.extra_state['tensors'])} tensors, "
+            f"{len(self.extra_state['scalars'])} scalars, "
+            f"{len(self.extra_state['opaque'])} opaque attributes, "
+            f"{len(host_state)} host-memory module(s)"
+        )
+        _maybe_dump_state_description(self.model, f"daemon_rank{self.tp_rank}")
 
         # Log approximate serialized metadata size (not payload-backed bytes).
         # Only the handle blob carries real weight, so measure it directly:
@@ -472,10 +510,14 @@ class WeightCacheDaemon:
         )
 
     def _initialize_eplb_expert_location_metadata(self, model_config) -> None:
-        """Build the same initial physical expert layout as the engine."""
-        if not get_exec().moe.enable_eplb:
-            return
+        """Build the same initial physical expert layout as the engine.
 
+        Not gated on --enable-eplb: like ModelRunner, a static
+        --init-expert-location (with redundant experts) decides which expert
+        each physical slot loads even when rebalancing is off. Skipping it
+        here loads a trivial placement the engine then routes against with
+        the configured one.
+        """
         from sglang.srt.eplb.expert_location import (
             compute_initial_expert_location_metadata,
             set_global_expert_location_metadata,
@@ -484,7 +526,12 @@ class WeightCacheDaemon:
         set_global_expert_location_metadata(
             compute_initial_expert_location_metadata(
                 model_config=model_config,
-                moe_ep_rank=get_parallel().moe_ep_rank,
+                moe_ep_rank=get_parallel().moe_ep_rank
+                + (
+                    get_parallel().ep_join_rank_offset
+                    if get_exec().moe.is_ep_scale_joiner
+                    else 0
+                ),
             )
         )
 
@@ -596,6 +643,7 @@ class WeightCacheDaemon:
                 # param.data (and any CUDA-graph-captured addresses) dangle.
                 pid=os.getpid(),
                 preloaded_weights_bytes=self.preloaded_weights_bytes,
+                extra_state=self.extra_state,
             )
 
         elif req.get("type") == "ping":
@@ -620,6 +668,23 @@ class WeightCacheDaemon:
         self.state_entries.clear()
         current_platform.empty_cache()
         self._running = False
+
+
+def _maybe_dump_state_description(model, tag: str) -> None:
+    """Debug aid: write the extra-state fingerprint when a dump dir is set."""
+    from sglang.srt.environ import envs
+
+    dump_dir = envs.SGLANG_WEIGHT_CACHE_DEBUG_DIR.get()
+    if not dump_dir:
+        return
+    import json
+
+    from .extra_state import describe_state
+
+    os.makedirs(dump_dir, exist_ok=True)
+    checksums = envs.SGLANG_WEIGHT_CACHE_DEBUG_CHECKSUM.get()
+    with open(os.path.join(dump_dir, f"{tag}.json"), "w") as f:
+        json.dump(describe_state(model, checksums), f, indent=0, sort_keys=True)
 
 
 def run_weight_cache_daemon(

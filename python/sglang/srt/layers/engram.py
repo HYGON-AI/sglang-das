@@ -795,6 +795,38 @@ class _HostTable:
     pins remain alive because the table is read by every forward.
     """
 
+    # Host memory, not tensor state: see weight_cache.extra_state.
+    _weight_cache_skip = True
+
+    def export_ipc(self) -> dict:
+        """Describe the loaded table so a weight-cache engine can attach it."""
+        if self._shared_manager is None:
+            raise RuntimeError(
+                f"engram host table: layout={self.layout!r} cannot be handed to a "
+                f"weight-cache engine; only the HCU shared (HSA IPC) layout can. "
+                f"Use --weight-cache-mode off, or the shared layout with "
+                f"HSA_USERPTR_FOR_PAGED_MEM=0."
+            )
+        return self._shared_manager.export_ipc()
+
+    @classmethod
+    def attach_ipc(cls, desc: dict) -> "_HostTable":
+        """Map a table another process group loaded (weight-cache daemon)."""
+        from sglang.srt.utils.host_shared_memory import HcuAttachedAllocation
+
+        table = cls.__new__(cls)
+        table.layout = "shared"
+        table.nbytes = desc["nbytes"]
+        table.group = None
+        table.dirty = False
+        table._shared_manager = None
+        table._attachment = HcuAttachedAllocation(
+            desc["handle"], desc["span"], desc["nbytes"]
+        )
+        table.bytes = table._attachment.bytes
+        table.device_ptr = table._attachment.device_ptr
+        return table
+
     def __init__(self, layout: str, nbytes: int, name: str, group):
         if layout not in ("shared", "per_rank"):
             layout_env = (
@@ -969,13 +1001,15 @@ class EngramEmbedding(nn.Module):
         row_end = num_embeddings * (tp_rank + 1) // self.tp_size
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
+        # Set while a weight-cache engine waits to attach the daemon's table.
+        self._pending_host_table: Optional[tuple[int, int, int]] = None
         host_table_enabled = (
             envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get()
             or (is_hcu() and envs.SGLANG_HCU_ENABLE_DSV41_ENGRAM_HOST_TABLE.get())
         )
         if host_table_enabled:
             self._init_host_table(num_embeddings, dim, layer_id)
-        if self.host_table is None:
+        if self.host_table is None and self._pending_host_table is None:
             self.weight = nn.Parameter(
                 torch.empty(self.rows, dim, dtype=torch.float8_e4m3fn),
                 requires_grad=False,
@@ -1005,12 +1039,29 @@ class EngramEmbedding(nn.Module):
         n = num_embeddings if layout == "shared" else self.rows
         w_bytes = n * dim
         s_bytes = n * (dim // FP8_BLOCK_SIZE)
+        if torch.empty(0).device.type == "meta":
+            # Built by a weight-cache engine (meta-device construction): the
+            # daemon holds the loaded table and attach_ipc_host_state() maps it.
+            # Allocating here would pin and leave empty a second full copy.
+            self._pending_host_table = (n, w_bytes, s_bytes)
+            self.weight = nn.Parameter(
+                torch.empty(n, dim, dtype=torch.float8_e4m3fn), requires_grad=False
+            )
+            self.scale = nn.Parameter(
+                torch.empty(n, dim // FP8_BLOCK_SIZE, dtype=torch.float8_e8m0fnu),
+                requires_grad=False,
+            )
+            return
         self.host_table = _HostTable(
             layout,
             max(1, w_bytes + s_bytes),  # mmap requires storage even for an empty shard.
             f"sglang_engram_{layer_id}",
             get_parallel().tp_group,
         )
+        self._bind_host_table(n, w_bytes, s_bytes)
+
+    def _bind_host_table(self, n: int, w_bytes: int, s_bytes: int):
+        dim = self.dim
         raw = self.host_table.bytes[: w_bytes + s_bytes]
         weight = raw[:w_bytes].view(torch.float8_e4m3fn).view(n, dim)
         scale = raw[w_bytes:].view(torch.float8_e8m0fnu).view(n, dim // FP8_BLOCK_SIZE)
@@ -1018,6 +1069,39 @@ class EngramEmbedding(nn.Module):
         self.scale = nn.Parameter(scale, requires_grad=False)
         device_ptr = self.host_table.device_ptr
         self._host_table_ptrs = (device_ptr, device_ptr + w_bytes)
+
+    # Per-process handles and addresses: never copied from a weight-cache daemon.
+    _weight_cache_skip_attrs = ("host_table", "_host_table_ptrs", "_pending_host_table")
+
+    def export_ipc_host_state(self) -> Optional[dict]:
+        """Weight-cache daemon: hand out the host table instead of its tensors."""
+        if self.host_table is None:
+            return None  # Device-memory table: ordinary parameters.
+        return self.host_table.export_ipc()
+
+    def attach_ipc_host_state(self, desc: Optional[dict]) -> None:
+        """Weight-cache engine: map the table the daemon loaded."""
+        if self._pending_host_table is None:
+            if desc is not None:
+                raise RuntimeError(
+                    "engram: the weight cache daemon holds a host table but this "
+                    "engine was built without one; their launch environments differ"
+                )
+            return
+        if desc is None:
+            raise RuntimeError(
+                "engram: this engine expects a shared host table but the weight "
+                "cache daemon did not export one; their launch environments differ"
+            )
+        n, w_bytes, s_bytes = self._pending_host_table
+        if desc["nbytes"] != max(1, w_bytes + s_bytes):
+            raise RuntimeError(
+                f"engram host table size mismatch: daemon {desc['nbytes']} bytes, "
+                f"engine {max(1, w_bytes + s_bytes)} bytes"
+            )
+        self.host_table = _HostTable.attach_ipc(desc)
+        self._bind_host_table(n, w_bytes, s_bytes)
+        self._pending_host_table = None
 
     @property
     def _shared(self) -> bool:
