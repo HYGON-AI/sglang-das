@@ -39,7 +39,10 @@ from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.cuda_wrapper import (
     get_loaded_hip_runtime,
 )
-from sglang.srt.distributed.parallel_state import inplace_all_reduce
+from sglang.srt.distributed.parallel_state import (
+    in_the_same_node_as,
+    inplace_all_reduce,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
@@ -778,6 +781,57 @@ def _registered_device_ptr(host_ptr: int) -> int:
     return device_ptr.value
 
 
+
+class _HostTableGroup:
+    """CPU collectives for TP ranks sharing one host-memory allocation."""
+
+    def __init__(self, ranks):
+        self.ranks = ranks
+        self.world_size = len(ranks)
+        self.rank_in_group = ranks.index(torch.distributed.get_rank())
+        # Disjoint TP groups may initialize different layers independently.
+        # Only members participate; no world-wide group creation is required.
+        self.cpu_group = torch.distributed.new_group(
+            ranks=ranks, backend="gloo", use_local_synchronization=True
+        )
+
+    def barrier(self):
+        torch.distributed.barrier(group=self.cpu_group)
+
+    def all_gather_object(self, obj):
+        objects = [None] * self.world_size
+        torch.distributed.all_gather_object(objects, obj, group=self.cpu_group)
+        return objects
+
+    def broadcast_object(self, obj=None, src=0):
+        objects = [obj]
+        torch.distributed.broadcast_object_list(
+            objects, src=self.ranks[src], group=self.cpu_group
+        )
+        return objects[0]
+
+
+@functools.cache
+def _get_host_table_group(tp_group):
+    """Split a TP group by actual shared-memory access, once per TP group."""
+    if tp_group.world_size == 1:
+        return tp_group
+    remaining = set(range(tp_group.world_size))
+    local_ranks = None
+    while remaining:
+        source = min(remaining)
+        same_node = in_the_same_node_as(tp_group.cpu_group, source_rank=source)
+        members = [i for i, same in enumerate(same_node) if same]
+        if source not in members:
+            raise RuntimeError("Cannot determine the Engram host-memory group")
+        remaining.difference_update(members)
+        if tp_group.rank_in_group in members:
+            local_ranks = [tp_group.ranks[i] for i in members]
+    if len(local_ranks) == tp_group.world_size:
+        return tp_group
+    return _HostTableGroup(local_ranks)
+
+
 class _HostTable:
     """Host-memory backing for one engram table ('shared' or 'per_rank' layout).
 
@@ -796,6 +850,8 @@ class _HostTable:
                 f"Invalid {layout_env.name}={layout!r}; expected "
                 "'shared' or 'per_rank'"
             )
+        if layout == "shared":
+            group = _get_host_table_group(group)
         self.layout = layout
         self.nbytes = nbytes
         self.group = group
@@ -1049,10 +1105,18 @@ class EngramEmbedding(nn.Module):
         return self._host_table_ptrs
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        rows = slice(self.row_start, self.row_start + self.rows)
         if self._shared:
+            # Each host owns a complete table. Partition loading among its local
+            # ranks, not the cross-node TP ranks, or every host misses rows.
+            group = self.host_table.group
+            n = param.shape[0]
+            rows = slice(
+                n * group.rank_in_group // group.world_size,
+                n * (group.rank_in_group + 1) // group.world_size,
+            )
             param.data[rows].copy_(loaded_weight[rows])
         else:
+            rows = slice(self.row_start, self.row_start + self.rows)
             param.data.copy_(loaded_weight[rows])
         if self.host_table is not None:
             self.host_table.dirty = True

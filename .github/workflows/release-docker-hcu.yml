@@ -82,6 +82,8 @@ jobs:
 
   # Test the exact image only after the build and both pushes succeed.
   test-models:
+    # Model deployment testing is moving to inference-chef-das.
+    if: ${{ false }}
     needs: build
     uses: ./.github/workflows/cookbook-deployment-smoke.yml
     with:

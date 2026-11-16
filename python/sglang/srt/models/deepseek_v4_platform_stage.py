@@ -174,14 +174,16 @@ class NonCudaDecoderMixin:
                 next=self.local_boundary,
                 world_size=world_size,
                 precomputed=precomputed,
+                mode=forward_batch.forward_mode,
             )
 
         def run_ffn_hc(state: mhc.HcState) -> mhc.HcState:
             assert self.ffn_hc is not None
             residual = state.residual
-            mhc.fork_stats_stream(stats_stream)
-            x = mhc.combine(self.ffn_hc, state)
             precomputed = state.stats
+            if precomputed is None:
+                mhc.fork_stats_stream(stats_stream)
+            x = mhc.combine(self.ffn_hc, state)
             state.release()
             del state
             fuse_all_reduce_mhc = self._can_fuse_ffn_mhc and can_fuse_all_reduce(

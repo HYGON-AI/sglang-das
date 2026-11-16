@@ -1,0 +1,616 @@
+# Shadow run of pr-test-hcu.yml on the ARC K8s runner pools.
+#
+# Runs alongside pr-test-hcu.yml (which still uses the [ci, bw1100] host
+# runners) so the two can be compared file by file. Not a required check.
+# Pools: hygon-cpu for helper jobs, hygon-build for jobs that need the CI image
+# or /ci_public but no card, hygon-bw1100-1card for single-card tests. Jobs on
+# the K8s pools run directly in container.image; the job template injects
+# HCU_CI_IN_K8S=1 so scripts/ci/hcu skips docker.
+#
+# Wheel-mode runs build their own wheels first by calling
+# release-pr-hcu-k8s.yml (build-wheels); the test jobs need it, so they only
+# start after the build succeeds and only install that build's wheels.
+#
+# pull_request_target only picks up this file from the default branch.
+# Rollback: delete this file.
+name: PR Test (HCU, K8s)
+run-name: ${{ inputs.target_stage_select && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage_select, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage_select)) || '' }}
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled
+      - ready_for_review
+    branches:
+      - v0.5.15.post1_dev
+      - main
+      - "release/**"
+      - feat/20260920_deepseek-v4.1
+    paths:
+      - ".github/workflows/pr-test-hcu.yml"
+      - ".github/workflows/pr-test-hcu-k8s.yml"
+      - ".github/workflows/pr-gate.yml"
+      - ".github/workflows/release-pr-hcu.yml"
+      - ".github/workflows/release-pr-hcu-k8s.yml"
+      - ".github/workflows/hcu-full-enabled.yml"
+      - ".github/workflows/release-pypi-nightly-hcu.yml"
+      - "scripts/ci/hcu/**"
+      - "python/**"
+      - "rust/**"
+      - "test/run_suite.py"
+      - "test/registered/**"
+      - "python/sglang/kernels/aot/**"
+      - "sgl-model-gateway/**"
+      - "requirements_hcu.txt"
+  workflow_dispatch:
+    inputs:
+      target_stage_select:
+        description: "Select a HCU stage to run"
+        required: false
+        type: choice
+        default: all
+        options:
+          - all
+          - stage-a-test-1-hcu-small
+          - stage-b-test-1-hcu-small
+      ref:
+        description: "Git ref, branch, tag, or SHA to test"
+        required: false
+        type: string
+        default: ""
+      pr_head_sha:
+        description: "PR head SHA for reruns"
+        required: false
+        type: string
+        default: ""
+      image:
+        description: "HCU CI container image override"
+        required: false
+        type: string
+        default: ""
+      continue_on_error:
+        description: "Continue running remaining files after a test failure"
+        required: false
+        type: boolean
+        default: false
+      force_wheel_mode:
+        description: "Force waiting for and installing HCU wheels"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  actions: read
+  contents: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  group: pr-test-hcu-k8s-${{ github.event_name }}-${{ github.event.pull_request.number || github.head_ref || github.ref_name || 'default' }}-${{ inputs.pr_head_sha || inputs.ref || 'current' }}-${{ inputs.target_stage_select || 'all' }}
+  cancel-in-progress: true
+
+# Steps in a job container default to sh, not bash.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check-changes:
+    name: Check changes
+    runs-on: hygon-cpu
+    timeout-minutes: 10
+    outputs:
+      hcu: ${{ steps.filter.outputs.hcu }}
+      auto_run_ci: ${{ steps.filter.outputs.auto_run_ci }}
+      run_stage_a: ${{ steps.plan.outputs.run_stage_a }}
+      run_stage_b: ${{ steps.plan.outputs.run_stage_b }}
+      wheel_required: ${{ steps.wheel.outputs.wheel_required }}
+      gateway_wheel_required: ${{ steps.wheel.outputs.gateway_wheel_required }}
+      image: ${{ steps.image.outputs.image }}
+      continue_on_error_flag: ${{ steps.image.outputs.continue_on_error_flag }}
+    steps:
+      # hygon-cpu runs in the runner Pod, which has no gh CLI. The list goes to
+      # a file because a large PR's list can exceed the 128 KiB limit on a
+      # single environment variable.
+      - name: List PR changed files
+        id: files
+        if: github.event_name == 'pull_request_target'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              per_page: 100,
+            });
+            const fs = require("fs");
+            fs.writeFileSync(
+              `${process.env.RUNNER_TEMP}/pr-changed-files.txt`,
+              files.map(f => f.filename).join("\n") + "\n",
+            );
+
+      - name: Detect HCU-relevant changes
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${EVENT_NAME}" != "pull_request_target" ]]; then
+            echo "hcu=true" >> "${GITHUB_OUTPUT}"
+            echo "auto_run_ci=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          changed_files="$(cat "${RUNNER_TEMP}/pr-changed-files.txt")"
+          echo "${changed_files}"
+
+          hcu_path_pattern='^(\.github/workflows/(pr-test-hcu|pr-test-hcu-k8s|pr-gate|release-pr-hcu|release-pr-hcu-k8s|hcu-full-enabled|release-pypi-nightly-hcu)\.yml|scripts/ci/hcu/|python/|rust/|test/run_suite\.py|test/registered/|python/sglang/kernels/aot/|sgl-model-gateway/|requirements_hcu\.txt$)'
+
+          if echo "${changed_files}" | grep -Eq "${hcu_path_pattern}"; then
+            echo "hcu=true" >> "${GITHUB_OUTPUT}"
+            echo "auto_run_ci=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "hcu=false" >> "${GITHUB_OUTPUT}"
+            echo "auto_run_ci=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Select HCU stages
+        id: plan
+        env:
+          TARGET_STAGE: ${{ inputs.target_stage_select || 'all' }}
+        run: |
+          run_stage_a=false
+          run_stage_b=false
+          if [[ "${TARGET_STAGE}" == "all" || "${TARGET_STAGE}" == "stage-a-test-1-hcu-small" ]]; then
+            run_stage_a=true
+          fi
+          if [[ "${TARGET_STAGE}" == "all" || "${TARGET_STAGE}" == "stage-b-test-1-hcu-small" ]]; then
+            run_stage_b=true
+          fi
+          echo "run_stage_a=${run_stage_a}" >> "${GITHUB_OUTPUT}"
+          echo "run_stage_b=${run_stage_b}" >> "${GITHUB_OUTPUT}"
+
+      - name: Classify HCU wheel sync mode
+        id: wheel
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FORCE_WHEEL_MODE: ${{ inputs.force_wheel_mode || false }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${FORCE_WHEEL_MODE}" == "true" ]]; then
+            echo "wheel_required=true" >> "${GITHUB_OUTPUT}"
+            echo "gateway_wheel_required=false" >> "${GITHUB_OUTPUT}"
+            echo "Wheel mode forced by workflow input."
+            exit 0
+          fi
+
+          if [[ "${EVENT_NAME}" != "pull_request_target" ]]; then
+            echo "wheel_required=false" >> "${GITHUB_OUTPUT}"
+            echo "gateway_wheel_required=false" >> "${GITHUB_OUTPUT}"
+            echo "Wheel mode disabled for non-PR run without force_wheel_mode."
+            exit 0
+          fi
+
+          changed_files="$(cat "${RUNNER_TEMP}/pr-changed-files.txt")"
+          wheel_required=false
+          gateway_wheel_required=false
+
+          if echo "${changed_files}" | grep -Eq '^(\.github/workflows/release-pr-hcu(-k8s)?\.yml$|python/sglang/kernels/aot/|requirements_hcu\.txt$|python/|rust/)'; then
+            wheel_required=true
+          fi
+
+          if echo "${changed_files}" | grep -Eq '^sgl-model-gateway/'; then
+            wheel_required=true
+            gateway_wheel_required=true
+          fi
+
+          echo "wheel_required=${wheel_required}" >> "${GITHUB_OUTPUT}"
+          echo "gateway_wheel_required=${gateway_wheel_required}" >> "${GITHUB_OUTPUT}"
+          echo "wheel_required=${wheel_required}, gateway_wheel_required=${gateway_wheel_required}"
+
+      # Every later job uses this as container.image, so pin the tag to a
+      # digest once here; a tag overwritten mid-run would otherwise mix images.
+      - name: Resolve immutable HCU image
+        id: image
+        env:
+          INPUT_IMAGE: ${{ inputs.image || '' }}
+          VAR_IMAGE: ${{ vars.HCU_CI_IMAGE_0518 || '' }}
+          DEFAULT_IMAGE: 10.16.1.152:5000/jenkins/model_test_env/sglang:0.5.18-latest
+          EVENT_NAME: ${{ github.event_name }}
+          CONTINUE_ON_ERROR: ${{ inputs.continue_on_error || false }}
+        run: |
+          set -euo pipefail
+          image="${INPUT_IMAGE:-${VAR_IMAGE:-${DEFAULT_IMAGE}}}"
+
+          if [[ "${image}" != *@sha256:* ]]; then
+            registry="${image%%/*}"
+            path="${image#*/}"
+            if [[ "${path##*/}" == *:* ]]; then
+              repo="${path%:*}"
+              tag="${path##*:}"
+            else
+              repo="${path}"
+              tag=latest
+            fi
+            digest=""
+            for scheme in http https; do
+              digest="$(curl -fsSkI --max-time 30 \
+                -H 'Accept: application/vnd.oci.image.index.v1+json' \
+                -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+                -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+                -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+                "${scheme}://${registry}/v2/${repo}/manifests/${tag}" \
+                | tr -d '\r' | awk -F': ' 'tolower($1) == "docker-content-digest" {print $2}')" || true
+              if [[ -n "${digest}" ]]; then
+                break
+              fi
+            done
+            if [[ -n "${digest}" ]]; then
+              image="${registry}/${repo}@${digest}"
+            else
+              echo "::warning::Could not resolve a digest for ${image}; using the tag as is."
+            fi
+          fi
+
+          continue_on_error_flag=""
+          if [[ "${CONTINUE_ON_ERROR}" == "true" || "${EVENT_NAME}" == "pull_request_target" ]]; then
+            continue_on_error_flag="--continue-on-error"
+          fi
+
+          echo "Using HCU image: ${image}"
+          echo "image=${image}" >> "${GITHUB_OUTPUT}"
+          echo "continue_on_error_flag=${continue_on_error_flag}" >> "${GITHUB_OUTPUT}"
+
+  call-gate:
+    name: Call PR gate
+    needs: check-changes
+    if: github.event_name == 'pull_request_target' && needs.check-changes.outputs.hcu == 'true'
+    runs-on: hygon-cpu
+    timeout-minutes: 10
+    steps:
+      - name: Fetch latest PR info
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            core.setOutput("labels", JSON.stringify(pr.data.labels.map(l => l.name)));
+            core.setOutput("draft", pr.data.draft);
+            core.setOutput("user", pr.data.user.login);
+
+      - name: Log PR info
+        run: |
+          echo "===== HCU PR Gate Info ====="
+          echo "PR Event: ${{ github.event_name }}"
+          echo "PR Labels: ${{ steps.pr.outputs.labels }}"
+          echo "PR Draft: ${{ steps.pr.outputs.draft }}"
+          echo "PR User: ${{ steps.pr.outputs.user }}"
+          echo "Require run-ci: true"
+          echo "Auto run HCU CI: ${{ needs.check-changes.outputs.auto_run_ci }}"
+          echo "============================"
+
+      - name: Block draft PR
+        if: fromJson(steps.pr.outputs.draft)
+        run: |
+          echo "PR is draft. Blocking HCU CI."
+          exit 1
+
+      - name: Require run-ci label or HCU auto-run
+        env:
+          AUTO_RUN_CI: ${{ needs.check-changes.outputs.auto_run_ci || 'false' }}
+          HAS_RUN_CI_LABEL: ${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}
+        run: |
+          if [[ "${HAS_RUN_CI_LABEL}" == "true" ]]; then
+            echo "Found run-ci label. Proceeding with HCU CI."
+            exit 0
+          fi
+
+          if [[ "${AUTO_RUN_CI}" == "true" ]]; then
+            echo "Auto-run HCU CI because HCU-impact paths changed."
+            exit 0
+          fi
+
+          echo "Missing required label 'run-ci'. See https://docs.sglang.io/developer_guide/contribution_guide.html#how-to-trigger-ci-tests for more details."
+          exit 1
+
+  validate-config:
+    name: Validate HCU config
+    needs:
+      - check-changes
+      - call-gate
+    if: always() && needs.check-changes.outputs.hcu == 'true' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+    runs-on: hygon-build
+    timeout-minutes: 30
+    container:
+      image: ${{ needs.check-changes.outputs.image }}
+    steps:
+      - name: Checkout code
+        env:
+          CHECKOUT_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CHECKOUT_DIR="${RUNNER_TEMP}/hcu-sglang-${GITHUB_RUN_ID}-validate"
+          rm -rf "${CHECKOUT_DIR}"
+          mkdir -p "${CHECKOUT_DIR}"
+          echo "HCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          git init "${CHECKOUT_DIR}"
+          cd "${CHECKOUT_DIR}"
+          git remote add origin "https://github.com/${CHECKOUT_REPOSITORY}.git"
+          auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
+          git \
+            -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${auth}" \
+            -c http.https://github.com.proxy= \
+            -c http.proxy= \
+            -c https.proxy= \
+            fetch --no-tags --depth=1 origin "${CHECKOUT_REF}"
+          git checkout --force FETCH_HEAD
+
+      - name: Verify HCU registration
+        run: |
+          cd "${HCU_CI_CHECKOUT_DIR}"
+          python3 scripts/ci/hcu/verify_hcu_registration.py
+
+  # Builds this commit's wheels inside this run, after the PR gate.
+  build-wheels:
+    name: Build HCU wheels
+    needs:
+      - check-changes
+      - call-gate
+      - validate-config
+    if: always() && needs.check-changes.outputs.hcu == 'true' && needs.check-changes.outputs.wheel_required == 'true' && needs.validate-config.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+    uses: ./.github/workflows/release-pr-hcu-k8s.yml
+    with:
+      # Empty on PR runs, where the called workflow uses the PR head SHA.
+      commit_sha: ${{ inputs.pr_head_sha || inputs.ref || '' }}
+      skip_gateway: ${{ needs.check-changes.outputs.gateway_wheel_required != 'true' }}
+
+  stage-a-test-1-hcu-small:
+    name: Stage A HCU smoke
+    needs:
+      - check-changes
+      - call-gate
+      - validate-config
+      - build-wheels
+    if: always() && needs.check-changes.outputs.hcu == 'true' && needs.check-changes.outputs.run_stage_a == 'true' && needs.validate-config.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') && (needs.build-wheels.result == 'success' || needs.build-wheels.result == 'skipped')
+    # The smoke test needs no card, but "Verify HCU external APIs" loads HCU
+    # ops (lightop, MoE op registration), which fail without a device.
+    runs-on: hygon-bw1100-1card
+    timeout-minutes: 60
+    container:
+      image: ${{ needs.check-changes.outputs.image }}
+    env:
+      HCU_CI_IMAGE: ${{ needs.check-changes.outputs.image }}
+      HCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.HCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
+      HCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.HCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
+      HCU_CI_SKIP_SGLANG_BUILD: ${{ vars.HCU_CI_SKIP_SGLANG_BUILD || '' }}
+      HCU_CI_INSTALL_WHEEL_URLS: ${{ needs.build-wheels.outputs.wheel_paths || '' }}
+      HCU_CI_USE_INSTALLED_WHEELS: ${{ needs.check-changes.outputs.wheel_required == 'true' && '1' || '' }}
+    steps:
+      - name: Checkout code
+        env:
+          CHECKOUT_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CHECKOUT_DIR="${RUNNER_TEMP}/hcu-sglang-${GITHUB_RUN_ID}-stage-a"
+          rm -rf "${CHECKOUT_DIR}"
+          mkdir -p "${CHECKOUT_DIR}"
+          echo "HCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          git init "${CHECKOUT_DIR}"
+          cd "${CHECKOUT_DIR}"
+          git remote add origin "https://github.com/${CHECKOUT_REPOSITORY}.git"
+          auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
+          git \
+            -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${auth}" \
+            -c http.https://github.com.proxy= \
+            -c http.proxy= \
+            -c https.proxy= \
+            fetch --no-tags --depth=1 origin "${CHECKOUT_REF}"
+          git checkout --force FETCH_HEAD
+
+      - name: Prepare HCU job container
+        run: |
+          GITHUB_WORKSPACE="${HCU_CI_CHECKOUT_DIR}" \
+            bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_start_container.sh" \
+              --image "${HCU_CI_IMAGE}"
+
+      - name: Install dependencies
+        run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_install_dependency.sh"
+
+      - name: Verify HCU external APIs
+        run: |
+          bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" -w /sglang-checkout -- python3 scripts/ci/hcu/check_hcu_external_api_compat.py
+
+      - name: Run stage-a-test-1-hcu-small
+        timeout-minutes: 30
+        run: |
+          bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" -w /sglang-checkout/test -- \
+            python3 run_suite.py \
+              --hw hcu \
+              --suite stage-a-test-1-hcu-small \
+              --include-file registered/hcu/interface/test_hcu_smoke.py \
+              --timeout-per-file 120 \
+              ${{ needs.check-changes.outputs.continue_on_error_flag }}
+
+  stage-b-test-1-hcu-small:
+    name: Stage B HCU required (${{ matrix.name }})
+    needs:
+      - check-changes
+      - call-gate
+      - validate-config
+      - stage-a-test-1-hcu-small
+      - build-wheels
+    if: always() && needs.check-changes.outputs.hcu == 'true' && needs.check-changes.outputs.run_stage_b == 'true' && needs.validate-config.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') && (needs.build-wheels.result == 'success' || needs.build-wheels.result == 'skipped')
+    runs-on: hygon-bw1100-1card
+    # Includes up to 30 minutes waiting for a card (pool prepare-job timeout).
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    container:
+      image: ${{ needs.check-changes.outputs.image }}
+    strategy:
+      fail-fast: false
+      # Each partition gets its own card, so they run in parallel.
+      matrix:
+        include:
+          - name: stage-b-required-0
+            part: 0
+            parts: 4
+            timeout_per_file: 600
+            timeout_minutes: 90
+          - name: stage-b-required-1
+            part: 1
+            parts: 4
+            timeout_per_file: 600
+            timeout_minutes: 90
+          - name: stage-b-required-2
+            part: 2
+            parts: 4
+            timeout_per_file: 600
+            timeout_minutes: 90
+          - name: stage-b-required-3
+            part: 3
+            parts: 4
+            timeout_per_file: 600
+            timeout_minutes: 90
+    env:
+      HCU_CI_IMAGE: ${{ needs.check-changes.outputs.image }}
+      HCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.HCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
+      HCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.HCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
+      HCU_CI_SKIP_SGLANG_BUILD: ${{ vars.HCU_CI_SKIP_SGLANG_BUILD || '' }}
+      HCU_CI_INSTALL_WHEEL_URLS: ${{ needs.build-wheels.outputs.wheel_paths || '' }}
+      HCU_CI_USE_INSTALLED_WHEELS: ${{ needs.check-changes.outputs.wheel_required == 'true' && '1' || '' }}
+      SGLANG_HCU_RERANKER_MODEL: /public/opendas/DL_DATA/llm-models/qwen3/Qwen3-Reranker-0.6B
+    steps:
+      - name: Checkout code
+        env:
+          CHECKOUT_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CHECKOUT_DIR="${RUNNER_TEMP}/hcu-sglang-${GITHUB_RUN_ID}-stage-b-${{ matrix.part }}"
+          rm -rf "${CHECKOUT_DIR}"
+          mkdir -p "${CHECKOUT_DIR}"
+          echo "HCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          git init "${CHECKOUT_DIR}"
+          cd "${CHECKOUT_DIR}"
+          git remote add origin "https://github.com/${CHECKOUT_REPOSITORY}.git"
+          auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
+          git \
+            -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${auth}" \
+            -c http.https://github.com.proxy= \
+            -c http.proxy= \
+            -c https.proxy= \
+            fetch --no-tags --depth=1 origin "${CHECKOUT_REF}"
+          git checkout --force FETCH_HEAD
+
+      - name: Prepare HCU job container
+        run: |
+          GITHUB_WORKSPACE="${HCU_CI_CHECKOUT_DIR}" \
+            bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_start_container.sh" \
+              --image "${HCU_CI_IMAGE}"
+
+      - name: Install dependencies
+        run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_install_dependency.sh"
+
+      - name: Verify HCU external APIs
+        run: |
+          bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" -w /sglang-checkout -- python3 scripts/ci/hcu/check_hcu_external_api_compat.py
+
+      - name: Run stage-b-test-1-hcu-small required partition
+        run: |
+          echo "Running stage-b-test-1-hcu-small required partition ${{ matrix.part }}/${{ matrix.parts }}"
+          # Same file list as pr-test-hcu.yml, minus
+          # registered/unit/managers/test_profile_merger_http_api.py, which no
+          # longer exists and makes run_suite.py exit before running anything.
+          bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" -w /sglang-checkout/test \
+            -e SGLANG_HCU_RERANKER_MODEL="${SGLANG_HCU_RERANKER_MODEL}" -- \
+            python3 run_suite.py \
+              --hw hcu \
+              --suite stage-b-test-1-hcu-small \
+              --include-file registered/hcu/interface/test_hcu_stage_b_flow_0.py \
+              --include-file registered/hcu/interface/test_hcu_stage_b_flow_1.py \
+              --include-file registered/unit/observability/test_metrics_utils.py \
+              --include-file registered/unit/parser/test_harmony_parser.py \
+              --include-file registered/unit/parser/test_jinja_template_utils.py \
+              --include-file registered/unit/parser/test_reasoning_parser.py \
+              --include-file registered/unit/entrypoints/openai/test_serving_embedding.py \
+              --include-file registered/attention/test_triton_attention_kernels.py \
+              --include-file registered/layers/mamba/test_mamba_ssm.py \
+              --include-file registered/layers/mamba/test_mamba_ssm_ssd.py \
+              --include-file registered/rl/test_fp32_lm_head.py \
+              --include-file registered/embedding/test_input_embeddings.py \
+              --include-file registered/embedding/test_openai_embedding.py \
+              --include-file registered/unit/multimodal/test_evs.py \
+              --include-file registered/openai_server/features/test_enable_thinking.py \
+              --include-file registered/openai_server/features/test_reasoning_content.py \
+              --include-file registered/attention/test_create_kvindices.py \
+              --include-file registered/layers/mamba/test_causal_conv1d.py \
+              --include-file registered/unit/managers/test_io_struct.py \
+              --include-file registered/unit/mem_cache/test_radix_cache_unit.py \
+              --include-file registered/ops/test_repeat_interleave.py \
+              --include-file registered/openai_server/basic/test_serving_completions.py \
+              --include-file registered/openai_server/validation/test_large_max_new_tokens.py \
+              --include-file registered/hcu/sampling/bw1100/test_original_logprobs_hcu.py \
+              --include-file registered/openai_server/validation/test_request_length_validation.py \
+              --include-file registered/sampling/test_pytorch_sampling_backend.py \
+              --include-file registered/sampling/test_penalty.py \
+              --include-file registered/hcu/core/bw1100/test_hidden_states_hcu.py \
+              --include-file registered/constrained_decoding/test_constrained_decoding.py \
+              --include-file registered/metrics/test_priority_metrics.py \
+              --include-file registered/hcu/srt/bw1100/test_qwen25_0p5b_server_hcu.py \
+              --include-file registered/hcu/openai_server/test_function_calling_hcu.py \
+              --include-file registered/hcu/openai_server/test_hidden_states_base_hcu.py \
+              --include-file registered/hcu/openai_server/test_protocol_hcu.py \
+              --include-file registered/hcu/openai_server/test_serving_chat_hcu.py \
+              --include-file registered/hcu/openai_server/test_tool_choice_hcu.py \
+              --include-file registered/hcu/reranker/bw1100/test_qwen3_reranker_hcu.py \
+              --include-file registered/hcu/lora/bw1100/test_qwen3_lora_server_hcu.py \
+              --include-file registered/hcu/rotary/test_mrope_smoke_hcu.py \
+              --include-file registered/hcu/spec/test_build_eagle_tree_hcu.py \
+              --include-file registered/hcu/unit/function_call/test_json_schema_constraint_hcu.py \
+              --include-file registered/hcu/unit/test_profile_merger_hcu.py \
+              --include-file registered/hcu/infra/test_hcu_server_guard_failures_hcu.py \
+              --include-file registered/hcu/vlm_models/bw1100/test_qwen25_vl_3b_server_hcu.py \
+              --auto-partition-id ${{ matrix.part }} \
+              --auto-partition-size ${{ matrix.parts }} \
+              --timeout-per-file ${{ matrix.timeout_per_file }} \
+              ${{ needs.check-changes.outputs.continue_on_error_flag }}
+
+  pr-test-hcu-k8s-finish:
+    name: PR Test (HCU, K8s) finish
+    needs:
+      - check-changes
+      - call-gate
+      - validate-config
+      - build-wheels
+      - stage-a-test-1-hcu-small
+      - stage-b-test-1-hcu-small
+    if: always()
+    runs-on: hygon-cpu
+    timeout-minutes: 10
+    steps:
+      - name: Check all dependent job statuses
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+          ANY_FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          echo "${NEEDS_JSON}"
+          if [[ "${ANY_FAILED}" == "true" ]]; then
+            echo "The above jobs failed."
+            exit 1
+          fi
