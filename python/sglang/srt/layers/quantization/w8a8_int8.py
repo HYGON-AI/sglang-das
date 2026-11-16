@@ -587,7 +587,9 @@ def enabled(layer, quant_config, prefix):
 def _projection_backend():
     mode = os.environ.get("SGLANG_DSV41_INT8_PROJECTION_BACKEND", "blaslt")
     if mode != "blaslt":
-        raise ValueError("INT8 projection backend must be blaslt; legacy GEMM backends are not supported")
+        raise ValueError(
+            "INT8 projection backend must be blaslt; legacy GEMM backends are not supported"
+        )
     return mode
 
 
@@ -661,7 +663,7 @@ def transform_quant_available(groups, rank, width):
     if grouped_input_pitch(1, groups, rank, width) is None:
         return False
     try:
-        from lightop.quant.transforms_int8 import is_transform_quant_available
+        from lightop.quant.transforms import is_transform_quant_available
     except (ImportError, OSError, RuntimeError):
         return False
     return is_transform_quant_available()
@@ -706,10 +708,17 @@ def rope_grouped_input(x, frequencies, positions, groups, rank, rope_dim):
         or rope_dim % 2
     ):
         return None
-    from lightop.quant import rope_per_token_quant_int8
+    from lightop.quant import rope_per_token_quant
 
-    return rope_per_token_quant_int8(
-        x, frequencies, positions, groups, rope_dim, inverse=True, output_pitch=pitch
+    return rope_per_token_quant(
+        x,
+        frequencies,
+        positions,
+        groups,
+        rope_dim,
+        inverse=True,
+        dtype=torch.int8,
+        output_pitch=pitch,
     )
 
 
@@ -745,6 +754,7 @@ class ChannelwiseInt8Method(QuantizeMethodBase):
 
         _projection_backend()
         from sglang.kernels.ops.gemm import dsv41_int8 as dsv41_int8_blaslt
+
         dsv41_int8_blaslt.prepare_weight(layer.weight)
 
     def apply(self, layer, x, bias=None):

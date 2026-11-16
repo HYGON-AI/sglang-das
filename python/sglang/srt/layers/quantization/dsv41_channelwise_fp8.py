@@ -175,10 +175,11 @@ def transform_quant_available():
     if torch.version.hip is None:
         return False
     try:
-        from lightop.quant.transforms_fp8 import is_transform_fp8_quant_available
+        from lightop.quant.fp8 import PER_TOKEN_QUANT_FP8_VERSION
+        from lightop.quant.transforms import is_transform_quant_available
     except (ImportError, OSError, RuntimeError):
         return False
-    return is_transform_fp8_quant_available()
+    return is_transform_quant_available() and PER_TOKEN_QUANT_FP8_VERSION >= 2
 
 
 def rope_grouped_input(x, frequencies, positions, groups, rope_dim):
@@ -211,10 +212,17 @@ def rope_grouped_input(x, frequencies, positions, groups, rope_dim):
         or frequencies.device != x.device
     ):
         return None
-    from lightop.quant import rope_per_token_quant_fp8
+    from lightop.quant import rope_per_token_quant
 
-    return rope_per_token_quant_fp8(
-        x, frequencies, positions, groups, rope_dim, inverse=True, group_major=True
+    return rope_per_token_quant(
+        x,
+        frequencies,
+        positions,
+        groups,
+        rope_dim,
+        inverse=True,
+        dtype=torch.float8_e4m3fn,
+        group_major=True,
     )
 
 
@@ -235,9 +243,9 @@ def grouped(x, layer, groups, rank, *, quantized=None, quantize_output=False):
     else:
         y = linear(x.transpose(0, 1).contiguous(), weight, scale)
     if quantize_output and x.shape[0] > 0:
-        from lightop.quant import per_token_quant_fp8_strided
+        from lightop.quant import per_token_quant_fp8
 
-        q, scales = per_token_quant_fp8_strided(y.transpose(0, 1))
+        q, scales = per_token_quant_fp8(y.transpose(0, 1), quant_ndim=2)
         return q, scales, x.dtype
     return _swap01_contiguous(y)
 

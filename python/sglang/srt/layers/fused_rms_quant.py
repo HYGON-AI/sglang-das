@@ -183,7 +183,9 @@ def linear_takes_fp8_operand(linear) -> bool:
     """Whether linear consumes LightOp's per-token ``(fp8, scale, orig_dtype)`` input
     as is (the HCU channelwise W8A8-FP8 scheme)."""
     return linear is not None and bool(
-        getattr(getattr(linear, "scheme", None), "supports_fp8_prequantized_input", False)
+        getattr(
+            getattr(linear, "scheme", None), "supports_fp8_prequantized_input", False
+        )
     )
 
 
@@ -341,17 +343,24 @@ def rms_norm_strided_int8_operand(x: torch.Tensor, norm) -> Optional[Int8PerToke
     ):
         return None
     try:
-        from lightop.norm.strided_int8 import (
-            is_strided_rms_quant_available,
-            rms_norm_strided_per_token_quant,
-        )
+        from lightop.norm import rms_norm_dynamic_per_token_quant_sglang
+        from lightop.rmsnorm import SGLANG_NATIVE_RMS_QUANT_VERSION
     except (ImportError, OSError, RuntimeError):
         return None
-    if not is_strided_rms_quant_available():
+    if (
+        SGLANG_NATIVE_RMS_QUANT_VERSION < 2
+        or not is_lightop_sglang_rms_quant_available()
+    ):
         return None
-    return Int8PerTokenInput(
-        *rms_norm_strided_per_token_quant(x, norm.weight, norm.variance_epsilon)
+    normalized = torch.empty(x.shape, device=x.device, dtype=x.dtype)
+    q, scale = rms_norm_dynamic_per_token_quant_sglang(
+        x,
+        norm.weight,
+        norm.variance_epsilon,
+        update_input=False,
+        norm_output=normalized,
     )
+    return Int8PerTokenInput(normalized, q, scale)
 
 
 def rms_norm_strided_fp8_operand(x: torch.Tensor, norm):
@@ -377,15 +386,18 @@ def rms_norm_strided_fp8_operand(x: torch.Tensor, norm):
     ):
         return None
     try:
-        from lightop.norm.strided_fp8 import (
-            is_strided_rms_fp8_quant_available,
-            rms_norm_strided_per_token_fp8_quant,
-        )
+        from lightop.norm import rms_norm_per_token_fp8_quant
+        from lightop.rmsnorm import RMS_NORM_FP8_QUANT_VERSION
     except (ImportError, OSError, RuntimeError):
         return None
-    if not is_strided_rms_fp8_quant_available():
+    if RMS_NORM_FP8_QUANT_VERSION < 2:
         return None
-    normalized, q, scale = rms_norm_strided_per_token_fp8_quant(
-        x, norm.weight, norm.variance_epsilon
+    normalized = torch.empty(x.shape, device=x.device, dtype=x.dtype)
+    q, scale = rms_norm_per_token_fp8_quant(
+        x,
+        norm.weight,
+        epsilon=norm.variance_epsilon,
+        update_input=False,
+        norm_output=normalized,
     )
     return normalized, (q, scale, x.dtype)
