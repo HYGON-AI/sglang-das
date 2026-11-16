@@ -88,8 +88,19 @@ class UnifiedCacheLinker(ABC):
         """Whether waiting-queue host prefetch is enabled on every rank."""
         return False
 
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        """Return a rank-local DFS policy candidate, if the backend has one."""
+        return None
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        """Apply a cross-rank DFS policy, if the backend supports it."""
+
     def disable_waiting_queue_prefetch(self) -> None:
         """Turn waiting-queue host prefetch off before any job is submitted."""
+
+    def prepare_load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        """Prepare a normal load while it can still degrade to a cache miss."""
+        return False
 
     def submit_host_prefetch(
         self, rid: str, transfers: list[PoolTransfer]
@@ -122,6 +133,13 @@ class UnifiedCacheLinker(ABC):
     @abstractmethod
     def start_layer_wise_loading(self) -> int:
         """Start queued loads and return the layer-counter consumer index."""
+
+    @abstractmethod
+    def wait_for_pending_loads(self) -> None:
+        """Wait for loads already issued to the backend worker to finish.
+
+        Loads still waiting for ``start_layer_wise_loading`` are not included.
+        """
 
     @abstractmethod
     def cancel_queued_load(self, rid: str) -> bool:
@@ -202,17 +220,22 @@ class UnifiedCacheLinkerWrapper:
     ):
         self.cache = cache
         self.cache_linker = cache_linker
+        self._waiting_queue_prefetch_enabled = (
+            cache_linker.waiting_queue_prefetch_enabled()
+        )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
         # Waiting-queue prefetches retain the original hit until admission can
         # rematch it. The backend owns the private session and readiness state.
-        self.host_prefetch_hits: dict[str, ExternalCacheHitMarker] = {}
+        self.host_prefetch_hits: dict[str, ExternalCacheHitMarker] | None = (
+            {} if self._waiting_queue_prefetch_enabled else None
+        )
         # Submission work is prepared and committed only by the scheduler
         # thread. The background worker receives a snapshot and never touches
         # this dict or the cache tree.
-        self.pending_host_prefetch_submissions: dict[
-            str, tuple[PreparedHostPrefetch, ExternalCacheHitMarker]
-        ] = {}
+        self.pending_host_prefetch_submissions: (
+            dict[str, tuple[PreparedHostPrefetch, ExternalCacheHitMarker]] | None
+        ) = {} if self._waiting_queue_prefetch_enabled else None
         # Loads in flight, each pinning its inserted endpoint until DMA
         # completes. The anchor is the request's node before the load, so a
         # failed load can walk back exactly the chain it published. Under PP
@@ -241,7 +264,27 @@ class UnifiedCacheLinkerWrapper:
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
 
+    def waiting_queue_prefetch_enabled(self) -> bool:
+        return self._waiting_queue_prefetch_enabled
+
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        linker = getattr(self, "cache_linker", None)
+        getter = getattr(linker, "get_local_dfs_health_policy", None)
+        return getter() if callable(getter) else None
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        linker = getattr(self, "cache_linker", None)
+        apply_policy = getattr(linker, "apply_dfs_health_policy", None)
+        if callable(apply_policy):
+            apply_policy(allow_read, allow_write)
+
+    def disable_waiting_queue_prefetch(self) -> None:
+        self._waiting_queue_prefetch_enabled = False
+        self.cache_linker.disable_waiting_queue_prefetch()
+
     def get_host_prefetch_admission_state(self, rid: str) -> str:
+        if not self._waiting_queue_prefetch_enabled:
+            return "not_tracked"
         if rid in self.pending_host_prefetch_submissions:
             return "pending"
         tracked = rid in self.host_prefetch_hits
@@ -258,11 +301,14 @@ class UnifiedCacheLinkerWrapper:
 
     def cancel_waiting_queue_prefetch(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
-        self.host_prefetch_hits.pop(rid, None)
+        if not self._waiting_queue_prefetch_enabled:
+            return
+        tracked = self.host_prefetch_hits.pop(rid, None) is not None
         pending = self.pending_host_prefetch_submissions.pop(rid, None)
         if pending is not None:
             pending[0].cancelled.set()
-        self.cache_linker.cancel_host_prefetch(rid)
+        if tracked or pending is not None:
+            self.cache_linker.cancel_host_prefetch(rid)
 
     def prepare_host_prefetch(self, req: Req) -> PreparedHostPrefetch:
         """Build a request-local snapshot without issuing any collectives."""
@@ -325,6 +371,8 @@ class UnifiedCacheLinkerWrapper:
         return False
 
     def prefetch_to_host(self, req: Req) -> bool:
+        if not self._waiting_queue_prefetch_enabled:
+            return False
         hit = self.hit_markers.get(req.rid)
         transfers = []
         locally_eligible = hit is not None
@@ -372,18 +420,26 @@ class UnifiedCacheLinkerWrapper:
         page = cache.page_size
         device_hit_len = int(result.device_indices.numel())
         self.hit_markers.pop(req.rid, None)
-        prefetched_hit = self.host_prefetch_hits.get(req.rid)
+        prefetched_hit = (
+            self.host_prefetch_hits.get(req.rid)
+            if self._waiting_queue_prefetch_enabled
+            else None
+        )
 
         known_hit_len = req.external_cache_hit_length if cache.pp_size > 1 else None
         if known_hit_len is not None:
-            # PP0's absolute boundary also survives later local L1 rematches.
+            # The absolute boundary also survives later local L1 rematches.
             key = key[:known_hit_len]
         elif cache.pp_size > 1:
-            if cache.pp_rank != 0:
-                req.external_cache_hit_length = 0
-                return result
-            # The local device hit is part of PP0's canonical restorable
-            # boundary even when the external tail lookup misses.
+            # Every PP stage must derive the same absolute boundary before it
+            # builds its extend batch.  In particular, a downstream stage
+            # cannot stop at its local L1 hit while PP0 extends that hit from
+            # L3: the hidden states sent by PP0 would then have a different
+            # token count from the downstream batch.  Direct-linker lookups
+            # are metadata-only, and PP-aware backends (for example Mooncake)
+            # validate every PP shard, so probing from each stage's local L1
+            # frontier produces the common restorable boundary without an
+            # additional scheduler-side PP control message.
             req.external_cache_hit_length = device_hit_len
 
         if device_hit_len >= len(key):
@@ -531,9 +587,9 @@ class UnifiedCacheLinkerWrapper:
     # ---- init_load_back: remote -> device, then insert ----
 
     def _build_load_transfers(
-        self, req: Req, tail_hashes
+        self, req: Req, tail_hashes, *, prepare_session: bool = False
     ) -> tuple[list[tuple[TreeComponent, PoolTransfer]], bool, BaseException | None]:
-        """Build every component's LOAD transfer on this rank only.
+        """Build LOAD transfers and optionally prepare their session locally.
 
         Building allocates device slots and can fail on one rank alone, so the
         caller must agree on the returned flag with the other ranks before any
@@ -556,6 +612,23 @@ class UnifiedCacheLinkerWrapper:
                 component_transfers.append((component, transfer))
         except BaseException as error:
             return component_transfers, False, error
+        if prepare_session:
+            try:
+                prepared = self.cache_linker.prepare_load(
+                    req.rid, [transfer for _, transfer in component_transfers]
+                )
+            except BaseException:
+                logger.warning(
+                    "External cache session preparation failed", exc_info=True
+                )
+                prepared = False
+            if not prepared:
+                logger.warning(
+                    "External cache session preparation failed for rid=%s, "
+                    "degrading request to cache miss",
+                    req.rid,
+                )
+                return component_transfers, False, None
         return component_transfers, True, None
 
     def _abort_disagreed_load(
@@ -566,6 +639,7 @@ class UnifiedCacheLinkerWrapper:
         *,
         cancel_prefetch: bool,
         pending: BaseException | None,
+        release_session: bool = False,
     ) -> None:
         """Clean up after the ranks agreed a load cannot proceed.
 
@@ -595,6 +669,16 @@ class UnifiedCacheLinkerWrapper:
                         req.rid,
                         exc_info=error,
                     )
+        if release_session:
+            try:
+                self.cache_linker.abort_prepared_load(req.rid)
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+                else:
+                    logger.error(
+                        "Releasing the failed load session also failed", exc_info=error
+                    )
         if pending is not None:
             if cleanup_error is not None:
                 logger.error(
@@ -613,8 +697,12 @@ class UnifiedCacheLinkerWrapper:
         if hit is None:
             return empty_indices, req.last_node
 
-        prepared_from_host_prefetch = False
-        prefetched = self.host_prefetch_hits.pop(req.rid, None) is not None
+        prepared_for_load = False
+        prefetched = (
+            self.host_prefetch_hits.pop(req.rid, None) is not None
+            if self._waiting_queue_prefetch_enabled
+            else False
+        )
         if prefetched:
             status = self.cache_linker.get_host_prefetch_status(req.rid)
             locally_complete = status in {"dfs_prefetched", "no_prefetch_needed"}
@@ -657,8 +745,9 @@ class UnifiedCacheLinkerWrapper:
             # Build before claiming so that the claim reduction also carries
             # the construction verdict: one reduction instead of two.
             component_transfers, constructed, build_error = self._build_load_transfers(
-                req, tail_hashes
+                req, tail_hashes, prepare_session=status == "no_prefetch_needed"
             )
+            prepared_locally = status == "no_prefetch_needed" and constructed
             claim_error: BaseException | None = None
             try:
                 if status == "no_prefetch_needed":
@@ -690,6 +779,7 @@ class UnifiedCacheLinkerWrapper:
                     prefix_len,
                     cancel_prefetch=True,
                     pending=build_error if build_error is not None else claim_error,
+                    release_session=prepared_locally,
                 )
                 if not constructed_all:
                     # Building failed somewhere: a miss, as on the normal path.
@@ -698,10 +788,14 @@ class UnifiedCacheLinkerWrapper:
                 # which builds again and agrees on its own construction.
                 self.hit_markers[req.rid] = hit
                 return self.load_back(req)
-            prepared_from_host_prefetch = True
+            prepared_for_load = True
         else:
+            # Ordinary LOAD construction must agree across ranks even when
+            # waiting-queue prefetch is disabled. Session preparation is only
+            # available after that capability has been enabled for the linker.
+            prepare_session = self._waiting_queue_prefetch_enabled
             component_transfers, constructed, build_error = self._build_load_transfers(
-                req, tail_hashes
+                req, tail_hashes, prepare_session=prepare_session
             )
             all_constructed = torch.tensor(int(constructed), dtype=torch.int)
             cache._all_reduce_attn_groups(
@@ -716,8 +810,12 @@ class UnifiedCacheLinkerWrapper:
                     prefix_len,
                     cancel_prefetch=False,
                     pending=build_error,
+                    release_session=prepare_session and constructed,
                 )
                 return empty_indices, req.last_node
+            if prepare_session:
+                # Session start/refresh already checked the master on every rank.
+                prepared_for_load = True
 
         # Keys can be evicted remotely (master memory-watermark eviction)
         # between the match-time lookup and this load-back; a stale hit would
@@ -725,7 +823,7 @@ class UnifiedCacheLinkerWrapper:
         # here so the request degrades to a plain cache miss instead.
         revalidate = getattr(self.cache_linker, "revalidate_load", None)
         if (
-            not prepared_from_host_prefetch
+            not prepared_for_load
             and revalidate is not None
             and not revalidate([transfer for _, transfer in component_transfers])
         ):
@@ -739,12 +837,16 @@ class UnifiedCacheLinkerWrapper:
 
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
-        prepared_transfers = self._update_load(
-            ExternalLinkerLoadPhase.PREPARE,
-            req,
-            component_transfers,
-            prefix_len,
-        )
+        try:
+            prepared_transfers = self._update_load(
+                ExternalLinkerLoadPhase.PREPARE,
+                req,
+                component_transfers,
+                prefix_len,
+            )
+        except BaseException:
+            self.cache_linker.abort_prepared_load(req.rid)
+            raise
 
         if cache.pp_size > 1:
             # Load into request-owned slots. The existing PP result ring delays
@@ -1096,15 +1198,20 @@ class UnifiedCacheLinkerWrapper:
     def start_layer_wise_loading(self) -> int:
         return self.cache_linker.start_layer_wise_loading()
 
+    def wait_for_pending_loads(self) -> None:
+        self.cache_linker.wait_for_pending_loads()
+
     # ---- lifecycle ----
 
     def reset(self) -> None:
-        for job, _hit in self.pending_host_prefetch_submissions.values():
-            job.cancelled.set()
-        self.pending_host_prefetch_submissions.clear()
+        if self.pending_host_prefetch_submissions is not None:
+            for job, _hit in self.pending_host_prefetch_submissions.values():
+                job.cancelled.set()
+            self.pending_host_prefetch_submissions.clear()
         self.cache_linker.reset()
         self.hit_markers.clear()
-        self.host_prefetch_hits.clear()
+        if self.host_prefetch_hits is not None:
+            self.host_prefetch_hits.clear()
         self._release_pending_locks()
 
     def _release_pending_locks(self) -> None:
@@ -1125,8 +1232,10 @@ class UnifiedCacheLinkerWrapper:
     def release_request(self, rid: str) -> None:
         # failed_chains is deliberately untouched: the chain outlives the
         # request's linker state, and cache_finished_req is what frees it.
-        self.hit_markers.pop(rid, None)
-        self.cancel_waiting_queue_prefetch(rid)
+        if self._waiting_queue_prefetch_enabled:
+            self.cancel_waiting_queue_prefetch(rid)
+        else:
+            self.hit_markers.pop(rid, None)
         # Only a load that has not started can be cancelled here. One already
         # in flight keeps its pending_loads entry and its lock until
         # commit_completed_loads retires the batch, which the linkers guarantee

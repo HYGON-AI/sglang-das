@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -46,6 +47,7 @@ class TestSchedulerDeferredRequests(unittest.TestCase):
 
         scheduler.process_input_requests = process_input_requests
         scheduler.request_receiver = SimpleNamespace(recv_requests=recv_requests)
+        scheduler._forward_ingress_enabled = True
 
         with self.assertRaises(StopPrefillLoop):
             SchedulerDisaggregationPrefillMixin.event_loop_normal_disagg_prefill(
@@ -54,6 +56,27 @@ class TestSchedulerDeferredRequests(unittest.TestCase):
 
         self.assertEqual(events, [("process", requests), ("receive", None)])
         self.assertEqual(scheduler._forward_deferred_reqs, [])
+
+    def test_disagg_prefill_off_skips_deferred_hook(self):
+        class StopPrefillLoop(Exception):
+            pass
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler._forward_ingress_enabled = False
+        scheduler._process_deferred_reqs = MagicMock(
+            side_effect=AssertionError("disabled ingress deferred hook called")
+        )
+
+        def recv_requests():
+            raise StopPrefillLoop
+
+        scheduler.request_receiver = SimpleNamespace(recv_requests=recv_requests)
+        with self.assertRaises(StopPrefillLoop):
+            SchedulerDisaggregationPrefillMixin.event_loop_normal_disagg_prefill(
+                scheduler
+            )
+
+        scheduler._process_deferred_reqs.assert_not_called()
 
 
 if __name__ == "__main__":

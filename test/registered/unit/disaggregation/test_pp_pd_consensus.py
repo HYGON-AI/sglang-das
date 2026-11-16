@@ -200,6 +200,7 @@ class TestPPPDConsensus(CustomTestCase):
         )
         req.external_kv_response_sent = False
         req.external_kv_metadata_released = False
+        req.external_kv_cleanup_done = False
 
         def mark_abort(target_req, message, status_code):
             del message, status_code
@@ -214,6 +215,10 @@ class TestPPPDConsensus(CustomTestCase):
             patch(
                 "sglang.srt.disaggregation.prefill.prepare_abort",
                 side_effect=mark_abort,
+            ),
+            patch(
+                "sglang.srt.disaggregation.prefill.all_reduce_min_attn_cp_tp_group",
+                side_effect=lambda values, *_groups: list(values),
             ),
         ):
             done_reqs = SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
@@ -233,6 +238,10 @@ class TestPPPDConsensus(CustomTestCase):
                 "sglang.srt.disaggregation.prefill."
                 "poll_and_all_reduce_attn_cp_tp_group",
                 return_value=[KVPoll.Success],
+            ),
+            patch(
+                "sglang.srt.disaggregation.prefill.all_reduce_min_attn_cp_tp_group",
+                side_effect=lambda values, *_groups: list(values),
             ),
             patch("sglang.srt.disaggregation.prefill.maybe_release_metadata_buffer"),
         ):

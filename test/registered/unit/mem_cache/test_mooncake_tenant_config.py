@@ -1,14 +1,17 @@
 import json
+import os
 import tempfile
 import types
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
     DEFAULT_TENANT_ID,
     MooncakeStoreConfig,
+    _get_mooncake_client_http_setup_kwargs,
+    _get_service_endpoint,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -44,6 +47,9 @@ class FakeMooncakeDistributedStore:
 
     def register_buffer(self, *args, **kwargs):
         return 0
+
+    def disable_dfs_prefetch(self):
+        return True
 
     def put(self, key, value, *args):
         self.objects[key] = value
@@ -206,6 +212,244 @@ class TestMooncakeTenantConfig(unittest.TestCase):
 
         fake_store = FakeMooncakeDistributedStore.instances[-1]
         self.assertEqual(fake_store.setup_calls[0][1]["tenant_id"], "tenant-embedding")
+
+
+class TestMooncakeServiceMetrics(unittest.TestCase):
+    def test_independent_tp_services_request_auto_http_ports(self):
+        with (
+            patch.dict(os.environ),
+            patch("torch.distributed.is_available", return_value=True),
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank") as get_rank,
+        ):
+            envs.MOONCAKE_CLIENT_METRICS_PORT_BASE.clear()
+            # Four independent TP=2 services all repeat rank 0 and rank 1.
+            # Every server must bind port zero itself, without rank offsets.
+            for _ in range(4):
+                for rank in range(2):
+                    get_rank.return_value = rank
+                    self.assertEqual(
+                        _get_mooncake_client_http_setup_kwargs(True),
+                        {"enable_client_http_server": True, "client_http_port": 0},
+                    )
+
+    def test_explicit_http_port_base_preserves_rank_offsets(self):
+        with (
+            envs.MOONCAKE_CLIENT_METRICS_PORT_BASE.override(15000),
+            patch("torch.distributed.is_available", return_value=True),
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=1),
+            patch("torch.distributed.get_world_size", return_value=2),
+        ):
+            self.assertEqual(
+                _get_mooncake_client_http_setup_kwargs(True, dp_rank=1),
+                {"enable_client_http_server": True, "client_http_port": 15003},
+            )
+            self.assertEqual(_get_mooncake_client_http_setup_kwargs(False), {})
+
+    def test_uses_existing_business_endpoint(self):
+        self.assertEqual(
+            _get_service_endpoint(
+                SimpleNamespace(host="10.0.0.20", port=30000, nnodes=1)
+            ),
+            "10.0.0.20:30000",
+        )
+        self.assertEqual(
+            _get_service_endpoint(
+                SimpleNamespace(host="2001:db8::20", port=30000, nnodes=1)
+            ),
+            "[2001:db8::20]:30000",
+        )
+
+    def test_single_node_wildcard_uses_existing_ip_discovery(self):
+        with patch(
+            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.get_local_ip_auto",
+            return_value="10.0.0.20",
+        ):
+            for host in ("0.0.0.0", "::", None):
+                self.assertEqual(
+                    _get_service_endpoint(
+                        SimpleNamespace(host=host, port=30000, nnodes=1)
+                    ),
+                    "10.0.0.20:30000",
+                )
+
+    def test_multiple_nodes_use_leader_ip_and_business_port(self):
+        for leader, expected in (
+            ("10.0.0.20:5000", "10.0.0.20:30000"),
+            ("[2001:db8::20]:5000", "[2001:db8::20]:30000"),
+        ):
+            args = SimpleNamespace(
+                host="0.0.0.0", port=30000, nnodes=2, dist_init_addr=leader
+            )
+            with patch(
+                "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.get_local_ip_auto",
+                side_effect=AssertionError("must not use a remote worker's IP"),
+            ):
+                self.assertEqual(_get_service_endpoint(args), expected)
+
+    def test_reports_before_warmup_with_client_http_disabled(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        config = _make_storage_config()
+        calls = []
+        with (
+            patch.dict(
+                "sys.modules", _fake_mooncake_modules(FakeMooncakeDistributedStore)
+            ),
+            patch.object(
+                FakeMooncakeDistributedStore,
+                "set_service_endpoint",
+                side_effect=lambda endpoint: calls.append(endpoint) or 0,
+                create=True,
+            ),
+            patch.object(
+                MooncakeStore, "warmup", side_effect=lambda: calls.append("warmup")
+            ),
+            patch(
+                "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.get_server_args",
+                return_value=SimpleNamespace(
+                    host="10.0.0.20",
+                    port=30000,
+                    nnodes=1,
+                    enable_hierarchical_cache=False,
+                    enable_unified_cache_external_linker=True,
+                ),
+            ),
+        ):
+            store = MooncakeStore(config, enable_client_http_server=False)
+
+        self.assertEqual(calls, ["10.0.0.20:30000", "warmup"])
+        self.assertNotIn("enable_client_http_server", store.store.setup_calls[0][1])
+
+    def test_shared_daemon_endpoint_conflict_warns_and_finishes_setup(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        shared = FakeMooncakeDistributedStore()
+        registered = []
+
+        def set_endpoint(endpoint):
+            if registered and registered[0] != endpoint:
+                return -1
+            registered[:] = [endpoint]
+            return 0
+
+        with (
+            patch.dict("sys.modules", _fake_mooncake_modules(lambda: shared)),
+            patch.object(shared, "set_service_endpoint", set_endpoint, create=True),
+            patch.object(MooncakeStore, "warmup") as warmup,
+            patch(
+                "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.get_server_args",
+                side_effect=[
+                    SimpleNamespace(host="10.0.0.20", port=30000, nnodes=1),
+                    SimpleNamespace(host="10.0.0.20", port=30001, nnodes=1),
+                ],
+            ),
+        ):
+            first = MooncakeStore(_make_storage_config())
+            with self.assertLogs(
+                "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store",
+                level="WARNING",
+            ) as logs:
+                second = MooncakeStore(_make_storage_config())
+
+        self.assertIs(first.store, second.store)
+        self.assertEqual(warmup.call_count, 2)
+        self.assertEqual(registered, ["10.0.0.20:30000"])
+        self.assertTrue(any("30001" in message for message in logs.output))
+        self.assertTrue(any("original endpoint" in message for message in logs.output))
+
+
+class TestMooncakePrefetchSetup(unittest.TestCase):
+    def test_hicache_factory_disables_unused_waiting_queue_arena(self):
+        from sglang.srt.mem_cache.storage.backend_factory import StorageBackendFactory
+
+        backend_class = Mock()
+        storage_config, host_pool = object(), object()
+        result = StorageBackendFactory._create_builtin_backend(
+            "mooncake", backend_class, storage_config, host_pool
+        )
+        backend_class.assert_called_once_with(
+            storage_config, host_pool, enable_dfs_prefetch=False
+        )
+        self.assertIs(result, backend_class.return_value)
+
+    def test_disabled_prefetch_overrides_client_without_changing_environment(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        with (
+            patch.dict(
+                "sys.modules", _fake_mooncake_modules(FakeMooncakeDistributedStore)
+            ),
+            patch.dict(os.environ, {"MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES": "4096"}),
+        ):
+            MooncakeStore(_make_storage_config(), enable_dfs_prefetch=False)
+            self.assertEqual(
+                os.environ["MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES"], "4096"
+            )
+
+        fake_store = FakeMooncakeDistributedStore.instances[-1]
+        self.assertIs(fake_store.setup_calls[0][1]["enable_dfs_prefetch"], False)
+
+    def test_enabled_or_unspecified_prefetch_preserves_environment_setup(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        for enabled in (True, None):
+            with (
+                self.subTest(enabled=enabled),
+                patch.dict(
+                    "sys.modules", _fake_mooncake_modules(FakeMooncakeDistributedStore)
+                ),
+            ):
+                MooncakeStore(_make_storage_config(), enable_dfs_prefetch=enabled)
+                self.assertNotIn(
+                    "enable_dfs_prefetch",
+                    FakeMooncakeDistributedStore.instances[-1].setup_calls[0][1],
+                )
+
+    def test_disabled_prefetch_cannot_silently_drop_unsupported_gate(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        class UnsupportedPrefetchStore(FakeMooncakeDistributedStore):
+            attempts = 0
+
+            def setup(self, *args, **kwargs):
+                type(self).attempts += 1
+                if "enable_dfs_prefetch" in kwargs:
+                    raise TypeError(
+                        "enable_dfs_prefetch is an invalid keyword argument"
+                    )
+                return super().setup(*args, **kwargs)
+
+        with patch.dict(
+            "sys.modules", _fake_mooncake_modules(UnsupportedPrefetchStore)
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cannot disable DFS prefetch"):
+                MooncakeStore(_make_storage_config(), enable_dfs_prefetch=False)
+        self.assertEqual(UnsupportedPrefetchStore.attempts, 1)
+
+    def test_prefetch_requires_release_api_before_setup(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        class UnsupportedReleaseStore(FakeMooncakeDistributedStore):
+            disable_dfs_prefetch = None
+
+        with patch.dict("sys.modules", _fake_mooncake_modules(UnsupportedReleaseStore)):
+            with self.assertRaisesRegex(RuntimeError, "disable_dfs_prefetch"):
+                MooncakeStore(_make_storage_config(), enable_dfs_prefetch=True)
+        self.assertEqual(UnsupportedReleaseStore.instances[-1].setup_calls, [])
 
 
 if __name__ == "__main__":

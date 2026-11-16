@@ -32,7 +32,10 @@ from sglang.srt.disaggregation.hidden_state import (
     get_pd_hidden_capture_layer_ids,
     get_pd_hidden_req_state as pd_hidden_state,
 )
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    poll_and_all_reduce_attn_cp_tp_group,
+)
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -73,6 +76,7 @@ if TYPE_CHECKING:
 
 PPTransferStatus = Tuple[List[str], List[str]]
 PPReleasePayload = Union[List[str], PPTransferStatus]
+_PP_LINKER_FAILURES_KEY = "__linker_failed_rids__"
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -192,9 +196,17 @@ class SchedulerPPMixin:
                 self.running_mbs[mb_id] = self.running_batch
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
+                linker_failed_rids = set()
                 if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    if self._pp_tracks_linker_failures(cur_batch):
+                        if pp_proxy_tensors is not None:
+                            linker_failed_rids = set(
+                                pp_proxy_tensors.tensors.pop(
+                                    _PP_LINKER_FAILURES_KEY, []
+                                )
+                            )
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -214,6 +226,18 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    if self._pp_tracks_linker_failures(cur_batch):
+                        # The linker reports load failures asynchronously. Wait
+                        # for this stage's forward to finish before draining its
+                        # verdicts and forwarding the accumulated set.
+                        self.launch_event.synchronize()
+                        linker_failed_rids.update(
+                            self._pp_collect_linker_load_failures(cur_batch)
+                        )
+                        if self.pp_group.is_last_rank:
+                            self.last_rank_comm_queue[-1][1].tensors[
+                                _PP_LINKER_FAILURES_KEY
+                            ] = sorted(linker_failed_rids)
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -227,6 +251,15 @@ class SchedulerPPMixin:
                         self._pp_process_batch_result(
                             self.mbs[next_mb_id],
                             next_batch_result,
+                            linker_failed_rids=(
+                                set(
+                                    next_pp_outputs.tensors.get(
+                                        _PP_LINKER_FAILURES_KEY, []
+                                    )
+                                )
+                                if self._pp_tracks_linker_failures(self.mbs[next_mb_id])
+                                else None
+                            ),
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
@@ -237,8 +270,18 @@ class SchedulerPPMixin:
                         with torch.profiler.record_function(
                             "send_proxy_dict_to_next_stage"
                         ):
+                            proxy_tensor_dict = (
+                                self._pp_prepare_proxy_tensor_dict_for_send(result)
+                            )
+                            if self._pp_tracks_linker_failures(cur_batch):
+                                # Attach after graph-safe tensor cloning; this
+                                # control list is deliberately not a tensor.
+                                proxy_tensor_dict = dict(proxy_tensor_dict)
+                                proxy_tensor_dict[_PP_LINKER_FAILURES_KEY] = sorted(
+                                    linker_failed_rids
+                                )
                             self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                                self._pp_prepare_proxy_tensor_dict_for_send(result),
+                                proxy_tensor_dict,
                                 async_send=True,
                                 msg_type="proxy",
                             )
@@ -1360,9 +1403,42 @@ class SchedulerPPMixin:
         return output_result
 
     def _pp_process_batch_result(
-        self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
+        self: Scheduler,
+        batch: ScheduleBatch,
+        output_result: GenerationBatchResult,
+        *,
+        linker_failed_rids: Optional[set[str]] = None,
     ):
+        if self._pp_tracks_linker_failures(batch):
+            self.process_batch_result(
+                batch, output_result, linker_failed_rids=linker_failed_rids or set()
+            )
+            return
         self.process_batch_result(batch, output_result)
+
+    def _pp_tracks_linker_failures(
+        self: Scheduler, batch: Optional[ScheduleBatch]
+    ) -> bool:
+        return (
+            batch is not None
+            and self.disaggregation_mode == DisaggregationMode.NULL
+            and self.server_args.enable_unified_cache_external_linker
+            and batch.forward_mode.is_extend()
+        )
+
+    def _pp_collect_linker_load_failures(
+        self: Scheduler, batch: ScheduleBatch
+    ) -> set[str]:
+        failed = set(self.tree_cache.drain_linker_loads(wait_for_completion=True))
+        if self.tree_cache.has_outstanding_failed_linker_chains():
+            failed.update(
+                req.rid
+                for req in self._iter_external_linker_candidates(batch)
+                if self.tree_cache.is_on_failed_linker_chain(
+                    getattr(req, "last_node", None)
+                )
+            )
+        return failed
 
     def _pp_send_output_to_next_stage(
         self: Scheduler,
@@ -1377,14 +1453,26 @@ class SchedulerPPMixin:
             target = mbs[next_first_rank_mb_id]
             if target is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
-                if (
-                    not target.forward_mode.is_prebuilt()
-                    and not _pp_can_skip_output_comm(target)
+                track_linker_failures = self._pp_tracks_linker_failures(target)
+                skip_output_comm = _pp_can_skip_output_comm(target)
+                if not target.forward_mode.is_prebuilt() and (
+                    not skip_output_comm or track_linker_failures
                 ):
                     self.device_module.current_stream().wait_event(q_event)
+                    tensor_dict = pp_outputs_to_send.tensors
+                    if track_linker_failures:
+                        if skip_output_comm:
+                            # Pure-chunk output tensors are still skipped. Send
+                            # only the failure envelope so every stage can
+                            # process the same linker verdict.
+                            tensor_dict = {
+                                _PP_LINKER_FAILURES_KEY: tensor_dict.get(
+                                    _PP_LINKER_FAILURES_KEY, []
+                                )
+                            }
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
-                            pp_outputs_to_send.tensors,
+                            tensor_dict,
                             async_send=True,
                             msg_type="output",
                         )
@@ -1444,13 +1532,31 @@ class SchedulerPPMixin:
             target = mbs[next_mb_id]
             if target is None or target.forward_mode.is_prebuilt():
                 return
-            if _pp_can_skip_output_comm(target):
+            track_linker_failures = self._pp_tracks_linker_failures(target)
+            skip_output_comm = _pp_can_skip_output_comm(target)
+            if skip_output_comm and not track_linker_failures:
                 next_pp_outputs, batch_result, d2h_event = (
                     self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])
                 )
                 return
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
-                next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
+                tensor_dict = self._pp_recv_dict_from_prev_stage()
+            if track_linker_failures:
+                next_pp_outputs = PPProxyTensors(tensor_dict)
+                if skip_output_comm:
+                    next_pp_outputs = PPProxyTensors(
+                        {
+                            _PP_LINKER_FAILURES_KEY: tensor_dict.get(
+                                _PP_LINKER_FAILURES_KEY, []
+                            )
+                        }
+                    )
+                    _, batch_result, d2h_event = self._pp_make_skip_output_result(
+                        target, mb_metadata[next_mb_id]
+                    )
+                    return
+            else:
+                next_pp_outputs = PPProxyTensors(tensor_dict)
             with self.copy_stream_ctx:
                 self.copy_stream.wait_stream(self.schedule_stream)
                 batch_result = self._pp_prep_batch_result(

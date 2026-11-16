@@ -113,6 +113,16 @@ class StorageAttachment:
                 f"'{storage_backend_extra_config_json}': {e}",
             )
 
+        if storage_backend == "mooncake":
+            from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
+                inject_dfs_health_config,
+            )
+            from sglang.srt.runtime_context import get_server_args
+
+            extra_config = inject_dfs_health_config(
+                extra_config, server_args=get_server_args()
+            )
+
         try:
             controller.attach_storage_backend(
                 storage_backend=storage_backend,

@@ -561,6 +561,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         # The tree agrees on the drain count across ranks before calling pop.
         return self._completed_loads.qsize()
 
+    def wait_for_pending_loads(self) -> None:
+        self._load_queue.join()
+
     def pop_completed_load(self) -> tuple[list[str], bool]:
         return self._completed_loads.get_nowait()
 

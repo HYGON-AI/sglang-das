@@ -461,21 +461,6 @@ class Scheduler(
         self.enable_overlap_mlx = (
             not get_schedule().disable_overlap_schedule and use_mlx()
         )
-        # The worker consumes immutable linker-prefetch snapshots. Per-iteration
-        # rounds keep every CP/TP participant in the same collective sequence,
-        # including rounds with no local jobs.
-        self._bg_prefetch_jobs: queue.Queue = queue.Queue()
-        self._bg_prefetch_acks: queue.Queue = queue.Queue()
-        self._bg_pending_prefetch_jobs = {}
-        self._bg_prefetch_join_age = {}
-        self._bg_condition = threading.Condition()
-        self._bg_requested_epoch = 0
-        self._bg_completed_epoch = 0
-        self._bg_error: Optional[BaseException] = None
-        self._bg_stop_flag = False
-        self._bg_thread = threading.Thread(target=self._bg_worker_loop, daemon=True)
-        self._bg_thread.start()
-
         self.enable_pdmux = get_disagg().enable_pdmux
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.stream_interval = get_serving().stream_interval
@@ -625,6 +610,12 @@ class Scheduler(
                 ),
                 tree_cache=self.tree_cache,
                 server_args=self.server_args,
+                attn_cp_group=self.attn_cp_cpu_group,
+                pp_group=(
+                    self.pp_group.cpu_group
+                    if self.pp_group is not None
+                    else None
+                ),
             )
         else:
             self.decode_offload_manager = None
@@ -1232,10 +1223,8 @@ class Scheduler(
         # Failed external-linker rids that matched no scheduled request on the
         # pass that drained them; retried once, see _mark_failed_linker_loads.
         self._deferred_linker_rids: Set[str] = set()
-        # Track requests marked for external KV abort and cleanup to ensure
-        # proper lifecycle and prevent duplicate releases.
+        # Track requests marked for external KV abort.
         self._external_kv_abort_rids: Set[str] = set()
-        self._external_kv_cleanup_rids: Set[str] = set()
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -1941,7 +1930,8 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
-            self._process_deferred_reqs()
+            if self._forward_ingress_enabled:
+                self._process_deferred_reqs()
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -2385,12 +2375,15 @@ class Scheduler(
                 )
 
     def _begin_scheduler_iteration(self) -> None:
+        if not self.enable_waiting_queue_dfs_prefetch:
+            return
         self._drain_bg_prefetch_acks()
         self._request_bg_prefetch_epoch()
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
-        self._trace_prefill_reqs("scheduler_receive", recv_reqs)
+        if DAS_PREFETCH_TRACE_ENABLED:
+            self._trace_prefill_reqs("scheduler_receive", recv_reqs)
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
         if get_mm().mm_feature_transport == "cuda_vmm":
@@ -3288,7 +3281,7 @@ class Scheduler(
         self._ingress_tp_cpu_group = self.tp_cpu_group
         self._forward_launch_executor = None
         self._forward_deferred_reqs = []
-        self._bg_prefetch_rooms = {} if DAS_PREFETCH_TRACE_ENABLED else None
+        self._bg_thread = None
         if self.enable_waiting_queue_dfs_prefetch:
             # Every rank creates groups in the same order. The helper
             # gathers each rank's local subgroup membership on the default
@@ -3328,6 +3321,20 @@ class Scheduler(
                 self._forward_launch_executor = ThreadPoolExecutor(
                     max_workers=1, thread_name_prefix="prefetch-forward"
                 )
+            # Start only after the prefetch decision and groups are ready.
+            # Per-iteration rounds include ranks with no local jobs.
+            self._bg_prefetch_jobs: queue.Queue = queue.Queue()
+            self._bg_prefetch_acks: queue.Queue = queue.Queue()
+            self._bg_pending_prefetch_jobs = {}
+            self._bg_prefetch_join_age = {}
+            self._bg_prefetch_rooms = {} if DAS_PREFETCH_TRACE_ENABLED else None
+            self._bg_condition = threading.Condition()
+            self._bg_requested_epoch = 0
+            self._bg_completed_epoch = 0
+            self._bg_error: Optional[BaseException] = None
+            self._bg_stop_flag = False
+            self._bg_thread = threading.Thread(target=self._bg_worker_loop, daemon=True)
+            self._bg_thread.start()
 
     def _waiting_queue_prefetch_configured(self) -> bool:
         """This rank's own conditions for waiting-queue prefetch, before the
@@ -3362,10 +3369,15 @@ class Scheduler(
         there), so other roles do not read the variable and report it off.
         """
 
-        prefetch_local = (
-            self._waiting_queue_prefetch_configured()
+        linker_prefetch = (
+            getattr(
+                self.server_args, "mooncake_enable_waiting_queue_dfs_prefetch", False
+            )
+            and self.server_args.enable_unified_cache_external_linker
+            and self.server_args.unified_cache_external_linker_backend == "mooncake"
             and self.tree_cache.waiting_queue_prefetch_enabled()
         )
+        prefetch_local = self._waiting_queue_prefetch_configured() and linker_prefetch
         # Forward ingress matches (and may split) radix nodes while the
         # forward runs; KV canary's sweep walks them from the forward thread.
         ingress_local = (
@@ -3373,12 +3385,16 @@ class Scheduler(
             == "none"
         )
         final_poll_on, final_poll_valid = False, True
+        final_poll_timeout_ms = 0.0
         if (
             self.disaggregation_mode == DisaggregationMode.PREFILL
             and self.ps.pp_size == 1
         ):
             try:
-                final_poll_on = envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get() > 0
+                final_poll_timeout_ms = (
+                    envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get()
+                )
+                final_poll_on = final_poll_timeout_ms > 0
             except Exception:
                 final_poll_on, final_poll_valid = False, False
 
@@ -3405,13 +3421,16 @@ class Scheduler(
                 "positive on every rank or <= 0 on every rank; this rank has "
                 f"on={final_poll_on}, valid={final_poll_valid}"
             )
+        self._mooncake_final_poll_timeout_ms = (
+            final_poll_timeout_ms if final_poll_on else 0.0
+        )
 
         enabled = bool(prefetch)
-        if prefetch_local and not enabled:
+        if linker_prefetch and not enabled:
             # Before any job exists: keep the linker consistent with the world.
             self.tree_cache.disable_waiting_queue_prefetch()
             logger.warning(
-                "Waiting-queue DFS prefetch disabled: another rank is not "
+                "Waiting-queue DFS prefetch disabled: this or another rank is not "
                 "configured for it or lacks the Mooncake capability."
             )
         forward_ingress = enabled and bool(ingress)
@@ -3537,10 +3556,12 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
+        req.time_stats.track_queue_wait_reasons = self.enable_waiting_queue_dfs_prefetch
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
-            self._prefetch_kvcache(req, is_retracted=is_retracted)
+            if self.enable_waiting_queue_dfs_prefetch or self.enable_hicache_storage:
+                self._prefetch_kvcache(req, is_retracted=is_retracted)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -3568,7 +3589,11 @@ class Scheduler(
                 )
             if added:
                 req.time_stats.set_prefill_bootstrap_queue_entry_time()
-                self._prefetch_kvcache(req, is_retracted=is_retracted)
+                if (
+                    self.enable_waiting_queue_dfs_prefetch
+                    or self.enable_hicache_storage
+                ):
+                    self._prefetch_kvcache(req, is_retracted=is_retracted)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
@@ -3831,9 +3856,9 @@ class Scheduler(
         self._release_aborted_request(req.rid)
 
         # Ensure idempotent KV release
-        if req.rid not in self._external_kv_cleanup_rids:
+        if not req.external_kv_cache_released:
             release_kv_cache(req, self.tree_cache, is_insert=False)
-            self._external_kv_cleanup_rids.add(req.rid)
+            req.external_kv_cache_released = True
 
         self._external_kv_abort_rids.discard(req.rid)
 
@@ -3937,7 +3962,8 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
-        self._begin_scheduler_iteration()
+        if self.enable_waiting_queue_dfs_prefetch:
+            self._begin_scheduler_iteration()
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:
@@ -4141,7 +4167,7 @@ class Scheduler(
         ):
             self.tree_cache.check_hicache_events()
 
-        waiting_queue_prefetch_states = {}
+        waiting_queue_prefetch_states = None
         if self.enable_waiting_queue_dfs_prefetch:
             waiting_queue_prefetch_states = (
                 self.tree_cache.get_waiting_queue_prefetch_admission_states(
@@ -4757,10 +4783,15 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
-        # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
+        # A cache load can publish shared radix entries before the bytes are
+        # ready. Forward waits for that load; early PD reads must defer until
+        # the regular post-forward send, including for another request that
+        # matched the newly published entries as a device hit.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in batch.reqs:
-                self.maybe_send_cached_prefix_chunk(req)
+                self.maybe_send_cached_prefix_chunk(
+                    req, cache_load_pending=batch.hicache_consumer_index >= 0
+                )
 
         # Run forward
         if self.is_generation:
@@ -4870,7 +4901,14 @@ class Scheduler(
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self._forward_with_waiting_queue_ingress(batch)
+                    if self._forward_ingress_enabled:
+                        batch_result = self._forward_with_waiting_queue_ingress(
+                            batch
+                        )
+                    else:
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch
+                        )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -4894,7 +4932,14 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
-                batch_result = self._forward_with_waiting_queue_ingress(batch, **kwargs)
+                if self._forward_ingress_enabled:
+                    batch_result = self._forward_with_waiting_queue_ingress(
+                        batch, **kwargs
+                    )
+                else:
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, **kwargs
+                    )
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(batch.req_pool_indices, batch_result)
@@ -5058,9 +5103,11 @@ class Scheduler(
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        *,
+        linker_failed_rids: Optional[set[str]] = None,
     ):
         if self.enable_unified_cache_external_linker and batch.forward_mode.is_extend():
-            self._mark_failed_linker_loads(batch)
+            self._mark_failed_linker_loads(batch, failed_rids=linker_failed_rids)
 
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
@@ -5150,7 +5197,9 @@ class Scheduler(
                 seen.add(req.rid)
                 yield req
 
-    def _mark_failed_linker_loads(self, batch: ScheduleBatch) -> None:
+    def _mark_failed_linker_loads(
+        self, batch: ScheduleBatch, *, failed_rids: Optional[set[str]] = None
+    ) -> None:
         """Mark requests whose external-linker KV load failed for this batch.
 
         Runs before the result processing that would otherwise stream their
@@ -5161,7 +5210,9 @@ class Scheduler(
         """
         deferred = self._deferred_linker_rids
         self._deferred_linker_rids = set()
-        failed = set(self.tree_cache.drain_linker_loads()) | deferred
+        failed = set(
+            self.tree_cache.drain_linker_loads() if failed_rids is None else failed_rids
+        ) | deferred
         # A request that matched the chain while the load was in flight holds
         # its pages too, and issued no load of its own -- so it is in no rid
         # list and has to be found by where it points.
@@ -5183,8 +5234,8 @@ class Scheduler(
             if not rid_match and not chain_match:
                 continue
 
-            # Already in cleanup phase - don't duplicate release
-            if req.rid in self._external_kv_cleanup_rids:
+            # Cache release state belongs to this request, not its reusable RID.
+            if req.external_kv_cache_released:
                 handled_rids.add(req.rid)
                 continue
 
@@ -5734,6 +5785,8 @@ class Scheduler(
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    self.abort_disagg_prefill_request(chunked_req)
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Abort requests still waiting for encoder embeddings (EPD language-only)
@@ -5757,19 +5810,14 @@ class Scheduler(
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
-            # For disaggregation prefill mode, free the metadata buffer index
+            # Keep prefill resources alive until forward and source transfers
+            # drain. The inflight queue also delivers the terminal notice to D.
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                bootstrap_pending = req.pending_bootstrap
-                maybe_release_metadata_buffer(
-                    req, self.req_to_metadata_buffer_idx_allocator
-                )
-                if (
-                    bootstrap_pending
-                    and hasattr(req, "disagg_kv_sender")
-                    and req.disagg_kv_sender is not None
-                ):
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
+                self.abort_disagg_prefill_request(req)
+                req.external_kv_response_sent = True
+                if req not in self.disagg_prefill_inflight_queue:
+                    self.disagg_prefill_inflight_queue.append(req)
+                continue
 
             # For mamba radix cache
             if (
@@ -5817,8 +5865,7 @@ class Scheduler(
             for req in self.disagg_prefill_inflight_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
+                    self.abort_disagg_prefill_request(req)
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # Mark Failed and record the rid for PP failed-union. Do not free
@@ -5860,6 +5907,8 @@ class Scheduler(
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    self.abort_disagg_prefill_request(req)
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

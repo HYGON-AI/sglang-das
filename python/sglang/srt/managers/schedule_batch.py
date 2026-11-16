@@ -990,6 +990,7 @@ class Req(ReqDllmMixin):
         self.external_kv_response_sent = False
         self.external_kv_abort_response_via_chunked = False
         self.external_kv_cleanup_done = False
+        self.prefill_transfer_failure_reported = False
         self.external_kv_cleanup_steps = {}
         self.stream = stream
         self.eos_token_ids = eos_token_ids
@@ -1036,7 +1037,8 @@ class Req(ReqDllmMixin):
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         self.host_loaded_length = 0
-        # Absolute external-cache hit boundary shared by PP0; None outside PP.
+        # Absolute external-cache hit boundary agreed by every PP stage;
+        # None outside PP.
         self.external_cache_hit_length: Optional[int] = None
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
@@ -1379,9 +1381,9 @@ class Req(ReqDllmMixin):
                 capped = max(0, input_len - reprefill_tail)
                 key_limit = capped if key_limit is None else min(key_limit, capped)
 
-        # PP0 owns the canonical external-cache boundary. Apply it only while
-        # admitting the request; cache insertion performs its own rematch and
-        # must be allowed to see KV computed after that original boundary.
+        # Keep the external-cache boundary stable while admitting the request
+        # on every PP stage. Cache insertion performs its own rematch and must
+        # be allowed to see KV computed after that original boundary.
         if (
             tree_cache is not None
             and self.external_cache_hit_length is not None

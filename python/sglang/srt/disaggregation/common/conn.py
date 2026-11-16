@@ -2010,6 +2010,8 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "prefill_drained_abort_rooms"):
+            self.kv_mgr.prefill_drained_abort_rooms.discard(self.bootstrap_room)
 
     def abort(self):
         self.kv_mgr.record_failure(

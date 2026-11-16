@@ -597,16 +597,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
-        _trace_disagg_prefill_dispatch("tokenizer_send_start", obj)
+        if _DAS_PREFETCH_TRACE_ENABLED:
+            _trace_disagg_prefill_dispatch("tokenizer_send_start", obj)
         sock_send(self.send_to_scheduler, obj)
-        _trace_disagg_prefill_dispatch("tokenizer_send_done", obj)
+        if _DAS_PREFETCH_TRACE_ENABLED:
+            _trace_disagg_prefill_dispatch("tokenizer_send_done", obj)
 
     async def _async_dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
-        _trace_disagg_prefill_dispatch("tokenizer_send_start", obj)
+        if _DAS_PREFETCH_TRACE_ENABLED:
+            _trace_disagg_prefill_dispatch("tokenizer_send_start", obj)
         await async_sock_send(self.send_to_scheduler, obj)
-        _trace_disagg_prefill_dispatch("tokenizer_send_done", obj)
+        if _DAS_PREFETCH_TRACE_ENABLED:
+            _trace_disagg_prefill_dispatch("tokenizer_send_done", obj)
 
     def init_running_status(self):
         # Request states
@@ -3443,15 +3447,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for i in range(len(obj.rid))
             ]
 
-        for rid, sub_obj, bootstrap_room in items:
-            if rid in self.rid_to_state:
+        rids = set()
+        for rid, _, _ in items:
+            if rid in self.rid_to_state or rid in rids:
                 raise ValueError(f"Duplicate request ID detected: {rid}")
+            rids.add(rid)
+
+        new_states = {}
+        for rid, sub_obj, bootstrap_room in items:
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
-            self.rid_to_state[rid] = state
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
+            new_states[rid] = state
+
+        self.rid_to_state.update(new_states)
 
     def _discard_pending_req_states(self, obj):
         """Drop rid_to_state entries created by _init_req_state for *obj*.

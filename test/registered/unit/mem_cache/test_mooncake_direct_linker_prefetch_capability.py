@@ -171,6 +171,83 @@ class TestResolveHostPrefetch(CustomTestCase):
         self.assertEqual(len(fake.calls), 1)
 
 
+class TestDisableHostPrefetch(CustomTestCase):
+    def test_disable_releases_native_arena_and_clears_wrapper(self):
+        from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+            UnifiedCacheLinkerWrapper,
+        )
+
+        store = MagicMock()
+        store.disable_dfs_prefetch.return_value = True
+        linker = _linker(store)
+        linker.host_prefetch_enabled = True
+        wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+        wrapper.cache_linker = linker
+        wrapper._waiting_queue_prefetch_enabled = True
+
+        wrapper.disable_waiting_queue_prefetch()
+
+        store.disable_dfs_prefetch.assert_called_once_with()
+        self.assertFalse(linker.waiting_queue_prefetch_enabled())
+        self.assertFalse(wrapper.waiting_queue_prefetch_enabled())
+
+    def test_busy_native_arena_is_not_silently_ignored(self):
+        store = MagicMock()
+        store.disable_dfs_prefetch.return_value = False
+        linker = _linker(store)
+        linker.host_prefetch_enabled = True
+        with self.assertRaisesRegex(RuntimeError, "requests have started"):
+            linker.disable_waiting_queue_prefetch()
+        self.assertTrue(linker.waiting_queue_prefetch_enabled())
+
+    def test_unsupported_local_config_disables_arena_at_setup(self):
+        module = "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker"
+        for settings in (
+            {"schedule_policy": "lpm"},
+            {"disaggregation_mode": "decode"},
+            {"pp_size": 2},
+        ):
+            with self.subTest(**settings):
+                args = MagicMock()
+                args.mooncake_enable_waiting_queue_dfs_prefetch = True
+                args.schedule_policy = settings.get("schedule_policy", "fcfs")
+                args.disaggregation_mode = settings.get(
+                    "disaggregation_mode", "prefill"
+                )
+                args.mooncake_page_wise_load_threshold = 10
+                params = MagicMock()
+                params.pp_size = settings.get("pp_size", 1)
+                params.attn_cp_cache_group = None
+                params.attn_tp_cache_group = None
+                pool_group = MagicMock()
+
+                # Stop at setup: no native allocation may have been requested.
+                class SetupReached(Exception):
+                    pass
+
+                with mock.patch(
+                    f"{module}.resolve_hybrid_device_pool_group",
+                    return_value=pool_group,
+                ), mock.patch(
+                    f"{module}.HybridCacheController.parse_storage_backend_extra_config",
+                    return_value=({},),
+                ), mock.patch(
+                    f"{module}.get_memory",
+                    return_value=types.SimpleNamespace(
+                        hicache_storage_backend_extra_config=None
+                    ),
+                ), mock.patch(
+                    f"{module}.get_model",
+                    return_value=types.SimpleNamespace(model_path="dummy"),
+                ), mock.patch(
+                    "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.MooncakeStore",
+                    side_effect=SetupReached,
+                ) as setup:
+                    with self.assertRaises(SetupReached):
+                        MooncakeDirectLinker(args, params, components=set())
+                self.assertIs(setup.call_args.kwargs["enable_dfs_prefetch"], False)
+
+
 def _gloo_rank(rank, world_size, port, unavailable_rank, flag_off_rank, results):
     """One rank of a CP x TP = 2 x 2 Gloo mesh running the real reduction."""
     import datetime
