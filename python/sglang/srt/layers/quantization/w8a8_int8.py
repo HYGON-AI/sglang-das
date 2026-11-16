@@ -280,10 +280,6 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 True,  # is_vnni
             )
         if isinstance(x, Int8QuantizedInput):
-            if input_quant_args is not None:
-                raise ValueError(
-                    "Specify either a quantized operand or input_quant_args"
-                )
             x_q, x_scale, output_dtype = x.unpack()
         elif input_quant_args is None:
             output_dtype = x.dtype
@@ -604,21 +600,6 @@ def _grouped(
     input_quant_args=None,
     quantize_output=False,
 ):
-    if (
-        x.ndim != 3
-        or x.shape[1] != groups
-        or w.dtype != torch.int8
-        or w.shape != (groups * rank, x.shape[-1])
-        or s.shape != (groups * rank, 1)
-        or s.dtype != torch.float32
-        or not w.is_contiguous()
-        or not s.is_contiguous()
-    ):
-        raise ValueError("Invalid grouped INT8 wo_a weight, scale or activation layout")
-    if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        raise ValueError(
-            "INT8 wo_a expects floating-point activations before quantization"
-        )
     _projection_backend()
     if x.shape[0] == 0 or rank == 0:
         return torch.empty(
@@ -670,46 +651,20 @@ def transform_quant_available(groups, rank, width):
 
 
 def rope_grouped_input(x, frequencies, positions, groups, rank, rope_dim):
-    """Prepare the existing service GEMM's pitched INT8 input without a RoPE copy."""
+    """Emit the packed WoA operand; model initialization checks kernel support."""
+    from lightop.quant import rope_per_token_quant
+
     from sglang.kernels.ops.gemm.dsv41_int8 import grouped_input_pitch
 
     if (
-        not x.is_cuda
-        or x.ndim != 3
-        or x.dtype != torch.bfloat16
-        or groups <= 0
-        or x.shape[1] <= 0
-        or x.shape[1] % groups
-        or x.shape[2] <= 0
+        x.dtype != torch.bfloat16
         or x.stride(2) != 1
         or x.stride(1) < x.shape[2]
         or x.stride(0) < x.shape[1] * x.stride(1)
-        or positions.dtype not in (torch.int32, torch.int64)
-        or positions.shape != (x.shape[0],)
-        or not positions.is_contiguous()
-        or positions.device != x.device
-        or frequencies.dtype != torch.complex64
-        or frequencies.ndim != 2
-        or frequencies.shape[0] <= 0
-        or frequencies.shape[1] * 2 != rope_dim
-        or not frequencies.is_contiguous()
-        or frequencies.device != x.device
     ):
         return None
     width = x.shape[1] // groups * x.shape[2]
-    if not transform_quant_available(groups, rank, width):
-        return None
     pitch = grouped_input_pitch(x.shape[0], groups, rank, width)
-    if (
-        pitch is None
-        or not 0 < width <= 16384
-        or x.shape[2] % 2
-        or not 0 < rope_dim <= x.shape[2]
-        or rope_dim % 2
-    ):
-        return None
-    from lightop.quant import rope_per_token_quant
-
     return rope_per_token_quant(
         x,
         frequencies,

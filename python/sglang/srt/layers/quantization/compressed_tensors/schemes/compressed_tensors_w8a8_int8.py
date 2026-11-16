@@ -320,15 +320,6 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
         # An opted-in layer must use the pair: the fused SwiGLU path passes the
         # gate half as x.
         if isinstance(x, Int8QuantizedInput):
-            if (
-                not self.supports_prequantized_input
-                or not self.supports_int8_quantized_input
-                or input_quant_args is not None
-                or silu_quant_args is not None
-            ):
-                raise ValueError(
-                    "This scheme is not opted into quantized-only INT8 input"
-                )
             x_q, x_scale, output_dtype = x.unpack()
         elif input_quant_args is not None and (
             self.supports_prequantized_input or _use_fused_rms_quant

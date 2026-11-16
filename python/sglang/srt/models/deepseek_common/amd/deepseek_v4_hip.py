@@ -98,6 +98,44 @@ def opt_shared_expert_into_fused_silu_mul_quant(mlp) -> None:
 # ---- MqaAttentionBase / MQALayer ----
 
 
+def init_wo_small_op_fusion(attn) -> None:
+    """Select the optional WoA/WoB preparation chain once per HCU layer."""
+    if not (attn.is_dsv41 and envs.SGLANG_OPT_DSV41_SMALL_OP_FUSION.get()):
+        return
+    from sglang.srt.layers.quantization import dsv41_channelwise_fp8 as fp8
+    from sglang.srt.layers.quantization import w8a8_int8 as int8
+
+    heads, groups, dim = attn.n_local_heads, attn.n_local_groups, attn.head_dim
+    rope_dim = attn.qk_rope_head_dim
+    if not (
+        heads > 0
+        and groups > 0
+        and heads % groups == 0
+        and dim > 0
+        and dim % 2 == 0
+        and 0 < rope_dim <= dim
+        and rope_dim % 2 == 0
+        and heads // groups * dim <= 16384
+    ):
+        return
+    attn.fuse_int8_small_ops = bool(
+        attn.wo_a_int8
+        and int8.transform_quant_available(
+            groups, attn.o_lora_rank, heads // groups * dim
+        )
+    )
+    attn.fuse_fp8_small_ops = bool(
+        attn.wo_a_channelwise_fp8 and fp8.transform_quant_available()
+    )
+    if attn.wo_b.input_is_parallel:
+        attn.fuse_wo_b_int8 = attn.fuse_int8_small_ops and opt_into_int8_operand(
+            attn.wo_b, quantized_only=True
+        )
+        attn.fuse_wo_b_fp8 = attn.fuse_fp8_small_ops and linear_takes_fp8_operand(
+            attn.wo_b
+        )
+
+
 def init_mqa_layer(attn, quant_config) -> None:
     """The ROCm state of MQALayer.__init__. On the gfx950 32-block route q_norm also emits
     the fp8-grid operand of wq_b; whether wq_b consumes native MXFP8, and wo_b the fp8-grid

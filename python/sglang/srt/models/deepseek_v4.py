@@ -984,6 +984,10 @@ class MqaAttentionBase(nn.Module):
     # Class-level default for subclasses that read it without running __init__.
     wo_a_fp8: bool = False
     wo_a_int8: bool = False
+    fuse_int8_small_ops: bool = False
+    fuse_wo_b_int8: bool = False
+    fuse_fp8_small_ops: bool = False
+    fuse_wo_b_fp8: bool = False
 
     def __init__(
         self,
@@ -1162,38 +1166,8 @@ class MqaAttentionBase(nn.Module):
             parallel_group="attn_tp",
         )
 
-        self.fuse_int8_small_ops = bool(
-            _is_hcu
-            and self.wo_a_int8
-            and envs.SGLANG_OPT_DSV41_SMALL_OP_FUSION.get()
-            and channelwise_int8.transform_quant_available(
-                self.n_local_groups,
-                self.o_lora_rank,
-                self.n_local_heads // self.n_local_groups * self.head_dim,
-            )
-        )
-        self.fuse_wo_b_int8 = False
-        if self.fuse_int8_small_ops:
-            from sglang.srt.layers.fused_rms_quant import opt_into_int8_operand
-
-            self.fuse_wo_b_int8 = self.wo_b.input_is_parallel and opt_into_int8_operand(
-                self.wo_b, quantized_only=True
-            )
-
-        self.fuse_fp8_small_ops = bool(
-            _is_hcu
-            and self.is_dsv41
-            and self.wo_a_channelwise_fp8
-            and envs.SGLANG_OPT_DSV41_SMALL_OP_FUSION.get()
-            and channelwise_fp8.transform_quant_available()
-        )
-        self.fuse_wo_b_fp8 = False
-        if self.fuse_fp8_small_ops:
-            from sglang.srt.layers.fused_rms_quant import linear_takes_fp8_operand
-
-            self.fuse_wo_b_fp8 = (
-                self.wo_b.input_is_parallel and linear_takes_fp8_operand(self.wo_b)
-            )
+        if _is_hcu:
+            _hip.init_wo_small_op_fusion(self)
 
         from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 

@@ -183,37 +183,16 @@ def transform_quant_available():
 
 
 def rope_grouped_input(x, frequencies, positions, groups, rope_dim):
-    """Inverse RoPE, E4M3 quantization and GEMM's group layout in one pass."""
+    """Emit group-major FP8 directly; model initialization checks kernel support."""
+    from lightop.quant import rope_per_token_quant
+
     if (
-        not transform_quant_available()
-        or not x.is_cuda
-        or x.ndim != 3
-        or x.dtype not in (torch.bfloat16, torch.float16)
-        or groups <= 0
-        or x.shape[1] <= 0
-        or x.shape[1] % groups
-        or x.shape[2] <= 0
-        or x.shape[2] % 2
-        or x.shape[1] // groups * x.shape[2] > 16384
+        x.dtype not in (torch.bfloat16, torch.float16)
         or x.stride(2) != 1
         or x.stride(1) < x.shape[2]
         or x.stride(0) < x.shape[1] * x.stride(1)
-        or positions.dtype not in (torch.int32, torch.int64)
-        or positions.shape != (x.shape[0],)
-        or not positions.is_contiguous()
-        or positions.device != x.device
-        or frequencies.dtype != torch.complex64
-        or frequencies.ndim != 2
-        or frequencies.shape[1] * 2 != rope_dim
-        or frequencies.shape[0] <= 0
-        or not 0 < rope_dim <= x.shape[2]
-        or rope_dim % 2
-        or not frequencies.is_contiguous()
-        or frequencies.device != x.device
     ):
         return None
-    from lightop.quant import rope_per_token_quant
-
     return rope_per_token_quant(
         x,
         frequencies,
