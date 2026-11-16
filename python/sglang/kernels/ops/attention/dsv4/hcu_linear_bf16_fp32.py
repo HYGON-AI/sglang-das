@@ -20,7 +20,7 @@ _MAX_INT32 = (1 << 31) - 1
 def _jit_linear_bf16_fp32_module() -> Module:
     if not is_hcu():
         raise RuntimeError(
-            "The HCU BF16-to-FP32 GEMM requires gfx936, gfx938, or gfx928"
+            "The HCU BF16-to-FP32 GEMM requires gfx936, gfx938, gfx928, or gfx946"
         )
     return load_jit(
         make_name("linear_bf16_fp32_hcu"),
