@@ -27,6 +27,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.weight_cache.protocol import (
+    IPC_QUANT_ALLOWLIST,
     CacheConfig,
     UnsupportedQuantForIPCError,
     check_ipc_quant_support,
@@ -375,6 +376,10 @@ class TestIpcQuantAllowlist(CustomTestCase):
         check_ipc_quant_support(
             "fp8", {"weight_block_size": [128, 128]}, where="daemon"
         )
+
+    def test_allowlist_registry_shape(self):
+        # Guard against accidentally widening the allowlist without review.
+        self.assertEqual(set(IPC_QUANT_ALLOWLIST), {"", "fp8", "compressed-tensors"})
 
 
 class TestCleanupStaleDaemonFiles(CustomTestCase):

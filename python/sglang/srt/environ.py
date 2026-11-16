@@ -2369,6 +2369,12 @@ class Envs:
     SGLANG_WEIGHT_CACHE_READY_TEMPLATE = EnvStr(
         "/tmp/sglang_weight_cache_{device_uuid}.ready"
     )
+    # Debug: daemon and engine each write a fingerprint of their load-time
+    # model state (one JSON per rank) into this directory, for diffing when an
+    # engine served from the weight cache disagrees with a disk load.
+    SGLANG_WEIGHT_CACHE_DEBUG_DIR = EnvStr("")
+    # Debug: also checksum every tensor in that fingerprint (slow).
+    SGLANG_WEIGHT_CACHE_DEBUG_CHECKSUM = EnvBool(False)
 
     # HCU GLM5-Next kernel controls.
     SGLANG_USE_LIGHTOP_PREFILL_DEQUANT = EnvBool(True)

@@ -5886,6 +5886,16 @@ class DeepseekV4ForCausalLM(nn.Module):
             if isinstance(layer, DeepseekV4PlatformDecoderLayer):
                 layer.bind_next(layers[i + 1] if i + 1 < len(layers) else None)
 
+    def post_ipc_weight_load(self) -> None:
+        """Per-process fix-up after the weight cache mapped this model.
+
+        ``load_weights`` never ran here. Its weight rewrites were done once by
+        the daemon on the shared memory, and the flags that guard them (e.g.
+        ``ape_converted``) were carried over, so ``post_load_weights`` only
+        rebuilds what is local to this process: layer links and derived caches.
+        """
+        self.post_load_weights()
+
     def precompile_kernels_after_loading(self) -> None:
         from sglang.srt.layers.moe.mega_moe import (
             build_mega_moe_shared_weights,
