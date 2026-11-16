@@ -200,7 +200,7 @@ def is_hcu() -> bool:
     try:
         props = torch.cuda.get_device_properties(0)
         gcn_arch = getattr(props, "gcnArchName", "")
-        supported_archs = ["gfx936", "gfx938", "gfx928"]
+        supported_archs = ["gfx936", "gfx938", "gfx928", "gfx92a", "gfx946"]
         return any(gfx in gcn_arch for gfx in supported_archs)
     except Exception as e:
         logger.warning("HCU detection failed (not a HCU or HIP misconfigured): %s", e)
@@ -1070,10 +1070,10 @@ def is_gfx95_supported():
 
 @lru_cache(maxsize=1)
 def is_gfx938_supported():
-    """Whether the device is an AMD gfx938 GPU (BW1100/CDNA family)."""
+    """Whether the device is an HCU gfx938/gfx946 GPU (BW1100/CDNA family)."""
     if torch.version.hip:
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return "gfx938" in gcn_arch
+        return any(gfx in gcn_arch for gfx in ("gfx938", "gfx946"))
     return False
 
 

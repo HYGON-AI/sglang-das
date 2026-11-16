@@ -122,7 +122,8 @@ def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
             if any(
                 arch in gcn_arch
                 for arch in (
-                    "gfx90a", "gfx936", "gfx938", "gfx940", "gfx941", "gfx942"
+                    "gfx90a", "gfx936", "gfx938", "gfx940", "gfx941", "gfx942",
+                    "gfx946",
                 )
             ):
                 flags.append("-DHIP_FP8_TYPE_FNUZ=1")

@@ -581,7 +581,7 @@ def _arch_candidates_for_moe_c_json() -> list[str]:
             pass
     except Exception:
         pass
-    for arch in ("gfx938", "gfx92a", "gfx936", "gfx928"):
+    for arch in ("gfx938", "gfx92a", "gfx936", "gfx928", "gfx946"):
         if arch not in candidates:
             candidates.append(arch)
     return candidates
