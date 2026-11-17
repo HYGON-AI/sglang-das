@@ -426,6 +426,14 @@ def _project_int8_affine(layer, x, params):
 
 
 def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
+    if not reuse_input and hidden.is_cuda and hidden.dtype == _BF16_DTYPE:
+        from sglang.multimodal_gen.runtime.layers.minimax_h3_swiglu import (
+            try_fused_swiglu,
+        )
+
+        fused = try_fused_swiglu(hidden)
+        if fused is not None:
+            return fused
     if (
         reuse_input
         and hidden.is_cuda
