@@ -50,11 +50,11 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     dequant_fp4_index_k,
     fp4_index_logits_decode,
 )
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.lightop_indexer import (
     lightop_paged_indexer_available,
     lightop_paired_rows_available,
 )
-from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     fill_all_compressed_indices,
 )
@@ -66,6 +66,7 @@ from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_lightop,
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
+from sglang.kernels.ops.attention.dsv4.topk import topk_transform_ragged_v2
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
@@ -91,7 +92,11 @@ from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateMasks,
     IndexerInputs,
     init_candidate_stream,
+)
+from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     make_candidate_indexer as make_hcu_candidate_indexer,
+)
+from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     mask_topk_scores,
     published_masks,
     select_candidate_blocks,
@@ -106,9 +111,10 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     token_req_indices,
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
-    C4IndexerBackendMixin, deep_gemm_fp4_paged_mqa_logits, topk_transform_paged_from_metadata,
+    C4IndexerBackendMixin,
+    deep_gemm_fp4_paged_mqa_logits,
+    topk_transform_paged_from_metadata,
 )
-from sglang.kernels.ops.attention.dsv4.topk import topk_transform_ragged_v2
 from sglang.srt.layers.attention.dsv4.metadata import (
     _LARGE_INDEXER_QUERY_THRESHOLD,
     PagedIndexerMetadata,
@@ -148,11 +154,11 @@ from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer_len,
     set_local_dp_buffer_len,
 )
-from sglang.srt.mem_cache.deepseek_v4_compress_state import KVAndScore
 from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers import (
     is_cp_cache_layer_split_deepseek_v4_pool,
     maybe_prepare_cp_cache_layer_split_forward,
 )
+from sglang.srt.mem_cache.deepseek_v4_compress_state import KVAndScore
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
@@ -1471,6 +1477,13 @@ class DeepseekV4AttnBackend(
         # V4.1 on HCU gathers low-ratio indexer slots with dedicated kernels
         # instead of HCU's generic index kernel; V4 keeps the upstream path.
         self.dsv41_hcu_indexer_kernels: bool = _is_hcu and self.is_dsv41
+        self.fuse_small_ops = bool(
+            self.dsv41_hcu_indexer_kernels
+            and envs.SGLANG_OPT_DSV41_SMALL_OP_FUSION.get()
+            and torch.cuda.get_device_properties(torch.cuda.current_device())
+            .gcnArchName.split(":")[0]
+            .startswith(("gfx936", "gfx938"))
+        )
         self.prefill_candidates, self.decode_candidates = make_candidate_indexer(
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
@@ -3669,16 +3682,16 @@ class DeepseekV4AttnBackend(
     ) -> None:
         """Decode or target-verify; an extend batch passes ``extend_offsets``, the int32
         (first row, row count) of each request."""
-        from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
-            c1_decode_norm_rope_store,
-            c2_decode_norm_rope_store,
-            c2_prefill_norm_rope_store,
-        )
         # The JIT writer has a portable HIP FP4 encoder as well as the CUDA
         # intrinsic path. Keep norm, RoPE, both quantization stages and the
         # paged cache store in one launch on both backends.
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
             index_k_norm_rope_pack_store,
+        )
+        from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
+            c1_decode_norm_rope_store,
+            c2_decode_norm_rope_store,
+            c2_prefill_norm_rope_store,
         )
         pool = self.token_to_kv_pool
         core = self.forward_metadata.core_metadata
@@ -4771,13 +4784,16 @@ class DeepseekV4AttnBackend(
         # fp4 query as (payload, scale), kernel layout [bs, 1, n_heads, dim]. The
         # kernel sums head scores locally, so the indexer heads must be replicated.
         assert indexer.n_local_heads == indexer.n_heads
+        fuse_small_ops = getattr(self, "fuse_small_ops", False)
+        q_input = getattr(q_lora, "x", q_lora)
         use_hcu_pack = (
-            _use_hcu_index_q_rope_pack
+            (_use_hcu_index_q_rope_pack or fuse_small_ops)
             and x.is_cuda
             and x.dtype == torch.bfloat16
-            and q_lora.dtype == torch.bfloat16
+            and isinstance(q_input, torch.Tensor)
+            and q_input.dtype == torch.bfloat16
             and x.is_contiguous()
-            and q_lora.is_contiguous()
+            and q_input.is_contiguous()
             and indexer.n_local_heads in (32, 64)
             and indexer.index_head_dim == 128
             and indexer.rope_head_dim == 64
@@ -4785,7 +4801,7 @@ class DeepseekV4AttnBackend(
             and layer.freqs_cis.is_contiguous()
             and pos.dtype in (torch.int32, torch.int64)
             and pos.is_contiguous()
-            and not _has_native_hcu_rope_fake_quant()
+            and (fuse_small_ops or not _has_native_hcu_rope_fake_quant())
         )
         if use_hcu_pack:
             from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hcu import (
@@ -4801,6 +4817,7 @@ class DeepseekV4AttnBackend(
                 indexer.head_weights_raw(x),
                 indexer.head_weight_scale,
                 indexer.rope_head_dim,
+                native_rope=fuse_small_ops and _has_native_hcu_rope_fake_quant(),
             )
         elif (
             x.is_cuda

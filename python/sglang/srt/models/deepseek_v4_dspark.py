@@ -30,11 +30,11 @@ from sglang.srt.layers.quantization import dsv41_channelwise_fp8 as channelwise_
 from sglang.srt.layers.quantization import w8a8_int8 as channelwise_int8
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     inverse_transform_scale_ue8m0,
     transform_scale_ue8m0,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -64,7 +64,12 @@ from sglang.srt.models.dspark import (
     project_through_lm_head,
     run_markov_block,
 )
-from sglang.srt.runtime_context import get_disagg, get_parallel, get_platform
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_forward,
+    get_parallel,
+    get_platform,
+)
 from sglang.srt.speculative.dspark_components.dspark_config import (
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
@@ -429,7 +434,19 @@ class DSparkAttention(MqaAttentionBase):
         if o.shape[1] != self.n_local_heads:
             o = o[:, : self.n_local_heads, :]
 
-        if self._use_fast_kernel:
+        input_quant_args = None
+        fp8_input_quant_args = None
+        if self.fuse_fp8_small_ops and self._use_fast_kernel:
+            fp8_input_quant_args = channelwise_fp8.rope_grouped_input(
+                o, self.freqs_cis, positions, self.n_local_groups, rd
+            )
+        if self.fuse_int8_small_ops and self._use_fast_kernel:
+            input_quant_args = channelwise_int8.rope_grouped_input(
+                o, self.freqs_cis, positions, self.n_local_groups, self.o_lora_rank, rd
+            )
+        if input_quant_args is not None or fp8_input_quant_args is not None:
+            pass  # Independent quantized operands already contain inverse RoPE.
+        elif self._use_fast_kernel:
             fused_rope_inplace(
                 o[..., -rd:], None, self.freqs_cis, positions=positions, inverse=True
             )
@@ -462,11 +479,25 @@ class DSparkAttention(MqaAttentionBase):
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         if self.wo_a_int8:
             o = channelwise_int8.grouped(
-                o, self.wo_a, self.n_local_groups, self.o_lora_rank
+                o,
+                self.wo_a,
+                self.n_local_groups,
+                self.o_lora_rank,
+                input_quant_args=input_quant_args,
+                quantize_output=(
+                    self.fuse_wo_b_int8
+                    and o.dtype == torch.bfloat16
+                    and not get_forward().sp_active
+                ),
             )
         elif self.wo_a_channelwise_fp8:
             o = channelwise_fp8.grouped(
-                o, self.wo_a, self.n_local_groups, self.o_lora_rank
+                o,
+                self.wo_a,
+                self.n_local_groups,
+                self.o_lora_rank,
+                quantized=fp8_input_quant_args,
+                quantize_output=(self.fuse_wo_b_fp8 and not get_forward().sp_active),
             )
         elif self._use_fast_kernel:
             o = _apply_wo_a_bf16_matmul(
@@ -478,7 +509,7 @@ class DSparkAttention(MqaAttentionBase):
             )
         else:
             o = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float()).to(q.dtype)
-        out, _ = self.wo_b(o.reshape(o.shape[0], o.shape[1] * o.shape[2]))
+        out, _ = self.wo_b(o.flatten(1) if isinstance(o, torch.Tensor) else o)
         return out
 
 

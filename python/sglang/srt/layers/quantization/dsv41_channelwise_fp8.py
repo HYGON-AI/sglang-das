@@ -10,6 +10,8 @@ to explicitly enable this method with custom checkpoint loaders.
 LM-head LoRA is not supported by this method.
 """
 
+from functools import lru_cache
+
 import torch
 from torch import nn
 
@@ -167,14 +169,49 @@ def _swap01_contiguous(t):
     return t.transpose(0, 1).contiguous()
 
 
-def grouped(x, layer, groups, rank):
+@lru_cache(maxsize=1)
+def transform_quant_available():
+    """Whether LightOp supplies the complete-row FP8 transform operations."""
+    if torch.version.hip is None:
+        return False
+    try:
+        from lightop.quant.fp8 import PER_TOKEN_QUANT_FP8_VERSION
+        from lightop.quant.transforms import is_transform_quant_available
+    except (ImportError, OSError, RuntimeError):
+        return False
+    return is_transform_quant_available() and PER_TOKEN_QUANT_FP8_VERSION >= 2
+
+
+def rope_grouped_input(x, frequencies, positions, groups, rope_dim):
+    """Emit group-major FP8 directly; model initialization checks kernel support."""
+    from lightop.quant import rope_per_token_quant
+
+    if (
+        x.dtype not in (torch.bfloat16, torch.float16)
+        or x.stride(2) != 1
+        or x.stride(1) < x.shape[2]
+        or x.stride(0) < x.shape[1] * x.stride(1)
+    ):
+        return None
+    return rope_per_token_quant(
+        x,
+        frequencies,
+        positions,
+        groups,
+        rope_dim,
+        inverse=True,
+        dtype=torch.float8_e4m3fn,
+        group_major=True,
+    )
+
+
+def grouped(x, layer, groups, rank, *, quantized=None, quantize_output=False):
     weight = layer.weight.view(groups, rank, -1)
     scale = layer.weight_scale_inv.view(groups, rank, 1)
-    if x.dim() == 3 and x.is_contiguous() and x.numel() > 0:
-        # x is [tokens, groups, dim]; the batched GEMM wants [groups, tokens,
-        # dim]. Per-token scales depend only on each (token, group) row, so
-        # quantize in the native layout and transpose the 1-byte FP8 result
-        # instead of the 2-byte BF16 input.
+    if quantized is not None:
+        xq, xs = quantized
+        y = linear(xq, weight, scale, output_dtype=x.dtype, quantized=(xq, xs))
+    elif x.dim() == 3 and x.is_contiguous() and x.numel() > 0:
         from lightop.quant import per_token_quant_fp8
 
         tokens, n_groups, dim = x.shape
@@ -184,6 +221,11 @@ def grouped(x, layer, groups, rank):
         y = linear(xq, weight, scale, output_dtype=x.dtype, quantized=(xq, xs))
     else:
         y = linear(x.transpose(0, 1).contiguous(), weight, scale)
+    if quantize_output and x.shape[0] > 0:
+        from lightop.quant import per_token_quant_fp8
+
+        q, scales = per_token_quant_fp8(y.transpose(0, 1), quant_ndim=2)
+        return q, scales, x.dtype
     return _swap01_contiguous(y)
 
 
