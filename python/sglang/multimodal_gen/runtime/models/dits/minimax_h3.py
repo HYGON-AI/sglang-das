@@ -1132,6 +1132,14 @@ class MiniMaxH3MLP(nn.Module):
             hidden, _ = self.fc1(x)
         else:
             hidden = _project_int8_affine(self.fc1, x, input_affine)
+        if envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_QUANT_FUSION:
+            from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_swiglu_quant import (
+                try_swiglu_fc2,
+            )
+
+            fused = try_swiglu_fc2(self.fc2, hidden)
+            if fused is not None:
+                return fused
         hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
         return out

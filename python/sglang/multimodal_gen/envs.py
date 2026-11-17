@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_VAE_QKNORM_ROPE: bool = False
     SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_AFFINE_QUANT_FUSION: bool = False
     SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_FUSION: bool = False
+    SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_QUANT_FUSION: bool = False
     SGLANG_MINIMAX_H3_INT8_ENABLE: bool = True
     SGLANG_MINIMAX_H3_INT8_FUSION: bool = True
     SGLANG_MINIMAX_H3_FP8_OPTIMIZE: bool = True
@@ -184,6 +185,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt in to H3 out-of-place SwiGLU with native BF16 SiLU rounding.
     "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_FUSION": _lazy_bool(
         "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_FUSION", "false"
+    ),
+    # Fuse BF16-rounded SwiGLU and fc2 INT8 row quantization. Requires both
+    # LIGHTOP_GEMM and LIGHTOP_GEMM_WHOLE; unsupported inputs retain the MLP path.
+    "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_QUANT_FUSION": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_QUANT_FUSION", "false"
     ),
     # Opt-in HCU VAE Q/K RMSNorm + partial RoPE; not bit-exact.
     "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_VAE_QKNORM_ROPE": _lazy_bool(
