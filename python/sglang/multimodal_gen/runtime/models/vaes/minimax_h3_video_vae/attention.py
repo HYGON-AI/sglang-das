@@ -10,11 +10,13 @@ import torch.nn.functional as F
 from diffusers.utils import logging
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.srt.utils import is_hcu
 
 from .vit_utils import _env_flag, apply_rotary_pos_emb_qk
 
@@ -138,13 +140,35 @@ class Attention(nn.Module):
         qkv = qkv.view(batch_size, seq_len, -1, 3 * self.dim_head)
         query, key, value = torch.chunk(qkv, 3, dim=-1)
 
-        if self.norm_q is not None:
-            query = _apply_qk_norm(self.norm_q, query)
-        if self.norm_k is not None:
-            key = _apply_qk_norm(self.norm_k, key)
+        fused_qk = None
+        if (
+            envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_VAE_QKNORM_ROPE
+            and is_hcu()
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and self.norm_q is not None
+            and self.norm_k is not None
+        ):
+            from sglang.kernels.ops.diffusion import (
+                can_use_minimax_h3_vae_qknorm_rope,
+                minimax_h3_vae_qknorm_rope,
+            )
 
-        if rotary_pos_emb is not None:
-            query, key = apply_rotary_pos_emb_qk(query, key, rotary_pos_emb)
+            if can_use_minimax_h3_vae_qknorm_rope(
+                query, key, rotary_pos_emb, self.norm_q, self.norm_k
+            ):
+                fused_qk = minimax_h3_vae_qknorm_rope(
+                    query, key, rotary_pos_emb[2], rotary_pos_emb[3], self.norm_q.eps
+                )
+        if fused_qk is None:
+            if self.norm_q is not None:
+                query = _apply_qk_norm(self.norm_q, query)
+            if self.norm_k is not None:
+                key = _apply_qk_norm(self.norm_k, key)
+            if rotary_pos_emb is not None:
+                query, key = apply_rotary_pos_emb_qk(query, key, rotary_pos_emb)
+        else:
+            query, key = fused_qk
 
         if self.attn is not None and query.dtype in (torch.float16, torch.bfloat16):
             hidden_states = self.attn(query, key, value)
