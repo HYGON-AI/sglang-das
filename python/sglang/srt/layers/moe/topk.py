@@ -3082,7 +3082,9 @@ def _post_process_topk_ids(
                 solver = get_global_lplb_solver(layer_id)
                 if solver is None:
                     raise RuntimeError(f"Missing HIP LPLB solver for layer {layer_id}")
-                probabilities = solver.solve(topk_ids)
+                probabilities = solver.solve(
+                    topk_ids, num_token_non_padded=num_token_non_padded
+                )
                 if hasattr(solver, "static_dispatch_map"):
                     from sglang.kernels.ops.lplb import cuda_solver
 
@@ -3090,8 +3092,8 @@ def _post_process_topk_ids(
                         topk_ids, probabilities, solver.static_dispatch_map
                     )
                 else:
-                    topk_ids = topk_ids_logical_to_physical(
-                        topk_ids, remap_info, probabilities
+                    topk_ids = _lp_or_static_remap(
+                        topk_ids, remap_info, solver, probabilities
                     )
                 remap_info = None  # IDs are physical; do not remap a second time.
             topk_ids = _biased_grouped_topk_postprocess(

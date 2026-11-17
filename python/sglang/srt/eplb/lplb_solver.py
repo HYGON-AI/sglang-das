@@ -27,6 +27,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_resources
+from sglang.srt.utils import is_hcu
 
 logger = logging.getLogger(__name__)
 
@@ -297,6 +298,7 @@ class LPLBSolver:
         # HIP has no cuBLASDx IPM backend: split replicas by water-filling,
         # on the stream by default (the host variant syncs every layer).
         self._hip_solver = None
+        self._uses_hip_device_solver = False
         self.dispatch_map = None
         if torch.version.hip:
             # Metadata pads every row to all physical experts (416 for r32), and
@@ -313,6 +315,7 @@ class LPLBSolver:
             else:
                 from sglang.srt.eplb.lplb_hip_waterfill import DeviceWaterfill
 
+                self._uses_hip_device_solver = True
                 self._hip_solver = DeviceWaterfill(
                     phy2log,
                     compact,
@@ -344,7 +347,12 @@ class LPLBSolver:
             device=device,
         )
 
-    def solve(self, topk_ids: torch.Tensor) -> torch.Tensor:
+    def solve(
+        self,
+        topk_ids: torch.Tensor,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Full LPLB pipeline: count -> all-reduce -> LP solve -> return log2phy_prob.
 
@@ -356,6 +364,7 @@ class LPLBSolver:
         Args:
             topk_ids: (num_tokens, topk) int32 tensor of logical expert IDs.
                       Can be empty (shape (0, topk)) for idle ranks.
+            num_token_non_padded: Device row count for HCU DeepEP graph padding.
 
         Returns:
             log2phy_prob: (num_logical, max_copies) float32 probability tensor.
@@ -374,11 +383,32 @@ class LPLBSolver:
         # and a no-op when topk_ids is empty (DP-attention idle rank case).
         local_counts = torch.zeros(self.num_logical, dtype=torch.int32, device=device)
         flat_ids = topk_ids.flatten()
-        local_counts.scatter_add_(
-            0,
-            flat_ids.long(),
-            torch.ones_like(flat_ids, dtype=torch.int32),
-        )
+        if num_token_non_padded is not None and is_hcu():
+            # DeepEP drops graph-padding rows after LP remapping. Exclude
+            # those rows from the solve without reading their count on CPU.
+            from sglang.kernels.ops.moe.ep_moe_kernels import (
+                count_expert_histogram_kernel,
+            )
+
+            if flat_ids.numel():
+                flat_ids = flat_ids.contiguous()
+                count_expert_histogram_kernel[
+                    ((flat_ids.numel() + 1023) // 1024,)
+                ](
+                    flat_ids,
+                    local_counts,
+                    flat_ids.numel(),
+                    E=self.num_logical,
+                    num_token_non_padded_ptr=num_token_non_padded,
+                    TOPK=topk_ids.shape[1],
+                    HAS_TOKEN_LIMIT=True,
+                )
+        else:
+            local_counts.scatter_add_(
+                0,
+                flat_ids.long(),
+                torch.ones_like(flat_ids, dtype=torch.int32),
+            )
 
         # Step 2: All-reduce to get global counts across all EP ranks.
         # All EP ranks must participate — empty-token ranks contribute zeros.
@@ -403,7 +433,11 @@ class LPLBSolver:
         Raises if the JIT CUDA backend is unavailable.
         """
         if self._hip_solver is not None:
-            return self._hip_solver.solve(global_counts, self._log2phy_prob)
+            out = self._log2phy_prob
+            if is_hcu() and self._uses_hip_device_solver:
+                # A following SBO stream must not overwrite a live dispatch.
+                out = torch.empty_like(out)
+            return self._hip_solver.solve(global_counts, out)
         from sglang.kernels.ops.lplb import cuda_solver
 
         cuda_solver.prep_lp_inputs(

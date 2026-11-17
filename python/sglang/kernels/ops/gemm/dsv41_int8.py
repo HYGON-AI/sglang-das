@@ -305,11 +305,13 @@ def _version(w):
 def _role(g,n,k):
  if (g,n,k)==(8,1024,4096):return 'wo_a'
  if (g,n,k)==(1,129280,5120):return 'lm_head'
+ if (g,n,k)==(1,16160,5120):return 'lm_head_tp8'
  if g==1 and k==256 and n in (16160,129280):return 'markov_tp8' if n==16160 else 'markov_full'
  return None
 
 
 def _layout(role,m,g,n,k):
+ if role=='lm_head_tp8':return 1,n,k*n,k,False
  if role=='wo_a':return g,n,k*n+131072,4224 if m in (36,40,42,48) else (k+64 if m>=64 else k),False
  if role=='lm_head':
   pitch=5120 if m<64 else (5136 if m==64 else (5248 if m<=96 else (5152 if m<=128 else 5376)))
