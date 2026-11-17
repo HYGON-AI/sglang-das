@@ -296,6 +296,70 @@ class TestHcuChannelFp8Allowlist(CustomTestCase):
         self.assertFalse(ipc_adopts_postprocessed_layout("fp8"))
         self.assertFalse(ipc_adopts_postprocessed_layout(""))
 
+    def test_repacked_deleted_params_are_dropped_on_client(self):
+        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        class _MoELayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w13_weight = nn.Parameter(torch.ones(2, 4), requires_grad=False)
+                self.w13_weight_scale = nn.Parameter(
+                    torch.ones(2, 1), requires_grad=False
+                )
+
+            def repack(self):
+                self.register_buffer(
+                    "w13_weight_deepgemm", self.w13_weight * 2, persistent=False
+                )
+                self._dsv4_channel_fp8_deepgemm_repacked = True
+                del self.w13_weight
+
+        daemon_model = nn.ModuleDict({"moe": _MoELayer()})
+        daemon_model["moe"].repack()
+        extra = export_extra_state(daemon_model, serialize=lambda t: t)
+        entries = {
+            "moe.w13_weight_scale": {
+                "tensor": daemon_model["moe"].w13_weight_scale.data,
+                "is_param": True,
+            },
+            "moe.w13_weight_deepgemm": {
+                "tensor": daemon_model["moe"].w13_weight_deepgemm,
+                "is_param": False,
+            },
+        }
+        loader = IpcModelLoader(LoadConfig(load_format=LoadFormat.IPC_CACHE))
+        model_cfg = SimpleNamespace(
+            dtype=torch.float32,
+            quantization="compressed-tensors",
+            hf_config=SimpleNamespace(quantization_config=_CHANNEL_FP8),
+        )
+        with (
+            mock.patch(
+                "sglang.srt.weight_cache.ipc_loader._initialize_model",
+                side_effect=lambda *a, **kw: nn.ModuleDict({"moe": _MoELayer()}),
+            ),
+            mock.patch.object(
+                loader._transport_backend,
+                "import_tensor",
+                side_effect=lambda entry: entry["tensor"],
+            ),
+        ):
+            client = loader._load_zero_copy_mode(
+                model_cfg,
+                device_config=None,
+                entries=entries,
+                quant_config=None,
+                extra_state=extra,
+            )
+        self.assertFalse(hasattr(client["moe"], "w13_weight"))
+        self.assertTrue(
+            torch.equal(
+                client["moe"].w13_weight_deepgemm,
+                daemon_model["moe"].w13_weight_deepgemm,
+            )
+        )
+
 
 class TestWeightLayoutStamp(CustomTestCase):
     def _stamp(self, location, redundant):
@@ -323,6 +387,20 @@ class TestWeightLayoutStamp(CustomTestCase):
     def test_redundant_experts_and_literal_location_change_the_stamp(self):
         self.assertNotEqual(self._stamp("trivial", 0), self._stamp("trivial", 32))
         self.assertNotEqual(self._stamp("trivial", 0), self._stamp("other", 0))
+
+
+class TestDeepseekV4RopeMetaCache(CustomTestCase):
+    def test_meta_init_does_not_poison_deepseek_v4_rope_cache(self):
+        from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
+
+        precompute_freqs_cis.cache_clear()
+        args = (64, 128, 64, 10000.0, 16.0, 32, 1)
+        with torch.device("meta"):
+            meta_freqs = precompute_freqs_cis(*args)
+        self.assertEqual(meta_freqs.device.type, "meta")
+        cpu_freqs = precompute_freqs_cis(*args)
+        self.assertEqual(cpu_freqs.device.type, "cpu")
+        self.assertEqual(cpu_freqs.shape, meta_freqs.shape)
 
 
 if __name__ == "__main__":

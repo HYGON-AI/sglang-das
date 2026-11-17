@@ -24,8 +24,8 @@ def _yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
-@lru_cache(2)
-def precompute_freqs_cis(
+@lru_cache(4)
+def _precompute_freqs_cis_for_device(
     dim,
     seqlen,
     original_seq_len,
@@ -33,6 +33,7 @@ def precompute_freqs_cis(
     factor,
     beta_fast,
     beta_slow,
+    device: torch.device,
 ) -> torch.Tensor:
 
     def find_correction_dim(num_rotations, dim, base, max_seq_len):
@@ -54,18 +55,50 @@ def precompute_freqs_cis(
         ramp_func = torch.clamp(linear_func, 0, 1)
         return ramp_func
 
-    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-    if original_seq_len > 0:
-        low, high = find_correction_range(
-            beta_fast, beta_slow, dim, base, original_seq_len
-        )
-        smooth = 1 - linear_ramp_factor(low, high, dim // 2)
-        freqs = freqs / factor * (1 - smooth) + freqs * smooth
+    with torch.device(device):
+        freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        if original_seq_len > 0:
+            low, high = find_correction_range(
+                beta_fast, beta_slow, dim, base, original_seq_len
+            )
+            smooth = 1 - linear_ramp_factor(low, high, dim // 2)
+            freqs = freqs / factor * (1 - smooth) + freqs * smooth
 
-    t = torch.arange(seqlen)
-    freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+        t = torch.arange(seqlen)
+        freqs = torch.outer(t, freqs)
+        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis
+
+
+def precompute_freqs_cis(
+    dim,
+    seqlen,
+    original_seq_len,
+    base,
+    factor,
+    beta_fast,
+    beta_slow,
+) -> torch.Tensor:
+    device = torch.empty(0).device
+    if device.type == "meta":
+        # Weight-cache target meta-init builds modules under torch.device("meta")
+        # and then replaces their buffers from IPC. Never cache a meta tensor:
+        # a draft model built afterwards in the same process needs real storage.
+        return torch.empty((seqlen, dim // 2), dtype=torch.complex64, device="meta")
+    return _precompute_freqs_cis_for_device(
+        dim,
+        seqlen,
+        original_seq_len,
+        base,
+        factor,
+        beta_fast,
+        beta_slow,
+        device,
+    )
+
+
+precompute_freqs_cis.cache_clear = _precompute_freqs_cis_for_device.cache_clear
+precompute_freqs_cis.cache_info = _precompute_freqs_cis_for_device.cache_info
 
 
 @triton.jit

@@ -161,7 +161,11 @@ def collect_extra_state(model: nn.Module) -> Dict[str, Any]:
             return
         opaque[path] = type(value).__name__
 
+    module_tensors: Dict[str, List[str]] = {}
     for module_name, module in modules:
+        module_tensors[module_name] = sorted(
+            set(module._parameters) | set(module._buffers)
+        )
         skip_attrs = getattr(type(module), "_weight_cache_skip_attrs", ())
         for key, value in vars(module).items():
             if key in _MODULE_INTERNAL_KEYS or key in skip_attrs:
@@ -172,6 +176,7 @@ def collect_extra_state(model: nn.Module) -> Dict[str, Any]:
         "scalars": scalars,
         "containers": containers,
         "opaque": opaque,
+        "module_tensors": module_tensors,
     }
 
 
@@ -217,6 +222,7 @@ def export_extra_state(
         "scalars": list(state["scalars"].items()),
         "containers": list(state["containers"].items()),
         "opaque": list(state["opaque"].items()),
+        "module_tensors": state["module_tensors"],
     }
 
 
