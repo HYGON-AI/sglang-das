@@ -3486,10 +3486,15 @@ def count_expert_histogram_kernel(
     counts_ptr,
     numel,
     E: tl.constexpr,
+    num_token_non_padded_ptr=None,
+    TOPK: tl.constexpr = 1,
+    HAS_TOKEN_LIMIT: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     offs = pid * 1024 + tl.arange(0, 1024)  # [1024]
     mask = offs < numel
+    if HAS_TOKEN_LIMIT:
+        mask = mask & (offs // TOPK < tl.load(num_token_non_padded_ptr))
     expert_id = tl.load(topk_ids_ptr + offs, mask=mask, other=-1)
     valid_mask = (expert_id >= 0) & (expert_id < E)
     tl.atomic_add(counts_ptr + expert_id, 1, mask=valid_mask)
