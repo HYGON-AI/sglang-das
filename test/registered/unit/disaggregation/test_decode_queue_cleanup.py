@@ -278,6 +278,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         first = decode_req(7)
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.use_new_rebootstrap_room = False
         queue.pending_reqs = [first]
         queue._prefill_dp_rank_queries = {}
         queue.kv_manager = SimpleNamespace(
@@ -382,6 +383,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.decode_offload_manager = None
         scheduler.enable_hisparse = False
         scheduler.enable_hierarchical_cache = False
+        scheduler.enable_unified_cache_external_linker = False
 
         self.assertFalse(scheduler.is_fully_idle())
 

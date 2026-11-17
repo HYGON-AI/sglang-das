@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler_components.output_streamer import (
     _GenerationStreamAccumulator,
 )
@@ -27,7 +28,7 @@ class _FakeReq:
             no_stop_trim=False,
         )
         self.output_ids = []
-        self.output_ids_through_stop = []
+        self.pd_rebootstrap_forced_output_id = None
         self.send_token_offset = 0
         self.send_output_token_logprobs_offset = 0
         self.send_decode_id_offset = 0
@@ -56,6 +57,13 @@ class _FakeReq:
         )
 
     def finished(self):
+        return self.finished_reason is not None
+
+    @property
+    def output_ids_through_stop(self):
+        return self.output_ids[: self.finished_len]
+
+    def check_match_stop_str_prefix(self):
         return False
 
     def init_incremental_detokenize(self):
@@ -96,6 +104,48 @@ class TestOutputStreamerLogprobs(unittest.TestCase):
         self.assertEqual(req.send_token_offset, 0)
         self.assertEqual(req.send_output_token_logprobs_offset, 1)
         self.assertEqual(accumulator.output_token_logprobs_val, [[-0.5]])
+
+    def test_stream_rebootstrap_does_not_resend_boundary_token(self):
+        """A late decode result must not publish the shortened output."""
+        req = _FakeReq(is_retracted=False, max_new_tokens=16)
+        req.stream = True
+        req.output_ids.append(42)
+        accumulator = _make_accumulator()
+        accumulator.accept(req=req)
+
+        req.is_retracted = True
+        req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+        accumulator.accept(req=req)
+
+        self.assertEqual(accumulator.completion_tokens, [1])
+        self.assertEqual(req.send_token_offset, 1)
+        self.assertEqual(req.send_output_token_logprobs_offset, 1)
+
+        req.output_ids.extend([req.pd_rebootstrap_forced_output_id, 43])
+        req.pd_rebootstrap_forced_output_id = None
+        req.is_retracted = False
+        req.logprob.output_token_logprobs_val.append(-0.25)
+        req.logprob.output_token_logprobs_idx.append(43)
+        accumulator.accept(req=req)
+
+        self.assertEqual(accumulator.completion_tokens, [1, 2])
+        self.assertEqual(accumulator.output_ids, [[42], [43]])
+        self.assertEqual(accumulator.output_token_logprobs_idx, [[42], [43]])
+        self.assertEqual(accumulator.output_token_logprobs_val, [[-0.5], [-0.25]])
+
+    def test_stream_rebootstrap_still_emits_abort(self):
+        req = _FakeReq(is_retracted=True, max_new_tokens=16)
+        req.stream = True
+        req.pd_rebootstrap_forced_output_id = 42
+        req.finished_reason = FINISH_ABORT("Prefill recompute failed", status_code=500)
+        accumulator = _make_accumulator()
+
+        accumulator.accept(req=req)
+
+        self.assertTrue(req.finished_output)
+        self.assertEqual(accumulator.rids, [req.rid])
+        self.assertEqual(accumulator.finished_reasons, [req.finished_reason.to_json()])
+        self.assertEqual(accumulator.output_ids, [[]])
 
 
 if __name__ == "__main__":

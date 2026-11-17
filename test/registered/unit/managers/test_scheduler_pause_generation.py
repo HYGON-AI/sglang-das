@@ -459,7 +459,9 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         )
         scheduler.running_batch.reqs = [req]
 
-        with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
+        with patch(
+            "sglang.srt.managers.scheduler.retract_all", return_value=[]
+        ) as mock_retract_all:
             scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         scheduler._add_request_to_queue.assert_not_called()
@@ -473,6 +475,32 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         # the device->host KV offload rather than offload-then-delete it.
         mock_retract_all.assert_called_once()
         self.assertEqual(mock_retract_all.call_args.kwargs["offload_kv"], False)
+
+    def test_pd_decode_pause_aborts_unresumable_request(self):
+        scheduler = self._new_scheduler()
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = MagicMock()
+        scheduler._release_aborted_request = MagicMock()
+        scheduler.ipc_channels = MagicMock()
+        req = self._make_req("unresumable")
+        req.output_ids.extend([10, 11])
+        req.input_embeds = object()
+        scheduler.running_batch.reqs = [req]
+
+        with patch(
+            "sglang.srt.managers.scheduler.retract_all", return_value=[req]
+        ):
+            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.assert_not_called()
+        scheduler._release_aborted_request.assert_called_once_with(req.rid)
+        abort_req, sent_req = (
+            scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args
+        )
+        self.assertIs(sent_req, req)
+        self.assertEqual(abort_req.finished_reason["status_code"], 503)
+        self.assertEqual(list(req.output_ids), [10, 11])
+        self.assertEqual(scheduler.running_batch.reqs, [])
 
     def test_pd_decode_continue_releases_held_rebootstrap(self):
         """continue_generation must enqueue staged rebootstrap reqs on resume."""

@@ -219,6 +219,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
     retract_all,
+    unresumable_abort_message,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -6004,12 +6005,13 @@ class Scheduler(
         self.last_batch = None
         self.cur_batch_for_debug = None
 
+        unresumable = []
         if retract_reqs:
             # Decode-side retract always rebootstraps (recomputes the KV from
             # the prefill), so skip the device->host KV offload that release_req
             # would otherwise do; the offloaded copy would be immediately
             # discarded. Non-decode modes ignore offload_kv (they never offload).
-            retract_all(
+            unresumable = retract_all(
                 reqs=retract_reqs,
                 server_args=self.server_args,
                 req_to_token_pool=self.req_to_token_pool,
@@ -6020,7 +6022,16 @@ class Scheduler(
             )
         self.running_batch.reqs = []
         for req in retract_reqs:
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
+            if req in unresumable:
+                abort_reason = FINISH_ABORT(
+                    unresumable_abort_message(),
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                self._release_aborted_request(req.rid)
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    _make_abort_req(req, finished_reason=abort_reason.to_json()), req
+                )
+            elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 if req.output_ids:
                     req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
                 req.pd_rebootstrap_in_progress = True

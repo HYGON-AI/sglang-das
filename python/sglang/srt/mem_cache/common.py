@@ -165,6 +165,14 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
             tree_cache.evict(EvictParams(num_tokens=num_tokens - available_size))
 
 
+def dsv4_needs_rebootstrap(
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+) -> bool:
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    return isinstance(token_to_kv_pool_allocator.get_kvcache(), DeepSeekV4TokenToKVPool)
+
+
 def retraction_backup(
     req: Req,
     tree_cache: BasePrefixCache,
@@ -172,8 +180,16 @@ def retraction_backup(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
 ) -> bool:
-    """Returns False when the host pool cannot hold the backup; the caller
-    aborts the request since its KV cannot be preserved."""
+    """Return whether the KV can be backed up or recomputed on prefill."""
+    if backend == "none":
+        return False
+    if dsv4_needs_rebootstrap(token_to_kv_pool_allocator):
+        if not req.resumable_by_rebootstrap:
+            return False
+        # Drain in-flight forwards before released slots can receive recomputed KV.
+        device = token_to_kv_pool_allocator.get_kvcache().device
+        torch.get_device_module(device).synchronize(device)
+        return True
     if backend == "cpu_tensor":
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
         return True

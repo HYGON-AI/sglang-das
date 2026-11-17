@@ -411,6 +411,10 @@ class _GenerationStreamAccumulator:
             should_output = True
         else:
             if req.stream:
+                # Rebootstrap temporarily removes a token that may already have
+                # been sent. An overlap result can still try to emit this req.
+                if req.pd_rebootstrap_forced_output_id is not None:
+                    return
                 stream_interval = (
                     req.sampling_params.stream_interval or self.default_stream_interval
                 )
