@@ -1,4 +1,4 @@
-"""Exact Torch RoPE plus fused FP4 pack in the HCU LightOp indexer layout."""
+"""HCU index-Q RoPE, two-stage FP4 pack and head-weight scaling."""
 
 from __future__ import annotations
 
@@ -25,9 +25,10 @@ def _index_q_fp4_pack_weights_hcu_kernel(
     HEADS: tl.constexpr,
     RD: tl.constexpr,
     AMAX_FLOOR: tl.constexpr,
+    NATIVE_ROPE: tl.constexpr,
 ):
-    # RoPE is already computed by the exact Torch reference. RD=0 keeps
-    # the two quantization stages while eliding the packer's own rotation.
+    # Native AOT needs distinct real/imaginary contraction; the caller sets it.
+    # The Torch-compatible fallback keeps its prior complex rotation.
     _index_k_rope_pack_kernel(
         Q,
         F,
@@ -38,12 +39,13 @@ def _index_q_fp4_pack_weights_hcu_kernel(
         Positions,
         F_STRIDE=F_STRIDE,
         HEADS=HEADS,
-        RD=0,
-        INDEXED=False,
+        RD=RD if NATIVE_ROPE else 0,
+        INDEXED=NATIVE_ROPE,
         STORE_CACHE=False,
         PAGE_SIZE=0,
         CACHE_STRIDE=0,
         AMAX_FLOOR=AMAX_FLOOR,
+        NATIVE_ROPE=NATIVE_ROPE,
     )
     row = tl.program_id(0)
     raw = tl.load(RawWeights + row).to(tl.float32)
@@ -59,6 +61,8 @@ def index_q_rope_pack_weights_hcu(
     raw_weights: torch.Tensor,
     weight_scale: float,
     rope_dim: int = 64,
+    *,
+    native_rope: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pack BF16 [T,H,128] Q plus BF16 [T,H] raw weights for the HCU indexer.
 
@@ -83,8 +87,9 @@ def index_q_rope_pack_weights_hcu(
     scale = torch.empty((tokens * heads,), dtype=torch.int32, device=q.device)
     weights = torch.empty((tokens, heads), dtype=torch.float32, device=q.device)
     if tokens * heads:
-        # Preserve Torch complex multiply ordering at BF16/FP4 boundaries.
-        q = rope_tail(q, freqs[positions], rope_dim)
+        if not native_rope:
+            # Preserve Torch complex multiply ordering in the existing fallback.
+            q = rope_tail(q, freqs[positions], rope_dim)
         _index_q_fp4_pack_weights_hcu_kernel[(tokens * heads,)](
             q,
             f,
@@ -98,6 +103,8 @@ def index_q_rope_pack_weights_hcu(
             HEADS=heads,
             RD=rope_dim,
             AMAX_FLOOR=FP4_AMAX_FLOOR,
-            num_warps=4,
+            NATIVE_ROPE=native_rope,
+            num_warps=1 if native_rope else 4,
+            enable_fp_fusion=not native_rope,
         )
     return payload, scale, weights

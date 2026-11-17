@@ -16,6 +16,7 @@ from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPUW8A8Int8DynamicLinearMethod,
 )
+from sglang.srt.layers.fused_rms_quant import Int8QuantizedInput
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
@@ -66,6 +67,7 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
         self.prequantized_input_eligible = (
             not is_static_input_scheme and input_symmetric
         )
+        self.supports_int8_quantized_input = self.prequantized_input_eligible
         self.w8a8_strategy = int(os.getenv("W8A8_SUPPORT_METHODS", "1"))  # TODO
 
     def create_weights(
@@ -317,17 +319,22 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
         # TODO: add cutlass_scaled_mm_azp support
         # An opted-in layer must use the pair: the fused SwiGLU path passes the
         # gate half as x.
-        if input_quant_args is not None and (
+        if isinstance(x, Int8QuantizedInput):
+            x_q, x_scale, output_dtype = x.unpack()
+        elif input_quant_args is not None and (
             self.supports_prequantized_input or _use_fused_rms_quant
         ):
+            output_dtype = x.dtype
             assert len(input_quant_args) == 2
             x_q, x_scale = input_quant_args
         elif _use_fused_silu_mul_quant and silu_quant_args is not None:
+            output_dtype = x.dtype
             x_q, x_scale = silu_quant_args
         else:
+            output_dtype = x.dtype
             x_q, x_scale = per_token_quant_int8(x)
 
-        # return quant_ops.custom_scaled_mm(x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias)
+        # return quant_ops.custom_scaled_mm(x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=output_dtype, bias=bias)
 
         if self.w8a8_strategy == 1:
             m = x_q.shape[0]
@@ -370,7 +377,7 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
                 layer.weight,
                 x_scale,
                 layer.weight_scale,
-                out_dtype=x.dtype,
+                out_dtype=output_dtype,
                 bias=bias,
                 best_config=best_config,
             )
@@ -380,7 +387,7 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
                 layer.weight,
                 scale_a=x_scale,
                 scale_b=layer.weight_scale,
-                out_dtype=x.dtype,
+                out_dtype=output_dtype,
                 bias=bias,
             )
         elif self.w8a8_strategy == 3:
@@ -389,7 +396,7 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
                 layer.weight,
                 scale_a=x_scale,
                 scale_b=layer.weight_scale,
-                out_dtype=x.dtype,
+                out_dtype=output_dtype,
                 bias=bias,
             )
         else:
@@ -398,7 +405,7 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
                 layer.weight,
                 scale_a=x_scale,
                 scale_b=layer.weight_scale,
-                out_dtype=x.dtype,
+                out_dtype=output_dtype,
                 bias=bias,
             )
 

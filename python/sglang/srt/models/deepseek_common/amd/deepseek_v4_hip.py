@@ -23,6 +23,8 @@ from sglang.srt.layers.fused_rms_quant import (
     opt_into_int8_operand,
     rms_norm_fp8_operand,
     rms_norm_int8_operand,
+    rms_norm_strided_fp8_operand,
+    rms_norm_strided_int8_operand,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -95,6 +97,44 @@ def opt_shared_expert_into_fused_silu_mul_quant(mlp) -> None:
 # ---- MqaAttentionBase / MQALayer ----
 
 
+def init_wo_small_op_fusion(attn) -> None:
+    """Select the optional WoA/WoB preparation chain once per HCU layer."""
+    if not (attn.is_dsv41 and envs.SGLANG_OPT_DSV41_SMALL_OP_FUSION.get()):
+        return
+    from sglang.srt.layers.quantization import dsv41_channelwise_fp8 as fp8
+    from sglang.srt.layers.quantization import w8a8_int8 as int8
+
+    heads, groups, dim = attn.n_local_heads, attn.n_local_groups, attn.head_dim
+    rope_dim = attn.qk_rope_head_dim
+    if not (
+        heads > 0
+        and groups > 0
+        and heads % groups == 0
+        and dim > 0
+        and dim % 2 == 0
+        and 0 < rope_dim <= dim
+        and rope_dim % 2 == 0
+        and heads // groups * dim <= 16384
+    ):
+        return
+    attn.fuse_int8_small_ops = bool(
+        attn.wo_a_int8
+        and int8.transform_quant_available(
+            groups, attn.o_lora_rank, heads // groups * dim
+        )
+    )
+    attn.fuse_fp8_small_ops = bool(
+        attn.wo_a_channelwise_fp8 and fp8.transform_quant_available()
+    )
+    if attn.wo_b.input_is_parallel:
+        attn.fuse_wo_b_int8 = attn.fuse_int8_small_ops and opt_into_int8_operand(
+            attn.wo_b, quantized_only=True
+        )
+        attn.fuse_wo_b_fp8 = attn.fuse_fp8_small_ops and linear_takes_fp8_operand(
+            attn.wo_b
+        )
+
+
 def init_mqa_layer(attn, quant_config) -> None:
     """The ROCm state of MQALayer.__init__. On the gfx950 32-block route q_norm also emits
     the fp8-grid operand of wq_b; whether wq_b consumes native MXFP8, and wo_b the fp8-grid
@@ -145,6 +185,11 @@ def q_norm_for_wq_b(attn, q_lora: torch.Tensor) -> Tuple[torch.Tensor, object]:
     if attn.fused_rmsnorm_fake_quant:
         return gfx95_dense.q_norm_fake_quant(attn, q_lora)
     if attn.fused_rmsnorm_fp8_operand:
+        if envs.SGLANG_OPT_DSV41_SMALL_OP_FUSION.get() and not q_lora.is_contiguous():
+            with record_function("dsv4_qnorm_strided_fp8_fused"):
+                result = rms_norm_strided_fp8_operand(q_lora, attn.q_norm)
+            if result is not None:
+                return result
         # q_lora may be a wqkv_a slice; the in-place launch needs its own rows.
         q_lora = q_lora.contiguous()
         with record_function("dsv4_qnorm_fp8_fused"):
@@ -152,6 +197,11 @@ def q_norm_for_wq_b(attn, q_lora: torch.Tensor) -> Tuple[torch.Tensor, object]:
         if operand is not None:
             return q_lora, operand
     if attn.fused_rmsnorm_int8_operand:
+        if envs.SGLANG_OPT_DSV41_SMALL_OP_FUSION.get() and not q_lora.is_contiguous():
+            with record_function("dsv4_qnorm_strided_int8_fused"):
+                operand = rms_norm_strided_int8_operand(q_lora, attn.q_norm)
+            if operand is not None:
+                return operand.x, operand
         q_lora = q_lora.contiguous()
         with record_function("dsv4_qnorm_int8_fused"):
             operand = rms_norm_int8_operand(q_lora, attn.q_norm)

@@ -1635,6 +1635,13 @@ class DeepseekV4AttnBackend(
         # V4.1 on HCU gathers low-ratio indexer slots with dedicated kernels
         # instead of HCU's generic index kernel; V4 keeps the upstream path.
         self.dsv41_hcu_indexer_kernels: bool = _is_hcu and self.is_dsv41
+        self.fuse_small_ops = bool(
+            self.dsv41_hcu_indexer_kernels
+            and envs.SGLANG_OPT_DSV41_SMALL_OP_FUSION.get()
+            and torch.cuda.get_device_properties(torch.cuda.current_device())
+            .gcnArchName.split(":")[0]
+            .startswith(("gfx936", "gfx938"))
+        )
         self.prefill_candidates, self.decode_candidates = make_candidate_indexer(
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
@@ -5547,13 +5554,16 @@ class DeepseekV4AttnBackend(
         # fp4 query as (payload, scale), kernel layout [bs, 1, n_heads, dim]. The
         # kernel sums head scores locally, so the indexer heads must be replicated.
         assert indexer.n_local_heads == indexer.n_heads
+        fuse_small_ops = getattr(self, "fuse_small_ops", False)
+        q_input = getattr(q_lora, "x", q_lora)
         use_hcu_pack = (
-            _use_hcu_index_q_rope_pack
+            (_use_hcu_index_q_rope_pack or fuse_small_ops)
             and x.is_cuda
             and x.dtype == torch.bfloat16
-            and q_lora.dtype == torch.bfloat16
+            and isinstance(q_input, torch.Tensor)
+            and q_input.dtype == torch.bfloat16
             and x.is_contiguous()
-            and q_lora.is_contiguous()
+            and q_input.is_contiguous()
             and indexer.n_local_heads in (32, 64)
             and indexer.index_head_dim == 128
             and indexer.rope_head_dim == 64
@@ -5561,7 +5571,7 @@ class DeepseekV4AttnBackend(
             and layer.freqs_cis.is_contiguous()
             and pos.dtype in (torch.int32, torch.int64)
             and pos.is_contiguous()
-            and not _has_native_hcu_rope_fake_quant()
+            and (fuse_small_ops or not _has_native_hcu_rope_fake_quant())
         )
         if use_hcu_pack:
             from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hcu import (
@@ -5577,6 +5587,7 @@ class DeepseekV4AttnBackend(
                 indexer.head_weights_raw(x),
                 indexer.head_weight_scale,
                 indexer.rope_head_dim,
+                native_rope=fuse_small_ops and _has_native_hcu_rope_fake_quant(),
             )
         elif (
             x.is_cuda
