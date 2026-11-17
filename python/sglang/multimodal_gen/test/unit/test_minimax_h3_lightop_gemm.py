@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant import (
 )
 
 FLAG = "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM"
+WHOLE_FLAG = "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM_WHOLE"
 requires_hcu = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is None, reason="Requires HCU"
 )
@@ -34,6 +35,10 @@ def test_environment_flag(monkeypatch):
     assert not envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM
     monkeypatch.setenv(FLAG, "true")
     assert envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM
+    monkeypatch.delenv(WHOLE_FLAG, raising=False)
+    assert not envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM_WHOLE
+    monkeypatch.setenv(WHOLE_FLAG, "true")
+    assert envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM_WHOLE
 
 
 def test_missing_and_legacy_lightop():
@@ -60,10 +65,12 @@ def _inputs(m=33, n=256, k=128):
 @requires_hcu
 @pytest.mark.parametrize("m,n,k", [(1, 256, 128), (17, 768, 384), (65, 512, 256)])
 @pytest.mark.parametrize("affine", [False, True])
-def test_real_lightop_matches_linear_reference(monkeypatch, m, n, k, affine):
+@pytest.mark.parametrize("whole", [False, True])
+def test_real_lightop_matches_linear_reference(monkeypatch, m, n, k, affine, whole):
     if torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] != "gfx936":
         pytest.skip("Ordered Lightop ASM requires gfx936")
     monkeypatch.setenv(FLAG, "true")
+    monkeypatch.setenv(WHOLE_FLAG, str(int(whole)))
     x, w, sw = _inputs(m, n, k)
     params = None
     reference_x = x
@@ -81,7 +88,7 @@ def test_real_lightop_matches_linear_reference(monkeypatch, m, n, k, affine):
             adapter, "try_lightop_gemm", wraps=adapter.try_lightop_gemm
         ) as calls:
             actual = linear(x, w, sw, chunk=32, input_affine=params)
-        assert calls.call_count > 0
+        assert calls.call_count == (1 if whole else (m + 31) // 32)
     assert torch.equal(actual, expected)
 
 
@@ -89,8 +96,10 @@ def test_real_lightop_matches_linear_reference(monkeypatch, m, n, k, affine):
 @pytest.mark.parametrize(
     "case", ["disabled", "grad", "compile", "bias", "unsupported", "legacy"]
 )
-def test_fallback_preserves_reference(monkeypatch, case):
+@pytest.mark.parametrize("whole", [False, True])
+def test_fallback_preserves_reference(monkeypatch, case, whole):
     monkeypatch.setenv(FLAG, "false" if case == "disabled" else "true")
+    monkeypatch.setenv(WHOLE_FLAG, str(int(whole)))
     x, w, sw = _inputs()
     bias = (
         torch.randn(w.shape[0], device=x.device, dtype=x.dtype)
@@ -158,3 +167,31 @@ def test_real_unsupported_alignment_falls_back(monkeypatch):
         q, sx = quant_rows(x)
         assert adapter.try_lightop_gemm(q, w, sx, sw) is None
         assert torch.equal(linear(x, w, sw), linear(x, w, sw, mode="reference"))
+
+
+@requires_hcu
+@pytest.mark.parametrize("m", [1, 17, 65])
+def test_whole_result_shares_gemm_storage_and_trims_padding(monkeypatch, m):
+    monkeypatch.setenv(FLAG, "true")
+    monkeypatch.setenv(WHOLE_FLAG, "true")
+    x, w, sw = _inputs(m)
+    outputs = []
+
+    def gemm(q, wt, sx, scales, bias, dtype, *, input_scale_first):
+        assert input_scale_first
+        output = ((torch._int_mm(q, wt).float() * sx) * scales.t()).to(dtype)
+        outputs.append(output)
+        return True, output
+
+    with (
+        torch.inference_mode(),
+        patch.object(adapter, "_ordered_gemm", return_value=gemm),
+    ):
+        actual = linear(x, w, sw, chunk=16)
+        expected = linear(x, w, sw, mode="reference", chunk=16)
+    assert len(outputs) == 1
+    assert actual.shape == (m, len(w)) and actual.is_contiguous()
+    assert (
+        actual.untyped_storage().data_ptr() == outputs[0].untyped_storage().data_ptr()
+    )
+    assert torch.equal(actual, expected)

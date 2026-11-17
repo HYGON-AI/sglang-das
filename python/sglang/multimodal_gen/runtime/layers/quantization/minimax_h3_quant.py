@@ -484,7 +484,11 @@ def restore_output(accum, sx, sw, out, bias=None):
 
 
 def linear(x, qw, sw, bias=None, *, mode="both", chunk=4096, input_affine=None):
-    """Dynamic per-token quantization, INT8 GEMM, and ordered FP32 epilogue."""
+    """Dynamic per-token quantization, INT8 GEMM, and ordered FP32 epilogue.
+
+    LIGHTOP_GEMM_WHOLE opts into quantizing all M rows at once and returning
+    Lightop's output directly. Unsupported calls retain the supplied chunk size.
+    """
     if mode not in ("reference", "epilogue", "both"):
         raise ValueError(mode)
     if (
@@ -520,6 +524,29 @@ def linear(x, qw, sw, bias=None, *, mode="both", chunk=4096, input_affine=None):
         mode != "both" or not supports_int8_affine_quant(x, *input_affine)
     ):
         raise ValueError("Fused affine quantization requires supported INT8 inputs")
+    if (
+        mode == "both"
+        and bias is None
+        and envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM_WHOLE
+        and _row_quant_block_size(x, "int8") is not None
+    ):
+        from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_lightop_gemm import (
+            lightop_gemm_enabled,
+            try_lightop_gemm,
+        )
+
+        if lightop_gemm_enabled():
+            if input_affine is None:
+                qx, sx = quant_rows(x)
+            else:
+                qx, sx = quant_affine_rows(x, *input_affine)
+            result = try_lightop_gemm(qx, qw, sx, sw)
+            if result is not None:
+                # Quantization pads M; slicing rows preserves contiguous layout
+                # and shares Lightop's allocation without a destination copy.
+                return result[:m]
+            # Unsupported GEMM keeps the original bounded-chunk fallback.
+            del qx, sx
     out = torch.empty((m, qw.shape[0]), device=x.device, dtype=x.dtype)
     for lo in range(0, m, chunk):
         part = x[lo : lo + chunk]

@@ -30,6 +30,17 @@ def _ordered_gemm():
     return gemm
 
 
+def lightop_gemm_enabled():
+    """Check opt-in and API capability before allocating whole-input buffers."""
+    return (
+        envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM
+        and not torch.is_grad_enabled()
+        and not torch.compiler.is_compiling()
+        and torch.version.hip is not None
+        and _ordered_gemm() is not None
+    )
+
+
 def try_lightop_gemm(qx, qw, sx, sw, bias=None):
     """Return BF16 output or None; Lightop owns architecture/alignment checks.
 

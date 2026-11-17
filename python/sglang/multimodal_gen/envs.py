@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM: bool = False
+    SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM_WHOLE: bool = False
     SGLANG_MINIMAX_H3_QUANT_OPTIMIZE: bool = True
     SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE: bool = False
     SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_VAE_QKNORM_ROPE: bool = False
@@ -169,6 +170,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Requires Lightop with input_scale_first support; unsupported calls fall back.
     "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM": _lazy_bool(
         "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM", "false"
+    ),
+    # Opt in to full-row Lightop execution and return its output directly.
+    # This trades bounded chunk temporaries for full-input quantization buffers.
+    "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM_WHOLE": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM_WHOLE", "false"
     ),
     # Opt in to indexed FP32 AdaLN + INT8 input quantization for H3.
     # QUANT_OPTIMIZE must also be enabled; unsupported calls keep the native path.
