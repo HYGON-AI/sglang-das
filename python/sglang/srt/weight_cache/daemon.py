@@ -299,13 +299,8 @@ class WeightCacheDaemon:
         # Initialize distributed backend for model loading
         # (must be done after server_args and model_config are available)
         # Build model config first, then init distributed
-        model_config = ModelConfig(
-            model_path=self.model_path,
-            trust_remote_code=self.trust_remote_code,
-            revision=self.revision,
-            dtype=self.dtype,
-            quantization=self.quantization,
-        )
+        # Use the same context length and model overrides as the target runner.
+        model_config = ModelConfig.from_server_args(server_args)
 
         # Build cache config fingerprint before loading the model.
         # Loading may mutate hf_config.quantization_config (e.g. via
@@ -383,6 +378,22 @@ class WeightCacheDaemon:
             model_config=model_config,
             device_config=DeviceConfig(current_platform.device_type, self.gpu_id),
         )
+
+        # The daemon never runs inference; drop process-local hipBLASLt packed
+        # INT8 scratch copies before measuring resident weight memory.
+        from sglang.srt.utils import is_hcu
+
+        if is_hcu():
+            from sglang.kernels.ops.gemm import dsv41_int8 as dsv41_int8_blaslt
+            from sglang.srt.layers.quantization.w8a8_int8 import ChannelwiseInt8Method
+
+            for module in self.model.modules():
+                if isinstance(
+                    getattr(module, "quant_method", None), ChannelwiseInt8Method
+                ):
+                    weight = getattr(module, "weight", None)
+                    if isinstance(weight, torch.Tensor):
+                        dsv41_int8_blaslt.release_weight_cache(weight)
 
         elapsed = time.perf_counter() - tic
         logger.info(

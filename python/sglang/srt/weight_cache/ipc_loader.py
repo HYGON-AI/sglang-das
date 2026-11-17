@@ -152,15 +152,17 @@ class IpcModelLoader(BaseModelLoader):
 
         quant_config = _get_quantization_config(model_config, self.load_config)
 
+        extra_state = cache_data.get("extra_state")
         model = self._load_zero_copy_mode(
             model_config,
             device_config,
             entries,
             quant_config,
-            host_state=(cache_data.get("extra_state") or {}).get("host"),
+            host_state=(extra_state or {}).get("host"),
+            extra_state=extra_state,
         )
         self.preloaded_weights_bytes = preloaded_weights_bytes
-        self._apply_extra_state(model, cache_data.get("extra_state"))
+        self._apply_extra_state(model, extra_state)
 
         # Skip _post_load_weights: the daemon already ran
         # process_weights_after_loading on the weights before exporting
@@ -219,6 +221,19 @@ class IpcModelLoader(BaseModelLoader):
         hook = getattr(model, "post_ipc_weight_load", None)
         if hook is not None:
             hook()
+        from sglang.srt.utils import is_hcu
+
+        if is_hcu():
+            from sglang.kernels.ops.gemm import dsv41_int8 as dsv41_int8_blaslt
+            from sglang.srt.layers.quantization.w8a8_int8 import ChannelwiseInt8Method
+
+            for module in model.modules():
+                if isinstance(
+                    getattr(module, "quant_method", None), ChannelwiseInt8Method
+                ):
+                    weight = getattr(module, "weight", None)
+                    if isinstance(weight, torch.Tensor):
+                        dsv41_int8_blaslt.prepare_weight(weight)
         self._check_deferred_aliases(model)
         if result is not None:
             verify_deferred_state(model, result)
@@ -401,6 +416,7 @@ class IpcModelLoader(BaseModelLoader):
         entries,
         quant_config,
         host_state=None,
+        extra_state=None,
     ) -> nn.Module:
         """Zero-copy load: map IPC tensors directly as param.data.
 
@@ -517,13 +533,48 @@ class IpcModelLoader(BaseModelLoader):
 
         # Weights the daemon keeps in shareable host memory are attached by
         # their modules, not mapped as device tensors.
-        from .extra_state import attach_host_state
+        from .extra_state import attach_host_state, canonical_modules
 
         host_modules = attach_host_state(model, host_state)
         if host_modules:
             logger.info(
                 f"[IpcModelLoader] Attached host-memory state of {host_modules} "
                 f"module(s) from the daemon"
+            )
+
+        # Post-processing schemes on the adopt_layout allowlist may repack
+        # canonical parameters into runtime buffers and delete the originals
+        # (e.g. HCU DeepEP MoE deleting w13_weight/w2_weight after building
+        # w13_weight_deepgemm/w2_weight_deepgemm). Drop only meta tensors that
+        # the daemon's own post-processed module explicitly removed.
+        module_tensors = (extra_state or {}).get("module_tensors")
+        removed_count = 0
+        if adopt_layout and isinstance(module_tensors, dict):
+            for module_name, module in canonical_modules(model):
+                kept = module_tensors.get(module_name)
+                if kept is None:
+                    continue
+                kept_set = set(kept)
+                for attr, param in list(module._parameters.items()):
+                    if (
+                        param is not None
+                        and param.device.type == "meta"
+                        and attr not in kept_set
+                    ):
+                        delattr(module, attr)
+                        removed_count += 1
+                for attr, buf in list(module._buffers.items()):
+                    if (
+                        buf is not None
+                        and buf.device.type == "meta"
+                        and attr not in kept_set
+                    ):
+                        delattr(module, attr)
+                        removed_count += 1
+        if removed_count:
+            logger.info(
+                f"[IpcModelLoader] Removed {removed_count} meta tensor(s) deleted "
+                f"by the daemon's post-load repacking"
             )
 
         # After mapping every daemon entry, any tensor still on the meta device
