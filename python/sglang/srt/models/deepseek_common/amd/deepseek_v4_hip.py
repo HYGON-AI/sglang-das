@@ -4,6 +4,7 @@ boundary in deepseek_v4_fused_mhc."""
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -45,6 +46,9 @@ wo_b_emits_mxfp8 = gfx95_dense.wo_b_emits_mxfp8
 
 _is_gfx95_supported = is_gfx95_supported()
 _is_hcu = is_hcu()
+_hcu_strided_qnorm = (
+    _is_hcu and os.environ.get("SGLANG_HCU_OPT_QNORM_STRIDED", "0") == "1"
+)
 
 
 def _hcu_fusion_on(env) -> bool:
@@ -185,7 +189,10 @@ def q_norm_for_wq_b(attn, q_lora: torch.Tensor) -> Tuple[torch.Tensor, object]:
     if attn.fused_rmsnorm_fake_quant:
         return gfx95_dense.q_norm_fake_quant(attn, q_lora)
     if attn.fused_rmsnorm_fp8_operand:
-        if envs.SGLANG_OPT_DSV41_SMALL_OP_FUSION.get() and not q_lora.is_contiguous():
+        if (
+            envs.SGLANG_OPT_DSV41_SMALL_OP_FUSION.get()
+            or _hcu_strided_qnorm
+        ) and not q_lora.is_contiguous():
             with record_function("dsv4_qnorm_strided_fp8_fused"):
                 result = rms_norm_strided_fp8_operand(q_lora, attn.q_norm)
             if result is not None:

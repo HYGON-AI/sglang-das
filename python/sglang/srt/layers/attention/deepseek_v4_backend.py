@@ -1635,6 +1635,10 @@ class DeepseekV4AttnBackend(
         # V4.1 on HCU gathers low-ratio indexer slots with dedicated kernels
         # instead of HCU's generic index kernel; V4 keeps the upstream path.
         self.dsv41_hcu_indexer_kernels: bool = _is_hcu and self.is_dsv41
+        self.fuse_indexer_q_prep = (
+            self.dsv41_hcu_indexer_kernels
+            and os.environ.get("SGLANG_HCU_OPT_INDEXER_PREP", "0") == "1"
+        )
         self.fuse_small_ops = bool(
             self.dsv41_hcu_indexer_kernels
             and envs.SGLANG_OPT_DSV41_SMALL_OP_FUSION.get()
@@ -5144,7 +5148,10 @@ class DeepseekV4AttnBackend(
                 use_hcu_fused_gather=self.dsv41_hcu_indexer_kernels,
             )
 
-        q = indexer.queries(q_lora, layer.freqs_cis[pos])  # [T, H, 128] fp4 grid
+        if self.fuse_indexer_q_prep:
+            q = indexer.queries(q_lora, layer.freqs_cis, positions=pos)
+        else:
+            q = indexer.queries(q_lora, layer.freqs_cis[pos])  # [T, H, 128] fp4 grid
         if not use_hcu_prep:
             compress_lens = ((pos + 1) // ratio).to(torch.int32)
             ks = torch.repeat_interleave(
