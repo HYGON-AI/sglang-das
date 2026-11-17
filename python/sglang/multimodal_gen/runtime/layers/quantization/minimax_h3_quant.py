@@ -535,6 +535,15 @@ def linear(x, qw, sw, bias=None, *, mode="both", chunk=4096, input_affine=None):
             padding = max(32, triton.cdiv(len(part), 16) * 16) - len(part)
             if padding:
                 qx = torch.nn.functional.pad(qx, (0, 0, 0, padding))
+        if mode == "both":
+            from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_lightop_gemm import (
+                try_lightop_gemm,
+            )
+
+            result = try_lightop_gemm(qx, qw, sx, sw, bias)
+            if result is not None:
+                out[lo : lo + len(part)].copy_(result[: len(part)])
+                continue
         acc = torch._int_mm(qx.contiguous(), qw.t())
         if mode == "reference":
             y = acc[: len(part)].float().mul_(sx[: len(part)]).mul_(sw.reshape(1, -1))

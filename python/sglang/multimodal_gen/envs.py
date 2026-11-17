@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM: bool = False
     SGLANG_MINIMAX_H3_QUANT_OPTIMIZE: bool = True
     SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE: bool = False
     SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_VAE_QKNORM_ROPE: bool = False
@@ -164,6 +165,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Only used after recognizing a validated MiniMax-H3 INT8/FP8 checkpoint.
     "SGLANG_MINIMAX_H3_QUANT_OPTIMIZE": _lazy_bool(
         "SGLANG_MINIMAX_H3_QUANT_OPTIMIZE", "true"
+    ),
+    # Requires Lightop with input_scale_first support; unsupported calls fall back.
+    "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM", "false"
     ),
     # Opt in to indexed FP32 AdaLN + INT8 input quantization for H3.
     # QUANT_OPTIMIZE must also be enabled; unsupported calls keep the native path.
