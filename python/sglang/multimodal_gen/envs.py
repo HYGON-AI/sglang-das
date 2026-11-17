@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     SGLANG_MINIMAX_H3_QUANT_OPTIMIZE: bool = True
+    SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE: bool = False
     SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_VAE_QKNORM_ROPE: bool = False
     SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_AFFINE_QUANT_FUSION: bool = False
     SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_FUSION: bool = False
@@ -176,6 +177,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in HCU VAE Q/K RMSNorm + partial RoPE; not bit-exact.
     "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_VAE_QKNORM_ROPE": _lazy_bool(
         "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_VAE_QKNORM_ROPE", "false"
+    ),
+    # Opt-in HCU DiT Q/K RMSNorm + partial RoPE; not bit-exact.
+    "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE", "false"
     ),
     # Legacy aliases; new deployments need only QUANT_OPTIMIZE.
     "SGLANG_MINIMAX_H3_INT8_ENABLE": _lazy_bool(

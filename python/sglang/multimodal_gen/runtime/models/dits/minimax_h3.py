@@ -446,6 +446,36 @@ def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
     return nn.functional.silu(gate) * up
 
 
+def _try_hcu_dit_qknorm_rope(q, k, q_norm, k_norm, cache, positions):
+    if (
+        not envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE
+        or not is_hcu()
+        or torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+    ):
+        return False
+    from sglang.kernels.ops.diffusion import (
+        can_use_minimax_h3_dit_qknorm_rope,
+        minimax_h3_dit_qknorm_rope,
+    )
+
+    if not can_use_minimax_h3_dit_qknorm_rope(
+        q,
+        k,
+        q_norm.weight,
+        k_norm.weight,
+        cache,
+        q_norm.eps,
+        k_norm.eps,
+        positions=positions,
+    ):
+        return False
+    minimax_h3_dit_qknorm_rope(
+        q, k, q_norm.weight, k_norm.weight, cache, positions, q_norm.eps
+    )
+    return True
+
+
 def _apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1012,7 +1042,9 @@ class MiniMaxH3Attention(nn.Module):
                     rope_dim=cos_sin_cache.shape[-1],
                     round_norm_before_rope=True,
                 )
-            else:
+            elif not _try_hcu_dit_qknorm_rope(
+                q, k, self.q_norm, self.k_norm, cos_sin_cache, positions
+            ):
                 q, k = _apply_qk_norm(
                     q,
                     k,
