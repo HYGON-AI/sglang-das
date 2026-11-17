@@ -4053,28 +4053,55 @@ class DeepseekV4AttnBackend(
             pos_global = forward_batch.positions[:total].to(torch.int64)
         num_local = sum(q_lens_cpu)
         if run_compressor and layer.compressor is not None:
-            x_global = cp_materialize_global_token_order(
-                x.contiguous(), forward_batch, torch.cuda.current_stream()
-            )[:total]
             keep = getattr(forward_batch, "encoder_swa_compress_rows", None)
+            projected = None
+            # Changing GEMM row count can change rounding. Only the audited
+            # complete shard shape uses local projection; tails retain gather-first.
+            if (
+                envs.SGLANG_OPT_DSV41_CP_LOCAL_COMPRESSOR_PROJECTION.get()
+                and keep is None
+                and x.shape[0] == 4096
+                and total == x.shape[0] * get_parallel().attn_cp_size
+            ):
+                # Keep the padded local rows until after the collective: legacy
+                # round-robin CP requires equal-size shards on every rank.
+                local_projection = layer.compressor.project_packed(x)
+                global_projection = cp_materialize_global_token_order(
+                    local_projection.contiguous(),
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )[:total]
+                projected = (
+                    (global_projection, None)
+                    if layer.compress_ratio == 1
+                    else global_projection.chunk(2, dim=-1)
+                )
+                compressor_input = x
+            else:
+                compressor_input = cp_materialize_global_token_order(
+                    x.contiguous(), forward_batch, torch.cuda.current_stream()
+                )[:total]
             out_loc_rows = None
             if _is_hcu and keep is not None:
                 if tail is None:
                     # A folded hit must read cached compressed/indexer keys for
                     # replay rows. Only new rows may update those persistent pools.
-                    x_global = x_global.index_select(0, keep)
+                    compressor_input = compressor_input.index_select(0, keep)
                     req_global = req_global.index_select(0, keep)
                     pos_global = pos_global.index_select(0, keep)
                     out_loc_rows = keep
-                elif keep.numel() < x_global.shape[0]:
+                elif keep.numel() < compressor_input.shape[0]:
                     raise RuntimeError("HCU folded decoder tail contains replay rows")
             self._low_ratio_compress_torch(
                 layer,
-                x_global,
+                compressor_input,
                 req_global,
                 pos_global,
                 out_loc_rows=out_loc_rows,
-                fuse_index_store=(x_global.is_cuda and _supports_index_k_rope_pack()),
+                projected=projected,
+                fuse_index_store=(
+                    x.is_cuda and _supports_index_k_rope_pack()
+                ),
                 fuse_rope_fq_store=True,
             )
         if run_indexer and layer.indexer is not None:

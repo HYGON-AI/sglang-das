@@ -230,6 +230,31 @@ def _get_hcu_w8a8_pre_dispatch_quant():
     return _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT
 
 
+def _try_stage_standalone_megamoe_inputs(hidden_states, topk_ids, topk_weights, buf):
+    # Eager validation and dispatch cost more than the saved copies on small inputs.
+    # Use workload size so this policy is independent of the device and quant dtype.
+    if (
+        not envs.SGLANG_OPT_DSV41_SMALL_OP_FUSION.get()
+        or hidden_states.ndim != 2
+        or hidden_states.shape[0] < 1024
+        or hidden_states.numel() < 4 * 1024 * 1024
+    ):
+        return False
+    from sglang.kernels.ops.moe.per_token_quant_stage import (
+        try_quantize_and_stage_moe_inputs,
+    )
+
+    return try_quantize_and_stage_moe_inputs(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        buf.x,
+        buf.x_sf,
+        buf.topk_idx,
+        buf.topk_weights,
+    )
+
+
 def _prepare_standalone_megamoe_inputs(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -238,6 +263,10 @@ def _prepare_standalone_megamoe_inputs(
     num_tokens: int,
 ) -> None:
     quant = _get_hcu_w8a8_pre_dispatch_quant()
+    if quant is not None and _try_stage_standalone_megamoe_inputs(
+        hidden_states, topk_ids, topk_weights, buf
+    ):
+        return
     if quant is not None:
         quant_input = (
             hidden_states
@@ -1077,7 +1106,9 @@ def _run_standalone_hcu_w4a8_mega_moe(
     from megamoe.w4a8 import w4a8_mega_moe
 
     tokens, hidden = hidden_states.shape
-    if tokens:
+    if tokens and not _try_stage_standalone_megamoe_inputs(
+        hidden_states, topk_ids, topk_weights, buf
+    ):
         qx, scale = per_token_quant_int8(hidden_states)
         buf.x[:tokens].copy_(qx)
         buf.x_sf[:tokens].copy_(scale.reshape(-1))

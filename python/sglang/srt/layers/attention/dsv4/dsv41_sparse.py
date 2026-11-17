@@ -204,6 +204,19 @@ class DeepseekV41Compressor(nn.Module):
         score = linear_bf16_fp32(x, self.wgate.weight)
         return kv, score
 
+    def project_packed(self, x: torch.Tensor) -> torch.Tensor:
+        """Project local CP rows into one contiguous collective payload.
+
+        Reuse the loaded fused gate layout without splitting and concatenating
+        it again. The separate-weight layout keeps its existing two GEMMs.
+        """
+        if self.compress_ratio == 1:
+            return self.wkv(x)
+        if self.use_fused_gate:
+            return self.project_fused(x)
+        kv, score = self.project(x)
+        return torch.cat((kv, score), dim=-1)
+
     def project_fused(self, x: torch.Tensor) -> torch.Tensor:
         """`[n, 2D]` fp32, `| kv | score |`."""
         return linear_bf16_fp32(x, self.wkv_gate.weight)

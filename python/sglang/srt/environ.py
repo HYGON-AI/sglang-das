@@ -1191,7 +1191,7 @@ class Envs:
     SGLANG_HCU_PREFILL_PAGED_SPARSE = EnvBool(True)
     # Existing packed INT8 service projections and their consumer layout.
     SGLANG_DSV41_INT8_SERVICE_OPT = EnvBool(False)
-    # DSV4.1 decode preparation fusions; GEMM implementations are unchanged.
+    # DSV4.1 prefill/decode normalization, layout, staging and quantization fusions.
     SGLANG_OPT_DSV41_SMALL_OP_FUSION = EnvBool(False)
     # Eager HCU C1/C2 keeps a compact layout; opt in to TopK-union dequantization.
     SGLANG_DSV41_PREFILL_TOPK_KV_WORKSPACE = EnvBool(True)
@@ -2013,6 +2013,9 @@ class Envs:
     SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE = EnvBool(False)
     SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER = EnvBool(False)
     SGLANG_OPT_USE_OLD_COMPRESSOR = EnvBool(False)
+    # Ratio-1/2 CP prefill: project each shard before gathering KV/score.
+    # Opt-in because changing the GEMM row count can change rounding.
+    SGLANG_OPT_DSV41_CP_LOCAL_COMPRESSOR_PROJECTION = EnvBool(False)
     SGLANG_OPT_USE_TRITON_SWA_PREPARE = EnvBool(True)
     SGLANG_OPT_USE_AITER_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_AITER_MHC_POST = EnvBool(True)
