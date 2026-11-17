@@ -32,6 +32,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_hcu
+
 
 @triton.jit
 def _lplb_waterfill_kernel(
@@ -143,6 +145,9 @@ class DeviceWaterfill:
         out.copy_(self.uniform)
         if self.R == 0:
             return out
+        # SBO can have multiple solves in flight on different streams.
+        # Give each HCU invocation its own scratch, including during capture.
+        share = torch.empty_like(self.share) if is_hcu() else self.share
         _lplb_waterfill_kernel[(1,)](
             global_counts.float(),
             self.single_log,
@@ -151,7 +156,7 @@ class DeviceWaterfill:
             self.rep_rank,
             self.rep_copies,
             self.rep_colrank,
-            self.share,
+            share,
             out,
             self.num_logical,
             self.single_log.numel(),

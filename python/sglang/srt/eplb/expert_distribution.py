@@ -56,7 +56,7 @@ from sglang.srt.runtime_context import (
     logs_expert_balancedness_to_server_log,
     reports_expert_balancedness,
 )
-from sglang.srt.utils import Withable, get_device, get_int_env_var
+from sglang.srt.utils import Withable, get_device, get_int_env_var, is_hcu
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
@@ -1026,6 +1026,17 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             logical_count=logical_count_of_buffered_step,
             average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
         )
+
+        if is_hcu():
+            # Preserve actual replica loads for offline static/LP validation.
+            # Logical counts alone cannot show how replicas split the traffic.
+            torch.distributed.all_reduce(
+                global_physical_count, op=torch.distributed.ReduceOp.SUM
+            )
+            output["physical_count"] = global_physical_count.squeeze(0)
+            output["physical_to_logical_map"] = (
+                self._expert_location_metadata.physical_to_logical_map_cpu
+            )
 
         if output_mode == "file":
             if self._rank == 0:
