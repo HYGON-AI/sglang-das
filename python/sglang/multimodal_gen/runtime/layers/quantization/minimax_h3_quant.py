@@ -317,6 +317,84 @@ def _quant_rows(
 
 
 @triton.jit
+def _quant_affine_rows(
+    X,
+    SHIFT,
+    SCALE,
+    INDICES,
+    Q,
+    SX,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    X_STRIDE: tl.constexpr,
+    SHIFT_STRIDE: tl.constexpr,
+    SCALE_STRIDE: tl.constexpr,
+    B: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.arange(0, B)
+    mask = (row < M) & (col < K)
+    condition = tl.load(INDICES + row, row < M, 0)
+    x = tl.load(X + row * X_STRIDE + col, mask, 0).to(tl.float32)
+    shift = tl.load(SHIFT + condition * SHIFT_STRIDE + col, mask, 0)
+    scale = tl.load(SCALE + condition * SCALE_STRIDE + col, mask, 0)
+    # Match affine()'s BF16 store/reload before the absmax reduction.
+    value = (x * (1.0 + scale) + shift).to(tl.bfloat16).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.where(col < K, tl.abs(value), 0)), 1.0e-12)
+    sx = amax * (1.0 / 127.0)
+    q = libdevice.nearbyint(tl.div_rn(value, sx))
+    q = tl.minimum(tl.maximum(q, -127.0), 127.0).to(tl.int8)
+    tl.store(Q + row * K + col, q, col < K)
+    tl.store(SX + row, sx)
+
+
+def supports_int8_affine_quant(x, shift, scale, indices):
+    """Check metadata only; share the row-quant reduction/indexing limits.
+
+    Condition indices have the same in-range contract as affine(). No input
+    values or request-specific projection sizes participate in dispatch.
+    """
+    if _row_quant_block_size(x, "int8") is None:
+        return False
+    if not supports_fp32_modulation(x, (shift, scale), indices, dtype=torch.bfloat16):
+        return False
+    return all(
+        p.shape[0] > 0
+        and p.stride(0) >= 0
+        and (p.shape[0] - 1) * p.stride(0) + p.shape[1] - 1
+        <= MAX_ROW_QUANT_LINEAR_OFFSET
+        for p in (shift, scale)
+    )
+
+
+def quant_affine_rows(x, shift, scale, indices):
+    """Indexed FP32 AdaLN -> BF16 rounding -> per-row INT8, in one kernel."""
+    if not supports_int8_affine_quant(x, shift, scale, indices):
+        raise ValueError("Unsupported indexed affine row-quantization inputs")
+    m, k = x.shape
+    padded_m = max(32, triton.cdiv(m, 16) * 16)
+    q = torch.empty((padded_m, k), device=x.device, dtype=torch.int8)
+    sx = torch.empty((padded_m, 1), device=x.device, dtype=torch.float32)
+    _quant_affine_rows[(padded_m,)](
+        x,
+        shift,
+        scale,
+        indices,
+        q,
+        sx,
+        m,
+        k,
+        x.stride(0),
+        shift.stride(0),
+        scale.stride(0),
+        _row_quant_block_size(x, "int8"),
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+    return q, sx
+
+
+@triton.jit
 def _restore_output(
     A,
     SX,
@@ -405,7 +483,7 @@ def restore_output(accum, sx, sw, out, bias=None):
     return out
 
 
-def linear(x, qw, sw, bias=None, *, mode="both", chunk=4096):
+def linear(x, qw, sw, bias=None, *, mode="both", chunk=4096, input_affine=None):
     """Dynamic per-token quantization, INT8 GEMM, and ordered FP32 epilogue."""
     if mode not in ("reference", "epilogue", "both"):
         raise ValueError(mode)
@@ -438,10 +516,17 @@ def linear(x, qw, sw, bias=None, *, mode="both", chunk=4096):
         raise ValueError("Unsupported _int_mm dimensions or scale shape")
     if m < 1 or chunk < 16 or chunk % 16:
         raise ValueError("Expected M>0 and chunk a positive multiple of 16")
+    if input_affine is not None and (
+        mode != "both" or not supports_int8_affine_quant(x, *input_affine)
+    ):
+        raise ValueError("Fused affine quantization requires supported INT8 inputs")
     out = torch.empty((m, qw.shape[0]), device=x.device, dtype=x.dtype)
     for lo in range(0, m, chunk):
         part = x[lo : lo + chunk]
-        if mode == "both" and _row_quant_block_size(part, "int8") is not None:
+        if input_affine is not None:
+            shift, scale, indices = input_affine
+            qx, sx = quant_affine_rows(part, shift, scale, indices[lo : lo + len(part)])
+        elif mode == "both" and _row_quant_block_size(part, "int8") is not None:
             qx, sx = quant_rows(part)
         else:
             r = part.float()
@@ -589,9 +674,9 @@ def inspect_fp8_checkpoint(paths):
     manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
     recognized = manifest.get("recipe") == FP8_RECIPE
     explicit_variant = manifest.get("variant")
-    source_component = manifest.get("source_component") or Path(
-        manifest.get("source", "")
-    ).name
+    source_component = (
+        manifest.get("source_component") or Path(manifest.get("source", "")).name
+    )
     if recognized:
         checkpoint_variant = explicit_variant or "fl2va"
         expected_component = {
@@ -599,7 +684,9 @@ def inspect_fp8_checkpoint(paths):
             "ref2va": "transformer_ref",
         }.get(checkpoint_variant)
         if expected_component is None or source_component != expected_component:
-            raise ValueError("MiniMax-H3 FP8 manifest variant/source component mismatch")
+            raise ValueError(
+                "MiniMax-H3 FP8 manifest variant/source component mismatch"
+            )
         if explicit_variant is None and source_component != "transformer":
             raise ValueError("Only the legacy FL2VA FP8 export may omit its variant")
         profile = manifest.get("profile", "backbone")

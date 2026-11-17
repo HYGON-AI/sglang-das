@@ -187,12 +187,22 @@ def test_cache_dit_preservation_only_makes_first_gate_out_of_place():
     block.mlp = torch.nn.Identity()
     gate_modes = []
 
-    def fake_gate(residual, _gate, _other, _indices, *, dtype, allow_inplace=True):
+    def fake_gate(
+        residual,
+        _gate,
+        _other,
+        _indices,
+        *,
+        dtype,
+        allow_inplace=True,
+        fused_fp32=False
+    ):
         gate_modes.append(allow_inplace)
         return residual.to(dtype)
 
     def run(preserve):
         block.preserve_input_for_cache_dit = preserve
+        block._fused_fp32_modulation = False
         gate_modes.clear()
         block(
             torch.zeros(2, 4),

@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     SGLANG_MINIMAX_H3_QUANT_OPTIMIZE: bool = True
+    SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_AFFINE_QUANT_FUSION: bool = False
     SGLANG_MINIMAX_H3_INT8_ENABLE: bool = True
     SGLANG_MINIMAX_H3_INT8_FUSION: bool = True
     SGLANG_MINIMAX_H3_FP8_OPTIMIZE: bool = True
@@ -160,6 +161,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Only used after recognizing a validated MiniMax-H3 INT8/FP8 checkpoint.
     "SGLANG_MINIMAX_H3_QUANT_OPTIMIZE": _lazy_bool(
         "SGLANG_MINIMAX_H3_QUANT_OPTIMIZE", "true"
+    ),
+    # Opt in to indexed FP32 AdaLN + INT8 input quantization for H3.
+    # QUANT_OPTIMIZE must also be enabled; unsupported calls keep the native path.
+    "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_AFFINE_QUANT_FUSION": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_AFFINE_QUANT_FUSION", "false"
     ),
     # Legacy aliases; new deployments need only QUANT_OPTIMIZE.
     "SGLANG_MINIMAX_H3_INT8_ENABLE": _lazy_bool(

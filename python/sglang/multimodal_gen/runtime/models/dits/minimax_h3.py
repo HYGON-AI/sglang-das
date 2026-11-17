@@ -394,6 +394,37 @@ def _modulate_gate(
     return (x + gate.index_select(0, indices) * other).to(dtype)
 
 
+def _can_fuse_int8_affine(layer, x, shift, scale, indices):
+    if (
+        not envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_AFFINE_QUANT_FUSION
+        or torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+        # This shortcut bypasses the Linear wrapper; retain its TP/gather path.
+        or getattr(layer, "tp_size", 0) != 1
+        or layer.bias is not None
+        or getattr(layer, "gather_output", True)
+    ):
+        return False
+    from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant import (
+        MiniMaxH3Int8LinearMethod,
+        supports_int8_affine_quant,
+    )
+
+    return (
+        isinstance(layer.quant_method, MiniMaxH3Int8LinearMethod)
+        and layer.quant_method.fused
+        and supports_int8_affine_quant(x, shift, scale, indices)
+    )
+
+
+def _project_int8_affine(layer, x, params):
+    from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant import (
+        linear,
+    )
+
+    return linear(x, layer.weight, layer.weight_scale_inv, input_affine=params)
+
+
 def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
     if (
         reuse_input
@@ -918,6 +949,7 @@ class MiniMaxH3Attention(nn.Module):
         max_seqlen: int,
         ulysses_active: bool = False,
         ring_active: bool = False,
+        input_affine: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -940,7 +972,10 @@ class MiniMaxH3Attention(nn.Module):
             )
 
         total = x.shape[0]
-        qkv, _ = self.qkv_proj(x)
+        if input_affine is None:
+            qkv, _ = self.qkv_proj(x)
+        else:
+            qkv = _project_int8_affine(self.qkv_proj, x, input_affine)
         q, k, v = qkv.split(self.local_inner_dim, dim=-1)
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_heads, self.head_dim)
@@ -1035,7 +1070,12 @@ class MiniMaxH3MLP(nn.Module):
             quant_config.get_name() == "gguf"
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        input_affine: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         if x.device.type == "mps":
             out = torch.empty_like(x)
             for start in range(0, x.shape[0], _MPS_MLP_TOKEN_CHUNK_SIZE):
@@ -1048,7 +1088,10 @@ class MiniMaxH3MLP(nn.Module):
                 torch.mps.synchronize()
                 torch.mps.empty_cache()
             return out
-        hidden, _ = self.fc1(x)
+        if input_affine is None:
+            hidden, _ = self.fc1(x)
+        else:
+            hidden = _project_int8_affine(self.fc1, x, input_affine)
         hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
         return out
@@ -1556,14 +1599,20 @@ class MiniMaxH3DiTBlock(nn.Module):
         # a block-local buffer.
         residual = x
         h = self.norm1(x)
-        h = _modulate_scale_shift(
-            h,
-            shift_msa,
-            scale_msa,
-            combined_indices,
-            dtype=_BF16_DTYPE,
-            fused_fp32=self._fused_fp32_modulation,
-        )
+        attn_affine = None
+        if self._fused_fp32_modulation and _can_fuse_int8_affine(
+            self.attn.qkv_proj, h, shift_msa, scale_msa, combined_indices
+        ):
+            attn_affine = (shift_msa, scale_msa, combined_indices)
+        else:
+            h = _modulate_scale_shift(
+                h,
+                shift_msa,
+                scale_msa,
+                combined_indices,
+                dtype=_BF16_DTYPE,
+                fused_fp32=self._fused_fp32_modulation,
+            )
         h = self.attn(
             h,
             rope_cache=rope_cache,
@@ -1572,6 +1621,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             max_seqlen=max_seqlen,
             ulysses_active=ulysses_active,
             ring_active=ring_active,
+            input_affine=attn_affine,
         )
         x = _modulate_gate(
             residual,
@@ -1585,15 +1635,24 @@ class MiniMaxH3DiTBlock(nn.Module):
 
         residual = x
         h = self.norm2(x)
-        h = _modulate_scale_shift(
-            h,
-            shift_mlp,
-            scale_mlp,
-            combined_indices,
-            dtype=_BF16_DTYPE,
-            fused_fp32=self._fused_fp32_modulation,
-        )
-        h = self.mlp(h)
+        mlp_affine = None
+        if self._fused_fp32_modulation and _can_fuse_int8_affine(
+            self.mlp.fc1, h, shift_mlp, scale_mlp, combined_indices
+        ):
+            mlp_affine = (shift_mlp, scale_mlp, combined_indices)
+        else:
+            h = _modulate_scale_shift(
+                h,
+                shift_mlp,
+                scale_mlp,
+                combined_indices,
+                dtype=_BF16_DTYPE,
+                fused_fp32=self._fused_fp32_modulation,
+            )
+        if mlp_affine is None:
+            h = self.mlp(h)
+        else:
+            h = self.mlp(h, input_affine=mlp_affine)
         # `residual` is block-local here (see above), so this stays in-place
         # even while Cache-DiT is attached.
         return _modulate_gate(
