@@ -336,8 +336,15 @@ def _strided_rms_quant_op(quant_dtype):
 def _rms_norm_strided_quant(x, norm, quant_dtype):
     op = _strided_rms_quant_op(quant_dtype)
     max_width = 8192 if quant_dtype == torch.int8 else 16384
-    if op is None or not _is_narrow_rms_quant_input(
-        x, norm.weight, allow_strided=True, max_width=max_width
+    if (
+        op is None
+        or not _is_narrow_rms_quant_input(
+            x, norm.weight, allow_strided=True, max_width=max_width
+        )
+        # Native FP8 uses a signed 32-bit row-offset product.
+        or x.shape[0] * x.stride(0) > 2147483647
+        or not math.isfinite(norm.variance_epsilon)
+        or norm.variance_epsilon <= 0
     ):
         return None
     normalized = torch.empty(x.shape, device=x.device, dtype=x.dtype)

@@ -428,6 +428,8 @@ class DeepseekV2MLP(nn.Module):
             self.swiglu_limit is not None
             and gate_up.dim() == 2
             and gate_up.is_contiguous()
+            # The reference clamp converts its operands through BF16.
+            and gate_up.dtype == torch.bfloat16
             and self.down_proj.supports_fused_silu_mul_quant_input()
         ):
             output, _ = self.down_proj(

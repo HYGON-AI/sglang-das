@@ -1,5 +1,6 @@
 """Legacy HCU CP must preserve global KV and rank-local query geometry."""
 
+import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -7,10 +8,13 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention import deepseek_v4_backend as backend
+from sglang.srt.layers.attention.dsv4 import dsv41_sparse
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import deepseek_v4 as model_module
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
 
@@ -84,7 +88,8 @@ def test_cp_attention_gathers_global_kv_before_store(hcu):
 
 
 @pytest.mark.parametrize("hcu", [True, False])
-def test_low_ratio_cp_compresses_all_real_tokens(hcu):
+@pytest.mark.parametrize("local_projection", [False, True])
+def test_low_ratio_cp_compresses_all_real_tokens(hcu, local_projection):
     lengths = [13, 8]
     total = sum(lengths)
     batch = SimpleNamespace(
@@ -107,6 +112,7 @@ def test_low_ratio_cp_compresses_all_real_tokens(hcu):
         patch.object(backend, "_is_hcu", hcu),
         patch.object(backend, "get_parallel", return_value=SimpleNamespace(attn_cp_rank=0, attn_cp_size=8)),
         patch.object(backend, "token_req_indices", side_effect=token_indices),
+        envs.SGLANG_OPT_DSV41_CP_LOCAL_COMPRESSOR_PROJECTION.override(local_projection),
         patch.object(backend, "cp_materialize_global_token_order", return_value=global_x),
         patch.object(torch.cuda, "current_stream", return_value=None),
     ):
@@ -128,7 +134,7 @@ def test_hcu_sparse_prefill_uses_rank_local_query_lengths():
     )
     core = SimpleNamespace(request_window_layout=None, seq_lens_casual=torch.tensor([1, 9, 4]))
     pool = SimpleNamespace(full_to_swa_index_mapping=None, get_swa_key_page_size=lambda: 64)
-    obj = SimpleNamespace(forward_metadata=SimpleNamespace(late_layer_tail=None), token_to_kv_pool=pool, req_to_token=None)
+    obj = SimpleNamespace(forward_metadata=SimpleNamespace(late_layer_tail=None), token_to_kv_pool=pool, req_to_token=None, is_dsv41=False)
     expected = (torch.tensor([2, 1]), torch.tensor([2, 1]), torch.tensor([0, 8, 3]))
     with (
         patch.object(backend, "_is_hcu", True),
@@ -142,3 +148,111 @@ def test_hcu_sparse_prefill_uses_rank_local_query_lengths():
     build_cp.assert_called_once()
     torch.testing.assert_close(build.call_args.kwargs["query_lens"], expected[0])
     torch.testing.assert_close(build.call_args.kwargs["real_query_seq_lens"], expected[1])
+
+
+class TestCPLocalCompressorProjection(CustomTestCase):
+    """Moving projection across gather must preserve padding and request order."""
+
+    def test_packed_projection_preserves_fused_storage(self):
+        packed = torch.arange(24, dtype=torch.float32).reshape(3, 8)
+        compressor = SimpleNamespace(
+            compress_ratio=2,
+            use_fused_gate=True,
+            project_fused=lambda x: packed,
+        )
+        actual = dsv41_sparse.DeepseekV41Compressor.project_packed(
+            compressor, torch.zeros(3, 4)
+        )
+        self.assertIs(actual, packed)
+        self.assertEqual(actual.data_ptr(), packed.data_ptr())
+
+    def test_cp_local_projection_matches_global_projection(self):
+        # Projecting only real local rows would shorten some collective shards;
+        # gathering twice would also change the collective order across ranks.
+        for hcu in (True, False):
+            for lengths in ([32760, 8], [32768]):
+                for ratio, fused in ((1, False), (2, False), (2, True)):
+                    for rank in (0, 7):
+                        with self.subTest(
+                            hcu=hcu, lengths=lengths, ratio=ratio,
+                            fused=fused, rank=rank,
+                        ):
+                            self._check_projection(hcu, lengths, ratio, fused, rank)
+
+    def _check_projection(self, hcu, lengths, ratio, fused, rank):
+        size, hidden, head = 8, 4, 2
+        total = sum(lengths)
+        padded = (total + size - 1) // size * size
+        all_x = torch.arange(padded * hidden, dtype=torch.bfloat16).reshape(
+            padded, hidden
+        ) / 16
+        compressor = dsv41_sparse.DeepseekV41Compressor(
+            hidden, head, ratio, 1e-6, fused_compress=fused
+        )
+        with torch.no_grad():
+            for parameter in compressor.parameters():
+                parameter.copy_(
+                    torch.arange(parameter.numel(), dtype=torch.float32).reshape(
+                        parameter.shape
+                    ) / 16
+                )
+        requests = torch.tensor([7] * lengths[0] + [11] * sum(lengths[1:]))
+        positions = torch.cat([torch.arange(n) for n in lengths])
+        batch = SimpleNamespace(
+            attn_cp_metadata=SimpleNamespace(total_seq_lens=0 if hcu else total),
+            extend_seq_lens_cpu=lengths,
+            positions=torch.cat((positions, torch.zeros(padded - total))),
+        )
+        captured = {}
+        local_x = all_x[rank::size]
+
+        def cpu_gemm(x, weight):
+            return torch.nn.functional.linear(x.float(), weight.float())
+
+        def gather(payload, fb, stream):
+            self.assertIs(fb, batch)
+            local_expected = compressor.project_packed(local_x)
+            torch.testing.assert_close(payload, local_expected, rtol=0, atol=0)
+            self.assertTrue(payload.is_contiguous())
+            self.assertEqual(payload.shape[0], padded // size)
+            self.assertEqual(payload.shape[1], head * ratio)
+            parts = [compressor.project_packed(all_x[r::size]) for r in range(size)]
+            return torch.stack(parts, dim=1).flatten(0, 1)
+
+        def compress(layer, x, req, pos, *, projected, **kwargs):
+            self.assertIs(x, local_x)
+            captured.update(kv=projected[0], score=projected[1], req=req, pos=pos)
+
+        owner = SimpleNamespace(
+            forward_metadata=SimpleNamespace(late_layer_tail=None),
+            _low_ratio_compress_torch=compress,
+        )
+        with (
+            patch.object(dsv41_sparse, "linear_bf16_fp32", side_effect=cpu_gemm),
+            patch.object(backend, "_is_hcu", hcu),
+            patch.object(backend, "get_parallel", return_value=SimpleNamespace(
+                attn_cp_rank=rank, attn_cp_size=size,
+            )),
+            patch.object(backend, "token_req_indices", return_value=requests),
+            patch.object(backend, "cp_materialize_global_token_order", side_effect=gather) as gathered,
+            patch.object(torch.cuda, "current_stream", return_value=None),
+            envs.SGLANG_OPT_DSV41_CP_LOCAL_COMPRESSOR_PROJECTION.override(True),
+        ):
+            expected_kv, expected_score = compressor.project(all_x[:total])
+            backend.DeepseekV4AttnBackend._forward_low_ratio_sources_cp(
+                owner, layer=SimpleNamespace(compressor=compressor, compress_ratio=ratio),
+                x=local_x, q_lora=None, positions=batch.positions[rank::size],
+                forward_batch=batch, run_compressor=True, run_indexer=False,
+            )
+        self.assertEqual(gathered.call_count, 1)
+        torch.testing.assert_close(captured["kv"], expected_kv, rtol=0, atol=0)
+        if expected_score is None:
+            self.assertIsNone(captured["score"])
+        else:
+            torch.testing.assert_close(captured["score"], expected_score, rtol=0, atol=0)
+        torch.testing.assert_close(captured["req"], requests, rtol=0, atol=0)
+        torch.testing.assert_close(captured["pos"], positions, rtol=0, atol=0)
+
+
+if __name__ == "__main__":
+    unittest.main()
