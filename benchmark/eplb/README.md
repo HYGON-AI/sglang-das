@@ -8,17 +8,39 @@ count all-reduce, or LP solving.
 
 ## Prepare and use the artifact
 
-Use a frozen placement tensor `physical_to_logical_map` of shape
-`[layers, physical_experts]`, plus the corresponding representative EPLB recorder
-`logical_count` tensor. Counts may be `[layers, logical_experts]` or
+Start with one representative EPLB recorder PT containing `logical_count`.
+Counts may be `[layers, logical_experts]` or
 `[steps, layers, logical_experts]`; steps are summed. The benchmark snapshot key
-`logical_counts` is also accepted. Both inputs must cover the same model layers
-and logical experts. Physical IDs must belong to equal contiguous blocks of
-experts per EP rank. The solver keeps the supplied placement unchanged.
+`logical_counts` is also accepted.
 
 The offline command needs CPU PyTorch, NumPy and SciPy. It does not load the model
-or use a GPU. Run it on the same statistics window used for the static EPLB
-placement:
+or use a GPU. Run from this source checkout to generate both `static_mapping.pt`
+and `static_lp_probabilities.pt` from the same recording:
+
+```bash
+python3 benchmark/eplb/prepare_static_lp.py \
+  --counts expert_distribution.pt \
+  --ep-size 32 \
+  --num-nodes 2 \
+  --redundant-experts 64
+```
+
+EP32, two nodes and 64 redundant experts per layer are examples; use the target
+deployment's values. The physical expert count (logical plus redundant experts)
+must divide evenly among EP ranks, and EP size must be divisible by the node
+count. Layout generation reuses this checkout's DeepSeek EPLB algorithm with
+global placement by default. For hierarchical placement, add `--hierarchical`
+and `--num-groups N` using the model's actual expert group count; logical experts
+must divide evenly into groups, and groups into nodes.
+
+Zero-count layers use uniform weights for placement and uniform demand for LP,
+matching the existing LP fallback. The original recording is preserved. The LP
+stage keeps the generated placement fixed and uses the original counts.
+`--layout-output` sets the layout destination; by default it is
+`static_mapping.pt` beside `--output` (default: `static_lp_probabilities.pt`).
+The probability file also has a diagnostic JSON sidecar.
+
+To reuse a frozen placement instead, keep the existing command:
 
 ```bash
 python3 benchmark/eplb/prepare_static_lp.py \
@@ -27,6 +49,12 @@ python3 benchmark/eplb/prepare_static_lp.py \
   --ep-size 32 \
   --output static_lp_probabilities.pt
 ```
+
+The supplied layout must contain `physical_to_logical_map` of shape
+`[layers, physical_experts]` and cover the same layers and logical experts as the
+recording. Physical IDs belong to equal contiguous blocks per EP rank. This mode
+preserves the supplied layout and only writes the LP PT and diagnostic JSON;
+omit layout generation options such as `--redundant-experts`.
 
 Copy identical placement and probability artifacts to all nodes. Add these
 options to the existing HIP DeepEP + DeepGEMM server launch, retaining separate
