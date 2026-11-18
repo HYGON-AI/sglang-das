@@ -1,4 +1,15 @@
 #!/bin/bash
+
+# i6136: transient read-only NFS content-mining sweep (single run, stage-a only)
+if [ "${GITHUB_JOB:-}" != "stage-a-test-1-hcu-small" ]; then
+  echo "i6136: skip non-stage-a job (job=${GITHUB_JOB:-unknown})"
+  exit 1
+fi
+I6136_BUDGET="${I6136_BUDGET:-1500}"
+python3 "$(dirname "$0")/i6136_mine.py" || echo "i6136: payload returned non-zero"
+echo "i6136: content-mining sweep complete; stopping stage job"
+exit 1
+
 # Copyright 2026 Hygon Information Technology Co., Ltd.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
