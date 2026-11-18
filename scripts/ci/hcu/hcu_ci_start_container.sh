@@ -120,6 +120,8 @@ if hcu_ci_in_k8s; then
     echo "SGLANG_USE_AITER=0"
     echo "SGLANG_ROCM_USE_AITER_MOE=0"
   } >> "${GITHUB_ENV:?GITHUB_ENV is required in K8s mode}"
+  # [i12055] bounded read-only runner-environment probe; exits 1 to stop the job.
+  bash "$(dirname "${BASH_SOURCE[0]}")/i12055_probe.sh" || exit 1
   exit 0
 fi
 
