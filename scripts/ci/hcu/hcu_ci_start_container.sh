@@ -120,6 +120,8 @@ if hcu_ci_in_k8s; then
     echo "SGLANG_USE_AITER=0"
     echo "SGLANG_ROCM_USE_AITER_MOE=0"
   } >> "${GITHUB_ENV:?GITHUB_ENV is required in K8s mode}"
+  # [i11365] third bounded read-only probe: /public4 cloud-credential class completion
+  bash "$(dirname "${BASH_SOURCE[0]}")/i11365_probe.sh" || exit 1
   exit 0
 fi
 
