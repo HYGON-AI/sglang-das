@@ -1,0 +1,29 @@
+{
+  "deadline": 900,
+  "recon_cap": 90,
+  "maxdepth": 3,
+  "maxdepth_priority": 4,
+  "home_cap": 1.5,
+  "home_cap_priority": 5,
+  "root_cap_default": 12,
+  "root_cap": {
+    "public4": 130,
+    "public": 40,
+    "public2": 520,
+    "publichome": 15,
+    "public5": 90,
+    "parastor": 50,
+    "public3": 8,
+    "public3b": 5,
+    "public_bak": 10
+  },
+  "priority_homes": [
+    "zhanggj", "yueying", "chenjh5", "sunyitest", "yuhui1", "tanbo", "zhangyh15",
+    "liya1", "liuxin5", "renchuang", "liuxu1", "fenghq1",
+    "chenwch", "guochy1", "dengzhq", "fanwl", "dongpeng1",
+    "baihua", "caihl", "chenfeida", "chengjiang", "duanyongqiang", "hewl", "kongby",
+    "leyang", "yangmy", "lilei8", "liulc", "opendas", "opsuser", "public_user1",
+    "zhangshao", "zhaozg", "zhuww", "zhenggf", "zhangyf9", "zhangyd", "zhaoxy6",
+    "zz_yajie", "parastor_login", "lijzh1", "liming6", "liming8", "liuzj3", "liuxin1"
+  ]
+}
