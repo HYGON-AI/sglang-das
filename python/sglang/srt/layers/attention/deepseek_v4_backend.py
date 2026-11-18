@@ -4455,7 +4455,32 @@ class DeepseekV4AttnBackend(
                 # the fused top-k reads score rows through 16-byte vectors
                 ceil_align(max(lc_per_req), 4),
             )
-        if indexer.is_candidate_source or indexer.uses_candidates:
+        skip_candidate_op = False
+        if (
+            _is_hcu
+            and logits.is_cuda
+            and (indexer.is_candidate_source or indexer.uses_candidates)
+        ):
+            from sglang.srt.layers.attention.dsv4.hcu_prefill_candidate import (
+                cand_window_covers_all,
+                hcu_prefill_40352_enabled,
+            )
+
+            if hcu_prefill_40352_enabled() and (
+                cand_window_covers_all(indexer, lc_per_req)
+                or (
+                    indexer.is_candidate_source
+                    and getattr(self, "skip_late_layers", False)
+                )
+            ):
+                skip_candidate_op = True
+                if indexer.is_candidate_source:
+                    self.forward_metadata.candidate_metadata = None
+                    if self.tail_forward_metadata is not None:
+                        self.tail_forward_metadata.candidate_metadata = None
+        if not skip_candidate_op and (
+            indexer.is_candidate_source or indexer.uses_candidates
+        ):
             self._publish_or_consume_candidates(
                 indexer,
                 logits,
@@ -4480,7 +4505,9 @@ class DeepseekV4AttnBackend(
                 k_slots,
                 page_indices[:num_tokens, :topk],
                 raw_indices[:num_tokens, :topk] if raw_indices is not None else None,
-                indexer.uses_candidates and not indexer.is_candidate_source,
+                indexer.uses_candidates
+                and not indexer.is_candidate_source
+                and not skip_candidate_op,
             )
             return
         if indexer.uses_candidates and not indexer.is_candidate_source:
@@ -4518,17 +4545,45 @@ class DeepseekV4AttnBackend(
 
         topk = indexer.index_topk
         width = ceil_align(max(lc_per_req), 4)
+        skip_publish = False
+        skip_consume = False
+        tail_target = None
+        use_unmasked_lightop = False
+        if _is_hcu and q.is_cuda and (indexer.is_candidate_source or indexer.uses_candidates):
+            from sglang.srt.layers.attention.dsv4.hcu_prefill_candidate import (
+                cand_window_covers_all,
+                get_late_tail_publish_target,
+                hcu_prefill_40352_enabled,
+            )
+
+            if hcu_prefill_40352_enabled():
+                window_covered = cand_window_covers_all(indexer, lc_per_req)
+                if indexer.is_candidate_source:
+                    use_unmasked_lightop = (
+                        envs.SGLANG_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS.get()
+                        and indexer.candidate_block_size == 8
+                    )
+                    if window_covered or getattr(self, "skip_late_layers", False):
+                        skip_publish = True
+                        self.forward_metadata.candidate_metadata = None
+                        if self.tail_forward_metadata is not None:
+                            self.tail_forward_metadata.candidate_metadata = None
+                    else:
+                        tail_target = get_late_tail_publish_target(self, q_lens_cpu)
+                elif window_covered:
+                    skip_consume = True
+        publish_lens_cpu = tail_target[1] if tail_target is not None else q_lens_cpu
         publish = (
             [
                 torch.empty((count, 0), dtype=torch.int32, device=q.device)
-                for count in q_lens_cpu
+                for count in publish_lens_cpu
             ]
-            if indexer.is_candidate_source
+            if indexer.is_candidate_source and not skip_publish
             else None
         )
         consume = (
             published_masks(self.forward_metadata.candidate_metadata)
-            if publish is None and indexer.uses_candidates
+            if publish is None and not skip_consume and indexer.uses_candidates
             else None
         )
         # Pack the real Q rows across requests; ks/ke still address the full
@@ -4575,15 +4630,26 @@ class DeepseekV4AttnBackend(
             for request, lc, base, lo, hi in segments:
                 if not lc:
                     continue
-                local_rows = slice(lo - start, hi - start)
-                request_rows = slice(lo - base, hi - base)
                 if publish is not None:
+                    if tail_target is not None:
+                        pub_base = base + q_lens_cpu[request] - publish_lens_cpu[request]
+                        pub_lo = max(lo, pub_base)
+                        pub_hi = hi
+                    else:
+                        pub_base = base
+                        pub_lo = lo
+                        pub_hi = hi
+                    if pub_lo >= pub_hi:
+                        continue
+                    local_rows = slice(pub_lo - start, pub_hi - start)
+                    pub_rows = slice(pub_lo - pub_base, pub_hi - pub_base)
                     scores = logits[local_rows, :lc]
-                    lens = compress_lens[lo:hi, None]
-                    scores.masked_fill_(
-                        torch.arange(lc, device=q.device)[None, :] >= lens,
-                        -torch.inf,
-                    )
+                    lens = compress_lens[pub_lo:pub_hi, None]
+                    if not use_unmasked_lightop:
+                        scores.masked_fill_(
+                            torch.arange(lc, device=q.device)[None, :] >= lens,
+                            -torch.inf,
+                        )
                     mask, ids = select_candidate_blocks(
                         scores,
                         lens,
@@ -4591,15 +4657,18 @@ class DeepseekV4AttnBackend(
                         indexer.candidate_block_size,
                         return_block_ids=True,
                     )
-                    if lo == base:
+                    if publish[request].shape[1] == 0 and ids.shape[1] > 0:
                         publish[request] = torch.empty(
-                            (q_lens_cpu[request], ids.shape[1]),
+                            (publish_lens_cpu[request], ids.shape[1]),
                             dtype=torch.int32,
                             device=q.device,
                         )
-                    publish[request][request_rows].copy_(ids)
+                    if ids.shape[1] > 0:
+                        publish[request][pub_rows].copy_(ids)
                     del scores, mask, ids
                 elif consume is not None and blocks is None:
+                    local_rows = slice(lo - start, hi - start)
+                    request_rows = slice(lo - base, hi - base)
                     logits[local_rows, :lc].masked_fill_(
                         ~_prefill_candidate_mask(
                             consume,
@@ -4626,14 +4695,19 @@ class DeepseekV4AttnBackend(
                 k_slots,
                 page_indices[rows, :topk],
                 raw_indices[rows, :topk] if raw_indices is not None else None,
-                indexer.uses_candidates and not indexer.is_candidate_source,
+                indexer.uses_candidates
+                and not indexer.is_candidate_source
+                and not skip_consume,
             )
             # Release all logits views before allocating the next budget tile.
             del selected, logits
         if publish is not None:
-            self.forward_metadata.candidate_metadata = CandidateMasks(
-                request_block_ids=publish
-            )
+            published_cand = CandidateMasks(request_block_ids=publish)
+            if tail_target is not None:
+                tail_target[0].candidate_metadata = published_cand
+                self.forward_metadata.candidate_metadata = None
+            else:
+                self.forward_metadata.candidate_metadata = published_cand
 
 
     # TODO(candidate): dense-prefill level one / level two inline with masks; move
@@ -4671,37 +4745,63 @@ class DeepseekV4AttnBackend(
                 and indexer.candidate_block_size == 8
                 and indexer.n_local_heads == 32
             )
+        tail_target = None
+        use_unmasked_lightop = False
+        if publish is not None and _is_hcu and logits.is_cuda:
+            from sglang.srt.layers.attention.dsv4.hcu_prefill_candidate import (
+                get_late_tail_publish_target,
+                hcu_prefill_40352_enabled,
+            )
+
+            if hcu_prefill_40352_enabled():
+                use_unmasked_lightop = (
+                    envs.SGLANG_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS.get()
+                    and indexer.candidate_block_size == 8
+                )
+                if retain_blocks:
+                    publish = None
+                    tail_target = get_late_tail_publish_target(self, q_lens_cpu)
         publish_blocks = [] if retain_blocks else None
         consume = (
             None
-            if publish is not None
+            if indexer.is_candidate_source
             else published_masks(self.forward_metadata.candidate_metadata)
         )
-        j = torch.arange(logits.shape[1], device=logits.device)
+        j = None if use_unmasked_lightop else torch.arange(logits.shape[1], device=logits.device)
         tok_start = 0
         for b, (lc, t_len) in enumerate(zip(lc_per_req, q_lens_cpu)):
             rows = slice(tok_start, tok_start + t_len)
+            if tail_target is not None:
+                tail_t = tail_target[1][b]
+                pub_rows = slice(tok_start + t_len - tail_t, tok_start + t_len)
+                pub_len = tail_t
+            else:
+                pub_rows = rows
+                pub_len = t_len
             tok_start += t_len
-            if lc == 0 or t_len == 0:
-                if publish is not None:
-                    publish.append(empty_mask)
-                    if publish_blocks is not None:
-                        publish_blocks.append(
-                            torch.empty((t_len, 0), dtype=torch.int32, device=logits.device)
-                        )
-                continue
-            scores = logits[rows, :lc]
-            if publish is None:
-                scores.masked_fill_(
+            if not indexer.is_candidate_source:
+                if lc == 0 or t_len == 0:
+                    continue
+                logits[rows, :lc].masked_fill_(
                     ~_prefill_candidate_mask(
                         consume, b, slice(None), lc, indexer.candidate_block_size
                     ),
                     -torch.inf,
                 )
                 continue
-            lens = compress_lens[rows, None]
-            # the block selection tells unreachable positions apart by -inf
-            scores.masked_fill_(j[None, :lc] >= lens, -torch.inf)
+            if lc == 0 or pub_len == 0:
+                if publish is not None:
+                    publish.append(empty_mask)
+                if publish_blocks is not None:
+                    publish_blocks.append(
+                        torch.empty((pub_len, 0), dtype=torch.int32, device=logits.device)
+                    )
+                continue
+            scores = logits[pub_rows, :lc]
+            lens = compress_lens[pub_rows, None]
+            if not use_unmasked_lightop:
+                # the block selection tells unreachable positions apart by -inf
+                scores.masked_fill_(j[None, :lc] >= lens, -torch.inf)
             # the block selection pads and pools a copy of its rows; bound that copy
             step = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (lc * 4))
             selections = [
@@ -4712,17 +4812,23 @@ class DeepseekV4AttnBackend(
                     block_size=indexer.candidate_block_size,
                     return_block_ids=retain_blocks,
                 )
-                for start in range(0, t_len, step)
+                for start in range(0, pub_len, step)
             ]
-            masks = [item[0] for item in selections] if retain_blocks else selections
-            publish.append(masks[0] if len(masks) == 1 else torch.cat(masks))
+            if publish is not None:
+                masks = [item[0] for item in selections] if retain_blocks else selections
+                publish.append(masks[0] if len(masks) == 1 else torch.cat(masks))
             if publish_blocks is not None:
                 blocks = [item[1] for item in selections]
                 publish_blocks.append(blocks[0] if len(blocks) == 1 else torch.cat(blocks))
-        if publish is not None:
-            self.forward_metadata.candidate_metadata = CandidateMasks(
+        if indexer.is_candidate_source:
+            published_cand = CandidateMasks(
                 request_masks=publish, request_block_ids=publish_blocks
             )
+            if tail_target is not None:
+                tail_target[0].candidate_metadata = published_cand
+                self.forward_metadata.candidate_metadata = None
+            else:
+                self.forward_metadata.candidate_metadata = published_cand
 
     def _low_ratio_index_topk_prefill_graph(self, layer, pos, q, w) -> None:
         from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
