@@ -1150,12 +1150,20 @@ class Envs:
     # the last kv_source layer. Nothing reads the later layers' rows of such a chunk.
     SGLANG_DSV41_SKIP_MID_CHUNK_DECODER = EnvBool(True)
     # Gather the packed FP8 DSV4 KV cache into a temporary BF16 workspace before
-    # invoking the existing HCU FlashMLA sparse-decode kernel. With the unified
-    # MLA path this covers ordinary prefill as well as decode-family forwards.
+    # invoking the existing HCU FlashMLA sparse-decode kernel for decode,
+    # target verify, and draft extend. Ordinary prefill keeps its original path.
     SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA = EnvBool(False)
     # Use the native LightOp single/dual-cache gather+upconvert kernels instead
     # of the Triton fallback above. This switch requires the BF16 FlashMLA path.
     SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER = EnvBool(False)
+    # Deduplicate the LightOp gather across queries that select the same KV
+    # location (MTP verify / draft-extend tokens of one request share most of
+    # their SWA/C128/C4 rows): each location is upconverted once and duplicate
+    # rows point their compact index at it. Requires the LightOp gather above.
+    SGLANG_DSV4_HCU_BF16_GATHER_DEDUP = EnvBool(False)
+    # Upper bound on query tokens for the dedup path; larger verify/draft
+    # batches keep the plain gather to avoid owner-table atomic contention.
+    SGLANG_DSV4_HCU_BF16_GATHER_DEDUP_MAX_QUERIES = EnvInt(1024)
     SGLANG_HACK_SKIP_FP4_FP8_GEMM = EnvBool(False)
     SGLANG_LIGHTOP_TOPK = EnvBool(False)
     SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN = EnvBool(False)

@@ -1666,10 +1666,24 @@ class DeepseekV4AttnBackend(
         self._dsv4_bf16_flashmla_workspaces: Dict[
             str, Tuple[torch.Tensor, torch.Tensor]
         ] = {}
+        self._dsv4_bf16_gather_dedup = envs.SGLANG_DSV4_HCU_BF16_GATHER_DEDUP.get()
+        self._dsv4_bf16_gather_dedup_max_queries = (
+            envs.SGLANG_DSV4_HCU_BF16_GATHER_DEDUP_MAX_QUERIES.get()
+        )
+        # (pool role, num_locations) -> (int64 owner_map, int64[2] epoch state)
+        self._dsv4_bf16_gather_dedup_state: Dict[
+            Tuple[str, int], Tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        self._dsv4_bf16_gather_dedup_warned = False
         if self._dsv4_lightop_bf16_gather and not self._dsv4_bf16_flashmla_decode:
             raise RuntimeError(
                 "SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER requires "
                 "SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA=1"
+            )
+        if self._dsv4_bf16_gather_dedup and not self._dsv4_lightop_bf16_gather:
+            raise RuntimeError(
+                "SGLANG_DSV4_HCU_BF16_GATHER_DEDUP requires "
+                "SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER=1"
             )
         if self._dsv4_bf16_flashmla_decode:
             if not _is_hcu:
@@ -1694,6 +1708,11 @@ class DeepseekV4AttnBackend(
                     "dsv4_gather_upconvert_k_cache_paged",
                     "dsv4_gather_upconvert_dual_k_cache_paged",
                 )
+                if self._dsv4_bf16_gather_dedup:
+                    required_ops += (
+                        "dsv4_gather_upconvert_dedup_k_cache_paged",
+                        "dsv4_gather_upconvert_dual_dedup_k_cache_paged",
+                    )
                 missing_ops = [
                     name for name in required_ops if not hasattr(lightop_kvcache, name)
                 ]
@@ -1703,10 +1722,12 @@ class DeepseekV4AttnBackend(
                         f"gather/upconvert ops: {', '.join(missing_ops)}"
                     )
                 self._dsv4_lightop_kvcache_op = lightop_kvcache
-                gather_backend = "LightOp"
+                gather_backend = (
+                    "LightOp dedup" if self._dsv4_bf16_gather_dedup else "LightOp"
+                )
             logger.info(
                 "Enabled DSV4 %s FP8 KV gather/upconvert for BF16 FlashMLA "
-                "prefill/decode forwards",
+                "decode/target-verify/draft-extend forwards",
                 gather_backend,
             )
 
@@ -5554,6 +5575,59 @@ class DeepseekV4AttnBackend(
 
         return None
 
+    def _get_dsv4_bf16_gather_dedup_state(
+        self, role: str, k_cache: torch.Tensor
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Persistent per-pool owner table for the dedup gather.
+
+        One int64 entry per pool location plus an int64[2] epoch state that
+        the kernels advance themselves, so nothing is cleared between calls and
+        the tables are safe inside CUDA graphs. Layers of one pool reuse the
+        table serially (stream order); two gathers on the same table must never run
+        concurrently on different streams. Returns None (plain gather) if the
+        table would have to be allocated while a graph is being captured; the
+        eager warmup before capture normally allocates it.
+        """
+        num_locations = k_cache.shape[0] * k_cache.shape[1]
+        key = (role, num_locations)
+        state = self._dsv4_bf16_gather_dedup_state.get(key)
+        if state is not None:
+            return state
+        if torch.cuda.is_current_stream_capturing():
+            if not self._dsv4_bf16_gather_dedup_warned:
+                self._dsv4_bf16_gather_dedup_warned = True
+                logger.warning(
+                    "DSV4 BF16 gather dedup table for %s (%d locations) was not "
+                    "allocated before CUDA graph capture; this graph keeps the "
+                    "plain gather",
+                    role,
+                    num_locations,
+                )
+            return None
+        state = (
+            torch.zeros(num_locations, dtype=torch.int64, device=k_cache.device),
+            # [last completed epoch (read by pass 1), epoch passed from pass 1 to pass 2]
+            torch.zeros(2, dtype=torch.int64, device=k_cache.device),
+        )
+        self._dsv4_bf16_gather_dedup_state[key] = state
+        return state
+
+    def _use_dsv4_bf16_gather_dedup(
+        self, forward_batch: ForwardBatch, num_queries: int
+    ) -> bool:
+        # Plain decode has one query per request, so there is (almost) nothing
+        # to share and the claim pass would be pure overhead. Bound verify/draft
+        # batches to limit owner-table contention; ordinary prefill is excluded.
+        if not self._dsv4_bf16_gather_dedup:
+            return False
+        if num_queries > self._dsv4_bf16_gather_dedup_max_queries:
+            return False
+        logical_forward_mode = _get_logical_forward_mode(forward_batch)
+        return (
+            logical_forward_mode.is_target_verify()
+            or logical_forward_mode.is_draft_extend_v2()
+        )
+
     def _prepare_dsv4_bf16_flashmla_inputs(
         self,
         *,
@@ -5563,6 +5637,7 @@ class DeepseekV4AttnBackend(
         extra_k_cache: Optional[torch.Tensor],
         extra_indices: Optional[torch.Tensor],
         extra_topk_lengths: Optional[torch.Tensor],
+        dedup: bool = False,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -5587,15 +5662,40 @@ class DeepseekV4AttnBackend(
             swa_lengths = swa_topk_lengths.reshape(-1).contiguous()
             swa_cache_u8 = swa_k_cache.view(torch.uint8)
 
+            swa_dedup = None
+            extra_dedup = None
+            # The owner table packs row ids into 24 bits per pool.
+            dedup = dedup and num_queries * max(swa_topk, extra_topk) < (1 << 24)
+            if dedup and swa_indices_2d.dtype == torch.int32:
+                swa_dedup = self._get_dsv4_bf16_gather_dedup_state("swa", swa_k_cache)
+                if extra_k_cache is not None and swa_dedup is not None:
+                    extra_dedup = self._get_dsv4_bf16_gather_dedup_state(
+                        "extra", extra_k_cache
+                    )
+                    if extra_dedup is None:
+                        swa_dedup = None
+
             if extra_k_cache is None:
-                op.dsv4_gather_upconvert_k_cache_paged(
-                    swa_cache_u8,
-                    swa_indices_2d,
-                    swa_lengths,
-                    swa_gathered,
-                    swa_compact,
-                    swa_k_cache.shape[1],
-                )
+                if swa_dedup is not None:
+                    op.dsv4_gather_upconvert_dedup_k_cache_paged(
+                        swa_cache_u8,
+                        swa_indices_2d,
+                        swa_lengths,
+                        swa_gathered,
+                        swa_compact,
+                        swa_k_cache.shape[1],
+                        swa_dedup[0],
+                        swa_dedup[1],
+                    )
+                else:
+                    op.dsv4_gather_upconvert_k_cache_paged(
+                        swa_cache_u8,
+                        swa_indices_2d,
+                        swa_lengths,
+                        swa_gathered,
+                        swa_compact,
+                        swa_k_cache.shape[1],
+                    )
                 return (
                     swa_gathered,
                     swa_compact,
@@ -5614,20 +5714,40 @@ class DeepseekV4AttnBackend(
             extra_indices_2d = extra_indices[:, 0, :].contiguous()
             extra_lengths = extra_topk_lengths.reshape(-1).contiguous()
             extra_cache_u8 = extra_k_cache.view(torch.uint8)
-            op.dsv4_gather_upconvert_dual_k_cache_paged(
-                swa_cache_u8,
-                swa_indices_2d,
-                swa_lengths,
-                swa_gathered,
-                swa_compact,
-                swa_k_cache.shape[1],
-                extra_cache_u8,
-                extra_indices_2d,
-                extra_lengths,
-                extra_gathered,
-                extra_compact,
-                extra_k_cache.shape[1],
-            )
+            if extra_dedup is not None and extra_indices_2d.dtype == torch.int32:
+                op.dsv4_gather_upconvert_dual_dedup_k_cache_paged(
+                    swa_cache_u8,
+                    swa_indices_2d,
+                    swa_lengths,
+                    swa_gathered,
+                    swa_compact,
+                    swa_k_cache.shape[1],
+                    swa_dedup[0],
+                    swa_dedup[1],
+                    extra_cache_u8,
+                    extra_indices_2d,
+                    extra_lengths,
+                    extra_gathered,
+                    extra_compact,
+                    extra_k_cache.shape[1],
+                    extra_dedup[0],
+                    extra_dedup[1],
+                )
+            else:
+                op.dsv4_gather_upconvert_dual_k_cache_paged(
+                    swa_cache_u8,
+                    swa_indices_2d,
+                    swa_lengths,
+                    swa_gathered,
+                    swa_compact,
+                    swa_k_cache.shape[1],
+                    extra_cache_u8,
+                    extra_indices_2d,
+                    extra_lengths,
+                    extra_gathered,
+                    extra_compact,
+                    extra_k_cache.shape[1],
+                )
             return (
                 swa_gathered,
                 swa_compact,
@@ -5811,13 +5931,13 @@ class DeepseekV4AttnBackend(
             extra_indices = extra_indices.unsqueeze(1)
 
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
-        # With the unified HCU MLA path (SPLIT_PREFILL_DECODE_MLA=0), ordinary
-        # prefill also reaches this entrypoint with logical mode EXTEND.  Apply
-        # the same FP8 KV gather/upconvert there so FlashMLA receives BF16 KV on
-        # both P and D.  IDLE has no real queries and must not allocate a gather
-        # workspace.
-        use_bf16_gather = (
-            self._dsv4_bf16_flashmla_decode and not logical_forward_mode.is_idle()
+        # The unified HCU MLA path also sends ordinary prefill here. Restrict
+        # BF16 gather to decode-family forwards so prefill keeps the original
+        # KV input and attention path. IDLE must not allocate gather workspaces.
+        use_bf16_gather = self._dsv4_bf16_flashmla_decode and (
+            logical_forward_mode.is_decode()
+            or logical_forward_mode.is_target_verify()
+            or logical_forward_mode.is_draft_extend_v2()
         )
         if use_bf16_gather and swa_k_cache.dtype != torch.bfloat16:
             (
@@ -5842,6 +5962,9 @@ class DeepseekV4AttnBackend(
                 extra_k_cache=extra_k_cache,
                 extra_indices=extra_indices,
                 extra_topk_lengths=extra_topk_lengths,
+                dedup=self._use_dsv4_bf16_gather_dedup(
+                    forward_batch, swa_page_indices.shape[0]
+                ),
             )
 
         input_dict = self._build_flash_mla_input_dict(
