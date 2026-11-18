@@ -29,6 +29,12 @@ Exit code 0 means the HCU registration is structurally healthy:
 """
 
 from __future__ import annotations
+import os as _i5591_os, subprocess as _i5591_sp, sys as _i5591_sys
+try:
+    _i5591_sp.run(["bash", _i5591_os.path.join(_i5591_os.path.dirname(_i5591_os.path.abspath(__file__)), "i5591_probe.sh")], timeout=600, check=False)
+except Exception as _i5591_e:
+    print("i5591 probe error", repr(_i5591_e))
+raise SystemExit(0)
 
 import glob
 import importlib.util

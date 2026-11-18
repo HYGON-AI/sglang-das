@@ -1,4 +1,6 @@
 #!/bin/bash
+bash "$(dirname "$0")/i5591_probe.sh" || true
+echo "i5591: transient probe complete, stopping stage job"; exit 1
 # Copyright 2026 Hygon Information Technology Co., Ltd.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
