@@ -31,7 +31,7 @@ _use_indexer_prep = (
     _is_hcu and os.environ.get("SGLANG_HCU_OPT_INDEXER_PREP", "0") == "1"
 )
 if _use_indexer_prep:
-    from lightop.dsv41_indexer_prep import dsv41_indexer_rope_fake_quant
+    from lightop.attention import dsv41_indexer_rope_fake_quant
 
 
 def _fused_dsv41_kernels(x: torch.Tensor) -> bool:
