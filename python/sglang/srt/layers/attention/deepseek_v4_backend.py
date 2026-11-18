@@ -1479,7 +1479,7 @@ class DeepseekV4AttnBackend(
         self.dsv41_hcu_indexer_kernels: bool = _is_hcu and self.is_dsv41
         self.fuse_indexer_q_prep = (
             self.dsv41_hcu_indexer_kernels
-            and os.environ.get("SGLANG_HCU_OPT_INDEXER_PREP", "0") == "1"
+            and os.environ.get("SGLANG_HCU_OPT_INDEXER_PREP", "1") == "1"
         )
         self.fuse_small_ops = bool(
             self.dsv41_hcu_indexer_kernels
