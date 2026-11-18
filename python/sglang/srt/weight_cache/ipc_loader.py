@@ -234,6 +234,9 @@ class IpcModelLoader(BaseModelLoader):
                     weight = getattr(module, "weight", None)
                     if isinstance(weight, torch.Tensor):
                         dsv41_int8_blaslt.prepare_weight(weight)
+            from sglang.kernels.ops.gemm.bf16_fp32 import prepare_hcu_nn_weights_for_model
+
+            prepare_hcu_nn_weights_for_model(model)
         self._check_deferred_aliases(model)
         if result is not None:
             verify_deferred_state(model, result)

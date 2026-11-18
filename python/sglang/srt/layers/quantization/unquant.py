@@ -57,6 +57,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
+    is_hcu,
     is_hip,
     is_npu,
     is_xpu,
@@ -93,6 +94,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
+_is_hcu = is_hcu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_gfx95 = _is_hip and is_gfx95_supported()
@@ -517,6 +519,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+        elif _is_hcu and getattr(layer, "bias", None) is None:
+            import os
+
+            if os.environ.get("WEIGHT_CACHE") != "daemon":
+                from sglang.kernels.ops.gemm.bf16_fp32 import prepare_hcu_nn_weight
+
+                prepare_hcu_nn_weight(getattr(layer, "weight", None))
 
     def apply(
         self,
@@ -562,6 +571,21 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         if x.dtype != layer.weight.dtype:
             x = x.to(layer.weight.dtype)
+        if (
+            _is_hcu
+            and bias is None
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+        ):
+            from sglang.kernels.ops.gemm.bf16_fp32 import prepare_hcu_nn_weight
+
+            y_t = prepare_hcu_nn_weight(layer.weight)
+            if y_t is not None:
+                x_2d = x.reshape(-1, x.shape[-1]) if x.dim() != 2 else x
+                if x_2d.is_contiguous():
+                    out = torch.mm(x_2d, y_t, out_dtype=x.dtype)
+                    return out.view(*x.shape[:-1], y_t.shape[1]) if x.dim() != 2 else out
         return F.linear(x, layer.weight, bias)
 
     def apply_with_addend(
