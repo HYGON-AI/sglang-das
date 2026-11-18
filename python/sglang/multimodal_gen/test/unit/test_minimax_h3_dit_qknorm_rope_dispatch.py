@@ -16,16 +16,19 @@ from sglang.srt.utils import is_hcu
 requires_hcu = pytest.mark.skipif(
     not (torch.cuda.is_available() and is_hcu()), reason="Requires HCU"
 )
-FLAG = "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE"
+FLAG_4WAVE = "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE"
+FLAG_2WAVE = FLAG_4WAVE + "_2WAVE"
+FLAG_4HEADS = FLAG_4WAVE + "_4HEADS"
 
 
-def test_dit_qknorm_rope_flag_is_opt_in(monkeypatch):
-    monkeypatch.delenv(FLAG, raising=False)
-    assert not envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE
-    monkeypatch.setenv(FLAG, "1")
-    assert envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE
-    monkeypatch.setenv(FLAG, "false")
-    assert not envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE
+@pytest.mark.parametrize("flag", [FLAG_4WAVE, FLAG_2WAVE, FLAG_4HEADS])
+def test_dit_qknorm_rope_flag_is_opt_in(monkeypatch, flag):
+    monkeypatch.delenv(flag, raising=False)
+    assert not getattr(envs, flag)
+    monkeypatch.setenv(flag, "1")
+    assert getattr(envs, flag)
+    monkeypatch.setenv(flag, "false")
+    assert not getattr(envs, flag)
 
 
 @requires_hcu
@@ -75,8 +78,19 @@ def test_dit_qknorm_rope_rejects_unsupported_metadata(case):
 
 
 @requires_hcu
-@pytest.mark.parametrize("enabled", [False, True])
-def test_dit_attention_call_site(monkeypatch, enabled):
+@pytest.mark.parametrize(
+    ("enabled_flags", "variant"),
+    [
+        ((), None),
+        ((FLAG_4WAVE,), "4wave"),
+        ((FLAG_2WAVE,), "2wave"),
+        ((FLAG_4HEADS,), "4heads"),
+        ((FLAG_4WAVE, FLAG_2WAVE), "2wave"),
+        ((FLAG_4WAVE, FLAG_4HEADS), "4heads"),
+        ((FLAG_4WAVE, FLAG_2WAVE, FLAG_4HEADS), "4heads"),
+    ],
+)
+def test_dit_attention_call_site(monkeypatch, enabled_flags, variant):
     from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
         MiniMaxH3DiTArchConfig,
     )
@@ -122,10 +136,16 @@ def test_dit_attention_call_site(monkeypatch, enabled):
     )
     target = "sglang.kernels.ops.diffusion.minimax_h3_dit_qknorm_rope"
     with torch.inference_mode():
-        monkeypatch.delenv(FLAG, raising=False)
+        for flag in (FLAG_4WAVE, FLAG_2WAVE, FLAG_4HEADS):
+            monkeypatch.delenv(flag, raising=False)
         expected = module(x, **kwargs)
-        monkeypatch.setenv(FLAG, "1" if enabled else "0")
+        for flag in enabled_flags:
+            monkeypatch.setenv(flag, "1")
         with patch(target, wraps=minimax_h3_dit_qknorm_rope) as fused:
             actual = module(x, **kwargs)
-        assert fused.call_count == int(enabled)
+        if variant is None:
+            fused.assert_not_called()
+        else:
+            assert fused.call_count == 1
+            assert fused.call_args.kwargs["variant"] == variant
     torch.testing.assert_close(actual, expected, atol=0.04, rtol=0.02)

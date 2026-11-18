@@ -4,7 +4,7 @@
 Specialized for BF16, head_dim=128 and rotary_dim=96. Token and head
 counts are dynamic, and actual Q/K row and head strides are used.
 Normalize and rotate in place while preserving the V slice of packed QKV.
-Each program handles four heads from one token and shares its RoPE cache.
+The four-head variant handles four heads per program and shares their RoPE cache.
 
 This kernel is not bit-exact to the native split chain: reduction and
 floating-point evaluation can differ. Explicitly round normalized values
@@ -26,6 +26,51 @@ from sglang.srt.utils.custom_op import register_custom_op
 _HEAD_DIM = 128
 _ROTARY_DIM = 96
 _HEADS_PER_BLOCK = 4
+
+
+@triton.jit
+def _minimax_h3_dit_qknorm_rope_kernel(
+    Q,
+    K,
+    WQ,
+    WK,
+    CACHE,
+    POS,
+    Q_ROW: tl.constexpr,
+    K_ROW: tl.constexpr,
+    Q_HEAD: tl.constexpr,
+    K_HEAD: tl.constexpr,
+    EPS: tl.constexpr,
+    D: tl.constexpr = _HEAD_DIM,
+    R: tl.constexpr = _ROTARY_DIM,
+):
+    token = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1)
+    i = tl.arange(0, D)
+    qptr = Q + token * Q_ROW + head * Q_HEAD + i
+    kptr = K + token * K_ROW + head * K_HEAD + i
+    q = tl.load(qptr).to(tl.float32)
+    k = tl.load(kptr).to(tl.float32)
+    wq = tl.load(WQ + i).to(tl.float32)
+    wk = tl.load(WK + i).to(tl.float32)
+    qscale = tl.rsqrt(tl.sum(q * q, 0) / D + EPS)
+    kscale = tl.rsqrt(tl.sum(k * k, 0) / D + EPS)
+    # Round to the activation dtype before RoPE, matching the affine
+    # RMSNorm's own output dtype at that point in the split chain.
+    qn = (q * qscale * wq).to(tl.bfloat16).to(tl.float32)
+    kn = (k * kscale * wk).to(tl.bfloat16).to(tl.float32)
+    partner = tl.where(i < R // 2, i + R // 2, tl.where(i < R, i - R // 2, i))
+    qp = tl.gather(qn, partner, 0)
+    kp = tl.gather(kn, partner, 0)
+    pos = tl.load(POS + token)
+    freq = i % (R // 2)
+    cos = tl.load(CACHE + pos * R + freq).to(tl.float32)
+    sin = tl.load(CACHE + pos * R + R // 2 + freq).to(tl.float32)
+    sign = tl.where(i < R // 2, -1.0, 1.0)
+    qo = tl.where(i < R, qn * cos + sign * qp * sin, qn)
+    ko = tl.where(i < R, kn * cos + sign * kp * sin, kn)
+    tl.store(qptr, qo)
+    tl.store(kptr, ko)
 
 
 @triton.jit
@@ -69,7 +114,7 @@ def _normalize_and_rotate(
 
 
 @triton.jit
-def _minimax_h3_dit_qknorm_rope_kernel(
+def _minimax_h3_dit_qknorm_rope_4heads_kernel(
     Q,
     K,
     WQ,
@@ -173,6 +218,7 @@ def minimax_h3_dit_qknorm_rope(
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
     eps: float,
+    variant: str = "4heads",
 ) -> None:
     """In-place fused affine RMSNorm + partial NeoX RoPE for the H3 DiT.
 
@@ -181,29 +227,42 @@ def minimax_h3_dit_qknorm_rope(
     ``[tokens, 96] = [cos_half(48) | sin_half(48)]``. Call
     ``can_use_minimax_h3_dit_qknorm_rope`` first; this function does not
     re-validate every condition.
+
+    ``variant`` selects the original ``4wave`` launch, the same kernel with
+    ``2wave``, or the ``4heads`` kernel.
     """
+    if variant not in ("4wave", "2wave", "4heads"):
+        raise ValueError(f"Unsupported H3 DiT QK-norm/RoPE variant: {variant}")
     if not can_use_minimax_h3_dit_qknorm_rope(
         q, k, q_weight, k_weight, cos_sin_cache, eps, eps, positions=positions
     ):
         raise ValueError("Unsupported H3 DiT QK-norm/RoPE input metadata")
+    args = (
+        q,
+        k,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        q.stride(0),
+        k.stride(0),
+        q.stride(1),
+        k.stride(1),
+    )
+    tokens, heads, _ = q.shape
     with torch.cuda.device(q.device):
-        grid = (q.shape[0] * triton.cdiv(q.shape[1], _HEADS_PER_BLOCK),)
-        _minimax_h3_dit_qknorm_rope_kernel[grid](
-            q,
-            k,
-            q_weight,
-            k_weight,
-            cos_sin_cache,
-            positions,
-            q.stride(0),
-            k.stride(0),
-            q.stride(1),
-            k.stride(1),
-            q.shape[1],
-            eps,
-            num_warps=1,
-            enable_fp_fusion=False,
-        )
+        if variant == "4heads":
+            grid = (tokens * triton.cdiv(heads, _HEADS_PER_BLOCK),)
+            _minimax_h3_dit_qknorm_rope_4heads_kernel[grid](
+                *args, heads, eps, num_warps=1, enable_fp_fusion=False
+            )
+        else:
+            _minimax_h3_dit_qknorm_rope_kernel[(tokens, heads)](
+                *args,
+                eps,
+                num_warps=2 if variant == "2wave" else 4,
+                enable_fp_fusion=False,
+            )
 
 
 __all__ = ["can_use_minimax_h3_dit_qknorm_rope", "minimax_h3_dit_qknorm_rope"]

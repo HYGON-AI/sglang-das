@@ -447,12 +447,16 @@ def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
 
 
 def _try_hcu_dit_qknorm_rope(q, k, q_norm, k_norm, cache, positions):
-    if (
-        not envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE
-        or not is_hcu()
-        or torch.is_grad_enabled()
-        or torch.compiler.is_compiling()
-    ):
+    if envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE_4HEADS:
+        variant = "4heads"
+    elif envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE_2WAVE:
+        variant = "2wave"
+    elif envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE:
+        variant = "4wave"
+    else:
+        return False
+
+    if not is_hcu() or torch.is_grad_enabled() or torch.compiler.is_compiling():
         return False
     from sglang.kernels.ops.diffusion import (
         can_use_minimax_h3_dit_qknorm_rope,
@@ -471,7 +475,14 @@ def _try_hcu_dit_qknorm_rope(q, k, q_norm, k_norm, cache, positions):
     ):
         return False
     minimax_h3_dit_qknorm_rope(
-        q, k, q_norm.weight, k_norm.weight, cache, positions, q_norm.eps
+        q,
+        k,
+        q_norm.weight,
+        k_norm.weight,
+        cache,
+        positions,
+        q_norm.eps,
+        variant=variant,
     )
     return True
 

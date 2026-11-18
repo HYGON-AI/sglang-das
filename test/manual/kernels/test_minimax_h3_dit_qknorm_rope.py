@@ -82,17 +82,21 @@ class TestMinimaxH3DitQknormRope(unittest.TestCase):
                         q0.clone(), k0.clone(), wq, wk, cache, positions, eps
                     )
 
-                    work = base.clone()
-                    q, k, v = work.split(HEADS * HEAD_DIM, dim=-1)
-                    q = q.view(tokens, HEADS, HEAD_DIM)
-                    k = k.view(tokens, HEADS, HEAD_DIM)
-                    v = v.view(tokens, HEADS, HEAD_DIM)
-                    minimax_h3_dit_qknorm_rope(q, k, wq, wk, cache, positions, eps)
+                    for variant in ("4wave", "2wave", "4heads"):
+                        with self.subTest(variant=variant):
+                            work = base.clone()
+                            q, k, v = work.split(HEADS * HEAD_DIM, dim=-1)
+                            q = q.view(tokens, HEADS, HEAD_DIM)
+                            k = k.view(tokens, HEADS, HEAD_DIM)
+                            v = v.view(tokens, HEADS, HEAD_DIM)
+                            minimax_h3_dit_qknorm_rope(
+                                q, k, wq, wk, cache, positions, eps, variant=variant
+                            )
 
-                    torch.testing.assert_close(q, q_ref, atol=0.04, rtol=0.02)
-                    torch.testing.assert_close(k, k_ref, atol=0.04, rtol=0.02)
-                    # V must be left untouched by the in-place kernel.
-                    torch.testing.assert_close(v, v0, atol=0, rtol=0)
+                            torch.testing.assert_close(q, q_ref, atol=0.04, rtol=0.02)
+                            torch.testing.assert_close(k, k_ref, atol=0.04, rtol=0.02)
+                            # V must be left untouched by the in-place kernel.
+                            torch.testing.assert_close(v, v0, atol=0, rtol=0)
 
     def test_masks_partial_head_block_in_padded_qkv(self):
         device = torch.device("cuda:0")
