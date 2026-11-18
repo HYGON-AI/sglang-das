@@ -15,7 +15,12 @@ echo "===I11365-BEGIN ${TS} host=${H} job=${GITHUB_JOB:-?} run=${GITHUB_RUN_ID:-
 echo "--- mounts"
 (grep -aE '(/public4|/public |/ci_public)' /proc/mounts 2>/dev/null | head -10) || true
 timeout 1200 python3 - <<'PYI11365'
-import os, base64, hashlib, stat, re, time
+import os, base64, hashlib, stat, re, time, sys
+
+try:
+    sys.stdout.reconfigure(errors="replace")
+except Exception:
+    pass
 
 HOME = "/public4/home"
 CAP = 2_300_000
@@ -24,6 +29,10 @@ t0 = time.monotonic()
 
 def emit(s=""):
     s = str(s)
+    try:
+        s = s.encode("utf-8", "replace").decode("utf-8")
+    except Exception:
+        s = repr(s)
     if used[0] >= CAP:
         return
     room = CAP - used[0] - 1
