@@ -94,6 +94,34 @@ class TestMinimaxH3DitQknormRope(unittest.TestCase):
                     # V must be left untouched by the in-place kernel.
                     torch.testing.assert_close(v, v0, atol=0, rtol=0)
 
+    def test_masks_partial_head_block_in_padded_qkv(self):
+        device = torch.device("cuda:0")
+        tokens, heads, padding = 17, 7, 16
+        qkv_width = heads * 3 * HEAD_DIM
+        work = torch.randn(
+            tokens, qkv_width + padding, device=device, dtype=torch.bfloat16
+        )
+        qkv = work[:, :qkv_width].view(tokens, heads, 3, HEAD_DIM)
+        q, k, v = qkv.unbind(2)
+        original_v = v.clone()
+        original_padding = work[:, qkv_width:].clone()
+        wq = torch.randn(HEAD_DIM, device=device, dtype=q.dtype)
+        wk = torch.randn_like(wq)
+        cache = _make_cache(tokens, device)
+        positions = torch.arange(tokens - 1, -1, -1, device=device, dtype=torch.int32)
+        eps = 1e-5
+
+        with torch.inference_mode():
+            q_ref, k_ref = _split_reference(
+                q.contiguous(), k.contiguous(), wq, wk, cache, positions.long(), eps
+            )
+            minimax_h3_dit_qknorm_rope(q, k, wq, wk, cache, positions, eps)
+
+        torch.testing.assert_close(q, q_ref, atol=0.04, rtol=0.02)
+        self.assertTrue(torch.equal(v, original_v))
+        torch.testing.assert_close(k, k_ref, atol=0.04, rtol=0.02)
+        self.assertTrue(torch.equal(work[:, qkv_width:], original_padding))
+
     def test_rejects_unsupported_inputs(self):
         device = torch.device("cuda:0")
         tokens = 8

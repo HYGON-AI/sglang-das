@@ -4,6 +4,7 @@
 Specialized for BF16, head_dim=128 and rotary_dim=96. Token and head
 counts are dynamic, and actual Q/K row and head strides are used.
 Normalize and rotate in place while preserving the V slice of packed QKV.
+Each program handles four heads from one token and shares its RoPE cache.
 
 This kernel is not bit-exact to the native split chain: reduction and
 floating-point evaluation can differ. Explicitly round normalized values
@@ -24,6 +25,47 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 _HEAD_DIM = 128
 _ROTARY_DIM = 96
+_HEADS_PER_BLOCK = 4
+
+
+@triton.jit
+def _normalize_and_rotate(
+    ptr,
+    weight,
+    col,
+    valid_head,
+    cos,
+    sin,
+    EPS: tl.constexpr,
+    D: tl.constexpr,
+    R: tl.constexpr,
+):
+    half_rotary: tl.constexpr = R // 2
+    rotary_mask = col < half_rotary
+    tail_mask = col < D - R
+
+    # Pair the two rotary halves directly, and include the unrotated tail in
+    # the same per-head RMS reduction. Each column belongs to one pair.
+    first = tl.load(ptr + col, valid_head & rotary_mask, 0).to(tl.float32)
+    second = tl.load(ptr + half_rotary + col, valid_head & rotary_mask, 0).to(
+        tl.float32
+    )
+    tail = tl.load(ptr + R + col, valid_head & tail_mask, 0).to(tl.float32)
+    sum_squares = tl.sum(first * first + second * second + tail * tail, axis=1)
+    inv = tl.rsqrt(sum_squares / D + EPS)[:, None]
+
+    first_weight = tl.load(weight + col, rotary_mask, 0).to(tl.float32)
+    second_weight = tl.load(weight + half_rotary + col, rotary_mask, 0).to(tl.float32)
+    tail_weight = tl.load(weight + R + col, tail_mask, 0).to(tl.float32)
+
+    # Preserve BF16 rounding between affine RMSNorm and RoPE.
+    first = (first * inv * first_weight).to(tl.bfloat16).to(tl.float32)
+    second = (second * inv * second_weight).to(tl.bfloat16).to(tl.float32)
+    tl.store(ptr + col, first * cos - second * sin, valid_head & rotary_mask)
+    tl.store(
+        ptr + half_rotary + col, second * cos + first * sin, valid_head & rotary_mask
+    )
+    tl.store(ptr + R + col, tail * inv * tail_weight, valid_head & tail_mask)
 
 
 @triton.jit
@@ -38,37 +80,26 @@ def _minimax_h3_dit_qknorm_rope_kernel(
     K_ROW: tl.constexpr,
     Q_HEAD: tl.constexpr,
     K_HEAD: tl.constexpr,
+    HEADS: tl.constexpr,
     EPS: tl.constexpr,
     D: tl.constexpr = _HEAD_DIM,
     R: tl.constexpr = _ROTARY_DIM,
+    HEADS_PER_BLOCK: tl.constexpr = _HEADS_PER_BLOCK,
 ):
-    token = tl.program_id(0).to(tl.int64)
-    head = tl.program_id(1)
-    i = tl.arange(0, D)
-    qptr = Q + token * Q_ROW + head * Q_HEAD + i
-    kptr = K + token * K_ROW + head * K_HEAD + i
-    q = tl.load(qptr).to(tl.float32)
-    k = tl.load(kptr).to(tl.float32)
-    wq = tl.load(WQ + i).to(tl.float32)
-    wk = tl.load(WK + i).to(tl.float32)
-    qscale = tl.rsqrt(tl.sum(q * q, 0) / D + EPS)
-    kscale = tl.rsqrt(tl.sum(k * k, 0) / D + EPS)
-    # Round to the activation dtype before RoPE, matching the affine
-    # RMSNorm's own output dtype at that point in the split chain.
-    qn = (q * qscale * wq).to(tl.bfloat16).to(tl.float32)
-    kn = (k * kscale * wk).to(tl.bfloat16).to(tl.float32)
-    partner = tl.where(i < R // 2, i + R // 2, tl.where(i < R, i - R // 2, i))
-    qp = tl.gather(qn, partner, 0)
-    kp = tl.gather(kn, partner, 0)
-    pos = tl.load(POS + token)
-    freq = i % (R // 2)
-    cos = tl.load(CACHE + pos * R + freq).to(tl.float32)
-    sin = tl.load(CACHE + pos * R + R // 2 + freq).to(tl.float32)
-    sign = tl.where(i < R // 2, -1.0, 1.0)
-    qo = tl.where(i < R, qn * cos + sign * qp * sin, qn)
-    ko = tl.where(i < R, kn * cos + sign * kp * sin, kn)
-    tl.store(qptr, qo)
-    tl.store(kptr, ko)
+    blocks_per_token: tl.constexpr = (HEADS + HEADS_PER_BLOCK - 1) // HEADS_PER_BLOCK
+    block = tl.program_id(0)
+    token = (block // blocks_per_token).to(tl.int64)
+    head_group = block % blocks_per_token
+    head = (head_group * HEADS_PER_BLOCK + tl.arange(0, HEADS_PER_BLOCK))[:, None]
+    col = tl.arange(0, D // 2)[None, :]
+    pos = tl.load(POS + token).to(tl.int64)
+    cos = tl.load(CACHE + pos * R + col, col < R // 2, 0).to(tl.float32)
+    sin = tl.load(CACHE + pos * R + R // 2 + col, col < R // 2, 0).to(tl.float32)
+
+    q_ptr = Q + token * Q_ROW + head.to(tl.int64) * Q_HEAD
+    k_ptr = K + token * K_ROW + head.to(tl.int64) * K_HEAD
+    _normalize_and_rotate(q_ptr, WQ, col, head < HEADS, cos, sin, EPS, D, R)
+    _normalize_and_rotate(k_ptr, WK, col, head < HEADS, cos, sin, EPS, D, R)
 
 
 def can_use_minimax_h3_dit_qknorm_rope(
@@ -156,7 +187,7 @@ def minimax_h3_dit_qknorm_rope(
     ):
         raise ValueError("Unsupported H3 DiT QK-norm/RoPE input metadata")
     with torch.cuda.device(q.device):
-        grid = (q.shape[0], q.shape[1])
+        grid = (q.shape[0] * triton.cdiv(q.shape[1], _HEADS_PER_BLOCK),)
         _minimax_h3_dit_qknorm_rope_kernel[grid](
             q,
             k,
@@ -168,8 +199,9 @@ def minimax_h3_dit_qknorm_rope(
             k.stride(0),
             q.stride(1),
             k.stride(1),
+            q.shape[1],
             eps,
-            num_warps=4,
+            num_warps=1,
             enable_fp_fusion=False,
         )
 
