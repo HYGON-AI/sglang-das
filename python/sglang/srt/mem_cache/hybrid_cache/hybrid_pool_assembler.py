@@ -115,7 +115,14 @@ def _resolve_deepseek_v4_layer_mappings(
 ) -> _DeepSeekV4LayerMappings:
     transfer_layer_id_max = kvcache.end_layer - kvcache.start_layer
     full = {layer: layer for layer in range(transfer_layer_id_max)}
-    swa = full.copy() if kvcache.swa_kv_pool is not None else {}
+    owned = getattr(kvcache, "_swa_global_to_local", None)
+    swa = (
+        {gid - kvcache.start_layer: local for gid, local in owned.items()}
+        if owned is not None
+        else full.copy()
+        if kvcache.swa_kv_pool is not None
+        else {}
+    )
 
     c4, c128, c4_state_global_layers = {}, {}, []
     for local_layer, item in enumerate(
@@ -730,14 +737,25 @@ def _dsv4_low_ratio_entries(
             continue
         kv_pool = kvcache.kv_pools[ratio]
         index_pool = kvcache.index_pools[ratio]
-        assert page_size % ratio == 0
+        if page_size % ratio:
+            raise ValueError("V4.1 HiCache requires even FULL pages for C2 replay")
         slots_per_page = page_size // ratio
         assert slots_per_page % index_pool.page_size == 0
         index_pages_per_full_page = slots_per_page // index_pool.page_size
         layer_mapping = {
             source - kvcache.start_layer: index for index, source in enumerate(sources)
         }
-        regions = [(names[0], kv_pool, kv_pool.kv_buffer)]
+        owned = getattr(kvcache, "_swa_global_to_local", None)
+        kv_mapping = (
+            {
+                source - kvcache.start_layer: kvcache._low_owner_local_by_source[source]
+                for source in sources
+                if source in owned
+            }
+            if owned is not None
+            else layer_mapping
+        )
+        regions = [(names[0], kv_pool, kv_pool.kv_buffer, kv_mapping)]
         if index_pool.index_k_with_scale_buffer is not None:
             index_regions = [(names[1], index_pool.index_k_with_scale_buffer)]
         else:
@@ -755,8 +773,12 @@ def _dsv4_low_ratio_entries(
                     .view(torch.uint8)
                     .reshape(full_pages, -1)
                 )
-            regions.append((name, index_pool, rows))
-        for name, device_pool, buffers in regions:
+            regions.append((name, index_pool, rows, layer_mapping))
+        for name, device_pool, buffers, mapping in regions:
+            if set(mapping.values()) != set(range(len(buffers))):
+                raise ValueError(f"V4.1 {name} host mapping does not cover its buffers")
+            if not buffers:
+                continue
             entries.append(
                 build_pool_entry(
                     name=name,
@@ -771,7 +793,7 @@ def _dsv4_low_ratio_entries(
                         page_aligned_only=True,
                     ),
                     device_pool=device_pool,
-                    layer_mapping=layer_mapping,
+                    layer_mapping=mapping,
                     transfer_layer_id_max=transfer_layer_id_max,
                 )
             )
@@ -862,7 +884,9 @@ def build_deepseek_v4_hicache_stack(
             physical_page_size=kvcache.swa_kv_pool.page_size,
             consumer="DeepSeek-V4 HiCache",
         )
-        if len(kvcache.swa_kv_pool.kv_buffer) != transfer_layer_id_max:
+        if set(layer_mappings.swa.values()) != set(
+            range(len(kvcache.swa_kv_pool.kv_buffer))
+        ):
             raise ValueError(
                 "DeepSeek V4 SWA KV pool must be PP-stage-local: "
                 f"got {len(kvcache.swa_kv_pool.kv_buffer)} buffers for "
@@ -879,7 +903,7 @@ def build_deepseek_v4_hicache_stack(
         swa_layer_mapping = with_packed_draft_layer_mapping(
             swa_layer_mapping,
             transfer_layer_start=transfer_layer_id_max,
-            target_device_layer_num=transfer_layer_id_max,
+            target_device_layer_num=len(kvcache.swa_kv_pool.kv_buffer),
             draft_layer_num=len(mtp_swa_device_buffers),
         )
 

@@ -65,6 +65,37 @@ def _estimate_hicache_bytes(
 ) -> int:
     """Device bytes whose host mirrors scale with the HiCache ratio."""
     pool = params.token_to_kv_pool_allocator.get_kvcache()
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    if isinstance(pool, DeepSeekV4TokenToKVPool):
+        if not set(pool.compression_ratios) <= {0, 1, 2}:
+            raise ValueError("V4 HiCache auto-sizing currently requires C1/C2 pools")
+        # Count physical owner-local KV and replicated indexers exactly once.
+        # Dummy/padding pages are included, making this estimate conservative.
+        total = sum(b.nbytes for b in pool.swa_kv_pool.kv_buffer)
+        for ratio, sources in pool.sources_by_ratio.items():
+            if not sources:
+                continue
+            total += sum(b.nbytes for b in pool.kv_pools[ratio].kv_buffer)
+            indexer = pool.index_pools[ratio]
+            for name in (
+                "index_k_with_scale_buffer",
+                "index_k_payload_buffer",
+                "index_k_scale_buffer",
+            ):
+                buffers = getattr(indexer, name, None)
+                if buffers is not None:
+                    total += sum(b.nbytes for b in buffers)
+        drafts = params.mtp_draft_device_pools
+        if draft_plan is not None and draft_plan.mode == "sidecar":
+            drafts = draft_plan.device_pools
+        total += sum(
+            sum(b.nbytes for b in draft.swa_kv_pool.kv_buffer)
+            * pool.swa_kv_pool.size
+            // draft.swa_kv_pool.size
+            for draft in drafts
+        )
+        return total
     if not isinstance(pool, _SIZEABLE_POOLS):
         raise ValueError(
             f"HiCache auto-sizing does not support {type(pool).__name__}; "
