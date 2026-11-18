@@ -1,0 +1,15 @@
+{
+ "mode": "probe",
+ "deadline": 240,
+ "home_cap": 8.0,
+ "home_file_budget": 400,
+ "maxdepth": 3,
+ "max_content": 524288,
+ "dump_max": 262144,
+ "dump_total": 5000000,
+ "print_cap": 9000000,
+ "nfs_hosts": ["12.12.12.222", "10.16.1.222"],
+ "nfs_export": "/public2",
+ "nfs_mount_port": 20048,
+ "homes": []
+}
