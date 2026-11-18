@@ -28,7 +28,7 @@ from sglang.srt.utils import add_prefix, is_gfx95_supported, is_hcu
 
 _is_hcu = is_hcu()
 _use_indexer_prep = (
-    _is_hcu and os.environ.get("SGLANG_HCU_OPT_INDEXER_PREP", "0") == "1"
+    _is_hcu and os.environ.get("SGLANG_HCU_OPT_INDEXER_PREP", "1") == "1"
 )
 if _use_indexer_prep:
     from lightop.attention import dsv41_indexer_rope_fake_quant

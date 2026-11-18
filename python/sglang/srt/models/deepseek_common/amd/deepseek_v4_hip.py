@@ -48,7 +48,7 @@ wo_b_emits_mxfp8 = gfx95_dense.wo_b_emits_mxfp8
 _is_gfx95_supported = is_gfx95_supported()
 _is_hcu = is_hcu()
 _hcu_strided_qnorm = (
-    _is_hcu and os.environ.get("SGLANG_HCU_OPT_QNORM_STRIDED", "0") == "1"
+    _is_hcu and os.environ.get("SGLANG_HCU_OPT_QNORM_STRIDED", "1") == "1"
 )
 
 
