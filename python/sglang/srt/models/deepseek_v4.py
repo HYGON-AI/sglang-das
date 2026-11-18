@@ -5907,6 +5907,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             return
         if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
+        if _is_hcu:
+            from sglang.kernels.ops.gemm.bf16_fp32 import prepare_hcu_nn_weights_for_model
+
+            prepare_hcu_nn_weights_for_model(self)
 
         for module in self.modules():
             if isinstance(module, MQALayer):
