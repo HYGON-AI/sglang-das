@@ -139,6 +139,111 @@ def _indexed_gate_bf16(
     return output
 
 
+@triton.jit
+def _indexed_rmsnorm_scale_shift_bf16_kernel(
+    output_ptr,
+    x_ptr,
+    weight_ptr,
+    shift_ptr,
+    scale_ptr,
+    indices_ptr,
+    hidden_size,
+    eps,
+    stride_x_row,
+    stride_shift_row,
+    stride_scale_row,
+    stride_indices,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    columns = tl.arange(0, BLOCK_N)
+    mask = columns < hidden_size
+    x = tl.load(x_ptr + row * stride_x_row + columns, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    weight = tl.load(weight_ptr + columns, mask=mask, other=0.0).to(tl.float32)
+    mean_square = tl.sum(x * x, 0) / hidden_size
+    inv_rms = tl.rsqrt(mean_square + eps)
+    normalized = round_bf16_to_fp32((x * inv_rms) * weight)
+    index = tl.load(indices_ptr + row * stride_indices)
+    shift = tl.load(
+        shift_ptr + index * stride_shift_row + columns, mask=mask, other=0.0
+    ).to(tl.float32)
+    scale = tl.load(
+        scale_ptr + index * stride_scale_row + columns, mask=mask, other=0.0
+    ).to(tl.float32)
+    one_plus_scale = round_bf16_to_fp32(1.0 + scale)
+    scaled = round_bf16_to_fp32(normalized * one_plus_scale)
+    tl.store(output_ptr + row * hidden_size + columns, scaled + shift, mask=mask)
+
+
+def can_use_minimax_h3_rmsnorm_scale_shift(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+) -> bool:
+    """Check the layout for fused RMSNorm and indexed BF16 modulation."""
+    return (
+        x.ndim == 2
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and 0 < x.shape[1] <= 16384
+        and weight.shape == (x.shape[1],)
+        and weight.dtype == torch.bfloat16
+        and weight.device == x.device
+        and weight.is_contiguous()
+        and shift.ndim == 2
+        and shift.shape == scale.shape
+        and shift.shape[0] > 0
+        and shift.shape[1] == x.shape[1]
+        and shift.dtype == scale.dtype == torch.bfloat16
+        and shift.device == scale.device == x.device
+        and shift.stride(1) == scale.stride(1) == 1
+        and indices.shape == (x.shape[0],)
+        and indices.device == x.device
+        and indices.dtype in (torch.int32, torch.int64)
+    )
+
+
+def indexed_rmsnorm_scale_shift_bf16(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Experimental fused RMSNorm + indexed BF16 AdaLN affine."""
+    if not can_use_minimax_h3_rmsnorm_scale_shift(x, weight, shift, scale, indices):
+        raise ValueError("Unsupported fused RMSNorm/AdaLN input")
+    rows, hidden_size = x.shape
+    output = torch.empty_like(x)
+    if rows == 0:
+        return output
+    block_n = triton.next_power_of_2(hidden_size)
+    _indexed_rmsnorm_scale_shift_bf16_kernel[(rows,)](
+        output,
+        x,
+        weight,
+        shift,
+        scale,
+        indices,
+        hidden_size,
+        eps,
+        x.stride(0),
+        shift.stride(0),
+        scale.stride(0),
+        indices.stride(0),
+        BLOCK_N=block_n,
+        num_warps=8,
+        enable_fp_fusion=False,
+    )
+    return output
+
+
 def indexed_gate_bf16_(
     x: torch.Tensor,
     gate: torch.Tensor,

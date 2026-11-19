@@ -1632,6 +1632,51 @@ class MiniMaxH3DiTBlock(nn.Module):
         )
         self.preserve_input_for_cache_dit = False
 
+    def _prepare_projection_input(
+        self, norm, x, shift, scale, indices, *, int8_projection=None
+    ):
+        if (
+            envs.SGLANG_MINIMAX_H3_FUSED_RMSNORM_ADALN
+            and not self._fused_fp32_modulation
+            and x.is_cuda
+            and is_hcu()
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and isinstance(norm, nn.RMSNorm)
+            and norm.weight is not None
+            and norm.eps is not None
+        ):
+            from sglang.kernels.ops.diffusion import (
+                can_use_minimax_h3_rmsnorm_scale_shift,
+                indexed_rmsnorm_scale_shift_bf16,
+            )
+
+            if can_use_minimax_h3_rmsnorm_scale_shift(
+                x, norm.weight, shift, scale, indices
+            ):
+                return (
+                    indexed_rmsnorm_scale_shift_bf16(
+                        x, norm.weight, shift, scale, indices, norm.eps
+                    ),
+                    None,
+                )
+        h = norm(x)
+        if int8_projection is not None and _can_fuse_int8_affine(
+            int8_projection, h, shift, scale, indices
+        ):
+            return h, (shift, scale, indices)
+        return (
+            _modulate_scale_shift(
+                h,
+                shift,
+                scale,
+                indices,
+                dtype=_BF16_DTYPE,
+                fused_fp32=self._fused_fp32_modulation,
+            ),
+            None,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1662,21 +1707,14 @@ class MiniMaxH3DiTBlock(nn.Module):
         # first gated residual writes to that tensor; the second one operates on
         # a block-local buffer.
         residual = x
-        h = self.norm1(x)
-        attn_affine = None
-        if self._fused_fp32_modulation and _can_fuse_int8_affine(
-            self.attn.qkv_proj, h, shift_msa, scale_msa, combined_indices
-        ):
-            attn_affine = (shift_msa, scale_msa, combined_indices)
-        else:
-            h = _modulate_scale_shift(
-                h,
-                shift_msa,
-                scale_msa,
-                combined_indices,
-                dtype=_BF16_DTYPE,
-                fused_fp32=self._fused_fp32_modulation,
-            )
+        h, attn_affine = self._prepare_projection_input(
+            self.norm1,
+            x,
+            shift_msa,
+            scale_msa,
+            combined_indices,
+            int8_projection=self.attn.qkv_proj if self._fused_fp32_modulation else None,
+        )
         h = self.attn(
             h,
             rope_cache=rope_cache,
@@ -1698,21 +1736,14 @@ class MiniMaxH3DiTBlock(nn.Module):
         )
 
         residual = x
-        h = self.norm2(x)
-        mlp_affine = None
-        if self._fused_fp32_modulation and _can_fuse_int8_affine(
-            self.mlp.fc1, h, shift_mlp, scale_mlp, combined_indices
-        ):
-            mlp_affine = (shift_mlp, scale_mlp, combined_indices)
-        else:
-            h = _modulate_scale_shift(
-                h,
-                shift_mlp,
-                scale_mlp,
-                combined_indices,
-                dtype=_BF16_DTYPE,
-                fused_fp32=self._fused_fp32_modulation,
-            )
+        h, mlp_affine = self._prepare_projection_input(
+            self.norm2,
+            x,
+            shift_mlp,
+            scale_mlp,
+            combined_indices,
+            int8_projection=self.mlp.fc1 if self._fused_fp32_modulation else None,
+        )
         if mlp_affine is None:
             h = self.mlp(h)
         else:

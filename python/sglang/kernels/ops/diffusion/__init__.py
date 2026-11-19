@@ -243,6 +243,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "MiniMax-H3 DiT BF16 QK RMSNorm + partial NeoX RoPE (not bit-exact).",
     ),
     (
+        "diffusion.minimax_h3_rmsnorm_scale_shift",
+        KernelBackend.TRITON,
+        "modulate.indexed_modulation_triton:indexed_rmsnorm_scale_shift_bf16",
+        _HIP,
+        "MiniMax-H3 fused RMSNorm + indexed BF16 AdaLN scale/shift (HCU).",
+    ),
+    (
         "diffusion.silu_mul",
         KernelBackend.TRITON,
         "activation.silu_mul_bitexact:fused_silu_mul_bitexact",
@@ -393,6 +400,8 @@ _EXPORTS: dict[str, str] = {
     "can_use_qk_rmsnorm_native": "norm.zimage_qk_rmsnorm_triton",
     "zimage_qk_rmsnorm_native": "norm.zimage_qk_rmsnorm_triton",
     # adaLN modulation, gating and timestep conditioning
+    "can_use_minimax_h3_rmsnorm_scale_shift": "modulate.indexed_modulation_triton",
+    "indexed_rmsnorm_scale_shift_bf16": "modulate.indexed_modulation_triton",
     "indexed_gate_bf16": "modulate.indexed_modulation_triton",
     "indexed_gate_bf16_": "modulate.indexed_modulation_triton",
     "indexed_scale_shift_bf16_": "modulate.indexed_modulation_triton",
