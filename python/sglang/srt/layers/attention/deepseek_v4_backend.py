@@ -259,6 +259,66 @@ def _has_native_hcu_rope_fake_quant() -> bool:
     return callable(rope_fp4_fake_quant)
 
 
+def _dsv4_bf16_gather_model_family(quant_config) -> str:
+    """Classify expert quantization, not the shared FP8 KV-cache storage."""
+    if not isinstance(quant_config, dict):
+        return "original"
+    method = quant_config.get("quant_method")
+    if quant_config.get("routed_experts_quant_method") == "mxfp4":
+        return "original"
+    if method == "fp8":
+        return (
+            "fp8"
+            if quant_config.get("routed_experts_quant_method") in (None, "fp8")
+            else "original"
+        )
+    if method != "compressed-tensors":
+        return "original"
+    families = set()
+    groups = quant_config.get("config_groups", {})
+    if not isinstance(groups, dict):
+        return "original"
+    for group in groups.values():
+        if not isinstance(group, dict):
+            continue
+        targets = group.get("targets", [])
+        if not isinstance(targets, list) or not any(
+            isinstance(target, str)
+            and "experts" in target
+            and "shared_experts" not in target
+            for target in targets
+        ):
+            continue
+        weight = group.get("weights")
+        activation = group.get("input_activations")
+        if not isinstance(weight, dict) or not isinstance(activation, dict):
+            families.add("original")
+            continue
+        if (
+            weight.get("type") == "int"
+            and weight.get("num_bits") == 4
+            and weight.get("strategy") in ("channel", "group")
+            and weight.get("symmetric") is True
+            and not weight.get("dynamic", False)
+            and activation.get("type") == "int"
+            and activation.get("num_bits") == 8
+            and activation.get("strategy") == "token"
+            and activation.get("dynamic") is True
+            and activation.get("symmetric") is True
+        ):
+            families.add("w4a8")
+        elif (
+            weight.get("type") == "float"
+            and weight.get("num_bits") == 8
+            and activation.get("type") == "float"
+            and activation.get("num_bits") == 8
+        ):
+            families.add("fp8")
+        else:
+            families.add("original")
+    return next(iter(families)) if len(families) == 1 else "original"
+
+
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     # IDLE is a real per-DP-rank mode. Do not let a stale _original_forward_mode
     # from a reused/padded ForwardBatch turn an empty rank into TARGET_VERIFY.
@@ -1649,6 +1709,19 @@ class DeepseekV4AttnBackend(
                 "prefill/decode forwards",
                 gather_backend,
             )
+
+        # Keep model selection separate from optional FP8 gather extensions.
+        self._dsv4_bf16_gather_family = _dsv4_bf16_gather_model_family(
+            model_runner.model_config.hf_quant_config
+        )
+        self._dsv4_compact_gather_enabled = self._dsv4_bf16_gather_family == "w4a8"
+        self._dsv4_query_reuse_zero_lengths = (
+            torch.zeros(64, dtype=torch.int32, device=self.device)
+            if self._dsv4_compact_gather_enabled
+            and self._dsv4_bf16_flashmla_decode
+            and self._dsv4_lightop_bf16_gather
+            else None
+        )
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -3220,6 +3293,14 @@ class DeepseekV4AttnBackend(
         self.forward_metadata = capture_metadata
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
+        if (
+            self._dsv4_compact_gather_enabled
+            and self._dsv4_bf16_flashmla_decode
+            and self._dsv4_lightop_bf16_gather
+        ):
+            self._allocate_dsv4_bf16_flashmla_workspace(
+                "swa", max_num_tokens, ceil_align(SWA_WINDOW, PAGE_INDEX_ALIGNED_SIZE)
+            )
         if self._dsv4_bf16_flashmla_decode:
             self._allocate_dsv4_bf16_flashmla_workspace(
                 "combined",
@@ -3230,7 +3311,7 @@ class DeepseekV4AttnBackend(
                 "combined",
                 max_num_tokens,
                 ceil_align(SWA_WINDOW, PAGE_INDEX_ALIGNED_SIZE)
-                + ceil_align(self.c4_topk, PAGE_INDEX_ALIGNED_SIZE),
+                + ceil_align(self.index_topk, PAGE_INDEX_ALIGNED_SIZE),
             )
             self._allocate_dsv4_bf16_flashmla_workspace(
                 "combined",
@@ -5301,11 +5382,17 @@ class DeepseekV4AttnBackend(
         if current is not None:
             current_capacity = current[0].shape[0]
             current_topk = current[0].shape[1]
-            if current_capacity >= capacity and current_topk == topk:
+            if current_capacity >= capacity and (
+                current_topk >= topk
+                if self._dsv4_compact_gather_enabled
+                else current_topk == topk
+            ):
                 return
-            # Drop the previous buffer before reallocating. c128 topk grows
-            # every prefill chunk; keeping one workspace per topk OOMs on
-            # long context with small chunked_prefill_size.
+            # Grow monotonically outside capture. Smaller per-layer shapes
+            # reuse compact contiguous views of this one reserved allocation.
+            if self._dsv4_compact_gather_enabled:
+                capacity = max(capacity, current_capacity)
+                topk = max(topk, current_topk)
             del self._dsv4_bf16_flashmla_workspaces[slot]
             del current
         if torch.cuda.is_current_stream_capturing():
@@ -5339,7 +5426,133 @@ class DeepseekV4AttnBackend(
         if workspace is None:
             raise RuntimeError("DSV4 BF16 FlashMLA gather workspace is unavailable")
         gathered_kv, compact_indices = workspace
-        return gathered_kv[:num_queries], compact_indices[:num_queries]
+        if not self._dsv4_compact_gather_enabled:
+            return gathered_kv[:num_queries], compact_indices[:num_queries]
+        # Flatten before taking the smaller shape: slicing only the topk
+        # axis would retain the larger page stride and change the cache ABI.
+        elements = num_queries * topk
+        gathered_view = gathered_kv.view(-1, 1, 512)[:elements].view(
+            num_queries, topk, 1, 512
+        )
+        indices_view = compact_indices.view(-1)[:elements].view(num_queries, 1, topk)
+        return gathered_view, indices_view
+
+    def _try_prepare_dsv4_w4a8_bf16_inputs(
+        self,
+        *,
+        swa_k_cache: torch.Tensor,
+        swa_indices: torch.Tensor,
+        swa_topk_lengths: torch.Tensor,
+        extra_k_cache: Optional[torch.Tensor],
+        extra_indices: Optional[torch.Tensor],
+        extra_topk_lengths: Optional[torch.Tensor],
+        logical_forward_mode: Optional[ForwardMode] = None,
+    ) -> Optional[
+        Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+        ]
+    ]:
+        """Try our W4A8 compact path, leaving other gather extensions untouched."""
+        if not self._dsv4_compact_gather_enabled:
+            return None
+        assert swa_indices.ndim == 3 and swa_indices.shape[1] == 1
+        num_queries, _, swa_topk = swa_indices.shape
+        extra_topk = 0 if extra_indices is None else extra_indices.shape[-1]
+
+        if self._dsv4_lightop_bf16_gather:
+            import lightop.kvcache as lightop_kvcache
+
+            compact_gather = getattr(
+                lightop_kvcache, "dsv4_gather_upconvert_compact_k_cache_paged", None
+            )
+            common = (
+                swa_k_cache.is_cuda
+                and swa_k_cache.shape[1] == 256
+                and swa_k_cache.shape[-1] == 584
+                and swa_indices.dtype == torch.int32
+                and swa_topk_lengths.dtype == torch.int32
+            )
+            draft_mode = (
+                logical_forward_mode is not None
+                and logical_forward_mode.is_draft_extend_v2()
+            )
+            target_mode = (
+                logical_forward_mode is not None
+                and logical_forward_mode.is_target_verify()
+            )
+            draft = (
+                common
+                and self.is_dspark_draft
+                and draft_mode
+                and extra_k_cache is None
+                and 10 <= num_queries <= 40
+                and num_queries % 5 == 0
+                and swa_topk in (128, 192)
+            )
+            dual = (
+                common
+                and extra_k_cache is not None
+                and extra_indices is not None
+                and extra_topk_lengths is not None
+                and extra_k_cache.shape[1] in (2, 64, 128, 256)
+                and extra_k_cache.shape[-1] == 584
+                and extra_indices.dtype == torch.int32
+                and extra_topk_lengths.dtype == torch.int32
+            )
+            if compact_gather is not None and (draft or dual):
+                swa_ids = swa_indices[:, 0, :].contiguous()
+                swa_lens = swa_topk_lengths.reshape(-1).contiguous()
+                group = 1
+                if draft:
+                    extra = swa_k_cache
+                    extra_ids = swa_ids[:, :0]
+                    extra_lens = self._dsv4_query_reuse_zero_lengths[:num_queries]
+                    page, slot, group = 256, "swa", 5
+                else:
+                    extra = extra_k_cache
+                    extra_ids = extra_indices[:, 0, :].contiguous()
+                    extra_lens = extra_topk_lengths.reshape(-1).contiguous()
+                    page, slot = extra.shape[1], "combined"
+                    if (
+                        not self.is_dspark_draft
+                        and target_mode
+                        and 12 <= num_queries <= 48
+                        and num_queries % 6 == 0
+                        and swa_topk == 128
+                        and extra_topk == 512
+                        and page in (128, 256)
+                    ):
+                        group = 6
+                gathered, compact = self._get_dsv4_bf16_flashmla_workspace(
+                    slot, num_queries, swa_topk + extra_topk
+                )
+                compact_gather(
+                    swa_k_cache.view(torch.uint8),
+                    swa_ids,
+                    swa_lens,
+                    extra.view(torch.uint8),
+                    extra_ids,
+                    extra_lens,
+                    gathered,
+                    compact,
+                    page,
+                    reuse_group=group,
+                )
+                return (
+                    gathered,
+                    compact,
+                    swa_lens if draft else swa_lens + extra_lens,
+                    None,
+                    None,
+                    None,
+                )
+
+        return None
 
     def _prepare_dsv4_bf16_flashmla_inputs(
         self,
@@ -5614,7 +5827,15 @@ class DeepseekV4AttnBackend(
                 extra_k_cache,
                 extra_indices,
                 extra_topk_lengths,
-            ) = self._prepare_dsv4_bf16_flashmla_inputs(
+            ) = self._try_prepare_dsv4_w4a8_bf16_inputs(
+                logical_forward_mode=logical_forward_mode,
+                swa_k_cache=swa_k_cache,
+                swa_indices=swa_page_indices,
+                swa_topk_lengths=swa_topk_lengths,
+                extra_k_cache=extra_k_cache,
+                extra_indices=extra_indices,
+                extra_topk_lengths=extra_topk_lengths,
+            ) or self._prepare_dsv4_bf16_flashmla_inputs(
                 swa_k_cache=swa_k_cache,
                 swa_indices=swa_page_indices,
                 swa_topk_lengths=swa_topk_lengths,
