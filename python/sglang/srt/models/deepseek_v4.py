@@ -5965,6 +5965,19 @@ class DeepseekV4ForCausalLM(nn.Module):
         ``ape_converted``) were carried over, so ``post_load_weights`` only
         rebuilds what is local to this process: layer links and derived caches.
         """
+        if _is_hcu:
+            from sglang.srt.layers.quantization.slimquant_w4a8_marlin import (
+                HCUW4A8Int8DeepEPMoEMethod,
+            )
+
+            for layer in self.modules():
+                method = getattr(layer, "quant_method", None)
+                if isinstance(method, HCUW4A8Int8DeepEPMoEMethod):
+                    if method.use_mega_moe:
+                        layer.mega_l1_weights = (layer.w13_weight, layer.w13_weight_scale)
+                        layer.mega_l2_weights = (layer.w2_weight, layer.w2_weight_scale)
+                    else:
+                        method.configure_deepep_dispatcher(layer)
         self.post_load_weights()
 
     def precompile_kernels_after_loading(self) -> None:

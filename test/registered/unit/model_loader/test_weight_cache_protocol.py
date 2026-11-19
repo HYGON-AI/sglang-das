@@ -22,6 +22,7 @@ import socket
 import struct
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -34,6 +35,7 @@ from sglang.srt.weight_cache.protocol import (
     cleanup_stale_daemon_files,
     compute_global_rank,
     compute_local_gpu_id,
+    compute_weight_layout_stamp,
     get_quant_method_name,
     get_ready_path,
     get_socket_path,
@@ -412,6 +414,86 @@ class TestIpcQuantAllowlist(CustomTestCase):
     def test_allowlist_registry_shape(self):
         # Guard against accidentally widening the allowlist without review.
         self.assertEqual(set(IPC_QUANT_ALLOWLIST), {"", "fp8", "compressed-tensors"})
+
+
+class TestHcuDsv41W4A8Ipc(CustomTestCase):
+    @staticmethod
+    def _config():
+        activation = {
+            "type": "int",
+            "num_bits": 8,
+            "strategy": "token",
+            "symmetric": True,
+            "dynamic": True,
+        }
+        groups = {}
+        for bits, fmt in ((4, "pack-quantized"), (8, "int-quantized")):
+            groups[f"int{bits}"] = {
+                "weights": {
+                    "type": "int",
+                    "num_bits": bits,
+                    "strategy": "channel",
+                    "symmetric": True,
+                    "dynamic": False,
+                },
+                "input_activations": activation.copy(),
+                "format": fmt,
+            }
+        return {"format": "pack-quantized", "config_groups": groups}
+
+    def test_pd_paths_use_separate_cache_layouts(self):
+        moe = SimpleNamespace(
+            enable_eplb=False,
+            moe_a2a_backend="megamoe",
+            moe_runner_backend="auto",
+            deepep_mode="normal",
+            init_expert_location="trivial",
+            ep_num_redundant_experts=0,
+        )
+        disagg = SimpleNamespace(disaggregation_mode="prefill")
+        with (
+            patch("sglang.srt.utils.is_hcu", return_value=True),
+            patch("sglang.srt.runtime_context.get_exec", return_value=SimpleNamespace(moe=moe)),
+            patch("sglang.srt.runtime_context.get_disagg", return_value=disagg),
+            patch.dict(os.environ, {"SGLANG_HCU_MEGA_MOE_RUNTIME": "deep_gemm"}),
+        ):
+            args = ("compressed-tensors", self._config())
+            # ModelConfig normalizes the checkpoint's V4.1 architecture name.
+            arch = "DeepseekV4ForCausalLM"
+            check_ipc_quant_support(*args, where="daemon", model_arch=arch)
+            prefill = compute_weight_layout_stamp(hcu_dsv41_w4a8=True)
+            disagg.disaggregation_mode = "decode"
+            moe.moe_a2a_backend = "deepep"
+            moe.moe_runner_backend = "deep_gemm"
+            moe.deepep_mode = "low_latency"
+            check_ipc_quant_support(*args, where="client", model_arch=arch)
+            decode = compute_weight_layout_stamp(hcu_dsv41_w4a8=True)
+            self.assertNotEqual(prefill, decode)
+            with patch.dict(os.environ, {"SGLANG_USE_W4A8_MASKED_HIPC": "1"}):
+                masked = compute_weight_layout_stamp(hcu_dsv41_w4a8=True)
+                with patch.dict(os.environ, {"SGLANG_USE_W4A8_MASKED_HIPC": "0"}):
+                    self.assertNotEqual(
+                        masked, compute_weight_layout_stamp(hcu_dsv41_w4a8=True)
+                    )
+            moe.deepep_mode = "normal"
+            with self.assertRaises(UnsupportedQuantForIPCError):
+                check_ipc_quant_support(*args, where="client", model_arch=arch)
+
+    def test_other_packed_checkpoints_stay_rejected(self):
+        cfg = self._config()
+        with patch("sglang.srt.utils.is_hcu", return_value=True):
+            with self.assertRaises(UnsupportedQuantForIPCError):
+                check_ipc_quant_support(
+                    "compressed-tensors", cfg, where="daemon", model_arch="OtherModel"
+                )
+            cfg["config_groups"]["int4"]["weights"]["strategy"] = "group"
+            with self.assertRaises(UnsupportedQuantForIPCError):
+                check_ipc_quant_support(
+                    "compressed-tensors",
+                    cfg,
+                    where="daemon",
+                    model_arch="DeepseekV41ForCausalLM",
+                )
 
 
 class TestCleanupStaleDaemonFiles(CustomTestCase):

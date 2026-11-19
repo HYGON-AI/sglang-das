@@ -786,6 +786,15 @@ class HCUW4A8Int8DeepEPMoEMethod(FusedMoEMethodBase):
             scale_name = prefix + "_weight_scale"
             scale = self._channel_scale(getattr(layer, scale_name).data)
             setattr(layer, scale_name, torch.nn.Parameter(scale, requires_grad=False))
+        self.configure_deepep_dispatcher(layer)
+        logger.info_once(
+            "HCU W4A8 reference DeepEP enabled: normal=INT8, low_latency=INT8; "
+            f"contiguous_hipc={_use_w4a8_contiguous_hipc}, masked_hipc={_use_w4a8_masked_hipc}"
+        )
+
+    @staticmethod
+    def configure_deepep_dispatcher(layer):
+        # Also rebuilds the process-local combine input event after IPC import.
         layer.dispatcher.set_quant_config(
             {
                 "normal_dispatcher_output_dtype": "int8",
@@ -794,10 +803,6 @@ class HCUW4A8Int8DeepEPMoEMethod(FusedMoEMethodBase):
                 "hcu_w4a8_int8_dispatch": True,
                 "hcu_w4a8_deepep_ll_producer_event": True,
             }
-        )
-        logger.info_once(
-            "HCU W4A8 reference DeepEP enabled: normal=INT8, low_latency=INT8; "
-            f"contiguous_hipc={_use_w4a8_contiguous_hipc}, masked_hipc={_use_w4a8_masked_hipc}"
         )
 
     def apply(self, layer, dispatch_output):
