@@ -4532,11 +4532,13 @@ class DeepseekV4AttnBackend(
             if count:
                 requests.append((request, lc, offset, offset + count))
             offset += count
-        step = (
-            min(rows_per_chunk, 65535)
-            if candidate_blocks is not None
-            else rows_per_chunk
-        )
+        step = rows_per_chunk
+        if candidate_blocks is not None:
+            step = min(step, 65535)
+        elif step >= 32:
+            # The dense LightOp kernel scores 32 Q rows per tile. Round down
+            # within the logits budget; keep small budgets and the real tail.
+            step = step // 32 * 32
         for start in range(0, offset, step):
             end = min(start + step, offset)
             rows = slice(start, end)
@@ -4573,10 +4575,8 @@ class DeepseekV4AttnBackend(
                 if publish is not None:
                     scores = logits[local_rows, :lc]
                     lens = compress_lens[lo:hi, None]
-                    scores.masked_fill_(
-                        torch.arange(lc, device=q.device)[None, :] >= lens,
-                        -torch.inf,
-                    )
+                    # LightOp initializes logits to -inf and only writes
+                    # [ks, ke), so future columns are already masked.
                     mask, ids = select_candidate_blocks(
                         scores,
                         lens,

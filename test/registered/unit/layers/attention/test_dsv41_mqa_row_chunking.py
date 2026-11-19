@@ -423,7 +423,7 @@ class TestDSV41MQARowChunking(CustomTestCase):
             lambda *args: None
         )
         self.run_chunked(483)
-        self.assertEqual(calls, [483] * 8 + [232])
+        self.assertEqual(calls, [480] * 8 + [256])
 
     def test_candidate_chunks_keep_native_row_limit_across_requests(self):
         self.indexer.uses_candidates = True
@@ -455,6 +455,55 @@ class TestDSV41MQARowChunking(CustomTestCase):
         )
         self.run_chunked(total, blocks)
         self.assertEqual(calls, [[32770, 32765], [5]])
+
+    def test_dense_budget_alignment_keeps_real_tail_and_small_budget(self):
+        self.counts = [37, 0, 63]
+        self.lens = [11, 0, 9]
+        self.q = self.q[:1].repeat(100, 1, 1)
+        self.weights = self.weights[:1].repeat(100, 1)
+        self.ks = torch.tensor([0] * 37 + [14] * 63, dtype=torch.int32)
+        self.compress = torch.tensor([11] * 37 + [9] * 63, dtype=torch.int32)
+        self.ke = self.ks + self.compress
+        reference = self.scores(self.q, self.weights, self.ks, self.ke, 12)
+        selected = torch.empty((100, 3), dtype=torch.int32)
+        self.topk(reference, self.compress, self.ks, selected)
+        expected_pages = torch.full_like(selected, -1)
+        expected_raw = torch.full_like(selected, -1)
+        self.postprocess(
+            reference, selected, self.ks, self.slots,
+            expected_pages, expected_raw, False,
+        )
+        for budget, calls in [
+            (47, [32, 32, 32, 4]),
+            (31, [31, 31, 31, 7]),
+            (128, [100]),
+        ]:
+            with self.subTest(budget=budget):
+                self.calls.clear()
+                self.previous = None
+                pages = torch.full_like(selected, -1)
+                raw = torch.full_like(selected, -1)
+                self.ns["_low_ratio_index_topk_chunked"](
+                    self.owner,
+                    self.indexer,
+                    self.q,
+                    (self.k, None),
+                    self.weights,
+                    self.ks,
+                    self.ke,
+                    self.compress,
+                    self.slots,
+                    self.lens,
+                    self.counts,
+                    pages,
+                    raw,
+                    None,
+                    budget,
+                )
+                self.assertEqual(self.calls, calls)
+                torch.testing.assert_close(pages, expected_pages)
+                torch.testing.assert_close(raw, expected_raw)
+                self.assertLessEqual(max(self.calls), budget)
 
     def test_empty_queries_do_not_allocate_logits(self):
         self.counts = [0] * len(self.lens)
