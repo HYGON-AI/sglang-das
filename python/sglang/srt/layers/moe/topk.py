@@ -803,6 +803,70 @@ def _load_hcu_bf16_mega_gate_op() -> Optional[Callable]:
     return bf16_mega_gate_hcu
 
 
+def _hcu_mega_gate_dispatch_supported(info) -> bool:
+    if info is None:
+        return not is_expert_remapping_enabled()
+    moe = get_exec().moe
+    mapping = info.partial_logical_to_rank_dispatch_physical_map
+    return (
+        not moe.enable_eplb
+        and moe.ep_num_redundant_experts == 0
+        and info.ep_dispatch_algorithm == "static"
+        and mapping is not None
+    )
+
+
+def _hcu_mega_gate_remap_ids(
+    topk_ids, info, valid_token_mask, num_token_non_padded=None
+):
+    # Mega Gate emits valid logical IDs or -1; restore -1 after remapping.
+    if info is None:
+        return topk_ids
+    if (
+        info.ep_dispatch_algorithm == "static"
+        and num_token_non_padded is not None
+        and num_token_non_padded.device == topk_ids.device
+        and num_token_non_padded.dtype in (torch.int32, torch.int64)
+        and num_token_non_padded.numel() == 1
+        and num_token_non_padded.is_contiguous()
+    ):
+        # The batch builds valid_token_mask as arange(M) < this same count.
+        # Mega Gate emits only valid logical IDs or -1. The existing compiled
+        # gather safely wraps -1 and restores the final -1 padding sentinel.
+        return _topk_ids_postprocess_torch(
+            topk_ids, info, num_token_non_padded,
+            output_int64=topk_ids.dtype == torch.int64,
+        )
+    valid = valid_token_mask[:, None]
+    safe_ids = torch.where(valid, topk_ids, 0)
+    physical_ids = topk_ids_logical_to_physical(safe_ids, info)
+    return torch.where(valid, physical_ids, -1)
+
+
+def _fake_hcu_bf16_static_mega_gate(x, weight, bias, topk, renormalize,
+                                 scale, apply_scale, mask, physical_map):
+    return _fake_hcu_bf16_mega_gate(
+        x, weight, bias, topk, renormalize, scale, apply_scale, mask)
+
+
+@register_custom_op(mutates_args=[], fake_impl=_fake_hcu_bf16_static_mega_gate)
+def hcu_bf16_static_mega_gate(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, topk: int,
+    renormalize: bool, scale: float, apply_scale: bool, mask: torch.Tensor,
+    physical_map: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    op = _load_hcu_bf16_mega_gate_op()
+    ids, weights, logits = op(
+        x, weight, num_topk=topk, use_shared_as_routed=False,
+        num_shared_experts=0, routed_scaling_factor=scale, ep_rank=0,
+        scoring_func="sqrtsoftplus", mask=mask, bias=bias,
+        to_physical_map=physical_map, return_logits=True,
+        renormalize=renormalize, apply_scale=apply_scale,
+        logits_dtype=torch.bfloat16,
+    )
+    return weights, ids, logits
+
+
 def _hcu_mega_gate_inputs_supported(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -989,11 +1053,14 @@ class TopK(BaseFusedOp):
         hidden_states: torch.Tensor,
         weight: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor],
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+        num_token_non_padded: Optional[torch.Tensor] = None,
     ) -> Optional[StandardTopKOutput]:
         """Try fused GEMM + routing; None selects the existing router.
 
         The batch prepares its mask once before the layer loop. LightOp emits
-        final INT64 IDs (-1 for padding) and zero padded weights in the kernel.
+        INT64 logical IDs (-1 for padding) and zero padded weights in the kernel.
+        Static layouts are remapped before recording or dispatching these IDs.
         V4.1's fused_gate_packed_ids preference only applies to CUDA/FlashInfer;
         this HCU/DeepEP path returns standard IDs regardless of that preference.
         """
@@ -1004,7 +1071,7 @@ class TopK(BaseFusedOp):
             and valid_token_mask is not None
         ):
             return None
-        if not self._hcu_mega_gate_routing_supported():
+        if not self._hcu_mega_gate_routing_supported(expert_location_dispatch_info):
             return None
         config = self.topk_config
         x, bias = hidden_states, config.correction_bias
@@ -1012,9 +1079,43 @@ class TopK(BaseFusedOp):
             x, weight, bias, valid_token_mask, config.top_k
         ):
             return None
+        if expert_location_dispatch_info is not None:
+            mapping = expert_location_dispatch_info.partial_logical_to_rank_dispatch_physical_map
+            if not (
+                mapping.shape == (weight.shape[0],)
+                and mapping.device == x.device
+                and mapping.dtype in (torch.int32, torch.int64)
+                and mapping.is_contiguous()
+                and expert_location_dispatch_info.num_physical_experts == weight.shape[0]
+            ):
+                return None
+        # The formal LightOp API rounds before scoring, matching the
+        # original BF16-output gate GEMM, and can emit static physical IDs.
+        op = _load_hcu_bf16_mega_gate_op()
+        if op is not None and "logits_dtype" in inspect.signature(op).parameters:
+            if tuple(weight.shape) == (384, 5120) and config.top_k == 6:
+                props = torch.cuda.get_device_properties(x.device)
+                supported = (props.gcnArchName.split(":")[0] == "gfx936"
+                             and props.multi_processor_count == 80)
+                if supported and expert_location_dispatch_info is not None:
+                    key = (mapping.data_ptr(), mapping._version, str(mapping.device))
+                    cached = getattr(self, "_hcu_static_physical_map", None)
+                    if cached is None or cached[0] != key:
+                        if torch.cuda.is_current_stream_capturing():
+                            raise RuntimeError("Warm static Mega Gate mapping before capture")
+                        if sorted(mapping.cpu().tolist()) != list(range(weight.shape[0])):
+                            return None
+                        cached = (key, mapping, mapping.to(dtype=torch.int64))
+                        self._hcu_static_physical_map = cached
+                    return StandardTopKOutput(*hcu_bf16_static_mega_gate(
+                        x, weight, bias, config.top_k, config.renormalize,
+                        config.routed_scaling_factor,
+                        config.apply_routed_scaling_factor_on_output,
+                        valid_token_mask, cached[2],
+                    ))
         if _load_hcu_bf16_mega_gate_op() is None:
             return None
-        return StandardTopKOutput(
+        output = StandardTopKOutput(
             *hcu_bf16_mega_gate(
                 x,
                 weight,
@@ -1027,7 +1128,14 @@ class TopK(BaseFusedOp):
             )
         )
 
-    def _hcu_mega_gate_routing_supported(self) -> bool:
+        return output._replace(
+            topk_ids=_hcu_mega_gate_remap_ids(
+                output.topk_ids, expert_location_dispatch_info, valid_token_mask,
+                num_token_non_padded,
+            )
+        )
+
+    def _hcu_mega_gate_routing_supported(self, expert_location_dispatch_info=None) -> bool:
         """Keep mutable routing settings and runtime overrides live."""
         config = self.topk_config
         if (
@@ -1042,7 +1150,7 @@ class TopK(BaseFusedOp):
             or config.routed_scaling_factor is None
             or not math.isfinite(config.routed_scaling_factor)
             or get_exec().deterministic.enable_deterministic_inference
-            or is_expert_remapping_enabled()
+            or not _hcu_mega_gate_dispatch_supported(expert_location_dispatch_info)
             or _use_aiter
             or _skip_hip_pad_mask
             or not get_moe_a2a_backend().is_deepep()
@@ -1061,7 +1169,7 @@ class TopK(BaseFusedOp):
 
     def record_mega_gate_output(self, output: StandardTopKOutput) -> None:
         # Keep these hooks at the original TopK site, after shared experts have
-        # been scheduled. No padding, remapping or dtype-conversion kernels.
+        # been scheduled. IDs are already physical and padding is finalized.
         capture_routed_experts_if_allowed(
             self.topk_config, self.layer_id, output.topk_ids
         )
