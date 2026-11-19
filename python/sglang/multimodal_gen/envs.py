@@ -15,16 +15,7 @@ from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM: bool = False
-    SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM_WHOLE: bool = False
     SGLANG_MINIMAX_H3_QUANT_OPTIMIZE: bool = True
-    SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE: bool = False
-    SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE_2WAVE: bool = False
-    SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE_4HEADS: bool = False
-    SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_VAE_QKNORM_ROPE: bool = False
-    SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_AFFINE_QUANT_FUSION: bool = False
-    SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_FUSION: bool = False
-    SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_QUANT_FUSION: bool = False
     SGLANG_MINIMAX_H3_INT8_ENABLE: bool = True
     SGLANG_MINIMAX_H3_INT8_FUSION: bool = True
     SGLANG_MINIMAX_H3_FP8_OPTIMIZE: bool = True
@@ -169,44 +160,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Only used after recognizing a validated MiniMax-H3 INT8/FP8 checkpoint.
     "SGLANG_MINIMAX_H3_QUANT_OPTIMIZE": _lazy_bool(
         "SGLANG_MINIMAX_H3_QUANT_OPTIMIZE", "true"
-    ),
-    # Requires Lightop with input_scale_first support; unsupported calls fall back.
-    "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM": _lazy_bool(
-        "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM", "false"
-    ),
-    # Opt in to full-row Lightop execution and return its output directly.
-    # This trades bounded chunk temporaries for full-input quantization buffers.
-    "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM_WHOLE": _lazy_bool(
-        "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM_WHOLE", "false"
-    ),
-    # Opt in to indexed FP32 AdaLN + INT8 input quantization for H3.
-    # QUANT_OPTIMIZE must also be enabled; unsupported calls keep the native path.
-    "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_AFFINE_QUANT_FUSION": _lazy_bool(
-        "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_AFFINE_QUANT_FUSION", "false"
-    ),
-    # Opt in to H3 out-of-place SwiGLU with native BF16 SiLU rounding.
-    "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_FUSION": _lazy_bool(
-        "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_FUSION", "false"
-    ),
-    # Fuse BF16-rounded SwiGLU and fc2 INT8 row quantization. Requires both
-    # LIGHTOP_GEMM and LIGHTOP_GEMM_WHOLE; unsupported inputs retain the MLP path.
-    "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_QUANT_FUSION": _lazy_bool(
-        "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_QUANT_FUSION", "false"
-    ),
-    # Opt-in HCU VAE Q/K RMSNorm + partial RoPE; not bit-exact.
-    "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_VAE_QKNORM_ROPE": _lazy_bool(
-        "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_VAE_QKNORM_ROPE", "false"
-    ),
-    # Opt-in HCU DiT Q/K RMSNorm + partial RoPE. When multiple flags are
-    # enabled, prefer 4HEADS, then 2WAVE, then the original 4-wave launch.
-    "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE": _lazy_bool(
-        "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE", "false"
-    ),
-    "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE_2WAVE": _lazy_bool(
-        "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE_2WAVE", "false"
-    ),
-    "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE_4HEADS": _lazy_bool(
-        "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE_4HEADS", "false"
     ),
     # Legacy aliases; new deployments need only QUANT_OPTIMIZE.
     "SGLANG_MINIMAX_H3_INT8_ENABLE": _lazy_bool(

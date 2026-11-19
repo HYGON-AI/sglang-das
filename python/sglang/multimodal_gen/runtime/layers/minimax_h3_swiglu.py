@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.multimodal_gen import envs
+from sglang.srt.environ import envs
 
 # Enumerate every BF16 bit pattern, not a sampled approximation of SiLU.
 _BF16_PATTERN_COUNT = 1 << (torch.finfo(torch.bfloat16).bits)
@@ -66,7 +66,7 @@ def _swiglu_lookup(
 def try_fused_swiglu(x):
     """Return a fresh BF16 output, or None to retain the caller's native path."""
     if (
-        not envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_FUSION
+        not envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_SWIGLU_FUSION.get()
         or torch.is_grad_enabled()
         or torch.compiler.is_compiling()
         or not x.is_cuda

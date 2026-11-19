@@ -6,7 +6,6 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers.minimax_h3_swiglu import _silu_table
 from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_lightop_gemm import (
     lightop_gemm_enabled,
@@ -17,6 +16,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant import (
     MiniMaxH3Int8LinearMethod,
     _row_quant_block_size,
 )
+from sglang.srt.environ import envs
 
 
 def _swiglu_quant_block_size(x):
@@ -93,8 +93,8 @@ def quant_swiglu_rows(x):
 def try_swiglu_fc2(layer, x):
     """Bypass activation materialization only for an eligible local INT8 fc2."""
     if (
-        not envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_QUANT_FUSION
-        or not envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM_WHOLE
+        not envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_SWIGLU_QUANT_FUSION.get()
+        or not envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_LIGHTOP_GEMM_WHOLE.get()
         or not lightop_gemm_enabled()
         # Bypassing RowParallelLinear must preserve its TP/reduction contract.
         or getattr(layer, "tp_size", 0) != 1

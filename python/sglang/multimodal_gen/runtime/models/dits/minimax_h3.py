@@ -397,7 +397,7 @@ def _modulate_gate(
 
 def _can_fuse_int8_affine(layer, x, shift, scale, indices):
     if (
-        not envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_AFFINE_QUANT_FUSION
+        not srt_envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_AFFINE_QUANT_FUSION.get()
         or torch.is_grad_enabled()
         or torch.compiler.is_compiling()
         # This shortcut bypasses the Linear wrapper; retain its TP/gather path.
@@ -448,11 +448,11 @@ def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
 
 
 def _try_hcu_dit_qknorm_rope(q, k, q_norm, k_norm, cache, positions):
-    if envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE_4HEADS:
+    if srt_envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_DIT_QKNORM_ROPE_4HEADS.get():
         variant = "4heads"
-    elif envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE_2WAVE:
+    elif srt_envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_DIT_QKNORM_ROPE_2WAVE.get():
         variant = "2wave"
-    elif envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE:
+    elif srt_envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_DIT_QKNORM_ROPE.get():
         variant = "4wave"
     else:
         return False
@@ -1149,7 +1149,7 @@ class MiniMaxH3MLP(nn.Module):
             hidden, _ = self.fc1(x)
         else:
             hidden = _project_int8_affine(self.fc1, x, input_affine)
-        if envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_QUANT_FUSION:
+        if srt_envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_SWIGLU_QUANT_FUSION.get():
             from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_swiglu_quant import (
                 try_swiglu_fc2,
             )
@@ -1637,7 +1637,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         self, norm, x, shift, scale, indices, *, int8_projection=None
     ):
         if (
-            srt_envs.SGLANG_ENABLE_MINIMAX_H3_RMSNORM_ADALN_FUSION.get()
+            srt_envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_RMSNORM_ADALN_FUSION.get()
             and not self._fused_fp32_modulation
             and x.is_cuda
             and is_hcu()

@@ -7,9 +7,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers import minimax_h3_swiglu as swiglu
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import _silu_mul
+from sglang.srt.environ import envs
 
 requires_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires GPU")
 
@@ -17,7 +17,7 @@ requires_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="Require
 @pytest.fixture(autouse=True)
 def enable_swiglu_fusion(monkeypatch):
     # Numerical tests explicitly opt in; the environment test removes it.
-    monkeypatch.setenv("SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_FUSION", "true")
+    monkeypatch.setenv("SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_SWIGLU_FUSION", "true")
 
 
 def _reference(x):
@@ -33,13 +33,13 @@ def _assert_same_bits(actual, expected):
 
 
 def test_swiglu_environment_flag(monkeypatch):
-    name = "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_FUSION"
+    name = "SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_SWIGLU_FUSION"
     monkeypatch.delenv(name, raising=False)
-    assert not envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_FUSION
+    assert not envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_SWIGLU_FUSION.get()
     monkeypatch.setenv(name, "false")
-    assert not envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_FUSION
+    assert not envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_SWIGLU_FUSION.get()
     monkeypatch.setenv(name, "1")
-    assert envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_FUSION
+    assert envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_SWIGLU_FUSION.get()
 
 
 def test_cpu_fallback_preserves_autograd():
@@ -102,7 +102,7 @@ def test_unsupported_calls_retain_native_path(monkeypatch, case):
     elif case == "empty":
         x = x[:0]
     elif case == "disabled":
-        monkeypatch.setenv("SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_FUSION", "false")
+        monkeypatch.setenv("SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_SWIGLU_FUSION", "false")
     with (
         torch.no_grad(),
         patch("torch.compiler.is_compiling", return_value=case == "compile"),
@@ -146,7 +146,7 @@ def test_model_helper_uses_lookup_when_enabled(monkeypatch):
         actual = _silu_mul(x, reuse_input=False)
         fused.assert_called_once_with(x)
     _assert_same_bits(actual, _reference(x))
-    monkeypatch.setenv("SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_FUSION", "false")
+    monkeypatch.setenv("SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_SWIGLU_FUSION", "false")
     with (
         torch.inference_mode(),
         patch.object(
@@ -259,9 +259,9 @@ def test_int8_mlp_fused_swiglu_matches_native(monkeypatch, use_affine):
             torch.arange(x.shape[0], device=x.device) % 4,
         )
     with torch.inference_mode():
-        monkeypatch.setenv("SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_FUSION", "false")
+        monkeypatch.setenv("SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_SWIGLU_FUSION", "false")
         expected = mlp(x, input_affine=params)
-        monkeypatch.setenv("SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_FUSION", "true")
+        monkeypatch.setenv("SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_SWIGLU_FUSION", "true")
         with patch.object(
             swiglu, "try_fused_swiglu", wraps=swiglu.try_fused_swiglu
         ) as fused:

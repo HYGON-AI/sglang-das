@@ -10,12 +10,12 @@ import torch.nn.functional as F
 from diffusers.utils import logging
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hcu
 
 from .vit_utils import _env_flag, apply_rotary_pos_emb_qk
@@ -142,7 +142,7 @@ class Attention(nn.Module):
 
         fused_qk = None
         if (
-            envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_VAE_QKNORM_ROPE
+            envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_VAE_QKNORM_ROPE.get()
             and is_hcu()
             and not torch.is_grad_enabled()
             and not torch.compiler.is_compiling()

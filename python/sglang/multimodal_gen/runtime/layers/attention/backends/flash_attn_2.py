@@ -92,7 +92,7 @@ class FlashAttention2Impl(AttentionImpl):
         # allow_strided_qkv is opt-in per caller; both flags must hold.
         use_strided = (
             self.allow_strided_qkv
-            and envs.SGLANG_ENABLE_MINIMAX_H3_FA2_STRIDED_QKV.get()
+            and envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_FA2_STRIDED_QKV.get()
             and all(
                 tensor.stride(-1) == 1 and tensor.stride(-2) == tensor.shape[-1]
                 for tensor in (query, key, value)

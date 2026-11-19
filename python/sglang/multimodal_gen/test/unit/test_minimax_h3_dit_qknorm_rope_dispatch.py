@@ -10,13 +10,13 @@ from sglang.kernels.ops.diffusion import (
     can_use_minimax_h3_dit_qknorm_rope,
     minimax_h3_dit_qknorm_rope,
 )
-from sglang.multimodal_gen import envs
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hcu
 
 requires_hcu = pytest.mark.skipif(
     not (torch.cuda.is_available() and is_hcu()), reason="Requires HCU"
 )
-FLAG_4WAVE = "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_DIT_QKNORM_ROPE"
+FLAG_4WAVE = "SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_DIT_QKNORM_ROPE"
 FLAG_2WAVE = FLAG_4WAVE + "_2WAVE"
 FLAG_4HEADS = FLAG_4WAVE + "_4HEADS"
 
@@ -24,11 +24,11 @@ FLAG_4HEADS = FLAG_4WAVE + "_4HEADS"
 @pytest.mark.parametrize("flag", [FLAG_4WAVE, FLAG_2WAVE, FLAG_4HEADS])
 def test_dit_qknorm_rope_flag_is_opt_in(monkeypatch, flag):
     monkeypatch.delenv(flag, raising=False)
-    assert not getattr(envs, flag)
+    assert not getattr(envs, flag).get()
     monkeypatch.setenv(flag, "1")
-    assert getattr(envs, flag)
+    assert getattr(envs, flag).get()
     monkeypatch.setenv(flag, "false")
-    assert not getattr(envs, flag)
+    assert not getattr(envs, flag).get()
 
 
 @requires_hcu

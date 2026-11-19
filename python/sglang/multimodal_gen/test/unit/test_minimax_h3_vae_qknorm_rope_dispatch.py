@@ -8,22 +8,22 @@ import torch
 
 from sglang.kernels.ops import diffusion
 from sglang.kernels.ops.diffusion import can_use_minimax_h3_vae_qknorm_rope
-from sglang.multimodal_gen import envs
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hcu
 
 requires_hcu = pytest.mark.skipif(
     not (torch.cuda.is_available() and is_hcu()), reason="Requires HCU"
 )
-FLAG = "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_VAE_QKNORM_ROPE"
+FLAG = "SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_VAE_QKNORM_ROPE"
 
 
 def test_vae_qknorm_rope_flag_is_opt_in(monkeypatch):
     monkeypatch.delenv(FLAG, raising=False)
-    assert not envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_VAE_QKNORM_ROPE
+    assert not envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_VAE_QKNORM_ROPE.get()
     monkeypatch.setenv(FLAG, "1")
-    assert envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_VAE_QKNORM_ROPE
+    assert envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_VAE_QKNORM_ROPE.get()
     monkeypatch.setenv(FLAG, "false")
-    assert not envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_VAE_QKNORM_ROPE
+    assert not envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_VAE_QKNORM_ROPE.get()
 
 
 @requires_hcu

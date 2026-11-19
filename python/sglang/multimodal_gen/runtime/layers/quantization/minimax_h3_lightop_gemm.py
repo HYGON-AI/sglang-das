@@ -7,7 +7,7 @@ from functools import lru_cache
 
 import torch
 
-from sglang.multimodal_gen import envs
+from sglang.srt.environ import envs
 
 
 @lru_cache(maxsize=1)
@@ -33,7 +33,7 @@ def _ordered_gemm():
 def lightop_gemm_enabled():
     """Check opt-in and API capability before allocating whole-input buffers."""
     return (
-        envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM
+        envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_LIGHTOP_GEMM.get()
         and not torch.is_grad_enabled()
         and not torch.compiler.is_compiling()
         and torch.version.hip is not None
@@ -48,7 +48,7 @@ def try_lightop_gemm(qx, qw, sx, sw, bias=None):
     dispatch. Runtime kernel errors propagate rather than silently falling back.
     """
     if (
-        not envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM
+        not envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_LIGHTOP_GEMM.get()
         or torch.is_grad_enabled()
         or torch.compiler.is_compiling()
         or torch.version.hip is None

@@ -7,7 +7,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers.quantization import (
     minimax_h3_lightop_gemm as adapter,
 )
@@ -15,9 +14,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant import (
     linear,
     quant_rows,
 )
+from sglang.srt.environ import envs
 
-FLAG = "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM"
-WHOLE_FLAG = "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM_WHOLE"
+FLAG = "SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_LIGHTOP_GEMM"
+WHOLE_FLAG = "SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_LIGHTOP_GEMM_WHOLE"
 requires_hcu = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is None, reason="Requires HCU"
 )
@@ -32,13 +32,13 @@ def reset_capability_cache():
 
 def test_environment_flag(monkeypatch):
     monkeypatch.delenv(FLAG, raising=False)
-    assert not envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM
+    assert not envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_LIGHTOP_GEMM.get()
     monkeypatch.setenv(FLAG, "true")
-    assert envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM
+    assert envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_LIGHTOP_GEMM.get()
     monkeypatch.delenv(WHOLE_FLAG, raising=False)
-    assert not envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM_WHOLE
+    assert not envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_LIGHTOP_GEMM_WHOLE.get()
     monkeypatch.setenv(WHOLE_FLAG, "true")
-    assert envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM_WHOLE
+    assert envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_LIGHTOP_GEMM_WHOLE.get()
 
 
 def test_missing_and_legacy_lightop():

@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
+from sglang.srt.environ import envs as srt_envs
 
 FORMAT = "sglang-minimax-h3-int8-v1"
 MANIFEST = "minimax_h3_int8.json"
@@ -527,7 +528,7 @@ def linear(x, qw, sw, bias=None, *, mode="both", chunk=4096, input_affine=None):
     if (
         mode == "both"
         and bias is None
-        and envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM_WHOLE
+        and srt_envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_LIGHTOP_GEMM_WHOLE.get()
         and _row_quant_block_size(x, "int8") is not None
     ):
         from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_lightop_gemm import (

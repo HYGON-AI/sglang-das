@@ -8,7 +8,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers import minimax_h3_swiglu as swiglu
 from sglang.multimodal_gen.runtime.layers.quantization import (
     minimax_h3_swiglu_quant as fused,
@@ -18,9 +17,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant import (
     MiniMaxH3Int8LinearMethod,
     quant_rows,
 )
+from sglang.srt.environ import envs
 
-FLAG = "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_QUANT_FUSION"
-GEMM_FLAG = "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_LIGHTOP_GEMM"
+FLAG = "SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_SWIGLU_QUANT_FUSION"
+GEMM_FLAG = "SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_LIGHTOP_GEMM"
 WHOLE_FLAG = GEMM_FLAG + "_WHOLE"
 requires_hcu = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is None, reason="Requires HCU"
@@ -39,9 +39,9 @@ def _enable(monkeypatch):
 
 def test_default_off_and_cpu_fallback(monkeypatch):
     monkeypatch.delenv(FLAG, raising=False)
-    assert not envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_QUANT_FUSION
+    assert not envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_SWIGLU_QUANT_FUSION.get()
     monkeypatch.setenv(FLAG, "true")
-    assert envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_SWIGLU_QUANT_FUSION
+    assert envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_SWIGLU_QUANT_FUSION.get()
     assert fused.quant_swiglu_rows(torch.zeros((3, 32), dtype=torch.bfloat16)) is None
 
 

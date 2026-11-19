@@ -7,7 +7,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant import (
     MiniMaxH3Int8LinearMethod,
     affine,
@@ -17,22 +16,23 @@ from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant import (
     supports_int8_affine_quant,
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import _can_fuse_int8_affine
+from sglang.srt.environ import envs
 
 requires_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires GPU")
 
 
 def test_affine_quant_environment_flag(monkeypatch):
-    name = "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_AFFINE_QUANT_FUSION"
+    name = "SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_AFFINE_QUANT_FUSION"
     monkeypatch.delenv(name, raising=False)
-    assert not envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_AFFINE_QUANT_FUSION
+    assert not envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_AFFINE_QUANT_FUSION.get()
     monkeypatch.setenv(name, "false")
-    assert not envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_AFFINE_QUANT_FUSION
+    assert not envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_AFFINE_QUANT_FUSION.get()
     monkeypatch.setenv(name, "1")
-    assert envs.SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_AFFINE_QUANT_FUSION
+    assert envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_AFFINE_QUANT_FUSION.get()
 
 
 def test_affine_quant_model_dispatch_guards(monkeypatch):
-    monkeypatch.setenv("SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_AFFINE_QUANT_FUSION", "true")
+    monkeypatch.setenv("SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_AFFINE_QUANT_FUSION", "true")
     layer = SimpleNamespace(
         tp_size=1,
         bias=None,
@@ -59,10 +59,10 @@ def test_affine_quant_model_dispatch_guards(monkeypatch):
         with patch("torch.compiler.is_compiling", return_value=True):
             assert not _can_fuse_int8_affine(layer, None, None, None, None)
         monkeypatch.setenv(
-            "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_AFFINE_QUANT_FUSION", "false"
+            "SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_AFFINE_QUANT_FUSION", "false"
         )
         assert not _can_fuse_int8_affine(layer, None, None, None, None)
-    monkeypatch.setenv("SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_AFFINE_QUANT_FUSION", "true")
+    monkeypatch.setenv("SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_AFFINE_QUANT_FUSION", "true")
     with torch.enable_grad():
         assert not _can_fuse_int8_affine(layer, None, None, None, None)
 
@@ -263,11 +263,11 @@ def test_int8_dit_block_affine_fusion_is_exact(monkeypatch, rows):
     target = "sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant.quant_affine_rows"
     with torch.inference_mode():
         monkeypatch.setenv(
-            "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_AFFINE_QUANT_FUSION", "false"
+            "SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_AFFINE_QUANT_FUSION", "false"
         )
         expected = block(x.clone(), **kwargs)
         monkeypatch.setenv(
-            "SGLANG_DIFFUSION_ENABLE_MINIMAX_H3_AFFINE_QUANT_FUSION", "true"
+            "SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_AFFINE_QUANT_FUSION", "true"
         )
         with patch(target, wraps=quant_affine_rows) as fused:
             actual = block(x.clone(), **kwargs)
