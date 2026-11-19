@@ -1662,9 +1662,16 @@ class DeepseekV2MoE(nn.Module):
             use_vision_topk = self.gate.e_score_correction_bias_vl is not None and (
                 not _is_hip or _hip_moe.batch_has_images(forward_batch)
             )
+            expert_location_dispatch_info = (
+                ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+                if not self.is_nextn else None
+            )
             fused_topk_output = (
                 self.topk.forward_hcu_mega_gate(
-                    hidden_states, self.gate.weight, forward_batch.hcu_moe_valid_token_mask
+                    hidden_states, self.gate.weight,
+                    forward_batch.hcu_moe_valid_token_mask,
+                    expert_location_dispatch_info=expert_location_dispatch_info,
+                    num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 )
                 if _is_hcu and not self.is_hash and not self.is_nextn and not use_vision_topk
                 else None
@@ -1710,13 +1717,7 @@ class DeepseekV2MoE(nn.Module):
                     hidden_states,
                     router_logits,
                     num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                    expert_location_dispatch_info=(
-                        ExpertLocationDispatchInfo.init_new(
-                            layer_id=self.layer_id,
-                        )
-                        if not self.is_nextn
-                        else None
-                    ),
+                    expert_location_dispatch_info=expert_location_dispatch_info,
                     **topk_kwargs,
                 )
         else:
