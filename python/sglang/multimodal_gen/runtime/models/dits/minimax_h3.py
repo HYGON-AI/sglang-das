@@ -71,6 +71,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.environ import envs as srt_envs
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
@@ -1636,7 +1637,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         self, norm, x, shift, scale, indices, *, int8_projection=None
     ):
         if (
-            envs.SGLANG_MINIMAX_H3_FUSED_RMSNORM_ADALN
+            srt_envs.SGLANG_ENABLE_MINIMAX_H3_RMSNORM_ADALN_FUSION.get()
             and not self._fused_fp32_modulation
             and x.is_cuda
             and is_hcu()

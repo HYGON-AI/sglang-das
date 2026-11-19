@@ -6,7 +6,6 @@ import torch
 from flash_attn import flash_attn_func as flash_attn_func_interface
 from flash_attn import flash_attn_varlen_func as flash_attn_varlen_func_interface
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
@@ -15,6 +14,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
 
@@ -92,7 +92,7 @@ class FlashAttention2Impl(AttentionImpl):
         # allow_strided_qkv is opt-in per caller; both flags must hold.
         use_strided = (
             self.allow_strided_qkv
-            and envs.SGLANG_MINIMAX_H3_FA2_STRIDED_QKV
+            and envs.SGLANG_ENABLE_MINIMAX_H3_FA2_STRIDED_QKV.get()
             and all(
                 tensor.stride(-1) == 1 and tensor.stride(-2) == tensor.shape[-1]
                 for tensor in (query, key, value)

@@ -1721,6 +1721,16 @@ class Envs:
     SGLANG_M3_ALLOW_CUSTOM_AR = EnvBool(False)
 
     # ===================================================================
+    # MiniMax H3 diffusion
+    # ===================================================================
+    SGLANG_ENABLE_MINIMAX_H3_FA2_STRIDED_QKV = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_MINIMAX_H3_FA2_STRIDED_QKV"
+    )
+    SGLANG_ENABLE_MINIMAX_H3_RMSNORM_ADALN_FUSION = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_MINIMAX_H3_FUSED_RMSNORM_ADALN"
+    )
+
+    # ===================================================================
     # Kimi K3
     # ===================================================================
     # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for

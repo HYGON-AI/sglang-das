@@ -8,8 +8,8 @@ with a single launch. It is *not* bit-exact against that chain: the eager
 ``nn.RMSNorm`` and the kernel sum the squares in different orders, and the
 kernel rounds the normalized value to bf16 one step earlier. The assertion
 is therefore a tolerance, not ``torch.equal`` -- which is exactly why the
-call site is behind ``SGLANG_MINIMAX_H3_FUSED_RMSNORM_ADALN`` and gated on
-HCU. Needs real HCU hardware, so this lives under ``test/manual``.
+call site is behind ``SGLANG_ENABLE_MINIMAX_H3_RMSNORM_ADALN_FUSION`` and gated on HCU.
+Needs real HCU hardware, so this lives under ``test/manual``.
 """
 
 import unittest
@@ -22,6 +22,7 @@ from sglang.kernels.ops.diffusion import (
     can_use_minimax_h3_rmsnorm_scale_shift,
     indexed_rmsnorm_scale_shift_bf16,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hcu
 
 HIDDEN = 5376
@@ -81,15 +82,15 @@ class TestMinimaxH3RmsnormScaleShift(unittest.TestCase):
         norm = torch.nn.RMSNorm(HIDDEN, eps=1e-6, device=x.device, dtype=x.dtype)
         block = SimpleNamespace(_fused_fp32_modulation=False)
         prepare = MiniMaxH3DiTBlock._prepare_projection_input
-        flag = "SGLANG_MINIMAX_H3_FUSED_RMSNORM_ADALN"
+        flag = envs.SGLANG_ENABLE_MINIMAX_H3_RMSNORM_ADALN_FUSION
         kernel = "sglang.kernels.ops.diffusion.indexed_rmsnorm_scale_shift_bf16"
         with torch.inference_mode():
             norm.weight.copy_(weight)
-            with patch.dict("os.environ", {flag: "0"}):
+            with flag.override(False):
                 expected, affine = prepare(block, norm, x, shift, scale, indices)
                 self.assertIsNone(affine)
             with (
-                patch.dict("os.environ", {flag: "1"}),
+                flag.override(True),
                 patch(kernel, wraps=indexed_rmsnorm_scale_shift_bf16) as fused,
             ):
                 actual, affine = prepare(block, norm, x, shift, scale, indices)
