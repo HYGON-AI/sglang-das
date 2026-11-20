@@ -33,6 +33,83 @@ def reference(src, dst, source, target, page, layout):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestRequestWindowCopy(CustomTestCase):
+    def test_reset_clears_only_selected_slot_tags_and_invalidates_proofs(self):
+        for dtype in (torch.int32, torch.int64):
+            for stride in (1, 2):
+                for slots in ([], [0], [1, 1, 3], [0, 3]):
+                    with self.subTest(dtype=dtype, stride=stride, slots=slots):
+                        w = RequestWindow.__new__(RequestWindow)
+                        w.capacity = 256
+                        backing = torch.arange(2 * 1088 * stride, device="cuda").reshape(2, 1088 * stride)
+                        w.tags = backing[:, ::stride]
+                        expected = backing.cpu()
+                        for slot in slots:
+                            expected[:, slot * 256 * stride : (slot + 1) * 256 * stride : stride] = -1
+                        w.prepared = object()
+                        w._prevalidated_history_layers = {0, 1}
+                        w._pending_prevalidated_history = (object(), {1})
+                        w.reset(torch.tensor(slots, dtype=dtype, device="cuda"))
+                        torch.testing.assert_close(backing.cpu(), expected, rtol=0, atol=0)
+                        self.assertIsNone(w.prepared)
+                        self.assertFalse(w._prevalidated_history_layers)
+                        self.assertIsNone(w._pending_prevalidated_history)
+
+    def test_reset_graph_replay_refreshes_selected_slots(self):
+        w = RequestWindow.__new__(RequestWindow)
+        w.capacity = 256
+        w.tags = torch.arange(2 * 1088, device="cuda").reshape(2, 1088)
+        slots = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
+        w.reset(slots)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            w.reset(slots)
+        for values in ([1, 3], [0, 0]):
+            seed = torch.arange(2 * 1088, device="cuda").reshape(2, 1088)
+            w.tags.copy_(seed)
+            slots.copy_(torch.tensor(values, dtype=torch.int32, device="cuda"))
+            expected = seed.cpu()
+            for slot in values:
+                expected[:, slot * 256 : (slot + 1) * 256] = -1
+            graph.replay()
+            torch.testing.assert_close(w.tags.cpu(), expected, rtol=0, atol=0)
+
+    def test_prevalidated_tail_copies_its_own_history_data_and_scales(self):
+        page, capacity = 64, 256
+        for fmt in KVLayout:
+            with self.subTest(layout=fmt):
+                def factory(size, layers):
+                    return SimpleNamespace(
+                        size=size, kv_layout=fmt,
+                        kv_buffer=[torch.randint(
+                            0, 256, ((size + page - 1) // page, fmt.page_bytes(page)),
+                            dtype=torch.uint8, device="cuda",
+                        ) for _ in range(layers)],
+                    )
+
+                w = RequestWindow(factory, num_slots=2, layers=2, page_size=page,
+                                  capacity=capacity, workspace_rows=256)
+                positions = torch.arange(capacity, device="cuda")
+                w.tags[:, capacity + positions] = positions
+                req = torch.ones(17, dtype=torch.int64, device="cuda")
+                early = window_layout(req, torch.arange(128, 145, device="cuda"),
+                                      capacity=capacity, num_groups=1)
+                tail = window_layout(req, torch.arange(192, 209, device="cuda"),
+                                     capacity=capacity, num_groups=1)
+                w.activate(early)
+                w.prevalidate_history([0])
+                w.prevalidate_pending_history(tail, [1])
+                for layer, layout in [(0, early), (1, tail)]:
+                    w.activate(layout)
+                    w.workspace.kv_buffer[0].fill_(193)
+                    expected = reference(
+                        w.state.kv_buffer[layer].cpu(), w.workspace.kv_buffer[0].cpu(),
+                        w.row_loc(layout.history_req, layout.history_pos).cpu(),
+                        layout.history_loc.cpu(), page, fmt,
+                    )
+                    torch.testing.assert_close(w.buffer(layer).cpu(), expected, rtol=0, atol=0)
+                    self.assertNotIn(layer, w._prevalidated_history_layers)
+
     def test_layouts_pages_and_strides(self):
         for layout in KVLayout:
             for page in (16, 64, 256):

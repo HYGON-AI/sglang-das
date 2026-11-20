@@ -205,6 +205,8 @@ class RequestWindow:
             self._ensure_workspace(workspace_rows)
         self.layout = None
         self.prepared = None
+        self._prevalidated_history_layers = set()
+        self._pending_prevalidated_history = None
 
     def _ensure_workspace(self, rows: int) -> None:
         if self.workspace is not None and self.workspace.size >= rows:
@@ -227,8 +229,12 @@ class RequestWindow:
         loc = slots.to(torch.int64)[:, None] * self.capacity + torch.arange(
             self.capacity, device=slots.device
         )
-        self.tags[:, loc.flatten()] = -1
+        # Indexed scalar assignment copies its 0-D CPU value onto the GPU and
+        # synchronizes queued work. index_fill_ passes the scalar to the kernel.
+        self.tags.index_fill_(1, loc.flatten(), -1)
         self.prepared = None
+        self._prevalidated_history_layers = set()
+        self._pending_prevalidated_history = None
 
     def transfer_buf_infos(self):
         """One PD item is a whole request ring, including its position tags.
@@ -266,8 +272,13 @@ class RequestWindow:
     def activate(self, layout):
         if self.layout is layout:
             return
+        pending = getattr(self, "_pending_prevalidated_history", None)
         self.layout = layout
         self.prepared = None
+        self._prevalidated_history_layers = (
+            pending[1] if pending is not None and pending[0] is layout else set()
+        )
+        self._pending_prevalidated_history = None
         if self.workspace is None:
             self._ensure_workspace(layout.size)
         elif self.workspace.size < layout.size:
@@ -285,6 +296,8 @@ class RequestWindow:
             buf.zero_()
         self.tags[:, loc] = layout.history_pos
         self.prepared = None
+        self._prevalidated_history_layers = set()
+        self._pending_prevalidated_history = None
 
     def _history_src(self, layout):
         return torch.where(
@@ -293,10 +306,54 @@ class RequestWindow:
             self.zero_row,
         )
 
+    def prevalidate_history(self, layers):
+        """Validate selected layers together before any of them writes this layout.
+
+        The caller must select only layers that consume the current layout. Late
+        decoder layers can use another layout or be skipped, so CP prefill passes
+        its early owned layers explicitly. Each validation is consumed by one
+        history copy; a later copy of a committed layer is checked again.
+        """
+        self._prevalidated_history_layers = set()
+        self._pending_prevalidated_history = None
+        if get_is_capture_mode() or _capturing() or not layers:
+            return
+        self._prevalidated_history_layers = self._validate_history(self.layout, layers)
+
+    def prevalidate_pending_history(self, layout, layers):
+        """Check a future tail layout before model execution starts.
+
+        Only activation of this exact layout can consume the proof. Reset,
+        capture, another layout switch, or a write to a selected layer invalidates
+        it, retaining the per-layer check whenever the proof no longer applies.
+        """
+        self._pending_prevalidated_history = None
+        if get_is_capture_mode() or _capturing() or not layers:
+            return
+        checked = self._validate_history(layout, layers)
+        self._pending_prevalidated_history = (layout, checked)
+
+    def _validate_history(self, layout, layers):
+        if layout is None:
+            raise RuntimeError("request-window metadata was not activated")
+        layers = sorted(set(layers))
+        if layers[0] < 0 or layers[-1] >= self.tags.shape[0]:
+            raise IndexError("request-window history layer is out of range")
+        expected = layout.history_pos.expand(len(layers), -1)
+        actual = self.tags[layers][:, self._history_src(layout)]
+        if not torch.equal(torch.where(layout.history_valid, actual, expected), expected):
+            raise RuntimeError(
+                "SWA history is missing: replay or window ownership is invalid"
+            )
+        return set(layers)
+
     def buffer(self, layer):
         # The runner's capture scope includes eager warmups before CUDA capture
         # starts, so the phase is part of the key: leaving the scope revalidates.
         in_capture = get_is_capture_mode() or _capturing()
+        if in_capture:
+            self._prevalidated_history_layers = set()
+            self._pending_prevalidated_history = None
         prepared_key = (layer, in_capture)
         if self.prepared != prepared_key:
             layout = self.layout
@@ -304,9 +361,14 @@ class RequestWindow:
                 raise RuntimeError("request-window metadata was not activated")
             src = self._history_src(layout)
             if not in_capture:
-                valid = layout.history_valid
-                if not torch.equal(
-                    self.tags[layer, src][valid], layout.history_pos[valid]
+                checked = getattr(self, "_prevalidated_history_layers", ())
+                if layer in checked:
+                    checked.remove(layer)
+                elif not torch.equal(
+                    torch.where(
+                        layout.history_valid, self.tags[layer, src], layout.history_pos
+                    ),
+                    layout.history_pos,
                 ):
                     raise RuntimeError(
                         "SWA history is missing: replay or window ownership is invalid"
@@ -324,6 +386,9 @@ class RequestWindow:
 
     def commit(self, layer):
         layout = self.layout
+        pending = getattr(self, "_pending_prevalidated_history", None)
+        if pending is not None:
+            pending[1].discard(layer)
         commit_packed_rows(
             self.buffer(layer),
             self.state.kv_buffer[layer],

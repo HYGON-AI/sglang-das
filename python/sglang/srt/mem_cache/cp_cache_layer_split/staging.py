@@ -126,6 +126,20 @@ def remap_page_table_to_staging(
     )
 
 
+def request_window_page_capacity(layout_size: int, page_size: int, max_pages: int) -> int:
+    """Upper bound for a dense, zero-based GLOBAL RequestWindow workspace.
+
+    The host knows its row count; no device readback is needed to allocate the
+    selected-page table, including when each CP rank sees only part of it.
+    """
+    if layout_size < 0 or page_size <= 0 or max_pages <= 0:
+        raise ValueError("invalid request-window page geometry")
+    capacity = max((layout_size + page_size - 1) // page_size, 1)
+    if capacity > max_pages:
+        raise ValueError("request-window layout exceeds its allocated workspace")
+    return capacity
+
+
 def active_pages_for_indices(
     indices: torch.Tensor,
     page_size: int,

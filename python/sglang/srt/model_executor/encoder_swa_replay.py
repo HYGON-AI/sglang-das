@@ -1,3 +1,4 @@
+import json
 import logging
 from copy import copy
 from typing import Any, Optional
@@ -295,6 +296,51 @@ def _set_execution_counts(*, batch, scheduled) -> None:
 logger = logging.getLogger(__name__)
 
 
+_HCU_REPLAY_PLAN_BYTES = 4096
+
+
+def _check_hcu_cp_replay_plan(plan, cp_size, cpu_group):
+    """Check the complete usual plan in one CPU collective, without hashing.
+
+    Arbitrary-size/nonstandard plans and differing frames take the original
+    object comparison. All ranks choose that fallback from the gathered headers,
+    so a long request ID on just one rank cannot change collective ordering.
+    """
+    ordinary = type(plan) is tuple and all(
+        type(row) is tuple
+        and len(row) == 3
+        and type(row[0]) is str
+        and type(row[1]) is bool
+        and type(row[2]) is int
+        for row in plan
+    )
+    data = (
+        json.dumps(plan, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        if ordinary
+        else b""
+    )
+    length = len(data) if ordinary else _HCU_REPLAY_PLAN_BYTES + 1
+    storage = bytearray(8 + _HCU_REPLAY_PLAN_BYTES)
+    storage[:8] = length.to_bytes(8, "little")
+    size = min(len(data), _HCU_REPLAY_PLAN_BYTES)
+    storage[8 : 8 + size] = data[:size]
+    frame = torch.frombuffer(storage, dtype=torch.uint8)
+    frames = [torch.empty_like(frame) for _ in range(cp_size)]
+    torch.distributed.all_gather(frames, frame, group=cpu_group)
+    received = [other.numpy().tobytes() for other in frames]
+    expected = bytes(storage)
+    fallback = any(
+        int.from_bytes(other[:8], "little") > _HCU_REPLAY_PLAN_BYTES
+        or other != expected
+        for other in received
+    )
+    if fallback:
+        plans = [None] * cp_size
+        torch.distributed.all_gather_object(plans, plan, group=cpu_group)
+        if any(other != plan for other in plans):
+            raise RuntimeError("Encoder SWA replay plan differs across CP ranks")
+
+
 def _run_hcu_encoder_swa_replay(worker, batch):
     from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
@@ -317,12 +363,9 @@ def _run_hcu_encoder_swa_replay(worker, batch):
                 batch.reqs, batch.encoder_swa_reset, batch.prefix_lens, strict=True
             )
         )
-        plans = [None] * parallel.attn_cp_size
-        torch.distributed.all_gather_object(
-            plans, plan, group=parallel.attn_cp_group.cpu_group
+        _check_hcu_cp_replay_plan(
+            plan, parallel.attn_cp_size, parallel.attn_cp_group.cpu_group
         )
-        if any(other != plan for other in plans):
-            raise RuntimeError("Encoder SWA replay plan differs across CP ranks")
     for i, reset in enumerate(batch.encoder_swa_reset):
         if not reset:
             continue

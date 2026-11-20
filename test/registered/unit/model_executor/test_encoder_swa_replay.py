@@ -34,6 +34,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.encoder_swa_replay import (
     _build_replay_batch,
+    _check_hcu_cp_replay_plan,
     _fold_batch,
     drop_folded_rows,
     folded_replay_rows,
@@ -88,6 +89,12 @@ class TestHcuSeparateReplay(CustomTestCase):
             if disagree:
                 plans[-1] = (("different-request", True, prefix),)
 
+        def gather_frames(frames, frame, group):
+            for other in frames:
+                other.copy_(frame)
+            if disagree:
+                frames[-1][0] ^= 1
+
         def init(replay, model_runner, **kwargs):
             self.assertIs(model_runner, runner)
             self.assertTrue(kwargs["encoder_swa_replay"])
@@ -110,6 +117,7 @@ class TestHcuSeparateReplay(CustomTestCase):
                 ),
             ),
             patch("torch.distributed.all_gather_object", side_effect=gather),
+            patch("torch.distributed.all_gather", side_effect=gather_frames),
             patch.object(ForwardBatch, "init_new", side_effect=init),
         ):
             run_encoder_swa_replay(SimpleNamespace(model_runner=runner), batch)
@@ -134,6 +142,65 @@ class TestHcuSeparateReplay(CustomTestCase):
         backend = DeepseekV4AttnBackend.__new__(DeepseekV4AttnBackend)
         with patch("sglang.srt.layers.attention.deepseek_v4_backend._is_hcu", False):
             self.assertTrue(backend.folds_encoder_swa_replay)
+
+
+class TestHcuReplayPlanConsensus(unittest.TestCase):
+    def _check(self, plans, *, differing_frame=False, oversized_peer=False):
+        def gather(frames, frame, group):
+            self.assertEqual(frame.device.type, "cpu")
+            self.assertEqual(frame.dtype, torch.uint8)
+            self.assertTrue(frame.is_contiguous())
+            for other in frames:
+                other.copy_(frame)
+            if differing_frame:
+                frames[-1][0] ^= 1
+            if oversized_peer:
+                frames[-1][:8] = torch.tensor(list((100000).to_bytes(8, "little")))
+
+        def gather_objects(outputs, plan, group):
+            outputs[:] = plans
+
+        with (
+            patch("torch.distributed.all_gather", side_effect=gather) as frames,
+            patch("torch.distributed.all_gather_object", side_effect=gather_objects) as objects,
+        ):
+            _check_hcu_cp_replay_plan(plans[0], len(plans), object())
+        return frames.call_count, objects.call_count
+
+    def test_normal_complete_plan_needs_one_collective(self):
+        for plan in [(), (("request", False, 0),),
+                     (("\u56fe\u7247\x00\n", True, 2304), ("request", False, 131072))]:
+            with self.subTest(plan=plan):
+                self.assertEqual(self._check([plan, plan]), (1, 0))
+
+    def test_rid_reset_prefix_and_order_disagreement_still_fails(self):
+        first = (("a", True, 2304), ("b", False, 65536))
+        for other in [(("different", True, 2304), ("b", False, 65536)),
+                      (("a", False, 2304), ("b", False, 65536)),
+                      (("a", True, 2306), ("b", False, 65536)),
+                      tuple(reversed(first))]:
+            with self.subTest(other=other), self.assertRaisesRegex(RuntimeError, "plan differs across CP ranks"):
+                self._check([first, other], differing_frame=True)
+
+    def test_long_plan_uses_original_object_comparison(self):
+        plan = (("long" * 2000, True, 2304),)
+        self.assertEqual(self._check([plan, plan]), (1, 1))
+
+    def test_one_oversized_peer_takes_the_common_fallback(self):
+        first = (("short", True, 2304),)
+        other = (("long" * 2000, True, 2304),)
+        with self.assertRaisesRegex(RuntimeError, "plan differs across CP ranks"):
+            self._check([first, other], oversized_peer=True)
+
+    def test_nonstandard_plan_retains_python_equality_semantics(self):
+        # Different JSON types may compare equal in Python, and vice versa.
+        self.assertEqual(self._check([((1, True, 0),), ((True, True, 0),)]), (1, 1))
+        with self.assertRaisesRegex(RuntimeError, "plan differs across CP ranks"):
+            self._check([(((1,), True, 0),), (([1], True, 0),)])
+
+    def test_different_frames_do_not_replace_the_exact_fallback(self):
+        plan = (("same", True, 2304),)
+        self.assertEqual(self._check([plan, plan], differing_frame=True), (1, 1))
 
 
 def _loc(slot, pos):

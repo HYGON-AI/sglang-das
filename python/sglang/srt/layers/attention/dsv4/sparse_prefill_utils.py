@@ -34,6 +34,7 @@ compressed branch becomes a no-op) and any ``compress_ratio >= 1``.
 
 import logging
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
@@ -48,10 +49,18 @@ _use_hcu_combine_topk_swa_indices = is_hcu() and get_bool_env_var(
     "SGLANG_HCU_OPT_COMBINE_TOPK_SWA_INDICES", "true"
 )
 _hcu_combine_topk_swa_indices = None
+_hcu_combine_explicit_swa = False
 if _use_hcu_combine_topk_swa_indices:
     try:
         from lightop import (
             combine_topk_swa_indices_hcu as _hcu_combine_topk_swa_indices,
+        )
+        _hcu_combine_explicit_swa = (
+            getattr(
+                sys.modules.get(_hcu_combine_topk_swa_indices.__module__),
+                "COMBINE_TOPK_SWA_INDICES_ABI",
+                1,
+            ) >= 2
         )
     except ImportError:
         logging.getLogger(__name__).warning(
@@ -259,8 +268,10 @@ def combine_topk_swa_indices(
 
     if num_tokens == 0:
         return combined_indices, combined_lens
-    if _hcu_combine_topk_swa_indices is not None:
-        _hcu_combine_topk_swa_indices(
+    if _hcu_combine_topk_swa_indices is not None and (
+        swa_indices is None or _hcu_combine_explicit_swa
+    ):
+        args = (
             topk_indices,
             query_start_loc,
             query_pos,
@@ -274,7 +285,16 @@ def combine_topk_swa_indices(
             compress_ratio,
             topk,
         )
+        if swa_indices is None:
+            _hcu_combine_topk_swa_indices(*args)
+        else:
+            _hcu_combine_topk_swa_indices(*args, swa_indices, swa_lengths)
         return combined_indices, combined_lens
+
+    if swa_lengths is not None:
+        # The Triton pointer contract assumes a contiguous length vector.
+        # Old LightOp builds remain correct for CP views, with this copy cost.
+        swa_lengths = swa_lengths.contiguous()
 
     block_t = 2  # Measured on B200 with num_warps=2, 16384 tokens, bs 1 to 64.
     _combine_topk_swa_indices_kernel[(triton.cdiv(num_tokens, block_t),)](
@@ -469,6 +489,8 @@ class SparsePrefillChunkCache:
         total_swa: int,
         real_query_seq_lens: Optional[torch.Tensor] = None,
         request_window_layout=None,
+        request_window_indices: Optional[torch.Tensor] = None,
+        request_window_lengths: Optional[torch.Tensor] = None,
         seq_lens_cpu: Optional[list[int]] = None,
         *,
         compact_seq_lens_cpu: Optional[tuple[int, ...]] = None,
@@ -477,6 +499,25 @@ class SparsePrefillChunkCache:
         a CP rank's interleaved share of it); the SWA gather spans the whole extend."""
         device = seq_lens.device
         num_reqs = seq_lens.shape[0]
+        if (request_window_indices is None) != (request_window_lengths is None):
+            raise ValueError(
+                "request-window indices and lengths must be provided together"
+            )
+        if request_window_indices is not None:
+            if request_window_layout is None:
+                raise ValueError("request-window query rows require the global layout")
+            assert request_window_indices.shape == (num_qo_tokens, swa_window_size)
+            assert request_window_lengths.shape == (num_qo_tokens,)
+            assert (
+                request_window_indices.dtype
+                == request_window_lengths.dtype
+                == torch.int32
+            )
+            assert (
+                request_window_indices.device
+                == request_window_lengths.device
+                == device
+            )
         if compact_seq_lens_cpu is not None:
             if (
                 len(compact_seq_lens_cpu) != num_reqs
@@ -515,8 +556,18 @@ class SparsePrefillChunkCache:
             swa_gather_lens = torch.zeros_like(seq_lens)
             # RequestWindow indices already address the shared workspace.
             swa_offsets = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
-            swa_indices = request_window_layout.indices
-            swa_lengths = request_window_layout.lengths
+            # CP shards queries only: the gather still spans the GLOBAL window,
+            # but indices/lengths must come from this rank's reindexed metadata.
+            swa_indices = (
+                request_window_layout.indices
+                if request_window_indices is None
+                else request_window_indices
+            )
+            swa_lengths = (
+                request_window_layout.lengths
+                if request_window_lengths is None
+                else request_window_lengths
+            )
 
         cache = cls(
             num_reqs=num_reqs,

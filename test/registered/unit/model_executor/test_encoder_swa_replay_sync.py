@@ -86,8 +86,9 @@ class TestEncoderSwaReplaySync(CustomTestCase):
             attn_cp_group=SimpleNamespace(cpu_group=None),
         )
 
-        def gather(plans, plan, **kwargs):
-            plans[:] = [plan] * cp_size
+        def gather(frames, frame, **kwargs):
+            for other in frames:
+                other.copy_(frame)
 
         with ExitStack() as stack:
             stack.enter_context(patch("sglang.srt.utils.is_hcu", return_value=True))
@@ -113,7 +114,7 @@ class TestEncoderSwaReplaySync(CustomTestCase):
                 patch.object(ForwardBatch, "init_new", side_effect=init_new)
             )
             stack.enter_context(
-                patch("torch.distributed.all_gather_object", side_effect=gather)
+                patch("torch.distributed.all_gather", side_effect=gather)
             )
             stack.enter_context(patch.object(fbi, "_is_cpu", True))
             stack.enter_context(patch.object(fbi, "dp_slot_in", return_value=0))
