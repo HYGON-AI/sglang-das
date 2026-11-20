@@ -27,6 +27,7 @@ from sglang.kernels.ops.diffusion import (
     timestep_embedding,
     try_fused_scaled_residual_add_exact,
 )
+from sglang.kernels.ops.diffusion.common.platform import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=75, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -187,9 +188,10 @@ def test_residual_gate_add_torch_compile_fullgraph():
 def test_scaled_residual_add_is_bit_exact(dtype):
     # fp32 residual accumulator + half-precision update, as the DiT blocks
     # that keep their residual stream in fp32 emit it.
-    residual = torch.randn(2, 17, 64, device=DEVICE, dtype=torch.float32)
-    x = torch.randn(2, 17, 64, device=DEVICE, dtype=dtype)
-    scale = torch.randn(64, device=DEVICE, dtype=torch.float32)
+    shape = (1, 2309, 2048) if is_hip() else (2, 17, 64)
+    residual = torch.randn(shape, device=DEVICE, dtype=torch.float32)
+    x = torch.randn(shape, device=DEVICE, dtype=dtype)
+    scale = torch.randn(shape[-1], device=DEVICE, dtype=torch.float32)
 
     actual = try_fused_scaled_residual_add_exact(residual, x, scale)
     assert actual is not None
@@ -201,10 +203,11 @@ def test_scaled_residual_add_rejects_unsupported_inputs():
     residual = torch.empty(2, 3, 8, device=DEVICE, dtype=torch.float32)
     x = torch.empty_like(residual)
     scale = torch.empty(8, device=DEVICE, dtype=torch.float32)
-    # A too-small hidden dim and a mismatched scale length both bail out;
-    # ``try_`` returning None is this helper's documented contract.
+    # An FP32 update and a mismatched scale length both bail out.
     assert try_fused_scaled_residual_add_exact(residual, x, scale) is None
     assert try_fused_scaled_residual_add_exact(residual, x.half(), scale[:-1]) is None
+    if is_hip():
+        assert try_fused_scaled_residual_add_exact(residual, x.half(), scale) is None
 
 
 # ---------------------------------------------------------------------------

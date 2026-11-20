@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
 
@@ -57,6 +58,7 @@ class FlashAttention2Impl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.dropout_p = float(extra_impl_args.get("dropout_p", 0.0))
+        self.allow_strided_qkv = bool(extra_impl_args.get("allow_strided_qkv", False))
 
     def forward(
         self,
@@ -86,13 +88,24 @@ class FlashAttention2Impl(AttentionImpl):
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         del cu_seqlens_host
-        cu_seqlens = cu_seqlens.to(
-            device=query.device, dtype=torch.int32
-        ).contiguous()
+        cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32).contiguous()
+        # allow_strided_qkv is opt-in per caller; both flags must hold.
+        use_strided = (
+            self.allow_strided_qkv
+            and envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_FA2_STRIDED_QKV.get()
+            and all(
+                tensor.stride(-1) == 1 and tensor.stride(-2) == tensor.shape[-1]
+                for tensor in (query, key, value)
+            )
+        )
+        if use_strided:
+            q, k, v = query, key, value
+        else:
+            q, k, v = query.contiguous(), key.contiguous(), value.contiguous()
         output = flash_attn_varlen_func_interface(
-            query.contiguous(),
-            key.contiguous(),
-            value.contiguous(),
+            q,
+            k,
+            v,
             cu_seqlens,
             cu_seqlens,
             max_seqlen,

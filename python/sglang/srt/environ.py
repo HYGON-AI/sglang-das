@@ -1721,6 +1721,30 @@ class Envs:
     SGLANG_M3_ALLOW_CUSTOM_AR = EnvBool(False)
 
     # ===================================================================
+    # MiniMax H3 diffusion
+    # ===================================================================
+    # Let HCU FA2 read packed QKV with contiguous head dimensions.
+    SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_FA2_STRIDED_QKV = EnvBool(False)
+    # DiT QK RMSNorm + RoPE variants in increasing priority order.
+    SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_DIT_QKNORM_ROPE = EnvBool(False)
+    SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_DIT_QKNORM_ROPE_2WAVE = EnvBool(False)
+    SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_DIT_QKNORM_ROPE_4HEADS = EnvBool(False)
+    # Fuse VAE QK RMSNorm with partial RoPE on HCU.
+    SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_VAE_QKNORM_ROPE = EnvBool(False)
+    # Fuse DiT RMSNorm with indexed BF16 AdaLN modulation.
+    SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_RMSNORM_ADALN_FUSION = EnvBool(False)
+    # Fuse indexed FP32 AdaLN with INT8 input quantization.
+    SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_AFFINE_QUANT_FUSION = EnvBool(False)
+    # Fuse BF16-rounded SwiGLU using a device-native SiLU lookup.
+    SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_SWIGLU_FUSION = EnvBool(False)
+    # Fuse BF16-rounded SwiGLU with fc2 INT8 input quantization.
+    SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_SWIGLU_QUANT_FUSION = EnvBool(False)
+    # Use the Lightop INT8 GEMM with ordered input scaling.
+    SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_LIGHTOP_GEMM = EnvBool(False)
+    # Run the entire projection in one Lightop GEMM.
+    SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_LIGHTOP_GEMM_WHOLE = EnvBool(False)
+
+    # ===================================================================
     # Kimi K3
     # ===================================================================
     # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for

@@ -71,6 +71,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.environ import envs as srt_envs
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
@@ -394,7 +395,46 @@ def _modulate_gate(
     return (x + gate.index_select(0, indices) * other).to(dtype)
 
 
+def _can_fuse_int8_affine(layer, x, shift, scale, indices):
+    if (
+        not srt_envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_AFFINE_QUANT_FUSION.get()
+        or torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+        # This shortcut bypasses the Linear wrapper; retain its TP/gather path.
+        or getattr(layer, "tp_size", 0) != 1
+        or layer.bias is not None
+        or getattr(layer, "gather_output", True)
+    ):
+        return False
+    from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant import (
+        MiniMaxH3Int8LinearMethod,
+        supports_int8_affine_quant,
+    )
+
+    return (
+        isinstance(layer.quant_method, MiniMaxH3Int8LinearMethod)
+        and layer.quant_method.fused
+        and supports_int8_affine_quant(x, shift, scale, indices)
+    )
+
+
+def _project_int8_affine(layer, x, params):
+    from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant import (
+        linear,
+    )
+
+    return linear(x, layer.weight, layer.weight_scale_inv, input_affine=params)
+
+
 def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
+    if not reuse_input and hidden.is_cuda and hidden.dtype == _BF16_DTYPE:
+        from sglang.multimodal_gen.runtime.layers.minimax_h3_swiglu import (
+            try_fused_swiglu,
+        )
+
+        fused = try_fused_swiglu(hidden)
+        if fused is not None:
+            return fused
     if (
         reuse_input
         and hidden.is_cuda
@@ -405,6 +445,47 @@ def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
         return silu_and_mul_with_activation_rounding_(hidden)
     gate, up = hidden.chunk(2, dim=-1)
     return nn.functional.silu(gate) * up
+
+
+def _try_hcu_dit_qknorm_rope(q, k, q_norm, k_norm, cache, positions):
+    if srt_envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_DIT_QKNORM_ROPE_4HEADS.get():
+        variant = "4heads"
+    elif srt_envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_DIT_QKNORM_ROPE_2WAVE.get():
+        variant = "2wave"
+    elif srt_envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_DIT_QKNORM_ROPE.get():
+        variant = "4wave"
+    else:
+        return False
+
+    if not is_hcu() or torch.is_grad_enabled() or torch.compiler.is_compiling():
+        return False
+    from sglang.kernels.ops.diffusion import (
+        can_use_minimax_h3_dit_qknorm_rope,
+        minimax_h3_dit_qknorm_rope,
+    )
+
+    if not can_use_minimax_h3_dit_qknorm_rope(
+        q,
+        k,
+        q_norm.weight,
+        k_norm.weight,
+        cache,
+        q_norm.eps,
+        k_norm.eps,
+        positions=positions,
+    ):
+        return False
+    minimax_h3_dit_qknorm_rope(
+        q,
+        k,
+        q_norm.weight,
+        k_norm.weight,
+        cache,
+        positions,
+        q_norm.eps,
+        variant=variant,
+    )
+    return True
 
 
 def _apply_qk_norm(
@@ -745,6 +826,10 @@ class MiniMaxH3Attention(nn.Module):
 
     def _set_attention_backend(self, backend) -> None:
         impl_cls = backend.get_impl_cls()
+        extra_impl_args = {}
+        if is_hcu() and backend.get_enum() is AttentionBackendEnum.FA2:
+            # HCU FA2 accepts packed QKV views with contiguous head dimensions.
+            extra_impl_args["allow_strided_qkv"] = True
         self._attention_impl = impl_cls(
             num_heads=self.num_heads,
             head_size=self.head_dim,
@@ -752,6 +837,7 @@ class MiniMaxH3Attention(nn.Module):
             softmax_scale=self.softmax_scale,
             num_kv_heads=self.num_heads,
             prefix=self.prefix,
+            **extra_impl_args,
         )
         # Ring only supports FA (see _minimax_h3_attention_core_impl); keep
         # the resolved enum alongside the impl instance instead of a second
@@ -918,6 +1004,7 @@ class MiniMaxH3Attention(nn.Module):
         max_seqlen: int,
         ulysses_active: bool = False,
         ring_active: bool = False,
+        input_affine: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -940,7 +1027,10 @@ class MiniMaxH3Attention(nn.Module):
             )
 
         total = x.shape[0]
-        qkv, _ = self.qkv_proj(x)
+        if input_affine is None:
+            qkv, _ = self.qkv_proj(x)
+        else:
+            qkv = _project_int8_affine(self.qkv_proj, x, input_affine)
         q, k, v = qkv.split(self.local_inner_dim, dim=-1)
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_heads, self.head_dim)
@@ -969,7 +1059,9 @@ class MiniMaxH3Attention(nn.Module):
                     rope_dim=cos_sin_cache.shape[-1],
                     round_norm_before_rope=True,
                 )
-            else:
+            elif not _try_hcu_dit_qknorm_rope(
+                q, k, self.q_norm, self.k_norm, cos_sin_cache, positions
+            ):
                 q, k = _apply_qk_norm(
                     q,
                     k,
@@ -1035,7 +1127,12 @@ class MiniMaxH3MLP(nn.Module):
             quant_config.get_name() == "gguf"
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        input_affine: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         if x.device.type == "mps":
             out = torch.empty_like(x)
             for start in range(0, x.shape[0], _MPS_MLP_TOKEN_CHUNK_SIZE):
@@ -1048,7 +1145,18 @@ class MiniMaxH3MLP(nn.Module):
                 torch.mps.synchronize()
                 torch.mps.empty_cache()
             return out
-        hidden, _ = self.fc1(x)
+        if input_affine is None:
+            hidden, _ = self.fc1(x)
+        else:
+            hidden = _project_int8_affine(self.fc1, x, input_affine)
+        if srt_envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_SWIGLU_QUANT_FUSION.get():
+            from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_swiglu_quant import (
+                try_swiglu_fc2,
+            )
+
+            fused = try_swiglu_fc2(self.fc2, hidden)
+            if fused is not None:
+                return fused
         hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
         return out
@@ -1525,6 +1633,51 @@ class MiniMaxH3DiTBlock(nn.Module):
         )
         self.preserve_input_for_cache_dit = False
 
+    def _prepare_projection_input(
+        self, norm, x, shift, scale, indices, *, int8_projection=None
+    ):
+        if (
+            srt_envs.SGLANG_ENABLE_DIFFUSION_MINIMAX_H3_RMSNORM_ADALN_FUSION.get()
+            and not self._fused_fp32_modulation
+            and x.is_cuda
+            and is_hcu()
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and isinstance(norm, nn.RMSNorm)
+            and norm.weight is not None
+            and norm.eps is not None
+        ):
+            from sglang.kernels.ops.diffusion import (
+                can_use_minimax_h3_rmsnorm_scale_shift,
+                indexed_rmsnorm_scale_shift_bf16,
+            )
+
+            if can_use_minimax_h3_rmsnorm_scale_shift(
+                x, norm.weight, shift, scale, indices
+            ):
+                return (
+                    indexed_rmsnorm_scale_shift_bf16(
+                        x, norm.weight, shift, scale, indices, norm.eps
+                    ),
+                    None,
+                )
+        h = norm(x)
+        if int8_projection is not None and _can_fuse_int8_affine(
+            int8_projection, h, shift, scale, indices
+        ):
+            return h, (shift, scale, indices)
+        return (
+            _modulate_scale_shift(
+                h,
+                shift,
+                scale,
+                indices,
+                dtype=_BF16_DTYPE,
+                fused_fp32=self._fused_fp32_modulation,
+            ),
+            None,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1555,14 +1708,13 @@ class MiniMaxH3DiTBlock(nn.Module):
         # first gated residual writes to that tensor; the second one operates on
         # a block-local buffer.
         residual = x
-        h = self.norm1(x)
-        h = _modulate_scale_shift(
-            h,
+        h, attn_affine = self._prepare_projection_input(
+            self.norm1,
+            x,
             shift_msa,
             scale_msa,
             combined_indices,
-            dtype=_BF16_DTYPE,
-            fused_fp32=self._fused_fp32_modulation,
+            int8_projection=self.attn.qkv_proj if self._fused_fp32_modulation else None,
         )
         h = self.attn(
             h,
@@ -1572,6 +1724,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             max_seqlen=max_seqlen,
             ulysses_active=ulysses_active,
             ring_active=ring_active,
+            input_affine=attn_affine,
         )
         x = _modulate_gate(
             residual,
@@ -1584,16 +1737,18 @@ class MiniMaxH3DiTBlock(nn.Module):
         )
 
         residual = x
-        h = self.norm2(x)
-        h = _modulate_scale_shift(
-            h,
+        h, mlp_affine = self._prepare_projection_input(
+            self.norm2,
+            x,
             shift_mlp,
             scale_mlp,
             combined_indices,
-            dtype=_BF16_DTYPE,
-            fused_fp32=self._fused_fp32_modulation,
+            int8_projection=self.mlp.fc1 if self._fused_fp32_modulation else None,
         )
-        h = self.mlp(h)
+        if mlp_affine is None:
+            h = self.mlp(h)
+        else:
+            h = self.mlp(h, input_affine=mlp_affine)
         # `residual` is block-local here (see above), so this stays in-place
         # even while Cache-DiT is attached.
         return _modulate_gate(
