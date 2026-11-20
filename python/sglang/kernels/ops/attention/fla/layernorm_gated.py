@@ -292,7 +292,8 @@ def _layer_norm_fwd(
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     # Calculate rows per block based on SM count
     rows_per_block = calc_rows_per_block(M, x.device)
-    quant = {}
+    # Explicit defaults keep the torch.compile Triton launcher signature aligned.
+    quant = {"Q": None, "S": None, "QUANT": False}
     # quant_heads: one block per token, same per-warp row split (rows round identically), FP8 (q, scale) out
     if quant_heads:
         assert ngroups == 1 and M % quant_heads == 0
@@ -308,7 +309,11 @@ def _layer_norm_fwd(
         quant = {"Q": q, "S": s, "QUANT": True}
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    pdl_kwargs = (
+        {"USE_GDC": True, "launch_pdl": True}
+        if is_arch_support_pdl()
+        else {"USE_GDC": False}
+    )
     # Workaround for PyTorch <= 2.12: torch.xpu.device is not Dynamo-compatible
     # in that release — it creates a DynamoConfigPatchProxy that
     # SourcelessBuilder cannot wrap, causing a hard error under

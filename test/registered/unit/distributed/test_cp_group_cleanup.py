@@ -4,6 +4,9 @@ from unittest.mock import Mock
 import pytest
 
 from sglang.srt.distributed import bootstrap, parallel_state
+from sglang.test.ci.ci_register import register_hcu_ci
+
+register_hcu_ci(est_time=10, suite="stage-b-test-1-hcu-small")
 
 
 @pytest.mark.parametrize("dp_group", ["tp", "attn_tp", "dedicated"])
@@ -41,3 +44,7 @@ def test_model_group_cleanup_destroys_aliases_once(monkeypatch, dp_group):
             1 if name != "dedicated" or dp_group == "dedicated" else 0
         )
     assert all(getattr(parallel_state, name) is None for name in bindings)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

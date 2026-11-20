@@ -8,6 +8,10 @@ from types import SimpleNamespace
 import pytest
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
+from sglang.test.ci.ci_register import register_hcu_ci
+
+register_hcu_ci(est_time=10, suite="stage-b-test-1-hcu-small")
+
 
 @pytest.fixture
 def collector():
@@ -106,3 +110,7 @@ def test_modern_l3_metrics_preserved(collector):
         )
         == 8
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

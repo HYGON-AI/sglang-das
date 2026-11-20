@@ -24,6 +24,7 @@ Usage (from the repository root):
     python scripts/ci/hcu/verify_hcu_registration.py
 
 Exit code 0 means the HCU registration is structurally healthy:
+    - All registered test files have CI metadata and an executable entry point.
     - At least one HCU test was collected.
     - Every HCU test belongs to a known HCU per-commit or nightly suite.
 """
@@ -45,9 +46,7 @@ def _load_ci_register():
     This avoids pulling in the full sglang runtime (tqdm, torch, ...) just
     to run a static AST-based check.
     """
-    path = os.path.join(
-        REPO_ROOT, "python", "sglang", "test", "ci", "ci_register.py"
-    )
+    path = os.path.join(REPO_ROOT, "python", "sglang", "test", "ci", "ci_register.py")
     spec = importlib.util.spec_from_file_location("hcu_ci_register", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Cannot load ci_register from {path}")
@@ -123,13 +122,13 @@ def main() -> int:
     registered_dir = os.path.join(test_dir, "registered")
     files = [
         f
-        for f in glob.glob(
-            os.path.join(registered_dir, "**", "*.py"), recursive=True
-        )
+        for f in glob.glob(os.path.join(registered_dir, "**", "*.py"), recursive=True)
         if not f.endswith(("conftest.py", "__init__.py"))
     ]
 
-    tests = collect_tests(files, sanity_check=False)
+    # Match run_suite.py: it validates the entire directory before filtering
+    # by backend, suite, or --include-file. Fail here before starting GPU jobs.
+    tests = collect_tests(files, sanity_check=True)
     hcu_tests = [t for t in tests if t.backend == HWBackend.HCU]
 
     print(f"Collected {len(hcu_tests)} HCU registered test file(s):")
@@ -151,8 +150,7 @@ def main() -> int:
     ]
     if unknown_suites:
         print(
-            "ERROR: HCU tests reference suites that are not declared in "
-            "run_suite.py:",
+            "ERROR: HCU tests reference suites that are not declared in run_suite.py:",
             file=sys.stderr,
         )
         for s in unknown_suites:

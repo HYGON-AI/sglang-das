@@ -9,6 +9,9 @@ from sglang.srt.layers.layer_boundary.factories import _resolve_ffn
 from sglang.srt.layers.layer_boundary.layout import SumGroup, TokenAxis
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.test.boundary_fixtures import parallel_of, planning
+from sglang.test.ci.ci_register import register_hcu_ci
+
+register_hcu_ci(est_time=10, suite="stage-b-test-1-hcu-small")
 
 
 @pytest.mark.parametrize(
@@ -36,3 +39,7 @@ def test_aligned_rows_keep_the_moe_sum(
     if aligned:
         assert not contract.output.may_reduce_scatter
         assert not contract.output.may_reduce_scatterv
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

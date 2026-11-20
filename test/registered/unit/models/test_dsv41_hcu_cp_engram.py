@@ -46,16 +46,20 @@ def test_engram_global_history_then_rank_local_hashes(hcu, cp):
     # Unequal request lengths and an execution-padding suffix, like a real P batch.
     lengths = [13, 8]
     live, padded = sum(lengths), 24
-    ids = torch.cat((torch.arange(1, live + 1), torch.zeros(padded-live, dtype=torch.long)))
+    ids = torch.cat(
+        (torch.arange(1, live + 1), torch.zeros(padded - live, dtype=torch.long))
+    )
     batch = SimpleNamespace(
         input_ids=ids,
-        positions=torch.tensor(list(range(13)) + list(range(8)) + [0]*3),
+        positions=torch.tensor(list(range(13)) + list(range(8)) + [0] * 3),
         forward_mode=ForwardMode.EXTEND,
         req_pool_indices=torch.tensor([0, 2]),
         extend_seq_lens=torch.tensor(lengths),
         extend_seq_lens_cpu=lengths,
         extend_start_loc=torch.tensor([0, 13]),
-        out_cache_loc=torch.cat((torch.arange(1, live+1), torch.zeros(3, dtype=torch.long))),
+        out_cache_loc=torch.cat(
+            (torch.arange(1, live + 1), torch.zeros(3, dtype=torch.long))
+        ),
         engram_history=None,
         # Legacy HCU round-robin metadata deliberately has no total token count.
         attn_cp_metadata=SimpleNamespace(total_seq_lens=0 if hcu else padded),
@@ -73,19 +77,25 @@ def test_engram_global_history_then_rank_local_hashes(hcu, cp):
 
         embed.layer_hash_index = 0
         layer = SimpleNamespace(
-            engram=embed, hc_cfg=None,
+            engram=embed,
+            hc_cfg=None,
             forward_hc_pre_from_prev=lambda **kwargs: kwargs["state"],
         )
         model = SimpleNamespace(
             decoder_replay_tail=None,
-            pp_group=SimpleNamespace(world_size=1), engram_hasher=hasher,
-            late_layer_start=None, start_layer=0, end_layer=1, layers=[layer],
+            pp_group=SimpleNamespace(world_size=1),
+            engram_hasher=hasher,
+            late_layer_start=None,
+            start_layer=0,
+            end_layer=1,
+            layers=[layer],
             config=SimpleNamespace(model_type="deepseek_v41", vision_n_layers=0),
         )
         local_ids = ids[rank::cp_size]
         with ExitStack() as stack:
             for name, value in {
-                "_is_hcu": hcu, "_is_hip": False,
+                "_is_hcu": hcu,
+                "_is_hip": False,
             }.items():
                 stack.enter_context(patch.object(model_module, name, value))
             for name, value in {
@@ -93,16 +103,30 @@ def test_engram_global_history_then_rank_local_hashes(hcu, cp):
                 "dsa_use_prefill_cp": cp and hcu,
                 "is_in_breakable_cuda_graph": False,
                 "check_cuda_graph_backend": True,
-                "get_parallel": SimpleNamespace(attn_cp_rank=rank, attn_cp_size=cp_size),
+                "get_parallel": SimpleNamespace(
+                    attn_cp_rank=rank, attn_cp_size=cp_size
+                ),
                 "get_forward": SimpleNamespace(sp_active=False),
             }.items():
-                stack.enter_context(patch.object(model_module, name, return_value=value))
+                stack.enter_context(
+                    patch.object(model_module, name, return_value=value)
+                )
             stack.enter_context(patch.object(model_module.mhc, "HcState", _State))
             model_module.DeepseekV4Model._forward_layers_hc_pre_from_prev(
-                model, batch.positions[rank::cp_size],
-                torch.zeros((len(local_ids), 2, 4)), batch,
-                local_ids, local_ids, False, [], None,
+                model,
+                batch.positions[rank::cp_size],
+                torch.zeros((len(local_ids), 2, 4)),
+                batch,
+                local_ids,
+                local_ids,
+                False,
+                [],
+                None,
             )
         torch.testing.assert_close(captured["hashes"], expected[rank::cp_size, 0])
         torch.testing.assert_close(hasher.history, reference.history)
         assert captured["cp_all_tokens"] == cp
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

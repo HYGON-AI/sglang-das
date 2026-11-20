@@ -10,6 +10,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.test.ci.ci_register import register_hcu_ci
+
+register_hcu_ci(est_time=10, suite="stage-b-test-1-hcu-small")
+
 ROOT = Path(__file__).parents[4]
 
 
@@ -125,3 +129,7 @@ def test_fp8_descale_expansion_preserves_calibration(scale):
     out = ns["_as_descale"](scale)
     torch.testing.assert_close(out, scale.expand(3, 2))
     assert out.is_contiguous()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

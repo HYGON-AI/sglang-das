@@ -1171,6 +1171,7 @@ class UnifiedMambaPool(MambaPool):
         else:
             self.mamba_cache = self.State(conv=list(conv_views), temporal=temporal_view)
 
+        self._init_layer_caches()
         self.mem_usage = unified_buffer.total_bytes / GB
         logger.info(
             "[unified-memory-pool] UnifiedMambaPool(%s) wrapped unified buffer: max_slots=%d, "
