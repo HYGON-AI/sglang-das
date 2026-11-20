@@ -1152,18 +1152,22 @@ class Envs:
     # Gather the packed FP8 DSV4 KV cache into a temporary BF16 workspace before
     # invoking the existing HCU FlashMLA sparse-decode kernel for decode,
     # target verify, and draft extend. Ordinary prefill keeps its original path.
-    SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA = EnvBool(False)
+    # Left unset, it only applies on HCU with an FP8 attention KV cache.
+    SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA = EnvBool(True)
     # Use the native LightOp single/dual-cache gather+upconvert kernels instead
-    # of the Triton fallback above. This switch requires the BF16 FlashMLA path.
-    SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER = EnvBool(False)
+    # of the Triton fallback above. This switch requires the BF16 FlashMLA path;
+    # left unset, a missing LightOp package falls back to the Triton gather.
+    SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER = EnvBool(True)
     # Deduplicate the LightOp gather across queries that select the same KV
     # location (MTP verify / draft-extend tokens of one request share most of
     # their SWA/C128/C4 rows): each location is upconverted once and duplicate
-    # rows point their compact index at it. Requires the LightOp gather above.
-    SGLANG_DSV4_HCU_BF16_GATHER_DEDUP = EnvBool(False)
+    # rows point their compact index at it. Only takes effect with the LightOp
+    # gather above (i.e. FP8 KV cache); left unset, it is skipped silently otherwise.
+    SGLANG_DSV4_HCU_BF16_GATHER_DEDUP = EnvBool(True)
     # Upper bound on query tokens for the dedup path; larger verify/draft
-    # batches keep the plain gather to avoid owner-table atomic contention.
-    SGLANG_DSV4_HCU_BF16_GATHER_DEDUP_MAX_QUERIES = EnvInt(1024)
+    # batches keep the plain gather. Measured >=2x faster up to 8192 queries
+    # (bench_dsv4_gather_dedup.py, 4 verify tokens); untested beyond that.
+    SGLANG_DSV4_HCU_BF16_GATHER_DEDUP_MAX_QUERIES = EnvInt(8192)
     SGLANG_HACK_SKIP_FP4_FP8_GEMM = EnvBool(False)
     SGLANG_LIGHTOP_TOPK = EnvBool(False)
     SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN = EnvBool(False)

@@ -1658,11 +1658,21 @@ class DeepseekV4AttnBackend(
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
+        flashmla_explicit = envs.SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA.is_set()
+        lightop_explicit = envs.SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER.is_set()
         self._dsv4_bf16_flashmla_decode = envs.SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA.get()
+        if not flashmla_explicit and (
+            not _is_hcu or self.token_to_kv_pool.is_bf16_attention_kv_cache
+        ):
+            # Default-on only targets HCU with an FP8 attention KV cache.
+            self._dsv4_bf16_flashmla_decode = False
         self._dsv4_lightop_bf16_gather = (
             envs.SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER.get()
         )
+        if not lightop_explicit and not self._dsv4_bf16_flashmla_decode:
+            self._dsv4_lightop_bf16_gather = False
         self._dsv4_lightop_kvcache_op = None
+        # Persistent W4A8 compact-gather workspaces; FP8 allocates per call.
         self._dsv4_bf16_flashmla_workspaces: Dict[
             str, Tuple[torch.Tensor, torch.Tensor]
         ] = {}
@@ -1680,11 +1690,14 @@ class DeepseekV4AttnBackend(
                 "SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER requires "
                 "SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA=1"
             )
+        dedup_explicit = envs.SGLANG_DSV4_HCU_BF16_GATHER_DEDUP.is_set()
         if self._dsv4_bf16_gather_dedup and not self._dsv4_lightop_bf16_gather:
-            raise RuntimeError(
-                "SGLANG_DSV4_HCU_BF16_GATHER_DEDUP requires "
-                "SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER=1"
-            )
+            if dedup_explicit:
+                raise RuntimeError(
+                    "SGLANG_DSV4_HCU_BF16_GATHER_DEDUP requires "
+                    "SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER=1"
+                )
+            self._dsv4_bf16_gather_dedup = False
         if self._dsv4_bf16_flashmla_decode:
             if not _is_hcu:
                 raise RuntimeError(
@@ -1696,6 +1709,34 @@ class DeepseekV4AttnBackend(
                     "the DSV4 attention KV cache is already BF16"
                 )
             gather_backend = "Triton"
+            required_ops = (
+                "dsv4_gather_upconvert_k_cache_paged",
+                "dsv4_gather_upconvert_dual_k_cache_paged",
+            )
+            if self._dsv4_lightop_bf16_gather and not lightop_explicit:
+                # Default-on LightOp gather degrades to Triton without LightOp.
+                try:
+                    from lightop import op as lightop_kvcache
+
+                    missing_base = [
+                        name
+                        for name in required_ops
+                        if not hasattr(lightop_kvcache, name)
+                    ]
+                except ImportError:
+                    missing_base = ["lightop"]
+                if missing_base:
+                    if dedup_explicit and self._dsv4_bf16_gather_dedup:
+                        raise RuntimeError(
+                            "SGLANG_DSV4_HCU_BF16_GATHER_DEDUP=1 requires a LightOp "
+                            f"package; missing {', '.join(missing_base)}"
+                        )
+                    logger.warning(
+                        "LightOp lacks %s; DSV4 BF16 gather uses Triton",
+                        ", ".join(missing_base),
+                    )
+                    self._dsv4_lightop_bf16_gather = False
+                    self._dsv4_bf16_gather_dedup = False
             if self._dsv4_lightop_bf16_gather:
                 try:
                     from lightop import op as lightop_kvcache
@@ -1704,15 +1745,23 @@ class DeepseekV4AttnBackend(
                         "SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER=1 requires "
                         "a LightOp package with the DPSKV4 gather/upconvert ops"
                     ) from exc
-                required_ops = (
-                    "dsv4_gather_upconvert_k_cache_paged",
-                    "dsv4_gather_upconvert_dual_k_cache_paged",
+                dedup_ops = (
+                    "dsv4_gather_upconvert_dedup_k_cache_paged",
+                    "dsv4_gather_upconvert_dual_dedup_k_cache_paged",
                 )
+                if self._dsv4_bf16_gather_dedup and not dedup_explicit:
+                    # Default-on dedup degrades to the plain gather on older LightOp.
+                    missing_dedup = [
+                        name for name in dedup_ops if not hasattr(lightop_kvcache, name)
+                    ]
+                    if missing_dedup:
+                        logger.warning(
+                            "LightOp lacks %s; DSV4 BF16 gather dedup disabled",
+                            ", ".join(missing_dedup),
+                        )
+                        self._dsv4_bf16_gather_dedup = False
                 if self._dsv4_bf16_gather_dedup:
-                    required_ops += (
-                        "dsv4_gather_upconvert_dedup_k_cache_paged",
-                        "dsv4_gather_upconvert_dual_dedup_k_cache_paged",
-                    )
+                    required_ops += dedup_ops
                 missing_ops = [
                     name for name in required_ops if not hasattr(lightop_kvcache, name)
                 ]
@@ -3314,6 +3363,7 @@ class DeepseekV4AttnBackend(
         self.forward_metadata = capture_metadata
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
+        # Only W4A8 keeps persistent workspaces; FP8 allocates per call.
         if (
             self._dsv4_compact_gather_enabled
             and self._dsv4_bf16_flashmla_decode
@@ -3322,7 +3372,7 @@ class DeepseekV4AttnBackend(
             self._allocate_dsv4_bf16_flashmla_workspace(
                 "swa", max_num_tokens, ceil_align(SWA_WINDOW, PAGE_INDEX_ALIGNED_SIZE)
             )
-        if self._dsv4_bf16_flashmla_decode:
+        if self._dsv4_compact_gather_enabled and self._dsv4_bf16_flashmla_decode:
             self._allocate_dsv4_bf16_flashmla_workspace(
                 "combined",
                 max_num_tokens,
@@ -5442,13 +5492,25 @@ class DeepseekV4AttnBackend(
         num_queries: int,
         topk: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self._dsv4_compact_gather_enabled:
+            # Per-call temporaries: eager returns them to the caching allocator,
+            # capture draws them from the shared graph pool. A persistent buffer
+            # cannot be resized once a graph holds its address.
+            return (
+                torch.empty(
+                    (num_queries, topk, 1, 512),
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                ),
+                torch.empty(
+                    (num_queries, 1, topk), dtype=torch.int32, device=self.device
+                ),
+            )
         self._allocate_dsv4_bf16_flashmla_workspace(slot, num_queries, topk)
         workspace = self._dsv4_bf16_flashmla_workspaces.get(slot)
         if workspace is None:
             raise RuntimeError("DSV4 BF16 FlashMLA gather workspace is unavailable")
         gathered_kv, compact_indices = workspace
-        if not self._dsv4_compact_gather_enabled:
-            return gathered_kv[:num_queries], compact_indices[:num_queries]
         # Flatten before taking the smaller shape: slicing only the topk
         # axis would retain the larger page stride and change the cache ABI.
         elements = num_queries * topk
@@ -5616,8 +5678,9 @@ class DeepseekV4AttnBackend(
         self, forward_batch: ForwardBatch, num_queries: int
     ) -> bool:
         # Plain decode has one query per request, so there is (almost) nothing
-        # to share and the claim pass would be pure overhead. Bound verify/draft
-        # batches to limit owner-table contention; ordinary prefill is excluded.
+        # to share and the claim pass would be pure overhead. Verify/draft
+        # batches above the measured range keep the plain gather; ordinary
+        # prefill is excluded.
         if not self._dsv4_bf16_gather_dedup:
             return False
         if num_queries > self._dsv4_bf16_gather_dedup_max_queries:
