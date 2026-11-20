@@ -1427,6 +1427,12 @@ class TestPrefillResultPolling(CustomTestCase):
 
 
 class TestPrefillPageIndexPrefetch(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        topology = published_topology(pp_size=1)
+        topology.__enter__()
+        self.addCleanup(topology.__exit__, None, None, None)
+
     def _fixture(self, dtype=torch.int32):
         req = Req("cached-pages", "", [1, 2, 3, 4], SamplingParams())
         req.kv.req_pool_idx = 0
@@ -1434,7 +1440,7 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
         req.extend_end = 4
         req.disagg_decode_prefix_len = 0
         raw = torch.tensor([[40, 44, 48, 52]], dtype=dtype)
-        pool = type("Pool", (), {})()
+        pool = type("Pool", (), {"request_window": None})()
         scheduler = SimpleNamespace(
             enable_overlap=True,
             enable_staging=False,
@@ -1463,6 +1469,7 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
             patch(module + "get_parallel", return_value=SimpleNamespace(enable_cp_cache_layer_split=True)),
             patch(module + "get_memory", return_value=SimpleNamespace(enable_unified_memory=memory.get("unified", False))),
             patch(module + "DeepSeekV4TokenToKVPool", type(pool)),
+            patch(module + "uses_draft_swa_ring", return_value=memory.get("draft_ring", False)),
             patch(module + "torch.empty_like", side_effect=allocate),
         ):
             SchedulerDisaggregationPrefillMixin.prefetch_disagg_page_indices(scheduler, req)
@@ -1499,6 +1506,23 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
                 self.assertEqual(self._pages(scheduler, req, 0, 4).tolist(), [20, 24])
                 self.assertEqual(self._pages(scheduler, req, 2, 4, swa=True).tolist(), [28])
                 self.assertEqual(req.disagg_page_indices["host"].dtype, torch.int64)
+
+    def test_request_window_full_and_paged_draft_swa_values(self):
+        for dtype in (torch.int32, torch.int64):
+            for window_size in (1, 2, 3, 8):
+                for decode_prefix in (0, 2, 4):
+                    with self.subTest(dtype=dtype, window=window_size, prefix=decode_prefix):
+                        scheduler, req, raw, pool = self._fixture(dtype)
+                        pool.request_window = object()
+                        pool.sliding_window = window_size
+                        scheduler.sliding_window_size = None
+                        req.disagg_decode_prefix_len = decode_prefix
+                        self._prefetch(scheduler, req, pool)
+                        self.assertIsNotNone(req.disagg_page_indices)
+                        self.assertEqual(self._pages(scheduler, req, 0, 4).tolist(), [20, 24])
+                        start = max(decode_prefix, 4 - window_size) // 2 * 2
+                        expected = ((raw[0, start:4:2] + 8) // 2).tolist()
+                        self.assertEqual(self._pages(scheduler, req, start, 4, swa=True).tolist(), expected)
 
     def test_out_of_range_and_changed_slot_fall_back(self):
         scheduler, req, raw, pool = self._fixture()
@@ -1549,9 +1573,19 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
         self.assertEqual(old.tolist(), [20, 24])
 
     def test_chunk_sequence_sends_all_pages_without_blocking_fallback(self):
+        self._check_chunk_sequence_sends_all_pages_without_blocking_fallback(False)
+
+    def test_request_window_chunk_sequence_preserves_pages_and_source_event(self):
+        self._check_chunk_sequence_sends_all_pages_without_blocking_fallback(True)
+
+    def _check_chunk_sequence_sends_all_pages_without_blocking_fallback(self, request_window):
         from sglang.srt.disaggregation.base.conn import StateType
 
         scheduler, req, raw, pool = self._fixture()
+        if request_window:
+            pool.request_window = object()
+            pool.sliding_window = 2
+            scheduler.sliding_window_size = None
         req.prefix_len = 0
         req.origin_input_ids = list(range(8))
         scheduler.req_to_token_pool.req_to_token = torch.arange(40, 72, 4).reshape(1, 8)
@@ -1572,7 +1606,10 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
         )
         req.disagg_kv_sender = sender
         module = "sglang.srt.disaggregation.prefill."
-        with patch(module + "kv_to_page_indices", side_effect=AssertionError("blocking page fallback")):
+        with (
+            patch(module + "kv_to_page_indices", side_effect=AssertionError("blocking page fallback")),
+            patch(module + "uses_draft_swa_ring", return_value=False),
+        ):
             for end in (3, 6, 8):
                 req.extend_end = end
                 self._prefetch(scheduler, req, pool)
@@ -1596,7 +1633,7 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
         sender.set_source_event.assert_not_called()
 
     def test_guarded_paths_do_not_allocate(self):
-        for mode in ("staging", "no-overlap", "pending", "unified", "request-window", "unified-kv"):
+        for mode in ("staging", "no-overlap", "pending", "unified", "request-window-ring", "unified-kv"):
             with self.subTest(mode=mode):
                 scheduler, req, raw, pool = self._fixture()
                 if mode == "staging":
@@ -1605,11 +1642,11 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
                     scheduler.enable_overlap = False
                 elif mode == "pending":
                     req.pending_bootstrap = True
-                elif mode == "request-window":
+                elif mode == "request-window-ring":
                     pool.request_window = object()
                 elif mode == "unified-kv":
                     pool._unified_kv = True
-                self._prefetch(scheduler, req, pool, unified=mode == "unified")
+                self._prefetch(scheduler, req, pool, unified=mode == "unified", draft_ring=mode == "request-window-ring")
                 self.assertIsNone(req.disagg_page_indices)
 
     def test_retraction_clears_prefetched_mapping(self):
@@ -1657,7 +1694,8 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
                     _components_tuple=(comp,),
                     tree_core=SimpleNamespace(is_eagle=False), page_size=2,
                     insert=lambda params: SimpleNamespace(
-                        rotation_tail_declined=False, prefix_len=dedup_len),
+                        rotation_tail_declined=False, prefix_len=dedup_len,
+                        last_device_node=1),
                     _match_tree=lambda params: SimpleNamespace(last_device_node=1),
                     path_device_indices=lambda node: canonical,
                     unlock=Mock(), lock=lambda *args, **kwargs: object(),

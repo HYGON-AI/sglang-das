@@ -230,6 +230,9 @@ _is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
+_HCU_ENCODER_PREFILL_VALIDATION_STEPS = int(
+    os.getenv("SGLANG_HCU_ENCODER_PREFILL_VALIDATION_STEPS", "0")
+)
 
 SWA_WINDOW = 128
 DEFAULT_INDEX_TOPK = 512
@@ -346,6 +349,43 @@ def _should_use_sparse_prefill(
         not _is_sm120
         and (allow_cp or not dsa_use_prefill_cp(forward_batch) or explicit_cp_override)
         and (q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD or sparse_prefill_enabled)
+    )
+
+
+
+def _validate_hcu_sparse_prefill_result(actual, reference, query_pos):
+    """Bounded debug-only comparison; never cast a whole 32K chunk to FP32."""
+    assert actual.shape == reference.shape
+    assert query_pos.shape == (actual.shape[0],)
+    max_abs = 0.0
+    real_rows = 0
+    for start in range(0, actual.shape[0], 128):
+        stop = min(start + 128, actual.shape[0])
+        valid = query_pos[start:stop] >= 0
+        actual_rows = actual[start:stop][valid]
+        reference_rows = reference[start:stop][valid]
+        torch.testing.assert_close(actual_rows, reference_rows, rtol=0.02, atol=0.02)
+        real_rows += actual_rows.shape[0]
+        if actual_rows.numel():
+            delta = actual_rows.float()
+            delta.sub_(reference_rows).abs_()
+            max_abs = max(max_abs, delta.max().item())
+            del delta
+        del actual_rows, reference_rows
+    return max_abs, real_rows
+
+
+def _request_window_allows_sparse_prefill(pool, forward_batch, core_metadata) -> bool:
+    if pool.request_window is None:
+        return True
+    # HCU LayerSplit keeps the SWA workspace in global token order, while the
+    # already-reindexed metadata supplies this rank's query rows. Other replay
+    # paths retain paged attention until they have the same read-side contract.
+    return (
+        _is_hcu
+        and is_cp_cache_layer_split_deepseek_v4_pool(pool)
+        and dsa_use_prefill_cp(forward_batch)
+        and core_metadata.request_window_layout is not None
     )
 
 
@@ -2213,6 +2253,7 @@ class DeepseekV4AttnBackend(
         self.tail_forward_metadata = self._build_late_layer_tail_metadata(
             forward_batch, legacy_cp=True
         )
+        self._prevalidate_cp_request_window_history(forward_batch, tail=True)
 
     def _skips_late_layers(self, forward_batch: ForwardBatch) -> bool:
         """Whether this extend stops at the last kv_source layer.
@@ -3286,6 +3327,51 @@ class DeepseekV4AttnBackend(
         )
 
         self._activate_request_window()
+        self._prevalidate_cp_request_window_history(forward_batch)
+
+    def _prevalidate_cp_request_window_history(
+        self, forward_batch: ForwardBatch, *, tail: bool = False
+    ) -> None:
+        pool = self.token_to_kv_pool
+        if not (
+            _is_hcu
+            and self.is_dsv41
+            and is_cp_cache_layer_split_deepseek_v4_pool(pool)
+            and pool.request_window is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return
+        # Legacy HCU CP attaches attn_cp_metadata inside model.forward(), after
+        # this planning hook. Use the already-sharded pool and extend mode here,
+        # as maybe_prepare_cp_cache_layer_split_forward does, rather than a
+        # predicate that depends on those later query-split metadata.
+        # The legacy CP tail is rebuilt inside model input preparation, still
+        # before any model layer runs. Validate late-owned history there against
+        # its own layout, avoiding host synchronization midway through the model.
+        stop = (
+            self.model_runner.model.model.late_layer_start
+            if self.enable_decoder_swa_bounded_replay
+            else None
+        )
+        if tail:
+            if stop is None or self.tail_forward_metadata is None:
+                return
+            layers = [
+                local
+                for global_id, local in pool._swa_global_to_local.items()
+                if global_id >= stop
+            ]
+            pool.request_window.prevalidate_pending_history(
+                self.tail_forward_metadata.core_attn_metadata.request_window_layout,
+                layers,
+            )
+            return
+        layers = [
+            local
+            for global_id, local in pool._swa_global_to_local.items()
+            if stop is None or global_id < stop
+        ]
+        pool.request_window.prevalidate_history(layers)
 
     def _activate_request_window(self) -> None:
         if self.token_to_kv_pool.request_window is not None:
@@ -3370,7 +3456,7 @@ class DeepseekV4AttnBackend(
         # Reject undersized query buffers before accessing attention metadata.
         request_layout = core_attn_metadata.request_window_layout
         assert tail is None or request_layout is not None
-        if request_layout is not None:
+        if request_layout is not None and not cp_active:
             request_layout = request_layout.leading_rows(num_qo_tokens)
         seq_lens_cpu_list = seq_lens_cpu.tolist()
         total_swa = sum(
@@ -3383,8 +3469,7 @@ class DeepseekV4AttnBackend(
         # HCU CP needs physical/real lengths split so dummy rows cannot alias a
         # request's C4/C128 workspace. Keep the device-side metadata path HCU-only.
         query_pos = core_attn_metadata.seq_lens_casual[:num_qo_tokens] - 1
-        if request_layout is not None:
-            assert not cp_active
+        if request_layout is not None and not cp_active:
             query_pos = request_layout.pos.to(torch.int32)
         if query_pos.shape[0] < num_qo_tokens:
             query_pos = _pad_tensor_to_size(query_pos, num_qo_tokens, value=0)
@@ -3436,10 +3521,19 @@ class DeepseekV4AttnBackend(
             seq_lens_cpu=seq_lens_cpu_list,
             total_swa=total_swa,
             request_window_layout=request_layout,
+            request_window_indices=(
+                core_attn_metadata.swa_page_indices[:num_qo_tokens, :SWA_WINDOW]
+                if request_layout is not None and cp_active
+                else None
+            ),
+            request_window_lengths=(
+                core_attn_metadata.swa_topk_lengths[:num_qo_tokens]
+                if request_layout is not None and cp_active
+                else None
+            ),
             compact_seq_lens_cpu=(
                 tuple(seq_lens_cpu_list)
                 if self.is_dsv41
-                and request_layout is None
                 and _use_dsv41_compact_sparse_prefill_workspace(forward_batch)
                 else None
             ),
@@ -6484,12 +6578,14 @@ class DeepseekV4AttnBackend(
             if forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
                 if (
                     self.forward_metadata.late_layer_tail is None
-                    and token_to_kv_pool.request_window is None
+                    and _request_window_allows_sparse_prefill(
+                        token_to_kv_pool, forward_batch, core_attn_metadata
+                    )
                     and _should_use_sparse_prefill(
                         q, forward_batch, allow_cp=self.is_dsv41
                     )
                 ):
-                    return self._forward_prefill_sparse(
+                    result = self._forward_prefill_sparse(
                         q=q,
                         layer_id=layer_id,
                         compress_ratio=compress_ratio,
@@ -6498,6 +6594,56 @@ class DeepseekV4AttnBackend(
                         core_attn_metadata=core_attn_metadata,
                         attn_sink=attn_sink,
                     )
+                    # Optional bounded correctness audit, disabled by default.
+                    # The budget must be exhausted during warmup, before timing.
+                    remaining = getattr(
+                        self,
+                        "_hcu_encoder_sparse_validate_remaining",
+                        _HCU_ENCODER_PREFILL_VALIDATION_STEPS,
+                    )
+                    if remaining > 0 and token_to_kv_pool.request_window is not None:
+                        reference = self._forward_flash_mla_prefill(
+                            q=q,
+                            swa_k_cache=swa_k_cache,
+                            swa_page_indices=swa_page_indices,
+                            swa_topk_lengths=swa_topk_lengths,
+                            flashmla_metadata=flashmla_metadata,
+                            attn_sink=attn_sink,
+                            extra_k_cache=extra_k_cache,
+                            extra_indices=extra_indices,
+                            extra_topk_lengths=extra_topk_lengths,
+                            forward_batch=forward_batch,
+                            compress_ratio=compress_ratio,
+                            layer_id=layer_id,
+                        )
+                        try:
+                            max_abs, real_rows = _validate_hcu_sparse_prefill_result(
+                                result,
+                                reference,
+                                self.forward_metadata.sparse_prefill_cache.query_pos,
+                            )
+                        except AssertionError:
+                            logger.exception(
+                                "HCU encoder sparse-prefill numerical FAILURE: "
+                                "rank=%d layer=%d ratio=%d shape=%s",
+                                get_parallel().attn_cp_rank,
+                                layer_id,
+                                compress_ratio,
+                                tuple(result.shape),
+                            )
+                            raise
+                        self._hcu_encoder_sparse_validate_remaining = remaining - 1
+                        logger.info(
+                            "HCU encoder sparse-prefill numerical check: "
+                            "rank=%d layer=%d ratio=%d rows=%d max_abs=%.6g remaining=%d",
+                            get_parallel().attn_cp_rank,
+                            layer_id,
+                            compress_ratio,
+                            real_rows,
+                            max_abs,
+                            remaining - 1,
+                        )
+                    return result
                 return self._forward_flash_mla_prefill(
                     q=q,
                     swa_k_cache=swa_k_cache,
@@ -6547,9 +6693,11 @@ class DeepseekV4AttnBackend(
 
         compact_workspace = (
             self.is_dsv41
-            and core_attn_metadata.request_window_layout is None
             and _use_dsv41_compact_sparse_prefill_workspace(forward_batch)
         )
+        # RequestWindow changes the SWA gather, not compressed logical rows.
+        # Its explicit SWA indices share a global suffix (zero per-request
+        # offsets), which the TopK packer rebases together with compressed rows.
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is not None and (
             (getattr(cache, "compact_seq_lens_cpu", None) is not None)

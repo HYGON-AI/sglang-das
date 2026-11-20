@@ -2847,10 +2847,11 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             return
         pool = self.token_to_kv_pool_allocator.get_kvcache()
+        request_window = getattr(pool, "request_window", None)
         if (
             not isinstance(pool, DeepSeekV4TokenToKVPool)
-            or getattr(pool, "request_window", None) is not None
             or getattr(pool, "_unified_kv", False)
+            or (request_window is not None and uses_draft_swa_ring())
         ):
             return
         page_size = self.token_to_kv_pool_allocator.page_size
@@ -2863,8 +2864,16 @@ class SchedulerDisaggregationPrefillMixin:
         pages = full_pages
         window_start = None
         if end == len(req.origin_input_ids):
+            # HCU encoder replay still transfers the draft's paged SWA through
+            # full-to-SWA. The target RequestWindow is a separate request-state
+            # payload; its ring indices must not be placed in this page snapshot.
+            window_size = (
+                self.sliding_window_size
+                if request_window is None
+                else pool.sliding_window
+            )
             window_start = max(
-                req.disagg_decode_prefix_len, end - self.sliding_window_size
+                req.disagg_decode_prefix_len, end - window_size
             )
             window_start = window_start // page_size * page_size
             swa = self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(

@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.cp_cache_layer_split.staging import (
     contiguous_request_page_capacity,
     remap_indices_to_staging,
     remap_page_table_to_staging,
+    request_window_page_capacity,
 )
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
@@ -629,25 +630,40 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         swa_cache = self._batch_active_pages["swa"]
         if swa_cache.selected_pages is None:
             static_size = None
-            if (
-                _USE_STATIC_CP_LAYER_SPLIT_PAGES
-                and (read_indices is not None or read_token_capacity is not None)
-                and num_reqs is not None
-                and getattr(self, "request_window", None) is None
-            ):
-                static_size = contiguous_request_page_capacity(
-                    read_indices.numel() if read_indices is not None else read_token_capacity,
-                    num_reqs,
+            window = getattr(self, "request_window", None)
+            if window is not None and window.layout is not None:
+                # Sparse prefill dequantizes the dense RequestWindow span from
+                # row 0, including history rows masked by all queries. Plan the
+                # full span on the first layer, before the sparse cache exists.
+                page_count = request_window_page_capacity(
+                    window.layout.size, page_size, max_pages
+                )
+                swa_cache.static_selected_pages = False
+                swa_cache.selected_pages = torch.arange(
+                    page_count, dtype=torch.int64, device=indices.device
+                )
+            else:
+                if (
+                    _USE_STATIC_CP_LAYER_SPLIT_PAGES
+                    and (read_indices is not None or read_token_capacity is not None)
+                    and num_reqs is not None
+                    and window is None
+                ):
+                    static_size = contiguous_request_page_capacity(
+                        read_indices.numel()
+                        if read_indices is not None
+                        else read_token_capacity,
+                        num_reqs,
+                        page_size,
+                        max_pages,
+                    )
+                swa_cache.static_selected_pages = static_size is not None
+                swa_cache.selected_pages = self._active_pages_for_indices(
+                    read_indices if read_indices is not None else indices,
                     page_size,
                     max_pages,
+                    static_size,
                 )
-            swa_cache.static_selected_pages = static_size is not None
-            swa_cache.selected_pages = self._active_pages_for_indices(
-                read_indices if read_indices is not None else indices,
-                page_size,
-                max_pages,
-                static_size,
-            )
             swa_cache.remapped = remap_indices_to_staging(
                 indices,
                 swa_cache.selected_pages,
@@ -856,7 +872,6 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             _USE_STATIC_CP_LAYER_SPLIT_PAGES
             and (read_indices is not None or read_token_capacity is not None)
             and num_reqs is not None
-            and getattr(self, "request_window", None) is None
         ):
             static_size = contiguous_request_page_capacity(
                 read_indices.numel() if read_indices is not None else read_token_capacity,
