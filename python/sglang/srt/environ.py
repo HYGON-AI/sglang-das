@@ -1205,6 +1205,10 @@ class Envs:
     # HCU W4A8 normal/auto: use low-latency MoE for CP bounded tails that fit.
     SGLANG_HCU_DSV41_TAIL_MOE_LOW_LATENCY = EnvBool(False)
     SGLANG_HCU_DSV41_TAIL_MOE_CUDA_GRAPH = EnvBool(False)
+    # Capture CP8 pre-tail and bounded SWA tail MegaMoE layers with live eager
+    # attention/routing while preserving --enable-decoder-swa-bounded-replay.
+    SGLANG_HCU_BOUNDED_PREFIX_BCG = EnvInt(0)
+    SGLANG_HCU_BOUNDED_PREFIX_BCG_LOG_REPLAYS = EnvBool(False)
     # With --enable-decoder-swa-bounded-replay: a chunked-prefill step in which every
     # request still has at least SWA_WINDOW prompt tokens after this chunk stops at
     # the last kv_source layer. Nothing reads the later layers' rows of such a chunk.

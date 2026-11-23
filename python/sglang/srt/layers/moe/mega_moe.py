@@ -37,8 +37,11 @@ from sglang.srt.layers.moe.mega_moe_sm90 import (
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.models.deepseek_common.utils import _device_sm
-from sglang.srt.runtime_context import get_disagg, get_exec
+from sglang.srt.runtime_context import get_disagg, get_exec, get_forward
 from sglang.srt.utils import is_hcu, is_hip, is_sm100_supported
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 
@@ -651,6 +654,64 @@ def forward_mega_moe(
     return y
 
 
+_PREFIX_GRAPH_EXPERTS = _is_hcu and envs.SGLANG_HCU_BOUNDED_PREFIX_BCG.get() > 0
+
+
+def _mega_topk(moe, hidden_states, forward_batch, input_ids_global):
+    router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
+    topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
+    num_token_non_padded = (
+        forward_batch.moe_num_token_non_padded()
+        if forward_batch is not None
+        else None
+    )
+    dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
+    if (
+        not moe.is_hash
+        and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None
+    ):
+        topk_output = vision_topk(
+            moe,
+            router_logits,
+            input_ids_global,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=dispatch_info,
+        )
+    else:
+        topk_output = moe.topk(
+            hidden_states,
+            router_logits,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=dispatch_info,
+            **topk_kwargs,
+        )
+    return topk_output.topk_ids, topk_output.topk_weights
+
+
+def _prefix_topk_stub(runner, moe, x):
+    return tuple(
+        x.new_empty((x.shape[0], *dims), dtype=dtype)
+        for dims, dtype in moe._prefix_topk_spec
+    )
+
+
+@eager_on_graph(capture_stub=_prefix_topk_stub)
+def _prefix_topk(runner, moe, x):
+    live_rows = getattr(runner, "live_rows", None)
+    if live_rows is not None and live_rows < x.shape[0]:
+        ids_live, w_live = _mega_topk(
+            moe, x[:live_rows], runner.forward_batch, runner.global_ids
+        )
+        # Fill padded rows with valid distinct expert IDs (from row 0) and zero
+        # weights so MegaMoE never sees duplicate expert-0 IDs on a single token.
+        ids = ids_live[:1].expand(x.shape[0], *ids_live.shape[1:]).contiguous()
+        w = w_live.new_zeros((x.shape[0], *w_live.shape[1:]))
+        ids[:live_rows].copy_(ids_live)
+        w[:live_rows].copy_(w_live)
+        return ids, w
+    return _mega_topk(moe, x, runner.forward_batch, runner.global_ids)
+
+
 def _run_mega_routed(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
@@ -661,35 +722,18 @@ def _run_mega_routed(
     hidden_size = moe.config.hidden_size
 
     if num_tokens > 0:
-        router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
-        topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
-        num_token_non_padded = (
-            forward_batch.moe_num_token_non_padded()
-            if forward_batch is not None
-            else None
-        )
-        dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
-        if (
-            not moe.is_hash
-            and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None
-        ):
-            topk_output = vision_topk(
-                moe,
-                router_logits,
-                input_ids_global,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=dispatch_info,
-            )
+        prefix = get_forward().dsv41_tail_graph_runner if _PREFIX_GRAPH_EXPERTS else None
+        if prefix is not None and getattr(prefix, "capture_experts", False):
+            topk_ids, topk_weights = _prefix_topk(prefix, moe, hidden_states)
         else:
-            topk_output = moe.topk(
-                hidden_states,
-                router_logits,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=dispatch_info,
-                **topk_kwargs,
+            topk_ids, topk_weights = _mega_topk(
+                moe, hidden_states, forward_batch, input_ids_global
             )
-        topk_ids = topk_output.topk_ids
-        topk_weights = topk_output.topk_weights
+            if _PREFIX_GRAPH_EXPERTS and not hasattr(moe, "_prefix_topk_spec"):
+                # Capture only needs a bridge with the warmed router layout.
+                moe._prefix_topk_spec = tuple(
+                    (t.shape[1:], t.dtype) for t in (topk_ids, topk_weights)
+                )
     else:
         # An empty rank still joins the per-layer LPLB count all-reduce.
         if get_exec().moe.ep_dispatch_algorithm == "lp":

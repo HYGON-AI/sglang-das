@@ -39,6 +39,8 @@ from sglang.srt.models.deepseek_common.moe_transport import (
 )
 from sglang.srt.models.deepseek_v2 import MoEOutput
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE, AttnOutput
+from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import is_in_breakable_cuda_graph
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_forward, get_parallel
@@ -139,6 +141,8 @@ class NonCudaDecoderMixin:
         input_ids: torch.Tensor,
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
+        seam_open: bool = True,
+        prefix_runner=None,
     ) -> mhc.HcState:
         """The layer's two hyper-connections, each collapsing with the previous one's
         pre-mix."""
@@ -161,7 +165,10 @@ class NonCudaDecoderMixin:
                 x.shape[0], self.hc_cfg.hidden
             )
             tail_graph_runner = get_forward().dsv41_tail_graph_runner
-            if tail_graph_runner is not None:
+            if tail_graph_runner is not None or (
+                is_hcu() and is_in_breakable_cuda_graph()
+                and self.self_attn.is_dsv41 and is_cp_active(forward_batch)
+            ):
                 from sglang.srt.models.deepseek_v4 import _hcu_tail_graph_attention
 
                 y = _hcu_tail_graph_attention(
@@ -201,20 +208,26 @@ class NonCudaDecoderMixin:
             fuse_all_reduce_mhc = self._can_fuse_ffn_mhc and can_fuse_all_reduce(
                 x.shape[0], self.hc_cfg.hidden
             )
-            y = self._run_moe_ffn_dp_sync(
-                x,
-                forward_batch,
-                input_ids=input_ids,
-                input_ids_global=input_ids_global,
-                return_moe_output=fuse_all_reduce_mhc,
-            )
+            if prefix_runner is not None and not prefix_runner.capture_experts:
+                assert not fuse_all_reduce_mhc
+                from sglang.srt.models.deepseek_v4 import _prefix_moe
+
+                y = _prefix_moe(prefix_runner, self, x)
+            else:
+                y = self._run_moe_ffn_dp_sync(
+                    x,
+                    forward_batch,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                    return_moe_output=fuse_all_reduce_mhc,
+                )
             del x
             return mhc.run_moe_post(
                 self.ffn_hc,
                 y,
                 residual,
                 stats_stream=stats_stream,
-                next=self.next_boundary,
+                next=self.next_boundary if seam_open else None,
                 world_size=self.mlp.tp_size,
                 precomputed=precomputed,
             )
