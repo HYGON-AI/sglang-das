@@ -1441,6 +1441,7 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
         req.disagg_decode_prefix_len = 0
         raw = torch.tensor([[40, 44, 48, 52]], dtype=dtype)
         pool = type("Pool", (), {"request_window": None})()
+        pool.needs_paged_swa_allocator = True
         scheduler = SimpleNamespace(
             enable_overlap=True,
             enable_staging=False,
@@ -1523,6 +1524,17 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
                         start = max(decode_prefix, 4 - window_size) // 2 * 2
                         expected = ((raw[0, start:4:2] + 8) // 2).tolist()
                         self.assertEqual(self._pages(scheduler, req, start, 4, swa=True).tolist(), expected)
+
+    def test_request_window_without_paged_swa_prefetches_full_pages(self):
+        scheduler, req, _, pool = self._fixture()
+        pool.request_window = object()
+        pool.sliding_window = 2
+        pool.needs_paged_swa_allocator = False
+        scheduler.sliding_window_size = None
+        del scheduler.token_to_kv_pool_allocator.translate_swa_indices_for_transfer
+        self._prefetch(scheduler, req, pool)
+        self.assertEqual(self._pages(scheduler, req, 0, 4).tolist(), [20, 24])
+        self.assertIsNone(self._pages(scheduler, req, 2, 4, swa=True))
 
     def test_out_of_range_and_changed_slot_fall_back(self):
         scheduler, req, raw, pool = self._fixture()

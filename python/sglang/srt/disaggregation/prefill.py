@@ -2863,7 +2863,7 @@ class SchedulerDisaggregationPrefillMixin:
         # Each fresh snapshot covers [0, end), including any pending older chunk.
         pages = full_pages
         window_start = None
-        if end == len(req.origin_input_ids):
+        if end == len(req.origin_input_ids) and pool.needs_paged_swa_allocator:
             # HCU encoder replay still transfers the draft's paged SWA through
             # full-to-SWA. The target RequestWindow is a separate request-state
             # payload; its ring indices must not be placed in this page snapshot.
