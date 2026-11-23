@@ -304,9 +304,6 @@ def get_mhc_ops() -> MhcOps:
 
 logger = logging.getLogger(__name__)
 
-# Opt in only to the bounded HCU prefill experiment.
-_HCU_PREFIX_BCG = os.environ.get("SGLANG_HCU_BOUNDED_PREFIX_BCG") == "1"
-
 _HCU_PREFIX_GRAPH_EXPERTS = envs.SGLANG_HCU_BOUNDED_PREFIX_BCG.get() > 0
 _HCU_BOUNDED_TAIL_MEGA_BCG = _HCU_PREFIX_GRAPH_EXPERTS
 _FUSE_MHC_REPEAT_CP_SPLIT = envs.SGLANG_DSV4_FUSE_MHC_REPEAT_CP_SPLIT.get()
@@ -4341,20 +4338,6 @@ class DeepseekV4Model(nn.Module):
         # must not re-evaluate it, and it must stay False whenever a tail is in play.
         fused_boundary = _is_hip and _hip.fused_boundary_allowed(forward_batch, tail)
         first_layer = self.start_layer
-        if (_HCU_PREFIX_BCG and _is_hcu and cp_extend and not capture_dspark
-                and self.late_layer_start is not None and tail is not None
-                and get_exec().features.enable_decoder_swa_bounded_replay
-                and get_moe_a2a_backend().is_megamoe()
-                and not forward_batch.contains_mm_inputs()):
-            from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import HcuBoundedPrefixRunner
-            runner = getattr(self, "_bounded_prefix_runner", None)
-            if runner is None:
-                self._bounded_prefix_runner = runner = HcuBoundedPrefixRunner(self)
-            replayed = runner.run(hidden_states, positions, input_ids, input_ids_global,
-                                  hash_ids, forward_batch, tail.positions.shape[0])
-            if replayed is not None:
-                state = replayed
-                first_layer = self.late_layer_start
         if (
             _HCU_PREFIX_GRAPH_EXPERTS
             and _is_hcu
@@ -4401,6 +4384,9 @@ class DeepseekV4Model(nn.Module):
                         hidden_states, forward_batch, next=next_boundary
                     )
             if tail is not None and i == self.late_layer_start:
+                prefix_runner = getattr(self, "_bounded_expert_prefix_graph", None)
+                if prefix_runner is not None and prefix_runner.pending_capture is not None:
+                    prefix_runner.capture_pending()
                 if self.tail_writes_source_kv:
                     source = self.layers[i]
                     attn_backend.write_tail_source_kv(
@@ -4566,6 +4552,9 @@ class DeepseekV4Model(nn.Module):
             residual_batch.clear(forward_batch)
         # The last run layer may have deferred its post to the next one.
         state = state.materialized(self.layers[end_layer - 1].hc_cfg)
+        tail_runner = getattr(self, "_bounded_tail_mega_graph", None)
+        if tail_runner is not None and tail_runner.pending_capture is not None:
+            tail_runner.capture_pending()
         if end_layer < self.end_layer and capture_dspark:
             # Keep the capture list whole; these rows precede every SWA window
             # that later reads them, the DSpark draft's included.
