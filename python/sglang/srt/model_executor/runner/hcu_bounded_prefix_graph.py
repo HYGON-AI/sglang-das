@@ -39,6 +39,12 @@ _PRE_TAIL_MAX_ROWS: int = int(
 _TAIL_MAX_ROWS: int = int(
     os.environ.get("SGLANG_HCU_BOUNDED_TAIL_BCG_MAX_ROWS", "192")
 )
+# Capture new buckets on first encounter (during warmup) once MoE router specs
+# are populated, eliminating the 2nd-encounter capture jitter on live traffic.
+_EAGER_CAPTURE_ON_WARMUP: bool = (
+    os.environ.get("SGLANG_HCU_BOUNDED_PREFIX_BCG_PRECAPTURE", "1").strip().lower()
+    not in ("0", "false", "no", "off")
+)
 
 
 def _pick_row_bucket(
@@ -104,6 +110,16 @@ def _layers_support_hcu_mega_bcg(layers) -> bool:
     )
 
 
+def _layers_topk_specs_ready(layers) -> bool:
+    for layer in layers:
+        mlp = getattr(layer, "mlp", None)
+        if getattr(mlp, "experts", None) is not None and not hasattr(
+            mlp, "_prefix_topk_spec"
+        ):
+            return False
+    return True
+
+
 class HcuBoundedPrefixGraph:
     """Run CP8 pre-tail layers (0..late_layer_start) via BCG and return full-row state."""
 
@@ -124,9 +140,73 @@ class HcuBoundedPrefixGraph:
         )
         self.warmed = set()
         self.entries = {}
+        self.pending_capture = None
         self.forward_batch = self.global_ids = self.hash_ids = None
         self.live_rows: Optional[int] = None
         self.log_replays = envs.SGLANG_HCU_BOUNDED_PREFIX_BCG_LOG_REPLAYS.get()
+
+    def _capture_bucket(self, bucket_rows, live_rows, hidden, positions, ids, global_ids, batch):
+        static_hidden = torch.zeros(
+            (bucket_rows, *hidden.shape[1:]),
+            dtype=hidden.dtype,
+            device=hidden.device,
+        )
+        static_pos = torch.zeros(
+            (bucket_rows,),
+            dtype=positions.dtype,
+            device=positions.device,
+        )
+        static_hidden[:live_rows].copy_(hidden)
+        static_pos[:live_rows].copy_(positions)
+        self.live_rows = bucket_rows
+        graph = BreakableCUDAGraph()
+        torch.cuda.synchronize()
+        group = get_parallel().tp_group
+        group.barrier()
+        with graph_pool_capture_scope(), BreakableCUDAGraphCapture(
+            graph,
+            pool=torch.cuda.graph_pool_handle(),
+            stream=torch.cuda.current_stream(),
+            barrier_fn=group.barrier,
+        ):
+            result = self._forward(static_hidden, static_pos, ids, global_ids, batch)
+        self.entries[bucket_rows] = (
+            graph,
+            static_hidden,
+            static_pos,
+            result.residual,
+            result.pre,
+        )
+        if get_parallel().attn_cp_rank == 0:
+            logger.info(
+                "bounded prefix capture bucket_rows=%d live_rows=%d tokens=%d layers=%d segments=%d breaks=%d",
+                bucket_rows,
+                live_rows,
+                bucket_rows * 8,
+                self.model.late_layer_start,
+                len(graph._segments),
+                len(graph._break_fns),
+            )
+
+    def capture_pending(self):
+        pending = self.pending_capture
+        if pending is None:
+            return
+        self.pending_capture = None
+        bucket_rows, live_rows, hidden, positions, ids, global_ids, hashes, batch = pending
+        if bucket_rows in self.entries or not _layers_topk_specs_ready(
+            self.model.layers[self.model.start_layer : self.model.late_layer_start]
+        ):
+            return
+        self.forward_batch, self.global_ids, self.hash_ids = batch, global_ids, hashes
+        try:
+            with get_forward().scoped(dsv41_tail_graph_runner=self):
+                self._capture_bucket(
+                    bucket_rows, live_rows, hidden, positions, ids, global_ids, batch
+                )
+        finally:
+            self.forward_batch = self.global_ids = self.hash_ids = None
+            self.live_rows = None
 
     def run(self, hidden, positions, ids, global_ids, hashes, batch):
         if not self.supported or torch.cuda.is_current_stream_capturing():
@@ -147,60 +227,31 @@ class HcuBoundedPrefixGraph:
         key = bucket_rows
         if key not in self.entries and len(self.entries) >= len(_PRE_TAIL_BUCKETS):
             return None
-        tokens = bucket_rows * 8
 
-        # Every rank sees the same global batch shape and warms the bucket first.
+        # On first encounter of a bucket, run the real eager pass to warm all
+        # shape-dependent kernels (e.g. HC_BF16X3 / MegaMoE / hipBLASLt), then
+        # capture immediately after layer late_layer_start-1 so subsequent steps
+        # replay with zero cold-start capture jitter.
         if key not in self.warmed:
             self.warmed.add(key)
+            if _EAGER_CAPTURE_ON_WARMUP:
+                self.pending_capture = (
+                    bucket_rows, live_rows, hidden, positions, ids, global_ids, hashes, batch
+                )
+            return None
+
+        if not _layers_topk_specs_ready(
+            self.model.layers[self.model.start_layer : self.model.late_layer_start]
+        ):
             return None
 
         self.forward_batch, self.global_ids, self.hash_ids = batch, global_ids, hashes
         try:
             with get_forward().scoped(dsv41_tail_graph_runner=self):
                 if key not in self.entries:
-                    static_hidden = torch.zeros(
-                        (bucket_rows, *hidden.shape[1:]),
-                        dtype=hidden.dtype,
-                        device=hidden.device,
+                    self._capture_bucket(
+                        bucket_rows, live_rows, hidden, positions, ids, global_ids, batch
                     )
-                    static_pos = torch.zeros(
-                        (bucket_rows,),
-                        dtype=positions.dtype,
-                        device=positions.device,
-                    )
-                    static_hidden[:live_rows].copy_(hidden)
-                    static_pos[:live_rows].copy_(positions)
-                    self.live_rows = bucket_rows
-                    graph = BreakableCUDAGraph()
-                    torch.cuda.synchronize()
-                    group = get_parallel().tp_group
-                    group.barrier()
-                    with graph_pool_capture_scope(), BreakableCUDAGraphCapture(
-                        graph,
-                        pool=torch.cuda.graph_pool_handle(),
-                        stream=torch.cuda.current_stream(),
-                        barrier_fn=group.barrier,
-                    ):
-                        result = self._forward(
-                            static_hidden, static_pos, ids, global_ids, batch
-                        )
-                    self.entries[key] = (
-                        graph,
-                        static_hidden,
-                        static_pos,
-                        result.residual,
-                        result.pre,
-                    )
-                    if get_parallel().attn_cp_rank == 0:
-                        logger.info(
-                            "bounded prefix capture bucket_rows=%d live_rows=%d tokens=%d layers=%d segments=%d breaks=%d",
-                            bucket_rows,
-                            live_rows,
-                            tokens,
-                            self.model.late_layer_start,
-                            len(graph._segments),
-                            len(graph._break_fns),
-                        )
                 graph, static_hidden, static_pos, residual, pre = self.entries[key]
                 static_hidden[:live_rows].copy_(hidden)
                 static_pos[:live_rows].copy_(positions)
@@ -258,9 +309,85 @@ class HcuBoundedTailMegaGraph:
         )
         self.warmed = set()
         self.entries = {}
+        self.pending_capture = None
         self.forward_batch = self.global_ids = self.hash_ids = None
         self.live_rows: Optional[int] = None
         self.log_replays = envs.SGLANG_HCU_BOUNDED_PREFIX_BCG_LOG_REPLAYS.get()
+
+    def _capture_bucket(
+        self, bucket_rows, has_pre, live_rows, res, pre, positions, ids, global_ids, batch
+    ):
+        static_res = torch.zeros(
+            (bucket_rows, *res.shape[1:]),
+            dtype=res.dtype,
+            device=res.device,
+        )
+        static_res[:live_rows].copy_(res)
+        static_pre = None
+        if has_pre:
+            static_pre = torch.zeros(
+                (bucket_rows, *pre.shape[1:]),
+                dtype=pre.dtype,
+                device=pre.device,
+            )
+            static_pre[:live_rows].copy_(pre)
+        static_pos = torch.zeros(
+            (bucket_rows,),
+            dtype=positions.dtype,
+            device=positions.device,
+        )
+        static_pos[:live_rows].copy_(positions)
+        self.live_rows = bucket_rows
+        graph = BreakableCUDAGraph()
+        torch.cuda.synchronize()
+        group = get_parallel().tp_group
+        group.barrier()
+        with graph_pool_capture_scope(), BreakableCUDAGraphCapture(
+            graph,
+            pool=torch.cuda.graph_pool_handle(),
+            stream=torch.cuda.current_stream(),
+            barrier_fn=group.barrier,
+        ):
+            in_state = mhc.HcState(static_res, static_pre)
+            result = self._forward(in_state, static_pos, ids, global_ids, batch)
+        self.entries[(bucket_rows, has_pre)] = (
+            graph,
+            static_res,
+            static_pre,
+            static_pos,
+            result.residual,
+            result.pre,
+        )
+        if get_parallel().attn_cp_rank == 0:
+            logger.info(
+                "bounded tail mega capture bucket_rows=%d live_rows=%d layers=%d..%d segments=%d breaks=%d",
+                bucket_rows,
+                live_rows,
+                self.model.late_layer_start,
+                self.model.end_layer - 1,
+                len(graph._segments),
+                len(graph._break_fns),
+            )
+
+    def capture_pending(self):
+        pending = self.pending_capture
+        if pending is None:
+            return
+        self.pending_capture = None
+        bucket_rows, has_pre, live_rows, res, pre, positions, ids, global_ids, hashes, batch = pending
+        if (bucket_rows, has_pre) in self.entries or not _layers_topk_specs_ready(
+            self.model.layers[self.model.late_layer_start : self.model.end_layer]
+        ):
+            return
+        self.forward_batch, self.global_ids, self.hash_ids = batch, global_ids, hashes
+        try:
+            with get_forward().scoped(dsv41_tail_graph_runner=self):
+                self._capture_bucket(
+                    bucket_rows, has_pre, live_rows, res, pre, positions, ids, global_ids, batch
+                )
+        finally:
+            self.forward_batch = self.global_ids = self.hash_ids = None
+            self.live_rows = None
 
     def run(self, state, positions, ids, global_ids, hashes, batch, tail):
         if not self.supported or torch.cuda.is_current_stream_capturing():
@@ -288,65 +415,25 @@ class HcuBoundedTailMegaGraph:
             return None
         if key not in self.warmed:
             self.warmed.add(key)
+            if _EAGER_CAPTURE_ON_WARMUP:
+                self.pending_capture = (
+                    bucket_rows, has_pre, live_rows, state.residual, state.pre,
+                    positions, ids, global_ids, hashes, batch,
+                )
+            return None
+        if not _layers_topk_specs_ready(
+            self.model.layers[self.model.late_layer_start : self.model.end_layer]
+        ):
             return None
 
         self.forward_batch, self.global_ids, self.hash_ids = batch, global_ids, hashes
         try:
             with get_forward().scoped(dsv41_tail_graph_runner=self):
                 if key not in self.entries:
-                    static_res = torch.zeros(
-                        (bucket_rows, *state.residual.shape[1:]),
-                        dtype=state.residual.dtype,
-                        device=state.residual.device,
+                    self._capture_bucket(
+                        bucket_rows, has_pre, live_rows, state.residual, state.pre,
+                        positions, ids, global_ids, batch,
                     )
-                    static_res[:live_rows].copy_(state.residual)
-                    static_pre = None
-                    if has_pre:
-                        static_pre = torch.zeros(
-                            (bucket_rows, *state.pre.shape[1:]),
-                            dtype=state.pre.dtype,
-                            device=state.pre.device,
-                        )
-                        static_pre[:live_rows].copy_(state.pre)
-                    static_pos = torch.zeros(
-                        (bucket_rows,),
-                        dtype=positions.dtype,
-                        device=positions.device,
-                    )
-                    static_pos[:live_rows].copy_(positions)
-                    self.live_rows = bucket_rows
-                    graph = BreakableCUDAGraph()
-                    torch.cuda.synchronize()
-                    group = get_parallel().tp_group
-                    group.barrier()
-                    with graph_pool_capture_scope(), BreakableCUDAGraphCapture(
-                        graph,
-                        pool=torch.cuda.graph_pool_handle(),
-                        stream=torch.cuda.current_stream(),
-                        barrier_fn=group.barrier,
-                    ):
-                        in_state = mhc.HcState(static_res, static_pre)
-                        result = self._forward(
-                            in_state, static_pos, ids, global_ids, batch
-                        )
-                    self.entries[key] = (
-                        graph,
-                        static_res,
-                        static_pre,
-                        static_pos,
-                        result.residual,
-                        result.pre,
-                    )
-                    if get_parallel().attn_cp_rank == 0:
-                        logger.info(
-                            "bounded tail mega capture bucket_rows=%d live_rows=%d layers=%d..%d segments=%d breaks=%d",
-                            bucket_rows,
-                            live_rows,
-                            self.model.late_layer_start,
-                            self.model.end_layer - 1,
-                            len(graph._segments),
-                            len(graph._break_fns),
-                        )
                 graph, static_res, static_pre, static_pos, residual, pre = self.entries[
                     key
                 ]

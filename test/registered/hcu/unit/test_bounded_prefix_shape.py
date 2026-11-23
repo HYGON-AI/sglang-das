@@ -1,3 +1,4 @@
+import types
 import unittest
 
 from sglang.srt.model_executor.runner.hcu_bounded_prefix_graph import (
@@ -6,6 +7,7 @@ from sglang.srt.model_executor.runner.hcu_bounded_prefix_graph import (
     _TAIL_BUCKETS,
     _TAIL_MIN_ROWS,
     _admit_prefix_bucket,
+    _layers_topk_specs_ready,
     _pick_row_bucket,
 )
 from sglang.test.ci.ci_register import register_hcu_ci
@@ -49,7 +51,6 @@ class TestBoundedPrefixShape(unittest.TestCase):
             ),
             192,
         )
-        # Exceeds launch-bound cutoff -> eager fallback
         self.assertIsNone(
             _admit_prefix_bucket(
                 240, [32256] * 15, _TAIL_BUCKETS, min_rows=_TAIL_MIN_ROWS, max_rows=192
@@ -57,7 +58,6 @@ class TestBoundedPrefixShape(unittest.TestCase):
         )
 
     def test_cold_and_tiny_warmup_batches_stay_eager(self):
-        # Cold prefill (cached=0) must not enter bounded prefix BCG
         self.assertIsNone(
             _admit_prefix_bucket(
                 64, [0], _PRE_TAIL_BUCKETS, min_rows=_PRE_TAIL_MIN_ROWS, max_rows=512
@@ -68,7 +68,6 @@ class TestBoundedPrefixShape(unittest.TestCase):
                 64, [], _PRE_TAIL_BUCKETS, min_rows=_PRE_TAIL_MIN_ROWS, max_rows=512
             )
         )
-        # Tiny warmup request (e.g. input=16 -> live_rows=2) stays eager
         self.assertIsNone(
             _admit_prefix_bucket(
                 2, [16], _PRE_TAIL_BUCKETS, min_rows=_PRE_TAIL_MIN_ROWS, max_rows=512
@@ -90,6 +89,15 @@ class TestBoundedPrefixShape(unittest.TestCase):
         self.assertEqual(
             _pick_row_bucket(240, _PRE_TAIL_BUCKETS, max_rows=512, min_rows=32), 256
         )
+
+    def test_topk_specs_ready_gate(self):
+        dense = types.SimpleNamespace(mlp=types.SimpleNamespace())
+        moe_unwarmed = types.SimpleNamespace(mlp=types.SimpleNamespace(experts=object()))
+        moe_warmed = types.SimpleNamespace(
+            mlp=types.SimpleNamespace(experts=object(), _prefix_topk_spec=((8,), int))
+        )
+        self.assertFalse(_layers_topk_specs_ready([dense, moe_unwarmed]))
+        self.assertTrue(_layers_topk_specs_ready([dense, moe_warmed]))
 
 
 if __name__ == "__main__":
