@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
+import os
 import time
 from array import array
 from contextlib import contextmanager, nullcontext
@@ -299,6 +300,11 @@ def get_mhc_ops() -> MhcOps:
 
 logger = logging.getLogger(__name__)
 
+# Opt in only to the bounded HCU prefill experiment.
+_HCU_PREFIX_BCG = os.environ.get("SGLANG_HCU_BOUNDED_PREFIX_BCG") == "1"
+
+_HCU_PREFIX_GRAPH_EXPERTS = envs.SGLANG_HCU_BOUNDED_PREFIX_BCG.get() > 0
+_HCU_BOUNDED_TAIL_MEGA_BCG = _HCU_PREFIX_GRAPH_EXPERTS
 _FUSE_MHC_REPEAT_CP_SPLIT = envs.SGLANG_DSV4_FUSE_MHC_REPEAT_CP_SPLIT.get()
 
 
@@ -971,13 +977,45 @@ def _hcu_tail_graph_attention_stub(runner, layer, x, positions, x_quant, defer_a
 @eager_on_graph(capture_stub=_hcu_tail_graph_attention_stub)
 def _hcu_tail_graph_attention(runner, layer, x, positions, x_quant, defer_all_reduce):
     # Read the live batch at every replay, never the capture request's KV layout.
-    batch = runner.forward_batch
+    batch = (runner.forward_batch if runner is not None
+             else get_tc_piecewise_forward_context().forward_batch)
+    live_rows = getattr(runner, "live_rows", None) if runner is not None else None
+    if live_rows is not None and live_rows < x.shape[0]:
+        xq_live = (
+            tuple(t[:live_rows] for t in x_quant)
+            if isinstance(x_quant, tuple)
+            else (x_quant[:live_rows] if x_quant is not None else None)
+        )
+        with layer.maybe_use_decode_attn_tp(batch):
+            y_live = layer(
+                x=x[:live_rows], positions=positions[:live_rows], forward_batch=batch,
+                x_quant=xq_live, defer_all_reduce=defer_all_reduce,
+            )
+        y = torch.zeros_like(x)
+        y[:live_rows].copy_(y_live)
+        return y
     with layer.maybe_use_decode_attn_tp(batch):
         return layer(
             x=x, positions=positions, forward_batch=batch,
             x_quant=x_quant, defer_all_reduce=defer_all_reduce,
         )
 
+
+
+def _prefix_op_stub(runner, layer, x):
+    return torch.empty_like(x)
+
+
+@eager_on_graph(capture_stub=_prefix_op_stub)
+def _prefix_engram(runner, layer, x):
+    batch, _, _, hash_ids = runner.live_inputs
+    return layer(x, hash_ids[:, layer.layer_hash_index], batch, cp_all_tokens=True)
+
+
+@eager_on_graph(capture_stub=_prefix_op_stub)
+def _prefix_moe(runner, layer, x):
+    batch, ids, global_ids, _ = runner.live_inputs
+    return layer._run_moe_ffn_dp_sync(x, batch, input_ids=ids, input_ids_global=global_ids)
 
 
 class MqaAttentionBase(nn.Module):
@@ -3666,6 +3704,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
         seam_open: bool = True,
+        prefix_runner=None,
     ) -> mhc.HcState:
         """The layer's two hyper-connections, each collapsing with the previous one's
         pre-mix. ``seam_open`` is False when the late-layer tail narrows the rows after
@@ -3688,7 +3727,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 x.shape[0], self.hc_cfg.hidden
             )
             tail_graph_runner = get_forward().dsv41_tail_graph_runner
-            if tail_graph_runner is not None:
+            if tail_graph_runner is not None or (
+                _is_hcu and is_in_breakable_cuda_graph()
+                and self.self_attn.is_dsv41 and is_cp_active(forward_batch)
+            ):
                 y = _hcu_tail_graph_attention(
                     tail_graph_runner, self.self_attn, x, positions,
                     quantized[0] if quantized else None, fuse_all_reduce_mhc,
@@ -3726,13 +3768,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             fuse_all_reduce_mhc = self._can_fuse_ffn_mhc and can_fuse_all_reduce(
                 x.shape[0], self.hc_cfg.hidden
             )
-            y = self._run_moe_ffn_dp_sync(
-                x,
-                forward_batch,
-                input_ids=input_ids,
-                input_ids_global=input_ids_global,
-                return_moe_output=fuse_all_reduce_mhc,
-            )
+            if prefix_runner is not None and not prefix_runner.capture_experts:
+                assert not fuse_all_reduce_mhc
+                y = _prefix_moe(prefix_runner, self, x)
+            else:
+                y = self._run_moe_ffn_dp_sync(
+                    x,
+                    forward_batch,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                    return_moe_output=fuse_all_reduce_mhc,
+                )
             del x
             return mhc.run_moe_post(
                 self.ffn_hc,
@@ -4480,7 +4526,10 @@ class DeepseekV4Model(nn.Module):
                         global_ids >= MM_PAD_SHIFT_VALUE,
                         self.engram_hasher.image_token_id,
                     )
-                hash_ids = self.engram_hasher(global_ids, forward_batch)
+                if _is_hcu and is_in_breakable_cuda_graph():
+                    hash_ids = bcg_deepseek_v4_engram_hash_ids(self.engram_hasher, global_ids)
+                else:
+                    hash_ids = self.engram_hasher(global_ids, forward_batch)
                 parallel = get_parallel()
                 hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
                 pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
@@ -4500,6 +4549,7 @@ class DeepseekV4Model(nn.Module):
         end_layer = self.end_layer
         if (
             self.late_layer_start is not None
+            and get_exec().features.enable_decoder_swa_bounded_replay
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             self._check_late_layer_tail_readers(forward_batch)
@@ -4519,7 +4569,47 @@ class DeepseekV4Model(nn.Module):
         # Batch-invariant by design (see fused_boundary_allowed): the layer loop below
         # must not re-evaluate it, and it must stay False whenever a tail is in play.
         fused_boundary = _is_hip and _hip.fused_boundary_allowed(forward_batch, tail)
-        for i in range(self.start_layer, end_layer):
+        first_layer = self.start_layer
+        if (_HCU_PREFIX_BCG and _is_hcu and cp_extend and not capture_dspark
+                and self.late_layer_start is not None and tail is not None
+                and get_exec().features.enable_decoder_swa_bounded_replay
+                and get_moe_a2a_backend().is_megamoe()
+                and not forward_batch.contains_mm_inputs()):
+            from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import HcuBoundedPrefixRunner
+            runner = getattr(self, "_bounded_prefix_runner", None)
+            if runner is None:
+                self._bounded_prefix_runner = runner = HcuBoundedPrefixRunner(self)
+            replayed = runner.run(hidden_states, positions, input_ids, input_ids_global,
+                                  hash_ids, forward_batch, tail.positions.shape[0])
+            if replayed is not None:
+                state = replayed
+                first_layer = self.late_layer_start
+        if (
+            _HCU_PREFIX_GRAPH_EXPERTS
+            and _is_hcu
+            and tail is not None
+            and cp_extend
+            and get_exec().features.enable_decoder_swa_bounded_replay
+            and not is_cp_active(forward_batch)
+            and not capture_dspark
+            and not is_in_breakable_cuda_graph()
+            and not forward_batch.contains_mm_inputs()
+            and get_moe_a2a_backend().is_megamoe()
+        ):
+            from sglang.srt.model_executor.runner.hcu_bounded_prefix_graph import (
+                HcuBoundedPrefixGraph,
+            )
+
+            runner = getattr(self, "_bounded_expert_prefix_graph", None)
+            if runner is None:
+                runner = self._bounded_expert_prefix_graph = HcuBoundedPrefixGraph(self)
+            replayed = runner.run(
+                hidden_states, positions, input_ids, input_ids_global, hash_ids, forward_batch,
+            )
+            if replayed is not None:
+                state = replayed
+                first_layer = self.late_layer_start
+        for i in range(first_layer, end_layer):
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
@@ -4552,6 +4642,31 @@ class DeepseekV4Model(nn.Module):
                         state, aux = result
                         for value in aux:
                             dspark_aux_hidden_states.append(value)
+                        break
+                elif (
+                    _HCU_BOUNDED_TAIL_MEGA_BCG
+                    and _is_hcu
+                    and not capture_dspark
+                    and not is_cp_active(forward_batch)
+                    and not is_in_breakable_cuda_graph()
+                    and not forward_batch.contains_mm_inputs()
+                    and get_moe_a2a_backend().is_megamoe()
+                ):
+                    from sglang.srt.model_executor.runner.hcu_bounded_prefix_graph import (
+                        HcuBoundedTailMegaGraph,
+                    )
+
+                    tail_runner = getattr(self, "_bounded_tail_mega_graph", None)
+                    if tail_runner is None:
+                        tail_runner = self._bounded_tail_mega_graph = (
+                            HcuBoundedTailMegaGraph(self)
+                        )
+                    replayed_tail = tail_runner.run(
+                        state, positions, input_ids, input_ids_global,
+                        hash_ids, forward_batch, tail,
+                    )
+                    if replayed_tail is not None:
+                        state = replayed_tail
                         break
             engram = self.layers[i].engram
             if engram is not None:
