@@ -6321,6 +6321,7 @@ class DeepseekV4AttnBackend(
                 selected_topk = (
                     _hcu_selected_topk_supported
                     and extra_k_layout is KVLayout.V4
+                    and extra_page_size in (2, 64, 256)
                     and flat_token_ids.numel() <= q_flat.shape[0] * compressed_topk
                 )
                 if not selected_topk:
@@ -6371,6 +6372,8 @@ class DeepseekV4AttnBackend(
             and envs.SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED.get()
             and (compressed_slice is None or extra_k_layout is KVLayout.V4)
             and swa_k_layout is KVLayout.V4
+            and cache.swa_page_size in (2, 64, 256)
+            and (compressed_slice is None or extra_page_size in (2, 64, 256))
             and (compressed_valid_count is None or selected_topk)
         ):
             from lightop.kvcache import dsv4_dequantize_k_cache_paged_out
