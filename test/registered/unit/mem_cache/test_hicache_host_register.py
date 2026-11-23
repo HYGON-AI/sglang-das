@@ -70,6 +70,24 @@ class _FakeCudart:
 
 
 class TestHiCacheHostRegister(unittest.TestCase):
+    def test_hip_host_pool_reuses_loaded_runtime(self):
+        hip = SimpleNamespace(
+            hipHostMalloc=mock.Mock(),
+            hipHostFree=mock.Mock(),
+            hipGetErrorString=mock.Mock(),
+        )
+        self.addCleanup(host_common._hip_runtime.cache_clear)
+        host_common._hip_runtime.cache_clear()
+        with mock.patch(
+            "sglang.srt.distributed.device_communicators.cuda_wrapper.get_loaded_hip_runtime",
+            return_value=hip,
+        ) as get_runtime:
+            self.assertIs(host_common._hip_runtime(), hip)
+            self.assertIs(host_common._hip_runtime(), hip)
+        get_runtime.assert_called_once_with()
+        self.assertEqual(hip.hipHostMalloc.restype, ctypes.c_int)
+        self.assertEqual(hip.hipHostFree.restype, ctypes.c_int)
+
     def _hip_non_userptr(self):
         return (
             mock.patch.object(host_common, "_is_hip", True),

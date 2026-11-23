@@ -239,14 +239,10 @@ def _cuda_host_unregister(buffer: torch.Tensor) -> None:
 @lru_cache(maxsize=1)
 def _hip_runtime() -> ctypes.CDLL:
     from sglang.srt.distributed.device_communicators.cuda_wrapper import (
-        find_loaded_library,
+        get_loaded_hip_runtime,
     )
 
-    # Bind the copy torch loaded; dlopen by soname could load a second HIP runtime.
-    path = find_loaded_library("libamdhip64")
-    if path is None:
-        raise RuntimeError("libamdhip64 is not loaded in this process")
-    lib = ctypes.CDLL(path)
+    lib = get_loaded_hip_runtime()
     lib.hipHostMalloc.argtypes = [
         ctypes.POINTER(ctypes.c_void_p),
         ctypes.c_size_t,

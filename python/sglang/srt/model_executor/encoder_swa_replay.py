@@ -38,6 +38,162 @@ def fold_encoder_swa_replay(worker, batch) -> Optional[FoldedExtend]:
     return _fold_batch(batch=batch, runner=runner, rows=rows)
 
 
+def _hcu_fold_supported(runner, batch, parallel) -> bool:
+    """A bounded eager CP8 domain whose decoder tail contains only new rows."""
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+    from sglang.srt.layers.cp.utils import enable_cp_v2
+    from sglang.srt.layers.moe import get_moe_a2a_backend
+    from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers import (
+        is_cp_cache_layer_split_deepseek_v4_pool,
+    )
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.runner.eager_runner import EagerRunner
+    from sglang.srt.runtime_context import (
+        get_disagg,
+        get_resources,
+        get_schedule,
+        max_prefill_buffer_tokens,
+    )
+    from sglang.srt.utils.common import ceil_align
+
+    resources = get_resources()
+    if (
+        batch.forward_mode != ForwardMode.EXTEND
+        or len(batch.reqs) != 1
+        or parallel.attn_cp_size != 8
+        or parallel.attn_dp_size != 1
+        or parallel.pp_size != 1
+        or parallel.cp_strategy != "interleave"
+        or enable_cp_v2()
+        or get_disagg().disaggregation_mode != "prefill"
+        or not getattr(runner.attn_backend, "is_dsv41", False)
+        or not runner.spec_algorithm.is_dspark()
+        or not is_cp_cache_layer_split_deepseek_v4_pool(runner.token_to_kv_pool)
+        or (
+            getattr(runner, "prefill_cuda_graph_runner", None) is not None
+            and not isinstance(runner.prefill_cuda_graph_runner, EagerRunner)
+        )
+        or getattr(batch, "return_logprob", False)
+        or getattr(batch, "spec_info", None) is not None
+        or getattr(batch, "has_grammar", False)
+        or getattr(batch, "input_embeds", None) is not None
+        # Capture writes back by cache location, including any replay rows.
+        or resources.experts_capturer is not None
+        or resources.indexer_capturer is not None
+    ):
+        return False
+    prefix, extend = batch.prefix_lens[0], batch.extend_lens[0]
+    # 128 is divisible by CP8: prepending it preserves every new row's owner.
+    # The DSpark tail is at most 128 rows, including with FULL capture.
+    # At least 128 new rows therefore keep replay rows out of that tail.
+    if prefix < 128 or prefix % 2 or extend < 128:
+        return False
+    replay = replay_len(prefix)
+    execution_rows = ceil_align(extend + replay, parallel.attn_tp_size)
+    execution_rows = ceil_align(execution_rows, get_cp_padding_align_size())
+    execution_limit = min(
+        get_schedule().chunked_prefill_size or 0, max_prefill_buffer_tokens()
+    )
+    if get_moe_a2a_backend().is_megamoe():
+        # MegaMoE receives the interleaved CP shard, including padding rows.
+        per_rank_limit = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+        execution_limit = min(execution_limit, per_rank_limit * parallel.attn_cp_size)
+    if execution_rows > execution_limit:
+        return False
+    if not _hcu_fold_images_are_before_replay(batch, prefix - replay):
+        return False
+    counts = batch.global_num_tokens
+    return counts is None or (
+        len(counts) == 1
+        and counts[0] == batch.extend_num_tokens
+        and batch.extend_logprob_start_lens is not None
+    )
+
+
+def _hcu_fold_images_are_before_replay(batch, replay_start: int) -> bool:
+    """Keep image features on the existing path when a forward touches them."""
+    inputs = [x for x in (batch.multimodal_inputs or []) if x is not None]
+    if not inputs:
+        return True
+    from sglang.srt.managers.schedule_batch import Modality
+
+    for inputs_for_request in inputs:
+        items = getattr(inputs_for_request, "mm_items", ())
+        if not items:
+            return False
+        for item in items:
+            if item.modality != Modality.IMAGE or not item.offsets:
+                return False
+            # The processor reports inclusive token ranges. Retain MM metadata
+            # for the forward, but only fold when there are no image rows to embed.
+            if any(
+                not 0 <= first <= last < replay_start for first, last in item.offsets
+            ):
+                return False
+    return True
+
+
+def try_fold_hcu_encoder_swa_replay(worker, batch) -> Optional[FoldedExtend]:
+    """Keep the general HCU guard; fold only the checked eager CP domain.
+
+    All other HCU cases still use the synchronized separate replay. CUDA's
+    existing fold selection and the scheduler's global declaration are unchanged.
+    """
+    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.utils import is_hcu
+
+    runner = worker.model_runner
+    if (
+        not is_hcu()
+        or getattr(runner.token_to_kv_pool, "request_window", None) is None
+        or not batch.forward_mode.is_extend_without_speculative()
+        or not any(
+            reset and prefix
+            for reset, prefix in zip(batch.encoder_swa_reset, batch.prefix_lens)
+        )
+    ):
+        return None
+    parallel = get_parallel()
+    if not _hcu_fold_supported(runner, batch, parallel):
+        return None
+    # This is the first replay collective on either path. A negative extend
+    # length distinguishes a fold vote from a separate replay's prefix plan.
+    plan = tuple(
+        (req.rid, bool(reset), int(prefix))
+        for req, reset, prefix in zip(
+            batch.reqs, batch.encoder_swa_reset, batch.prefix_lens, strict=True
+        )
+    ) + (("hcu-eager-fold-domain", True, -int(batch.extend_num_tokens)),)
+    _check_hcu_cp_replay_plan(
+        plan, parallel.attn_cp_size, parallel.attn_cp_group.cpu_group
+    )
+    folded = fold_encoder_swa_replay(worker, batch)
+    assert folded is not None
+    if batch.engram_history is None:
+        # HCU's host-table path may defer history creation. The folded input
+        # starts 128 rows earlier than the scheduler's original extend.
+        folded.batch.engram_history = _engram_history(
+            reqs=batch.reqs, starts=folded.batch.prefix_lens, runner=runner
+        )
+    # DP1's scheduler counted the original extend because the general HCU fold
+    # property stays false. Only this copied execution batch gains replay rows.
+    _set_execution_counts(batch=folded.batch, scheduled=batch)
+    folded.batch.global_cp_num_tokens = None  # legacy interleave, never CP-v2
+    if parallel.attn_cp_rank == 0:
+        prefix = batch.prefix_lens[0]
+        logger.info(
+            "Encoder SWA folded replay: rid=%s prefix=%d start=%d "
+            "replay_tokens=128 new_tokens=%d execution_tokens=%d cp_size=8",
+            batch.reqs[0].rid,
+            prefix,
+            prefix - 128,
+            batch.extend_num_tokens,
+            folded.num_rows,
+        )
+    return folded
+
+
 def resets_swa_window(req) -> bool:
     """Whether this step starts the request's SWA window: a new request slot or a
     retraction. The prefill budget and `encoder_swa_reset` both read this."""

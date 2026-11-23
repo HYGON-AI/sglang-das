@@ -628,14 +628,17 @@ class TpModelWorker(BaseTpWorker):
                     apply_folded_extend,
                     fold_encoder_swa_replay,
                     run_encoder_swa_replay,
+                    try_fold_hcu_encoder_swa_replay,
                 )
 
                 if self.model_runner.attn_backend.folds_encoder_swa_replay:
                     # Hits extend from their replay start, rebuilding the window in-pass.
                     folded = fold_encoder_swa_replay(self, batch)
                 else:
-                    # Replay reads restored main/indexer KV before the normal extend.
-                    run_encoder_swa_replay(self, batch)
+                    folded = try_fold_hcu_encoder_swa_replay(self, batch)
+                    if folded is None:
+                        # Replay reads restored main/indexer KV before the normal extend.
+                        run_encoder_swa_replay(self, batch)
 
             forward_batch = ForwardBatch.init_new(
                 batch if folded is None else folded.batch,

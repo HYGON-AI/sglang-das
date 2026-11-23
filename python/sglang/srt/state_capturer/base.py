@@ -198,6 +198,11 @@ class BaseTopkCapturer:
         the overlap thread can do non-blocking D2H + finalize itself. Otherwise sync
         D2H inline and return None (legacy non-overlap path).
         """
+        # A standalone encoder replay rebuilds the window using cached prefix slots.
+        # Keep the diagnostics captured when those tokens were first computed.
+        if getattr(forward_batch, "encoder_swa_replay", False):
+            return None
+
         slice_gpu = self._get_local_slice(
             forward_batch, can_run_graph, cuda_graph_batch
         )
