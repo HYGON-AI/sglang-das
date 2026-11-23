@@ -130,7 +130,12 @@ def enable_cp_v2() -> bool:
     """Return whether the strategy-based generic prefill CP path is available."""
     from sglang.srt.utils import is_hcu, is_musa, is_npu
 
-    return not (is_hcu() or is_npu() or is_musa())
+    if is_hcu():
+        # Experimental opt-in for the DSV4.1 interleave BCG launcher only.
+        # Both the model and runner consult this switch; never split twice.
+        import os
+        return os.environ.get("SGLANG_HCU_DSV41_BCG_CP_V2") == "1"
+    return not (is_npu() or is_musa())
 
 
 def is_cp_active(forward_batch) -> bool:
