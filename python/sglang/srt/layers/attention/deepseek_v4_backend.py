@@ -2530,9 +2530,14 @@ class DeepseekV4AttnBackend(
                 token_indices=token_indices,
                 contiguous_start=contiguous_start,
             )
-        tail_lens = forward_batch.extend_seq_lens.clamp(max=SWA_WINDOW).to(
-            torch.int32
-        )
+        if any(n > SWA_WINDOW for n in tail_lens_cpu):
+            # Prompt logprobs or full hidden states may retain the whole extend.
+            tail_lens = torch.tensor(
+                tail_lens_cpu, dtype=torch.int32, device="cpu",
+                pin_memory=device.type == "cuda",
+            ).to(device, non_blocking=True)
+        else:
+            tail_lens = forward_batch.extend_seq_lens.clamp(max=SWA_WINDOW).to(torch.int32)
         cp_tail = (
             self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens_cpu)
             if legacy_cp or is_cp_active(forward_batch)
