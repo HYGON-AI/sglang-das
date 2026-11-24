@@ -35,3 +35,36 @@ def test_topk_uses_the_layout_of_the_loaded_experts(monkeypatch, use_draft_weigh
     else:
         lookup.assert_called_once_with(layer_id=0)
         assert ids.tolist() == [415]
+
+
+@pytest.mark.parametrize(
+    "extend,images,dp_size,capture,use_vision",
+    [
+        (True, False, 1, False, False),
+        (True, True, 1, False, True),
+        (True, False, 2, False, True),
+        (True, False, 1, True, True),
+        (False, False, 1, False, True),
+    ],
+)
+def test_text_prefill_router(monkeypatch, extend, images, dp_size, capture, use_vision):
+    result = SimpleNamespace(topk_ids=None, topk_weights=None)
+    vision = Mock(return_value=result)
+    text = Mock(return_value=result)
+    monkeypatch.setattr(mega_moe, "vision_topk", vision)
+    monkeypatch.setattr(mega_moe, "_is_hcu", True)
+    monkeypatch.setattr(mega_moe, "get_attention_dp_size", lambda: dp_size)
+    monkeypatch.setattr(mega_moe, "get_is_capture_mode", lambda: capture)
+    monkeypatch.setattr(mega_moe.ExpertLocationDispatchInfo, "init_new", Mock())
+    moe = SimpleNamespace(
+        gate=Mock(e_score_correction_bias_vl=object()), experts=object(),
+        topk=text, layer_id=0, is_hash=False,
+    )
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_extend_without_speculative=lambda: extend),
+        input_embeds=None, mm_input_embeds=None, contains_mm_inputs=lambda: images,
+        moe_num_token_non_padded=lambda: None,
+    )
+    mega_moe._mega_topk(moe, None, batch, None)
+    assert vision.call_count == int(use_vision)
+    assert text.call_count == int(not use_vision)

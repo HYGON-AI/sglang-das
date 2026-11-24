@@ -146,7 +146,13 @@ def test_hcu_sparse_prefill_uses_rank_local_query_lengths():
         patch.object(backend, "build_cp_sparse_query_metadata", return_value=expected) as build_cp,
         patch.object(backend.SparsePrefillChunkCache, "build", return_value=None) as build,
     ):
-        backend.DeepseekV4AttnBackend._build_sparse_prefill_chunk_cache(obj, batch, core, num_qo_tokens=3)
+        with pytest.raises(AssertionError, match="CP-local offsets cover 3"):
+            backend.DeepseekV4AttnBackend._build_sparse_prefill_chunk_cache(
+                obj, batch, core, num_qo_tokens=2
+            )
+        build_cp.assert_not_called()
+        with patch.object(torch.Tensor, "sum", side_effect=AssertionError("device reduction")):
+            backend.DeepseekV4AttnBackend._build_sparse_prefill_chunk_cache(obj, batch, core, num_qo_tokens=3)
     build_cp.assert_called_once()
     torch.testing.assert_close(build.call_args.kwargs["query_lens"], expected[0])
     torch.testing.assert_close(build.call_args.kwargs["real_query_seq_lens"], expected[1])

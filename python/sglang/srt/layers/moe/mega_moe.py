@@ -30,7 +30,7 @@ from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+from sglang.srt.layers.dp_attention import get_attention_dp_size, get_dp_global_num_tokens
 from sglang.srt.layers.moe.mega_moe_sm90 import (
     is_sm90_fp8_mega_moe_available,
     run_sm90_mega_routed,
@@ -672,10 +672,23 @@ def _mega_topk(moe, hidden_states, forward_batch, input_ids_global):
         if getattr(moe.experts, "_skip_expert_location", False)
         else ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
     )
-    if (
+    use_vision_topk = (
         not moe.is_hash
         and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None
-    ):
+    )
+    if use_vision_topk and _is_hcu and forward_batch is not None:
+        # Local batch metadata describes every routed row only without attention DP.
+        # During capture keep the token-dependent choice available for graph replay.
+        if (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            and get_attention_dp_size() == 1
+            and not get_is_capture_mode()
+            and forward_batch.input_embeds is None
+            and forward_batch.mm_input_embeds is None
+            and not forward_batch.contains_mm_inputs()
+        ):
+            use_vision_topk = False
+    if use_vision_topk:
         topk_output = vision_topk(
             moe,
             router_logits,

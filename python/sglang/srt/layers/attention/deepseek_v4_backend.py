@@ -3629,6 +3629,20 @@ class DeepseekV4AttnBackend(
                 f"allocated {num_qo_tokens}, but request offsets cover {num_global_queries}. "
                 "CP-local queries must use paged attention."
             )
+        elif _is_hcu and tail is None:
+            # The scheduler already holds the lengths of this contiguous, interleaved
+            # batch on the host. Count real rows before the kernel adds graph padding.
+            parallel = get_parallel()
+            num_local_queries = sum(
+                interleave_rows_per_request(
+                    extend_seq_lens_cpu, parallel.attn_cp_rank, parallel.attn_cp_size
+                )
+            )
+            assert num_qo_tokens >= num_local_queries, (
+                "DSV4 sparse prefill requires the rank-local query rows: "
+                f"allocated {num_qo_tokens}, but CP-local offsets cover "
+                f"{num_local_queries}."
+            )
         # Reject undersized query buffers before accessing attention metadata.
         request_layout = core_attn_metadata.request_window_layout
         assert tail is None or request_layout is not None
@@ -3672,7 +3686,7 @@ class DeepseekV4AttnBackend(
                 )
         else:
             query_lens = extend_seq_lens.to(torch.int32)
-        if cp_active:
+        if cp_active and (not _is_hcu or tail is not None):
             # CP shards the query layout: the rank-local lens, not the global
             # extend lens, are the rows this cache indexes.
             num_local_queries = int(query_lens.sum())
