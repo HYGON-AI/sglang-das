@@ -4700,7 +4700,6 @@ class DeepseekV4AttnBackend(
         skip_publish = False
         skip_consume = False
         tail_target = None
-        use_unmasked_lightop = False
         if _is_hcu and q.is_cuda and (indexer.is_candidate_source or indexer.uses_candidates):
             from sglang.srt.layers.attention.dsv4.hcu_prefill_candidate import (
                 cand_window_covers_all,
@@ -4711,10 +4710,6 @@ class DeepseekV4AttnBackend(
             if hcu_prefill_40352_enabled():
                 window_covered = cand_window_covers_all(indexer, lc_per_req)
                 if indexer.is_candidate_source:
-                    use_unmasked_lightop = (
-                        envs.SGLANG_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS.get()
-                        and indexer.candidate_block_size == 8
-                    )
                     if window_covered or getattr(self, "skip_late_layers", False):
                         skip_publish = True
                         self.forward_metadata.candidate_metadata = None
@@ -4746,11 +4741,13 @@ class DeepseekV4AttnBackend(
             if count:
                 requests.append((request, lc, offset, offset + count))
             offset += count
-        step = (
-            min(rows_per_chunk, 65535)
-            if candidate_blocks is not None
-            else rows_per_chunk
-        )
+        step = rows_per_chunk
+        if candidate_blocks is not None:
+            step = min(step, 65535)
+        elif step >= 32:
+            # The dense LightOp kernel scores 32 Q rows per tile. Round down
+            # within the logits budget; keep small budgets and the real tail.
+            step = step // 32 * 32
         for start in range(0, offset, step):
             end = min(start + step, offset)
             rows = slice(start, end)
@@ -4797,11 +4794,8 @@ class DeepseekV4AttnBackend(
                     pub_rows = slice(pub_lo - pub_base, pub_hi - pub_base)
                     scores = logits[local_rows, :lc]
                     lens = compress_lens[pub_lo:pub_hi, None]
-                    if not use_unmasked_lightop:
-                        scores.masked_fill_(
-                            torch.arange(lc, device=q.device)[None, :] >= lens,
-                            -torch.inf,
-                        )
+                    # LightOp initializes logits to -inf and only writes
+                    # [ks, ke), so future columns are already masked.
                     mask, ids = select_candidate_blocks(
                         scores,
                         lens,

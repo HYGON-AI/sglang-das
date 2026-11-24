@@ -168,8 +168,7 @@ def _hcu_channelwise_fp8_round_trips_via_ipc(quant_config: Any) -> bool:
     The serialized FP8 weights are loaded as-is and the per-channel scales are
     ordinary parameters, so the state_dict carries the whole numeric state.
     What the load leaves outside it (fix-up flags, derived tensors) is carried
-    by weight_cache.extra_state. Other compressed-tensors schemes repack
-    weights (Marlin, W4A8) and stay unsupported.
+    by weight_cache.extra_state.
     """
     from sglang.srt.utils import is_hcu
 
@@ -190,6 +189,52 @@ def _hcu_channelwise_fp8_round_trips_via_ipc(quant_config: Any) -> bool:
         ):
             return False
     return True
+
+
+def is_hcu_dsv41_w4a8_ipc(
+    quant_method: str, quant_config: Any, model_arch: str
+) -> bool:
+    """Recognize the mixed channelwise W4A8/W8A8 DSV4.1 checkpoint."""
+    if (
+        quant_method != "compressed-tensors"
+        or model_arch not in ("DeepseekV41ForCausalLM", "DeepseekV4ForCausalLM")
+        or _get_quant_field(quant_config, "format") != "pack-quantized"
+    ):
+        return False
+    from sglang.srt.utils import is_hcu
+
+    if not is_hcu():
+        return False
+    groups = _get_quant_field(quant_config, "config_groups")
+    if not isinstance(groups, dict) or not groups:
+        return False
+    has_int4 = False
+    for group in groups.values():
+        if not isinstance(group, dict):
+            return False
+        weight = group.get("weights")
+        activation = group.get("input_activations")
+        if not isinstance(weight, dict) or not isinstance(activation, dict):
+            return False
+        bits = weight.get("num_bits")
+        if (
+            bits not in (4, 8)
+            or group.get("format", "pack-quantized")
+            != ("pack-quantized" if bits == 4 else "int-quantized")
+            or weight.get("type") != "int"
+            or weight.get("strategy") != "channel"
+            or weight.get("dynamic") is not False
+            or weight.get("symmetric") is not True
+            or weight.get("actorder") is not None
+            or activation.get("type") != "int"
+            or activation.get("num_bits") != 8
+            or activation.get("strategy") != "token"
+            or activation.get("dynamic") is not True
+            or activation.get("symmetric") is not True
+        ):
+            return False
+        has_int4 |= bits == 4
+    return has_int4
 
 
 # quant_method name -> predicate(quant_config) -> bool (True == verified safe).
@@ -224,7 +269,7 @@ def is_ipc_quant_supported(quant_method: str, quant_config: Any) -> bool:
 
 
 def check_ipc_quant_support(
-    quant_method: str, quant_config: Any, *, where: str
+    quant_method: str, quant_config: Any, *, where: str, model_arch: str = ""
 ) -> None:
     """Hard-error unless `quant_method` is verified safe for IPC zero-copy sharing.
 
@@ -233,6 +278,29 @@ def check_ipc_quant_support(
     """
     if is_ipc_quant_supported(quant_method, quant_config):
         return
+    if is_hcu_dsv41_w4a8_ipc(quant_method, quant_config, model_arch):
+        from sglang.srt.runtime_context import get_disagg, get_exec
+
+        moe = get_exec().moe
+        role = get_disagg().disaggregation_mode
+        if not moe.enable_eplb and (
+            (
+                role == "prefill"
+                and moe.moe_a2a_backend == "megamoe"
+                and envs.SGLANG_HCU_MEGA_MOE_RUNTIME.get().strip().lower() == "deep_gemm"
+            )
+            or (
+                role == "decode"
+                and moe.moe_a2a_backend == "deepep"
+                and moe.moe_runner_backend == "deep_gemm"
+                and moe.deepep_mode == "low_latency"
+            )
+        ):
+            return
+        raise UnsupportedQuantForIPCError(
+            f"[weight_cache:{where}] DSV4.1 W4A8 IPC requires DeepGEMM MegaMoE "
+            "prefill or DeepGEMM DeepEP low-latency decode with static expert placement."
+        )
     verified = ", ".join(
         (repr(m) if m else "'' (unquantized)") for m in IPC_QUANT_ALLOWLIST
     )
@@ -244,7 +312,8 @@ def check_ipc_quant_support(
         f"meta-initialized client cannot reproduce, which would silently serve "
         f"wrong-numerics weights. Verified methods: {verified}. Note: FP8 is "
         f"only verified for block-wise configs (weight_block_size set), not "
-        f"per-tensor FP8; compressed-tensors only for HCU per-channel FP8. "
+        f"per-tensor FP8. HCU compressed-tensors supports per-channel FP8 "
+        f"and DSV4.1 channelwise W4A8 in the supported PD layouts. "
         f"Disable the weight cache (--weight-cache-mode off) "
         f"for this model."
     )
@@ -319,7 +388,7 @@ def compute_env_stamp() -> Dict[str, str]:
     return {"device_capability": device_capability, "torch_version": torch_version}
 
 
-def compute_weight_layout_stamp() -> str:
+def compute_weight_layout_stamp(*, hcu_dsv41_w4a8: bool = False) -> str:
     """Fingerprint of the static expert placement.
 
     ``--init-expert-location`` / ``--ep-num-redundant-experts`` decide which
@@ -340,6 +409,23 @@ def compute_weight_layout_stamp() -> str:
                 digest.update(chunk)
     else:
         digest.update(f"location={location}".encode())
+    if hcu_dsv41_w4a8:
+        from sglang.srt.runtime_context import get_disagg
+
+        # INT4 repacking and scale handling differ across PD roles and backends.
+        layout = (
+            "hcu-dsv41-w4a8-v1",
+            get_disagg().disaggregation_mode,
+            moe.moe_runner_backend,
+            moe.deepep_mode,
+            envs.SGLANG_HCU_MEGA_MOE_RUNTIME.get().strip().lower(),
+            os.environ.get("SGLANG_USE_W4A8_CONTIGUOUS_HIPC"),
+            os.environ.get("SGLANG_USE_W4A8_MASKED_HIPC"),
+            os.environ.get("SGLANG_HCU_DSV41_TAIL_MOE_LOW_LATENCY"),
+            os.environ.get("SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE"),
+            os.environ.get("SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT"),
+        )
+        digest.update(json.dumps(layout).encode())
     return digest.hexdigest()[:16]
 
 

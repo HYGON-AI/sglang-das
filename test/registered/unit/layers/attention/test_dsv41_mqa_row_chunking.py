@@ -198,6 +198,7 @@ class TestDSV41MQARowChunking(CustomTestCase):
             is_candidate_source=False,
         )
         self.owner = SimpleNamespace(
+            fuse_indexer_q_prep=False,
             forward_metadata=SimpleNamespace(candidate_metadata=None)
         )
         self.calls = []
@@ -347,6 +348,62 @@ class TestDSV41MQARowChunking(CustomTestCase):
                 torch.testing.assert_close(got, expected)
             offset += count
 
+    def test_source_publishes_only_tail_rows_across_query_chunks(self):
+        class CudaQuery(torch.Tensor):
+            @property
+            def is_cuda(self):
+                return True
+
+        self.q = self.q.as_subclass(CudaQuery)
+        self.indexer.is_candidate_source = True
+        tail_counts = [2, 0, 2, 0]
+        tail_metadata = SimpleNamespace(
+            late_layer_tail=SimpleNamespace(
+                cp_metadata=None, extend_seq_lens_cpu=tail_counts
+            )
+        )
+        self.owner.tail_forward_metadata = tail_metadata
+        helper = types.ModuleType(
+            "sglang.srt.layers.attention.dsv4.hcu_prefill_candidate"
+        )
+        load_functions(
+            ATTENTION / "dsv4/hcu_prefill_candidate.py",
+            {"get_late_tail_publish_target"},
+            helper.__dict__,
+        )
+        helper.hcu_prefill_40352_enabled = lambda: True
+        helper.cand_window_covers_all = lambda *args: False
+        select = self.ns["select_candidate_blocks"]
+
+        def checked_select(scores, lens, *args, **kwargs):
+            self.assertEqual(scores.shape[0], lens.shape[0])
+            invalid = torch.arange(scores.shape[1])[None, :] >= lens
+            self.assertTrue(torch.isneginf(scores[invalid]).all())
+            return select(scores, lens, *args, **kwargs)
+
+        self.ns["select_candidate_blocks"] = checked_select
+        for step in (2, 4, 47):
+            with self.subTest(step=step):
+                with patch.dict(sys.modules, {helper.__name__: helper}):
+                    self.run_chunked(step)
+                self.assertIsNone(self.owner.forward_metadata.candidate_metadata)
+                published = tail_metadata.candidate_metadata.request_block_ids
+                full = self.scores(self.q, self.weights, self.ks, self.ke, 12)
+                offset = 0
+                for request, (count, tail, lc) in enumerate(
+                    zip(self.counts, tail_counts, self.lens)
+                ):
+                    if tail and lc:
+                        rows = slice(offset + count - tail, offset + count)
+                        _, expected = select(
+                            full[rows, :lc], self.compress[rows, None], 2, 2,
+                            return_block_ids=True,
+                        )
+                        torch.testing.assert_close(published[request], expected)
+                    else:
+                        self.assertEqual(published[request].shape[0], tail)
+                    offset += count
+
     def test_consumers_support_compact_ids_and_original_masks(self):
         self.indexer.is_candidate_source = True
         self.run_chunked(2)
@@ -423,7 +480,7 @@ class TestDSV41MQARowChunking(CustomTestCase):
             lambda *args: None
         )
         self.run_chunked(483)
-        self.assertEqual(calls, [483] * 8 + [232])
+        self.assertEqual(calls, [480] * 8 + [256])
 
     def test_candidate_chunks_keep_native_row_limit_across_requests(self):
         self.indexer.uses_candidates = True
@@ -455,6 +512,55 @@ class TestDSV41MQARowChunking(CustomTestCase):
         )
         self.run_chunked(total, blocks)
         self.assertEqual(calls, [[32770, 32765], [5]])
+
+    def test_dense_budget_alignment_keeps_real_tail_and_small_budget(self):
+        self.counts = [37, 0, 63]
+        self.lens = [11, 0, 9]
+        self.q = self.q[:1].repeat(100, 1, 1)
+        self.weights = self.weights[:1].repeat(100, 1)
+        self.ks = torch.tensor([0] * 37 + [14] * 63, dtype=torch.int32)
+        self.compress = torch.tensor([11] * 37 + [9] * 63, dtype=torch.int32)
+        self.ke = self.ks + self.compress
+        reference = self.scores(self.q, self.weights, self.ks, self.ke, 12)
+        selected = torch.empty((100, 3), dtype=torch.int32)
+        self.topk(reference, self.compress, self.ks, selected)
+        expected_pages = torch.full_like(selected, -1)
+        expected_raw = torch.full_like(selected, -1)
+        self.postprocess(
+            reference, selected, self.ks, self.slots,
+            expected_pages, expected_raw, False,
+        )
+        for budget, calls in [
+            (47, [32, 32, 32, 4]),
+            (31, [31, 31, 31, 7]),
+            (128, [100]),
+        ]:
+            with self.subTest(budget=budget):
+                self.calls.clear()
+                self.previous = None
+                pages = torch.full_like(selected, -1)
+                raw = torch.full_like(selected, -1)
+                self.ns["_low_ratio_index_topk_chunked"](
+                    self.owner,
+                    self.indexer,
+                    self.q,
+                    (self.k, None),
+                    self.weights,
+                    self.ks,
+                    self.ke,
+                    self.compress,
+                    self.slots,
+                    self.lens,
+                    self.counts,
+                    pages,
+                    raw,
+                    None,
+                    budget,
+                )
+                self.assertEqual(self.calls, calls)
+                torch.testing.assert_close(pages, expected_pages)
+                torch.testing.assert_close(raw, expected_raw)
+                self.assertLessEqual(max(self.calls), budget)
 
     def test_empty_queries_do_not_allocate_logits(self):
         self.counts = [0] * len(self.lens)

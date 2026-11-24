@@ -35,6 +35,7 @@ from .protocol import (
     get_socket_path,
     hash_quant_config,
     ipc_adopts_postprocessed_layout,
+    is_hcu_dsv41_w4a8_ipc,
     recv_msg,
     send_msg,
 )
@@ -105,12 +106,20 @@ class IpcModelLoader(BaseModelLoader):
         # (client mode) or serving wrong-numerics IPC weights. Checked here so
         # it applies regardless of whether the daemon is reachable.
         quant_method, engine_quant_config = self._resolve_engine_quant(model_config)
-        check_ipc_quant_support(quant_method, engine_quant_config, where="client")
+        model_arch = (model_config.hf_config.architectures or [""])[0]
+        check_ipc_quant_support(
+            quant_method, engine_quant_config, where="client", model_arch=model_arch
+        )
 
         # Try to fetch state from daemon
         cache_data = self._fetch_from_cache(model_config, device_config)
 
         if cache_data is None:
+            if is_hcu_dsv41_w4a8_ipc(quant_method, engine_quant_config, model_arch):
+                raise RuntimeError(
+                    f"[IpcModelLoader] DSV4.1 W4A8 cache is absent at {self.socket_path}. "
+                    "Start the matching weight cache daemon before starting the client."
+                )
             if self.weight_cache_mode == "daemon":
                 raise RuntimeError(
                     f"[IpcModelLoader] Weight cache daemon not available at "
@@ -701,13 +710,10 @@ class IpcModelLoader(BaseModelLoader):
 
             quant_method, quant_config = self._resolve_engine_quant(model_config)
 
+            model_arch = (model_config.hf_config.architectures or [""])[0]
             engine_config = CacheConfig(
                 model_path=model_config.model_path,
-                model_arch=(
-                    model_config.hf_config.architectures[0]
-                    if model_config.hf_config.architectures
-                    else ""
-                ),
+                model_arch=model_arch,
                 tp_size=tp_size,
                 tp_rank=tp_rank,
                 pp_size=pp_size,
@@ -727,7 +733,11 @@ class IpcModelLoader(BaseModelLoader):
                 dtype=str(model_config.dtype),
                 revision=model_config.revision or "",
                 **compute_env_stamp(),
-                weight_layout_stamp=compute_weight_layout_stamp(),
+                weight_layout_stamp=compute_weight_layout_stamp(
+                    hcu_dsv41_w4a8=is_hcu_dsv41_w4a8_ipc(
+                        quant_method, quant_config, model_arch
+                    )
+                ),
             )
 
             logger.info(

@@ -37,6 +37,7 @@ Usage:
 import argparse
 import dataclasses
 import datetime
+import gc
 import logging
 import multiprocessing
 import os
@@ -72,6 +73,7 @@ from .protocol import (
     get_ready_path,
     get_socket_path,
     hash_quant_config,
+    is_hcu_dsv41_w4a8_ipc,
     recv_msg,
     send_msg,
 )
@@ -255,6 +257,9 @@ class WeightCacheDaemon:
 
     def load(self):
         """Full loading pipeline: disk → TP shard → quantize → export IPC handles."""
+        # Weight owners never run GEMMs; engine-local packed copies are rebuilt
+        # by the IPC client after mapping the shared parameters.
+        os.environ["WEIGHT_CACHE"] = "daemon"
         # CUDA IPC weight sharing relies on torch's _share_cuda_ handle export,
         # which only exists on CUDA-alike platforms (CUDA / ROCm). Fail loud here
         # instead of dying deep inside the export with an opaque error.
@@ -317,7 +322,13 @@ class WeightCacheDaemon:
 
         # Refuse unsupported quant methods before creating distributed groups
         # or touching model weights.
-        check_ipc_quant_support(quant_method, quant_config, where="daemon")
+        model_arch = (model_config.hf_config.architectures or [""])[0]
+        check_ipc_quant_support(
+            quant_method, quant_config, where="daemon", model_arch=model_arch
+        )
+        self._hcu_dsv41_w4a8 = is_hcu_dsv41_w4a8_ipc(
+            quant_method, quant_config, model_arch
+        )
 
         # The initialized groups are the authority for rank identity. This
         # avoids maintaining a second copy of the model-parallel hierarchy.
@@ -327,11 +338,7 @@ class WeightCacheDaemon:
         moe_ep_rank = get_parallel().moe_ep_rank
         self.config = CacheConfig(
             model_path=self.model_path,
-            model_arch=(
-                model_config.hf_config.architectures[0]
-                if model_config.hf_config.architectures
-                else ""
-            ),
+            model_arch=model_arch,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             pp_size=self.pp_size,
@@ -353,7 +360,9 @@ class WeightCacheDaemon:
             dtype=str(model_config.dtype),
             revision=self.revision or "",
             **compute_env_stamp(),
-            weight_layout_stamp=compute_weight_layout_stamp(),
+            weight_layout_stamp=compute_weight_layout_stamp(
+                hcu_dsv41_w4a8=self._hcu_dsv41_w4a8
+            ),
         )
 
         current_platform.empty_cache()
@@ -404,6 +413,7 @@ class WeightCacheDaemon:
         # Ensure every post-processing kernel has retired before we export the
         # memory: clients map these tensors read-only via IPC and would otherwise
         # risk observing half-written weights.
+        gc.collect()
         current_platform.synchronize()
         current_platform.empty_cache()
         self.preloaded_weights_bytes = max(
@@ -731,6 +741,20 @@ def run_weight_cache_daemon(
     _await_cluster_ready_to_serve(
         timeout=resolving_view(server_args).weight_cache_timeout
     )
+    if daemon._hcu_dsv41_w4a8:
+        # W4A8 owners only serve immutable IPC handles after loading. Retaining
+        # their load-time communicators competes with the engine's MoE buffers.
+        from sglang.srt.distributed.parallel_state import cleanup_dist_env_and_memory
+
+        current_platform.synchronize()
+        free_before, _ = torch.cuda.mem_get_info(gpu_id)
+        cleanup_dist_env_and_memory()
+        free_after, _ = torch.cuda.mem_get_info(gpu_id)
+        logger.info(
+            "[WeightCacheDaemon gpu=%d] Released loading runtime: %.2f GiB freed",
+            gpu_id,
+            (free_after - free_before) / (1 << 30),
+        )
     daemon.serve()
 
 
