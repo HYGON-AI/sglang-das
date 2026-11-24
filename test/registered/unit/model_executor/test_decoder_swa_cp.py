@@ -173,6 +173,9 @@ class TestDecoderTailCP(CustomTestCase):
             DeepSeekV4TokenToKVPool=Pool, is_cp_cache_layer_split_deepseek_v4_pool=lambda pool: False,
             _should_use_sparse_prefill=lambda *a, **k: True,
             envs=SimpleNamespace(SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA=SimpleNamespace(get=lambda: True)))
+        namespace['_HCU_ENCODER_PREFILL_VALIDATION_STEPS'] = 0
+        load(SOURCE / 'srt/layers/attention/deepseek_v4_backend.py',
+             '_request_window_allows_sparse_prefill', namespace)
         attention = load(SOURCE / 'srt/layers/attention/deepseek_v4_backend.py',
                          '_forward_attention', namespace, 'DeepseekV4AttnBackend')
         prefill = load(SOURCE / 'srt/layers/attention/deepseek_v4_backend.py',
@@ -243,7 +246,11 @@ class TestDecoderReplayPadding(CustomTestCase):
                 self.assertEqual(torch.count_nonzero(actual_floor[tail_total:]).item(), 0)
                 # The operation that failed in make_core_attn_metadata.
                 visible = kwargs['seq_lens_casual'] - actual_floor
-                expected = torch.cat([torch.arange(1, n + 1) for n in tail_lens])
+                # A short extend can also see cached tokens within the 128-row window.
+                expected = torch.cat([
+                    torch.arange(min(seq, 128) - tail + 1, min(seq, 128) + 1)
+                    for seq, tail in zip(seq_lengths, tail_lens)
+                ])
                 torch.testing.assert_close(visible[:tail_total], expected.to(visible.dtype))
                 if metadata_rows == tail_total:
                     self.assertIs(actual_floor, floor)
@@ -342,7 +349,7 @@ class TestLateLayerTailUpload(CustomTestCase):
                 seq_lens_cpu=seq, tail_len=128, device=torch.device('cuda'))
             self.assertEqual(tails, [1, 128, 17])
             self.assertEqual(indices.numel(), 146)
-            self.assertEqual(floors[0].item(), seq[0] - 1)
+            self.assertEqual(floors[0].item(), seq[0] - 128)
         self.assertEqual(len(copies), 2)
         self.assertEqual(copies[0].dtype, torch.int64)
         self.assertNotEqual(allocations[0].data_ptr(), allocations[1].data_ptr())
