@@ -5566,8 +5566,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
 
         device, dtype = self.image_start.device, self.image_start.dtype
-        for item in items:
-            item.reconstruct(device.index)
         r = self.config.vision_downsample_ratio
         grids = [(int(item.n_vit_h), int(item.n_vit_w)) for item in items]
         span_lens = [
