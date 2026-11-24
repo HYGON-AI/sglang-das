@@ -665,7 +665,13 @@ def _mega_topk(moe, hidden_states, forward_batch, input_ids_global):
         if forward_batch is not None
         else None
     )
-    dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
+    # DSpark stage indices overlap the target layers, but its weight loader
+    # keeps logical expert order. Only route through a map the weights used.
+    dispatch_info = (
+        None
+        if getattr(moe.experts, "_skip_expert_location", False)
+        else ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
+    )
     if (
         not moe.is_hash
         and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None
@@ -736,7 +742,9 @@ def _run_mega_routed(
                 )
     else:
         # An empty rank still joins the per-layer LPLB count all-reduce.
-        if get_exec().moe.ep_dispatch_algorithm == "lp":
+        if get_exec().moe.ep_dispatch_algorithm == "lp" and not getattr(
+            moe.experts, "_skip_expert_location", False
+        ):
             moe.topk.empty_topk_output(hidden_states.device, layer_id=moe.layer_id)
         topk_ids = None
         topk_weights = None
