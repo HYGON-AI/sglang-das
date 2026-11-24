@@ -7,6 +7,7 @@ share that storage.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -26,6 +27,12 @@ from sglang.srt.utils import add_prefix, is_gfx95_supported, is_hcu
 
 
 _is_hcu = is_hcu()
+_use_indexer_prep = (
+    _is_hcu and os.environ.get("SGLANG_HCU_OPT_INDEXER_PREP", "1") == "1"
+)
+if _use_indexer_prep:
+    from lightop.attention import dsv41_indexer_rope_fake_quant
+
 
 def _fused_dsv41_kernels(x: torch.Tensor) -> bool:
     # validated on CUDA and gfx950; other ROCm GPUs keep the torch forms
@@ -43,6 +50,18 @@ def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False, positions=None):
         return rope_tail_fake_quant_fp4(
             x, freqs, rope_dim, compressed_kv=compressed_kv, positions=positions
         )
+    if (
+        _use_indexer_prep
+        and not compressed_kv
+        and positions is not None
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and x.ndim == 3
+        and x.shape[-1] == 128
+        and rope_dim == 64
+        and x.is_contiguous()
+    ):
+        return dsv41_indexer_rope_fake_quant(x, freqs, positions)
     if positions is not None:
         freqs = freqs[positions]
     # HIP/DCU: fused sgl-kernel AOT path.

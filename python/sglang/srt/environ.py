@@ -1145,17 +1145,33 @@ class Envs:
     # HCU W4A8 normal/auto: use low-latency MoE for CP bounded tails that fit.
     SGLANG_HCU_DSV41_TAIL_MOE_LOW_LATENCY = EnvBool(False)
     SGLANG_HCU_DSV41_TAIL_MOE_CUDA_GRAPH = EnvBool(False)
+    # Capture CP8 pre-tail and bounded SWA tail MegaMoE layers with live eager
+    # attention/routing while preserving --enable-decoder-swa-bounded-replay.
+    SGLANG_HCU_BOUNDED_PREFIX_BCG = EnvInt(0)
+    SGLANG_HCU_BOUNDED_PREFIX_BCG_LOG_REPLAYS = EnvBool(False)
     # With --enable-decoder-swa-bounded-replay: a chunked-prefill step in which every
     # request still has at least SWA_WINDOW prompt tokens after this chunk stops at
     # the last kv_source layer. Nothing reads the later layers' rows of such a chunk.
     SGLANG_DSV41_SKIP_MID_CHUNK_DECODER = EnvBool(True)
     # Gather the packed FP8 DSV4 KV cache into a temporary BF16 workspace before
-    # invoking the existing HCU FlashMLA sparse-decode kernel. With the unified
-    # MLA path this covers ordinary prefill as well as decode-family forwards.
-    SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA = EnvBool(False)
+    # invoking the existing HCU FlashMLA sparse-decode kernel for decode,
+    # target verify, and draft extend. Ordinary prefill keeps its original path.
+    # Left unset, it only applies on HCU with an FP8 attention KV cache.
+    SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA = EnvBool(True)
     # Use the native LightOp single/dual-cache gather+upconvert kernels instead
-    # of the Triton fallback above. This switch requires the BF16 FlashMLA path.
-    SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER = EnvBool(False)
+    # of the Triton fallback above. This switch requires the BF16 FlashMLA path;
+    # left unset, a missing LightOp package falls back to the Triton gather.
+    SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER = EnvBool(True)
+    # Deduplicate the LightOp gather across queries that select the same KV
+    # location (MTP verify / draft-extend tokens of one request share most of
+    # their SWA/C128/C4 rows): each location is upconverted once and duplicate
+    # rows point their compact index at it. Only takes effect with the LightOp
+    # gather above (i.e. FP8 KV cache); left unset, it is skipped silently otherwise.
+    SGLANG_DSV4_HCU_BF16_GATHER_DEDUP = EnvBool(True)
+    # Upper bound on query tokens for the dedup path; larger verify/draft
+    # batches keep the plain gather. Measured >=2x faster up to 8192 queries
+    # (bench_dsv4_gather_dedup.py, 4 verify tokens); untested beyond that.
+    SGLANG_DSV4_HCU_BF16_GATHER_DEDUP_MAX_QUERIES = EnvInt(8192)
     SGLANG_HACK_SKIP_FP4_FP8_GEMM = EnvBool(False)
     SGLANG_LIGHTOP_TOPK = EnvBool(False)
     SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN = EnvBool(False)

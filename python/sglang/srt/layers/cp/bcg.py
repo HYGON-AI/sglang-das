@@ -31,6 +31,7 @@ from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
+    cp_shard_hidden_states,
     cp_split_before_forward,
     prepare_cp_forward,
 )
@@ -104,6 +105,7 @@ class PrefillCPBCGInput:
 
     input_embeds: torch.Tensor
     positions: torch.Tensor
+    local_ids: Optional[torch.Tensor] = None
     bucket_local_tokens: Dict[int, int] = field(default_factory=dict)
     live_local_tokens: int = 0
 
@@ -269,7 +271,19 @@ class PrefillCPBCGInput:
         input_embeds[:live_local_tokens].copy_(local_input_embeds)
         positions[:live_local_tokens].copy_(local_positions)
         forward_batch.input_embeds = input_embeds
-        forward_batch.positions = positions
+        from sglang.srt.utils import is_hcu
+        if is_hcu() and getattr(runner.model_runner.model_config.hf_config, "model_type", None) == "deepseek_v41":
+            # Engram and the compressor need global IDs, positions and KV slots.
+            # Feed only the model body the CP-local tensors, as eager CP does.
+            if self.local_ids is None:
+                self.local_ids = global_input_ids.new_zeros(self.positions.shape)
+            local_ids = self.local_ids[:captured_local_tokens]
+            local_ids.zero_()
+            local_ids[:live_local_tokens].copy_(cp_shard_hidden_states(global_input_ids, forward_batch))
+            forward_batch.bcg_cp_input_ids = local_ids
+            forward_batch.bcg_cp_positions = positions
+        else:
+            forward_batch.positions = positions
         self.live_local_tokens = live_local_tokens
 
         if isinstance(get_cp_strategy(), InterleaveCPStrategy):
