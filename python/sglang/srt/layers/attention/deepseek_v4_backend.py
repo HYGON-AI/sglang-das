@@ -4032,11 +4032,24 @@ class DeepseekV4AttnBackend(
             x_global = cp_materialize_global_token_order(
                 x.contiguous(), forward_batch, torch.cuda.current_stream()
             )[:total]
+            keep = getattr(forward_batch, "encoder_swa_compress_rows", None)
+            out_loc_rows = None
+            if _is_hcu and keep is not None:
+                if tail is None:
+                    # A folded hit must read cached compressed/indexer keys for
+                    # replay rows. Only new rows may update those persistent pools.
+                    x_global = x_global.index_select(0, keep)
+                    req_global = req_global.index_select(0, keep)
+                    pos_global = pos_global.index_select(0, keep)
+                    out_loc_rows = keep
+                elif keep.numel() < x_global.shape[0]:
+                    raise RuntimeError("HCU folded decoder tail contains replay rows")
             self._low_ratio_compress_torch(
                 layer,
                 x_global,
                 req_global,
                 pos_global,
+                out_loc_rows=out_loc_rows,
                 fuse_index_store=(x_global.is_cuda and _supports_index_k_rope_pack()),
                 fuse_rope_fq_store=True,
             )
@@ -4417,6 +4430,7 @@ class DeepseekV4AttnBackend(
         *,
         fuse_index_store=False,
         fuse_rope_fq_store=False,
+        out_loc_rows=None,
     ) -> None:
         core = self.forward_metadata.core_metadata
         num_tokens = pos.shape[0]
@@ -4424,23 +4438,35 @@ class DeepseekV4AttnBackend(
         if not num_tokens:
             return
         if layer.compress_ratio == 1:
+            out_loc = core.c1_out_loc
+            out_loc = (
+                out_loc[:num_tokens]
+                if out_loc_rows is None
+                else out_loc.index_select(0, out_loc_rows)
+            )
             self._low_ratio_write_group(
                 layer,
                 kv,
-                core.c1_out_loc[:num_tokens],
+                out_loc,
                 pos,
                 fuse_index_store=fuse_index_store,
                 fuse_rope_fq_store=fuse_rope_fq_store,
             )
             return
 
+        raw_loc = core.raw_out_loc
+        raw_loc = (
+            raw_loc[:num_tokens]
+            if out_loc_rows is None
+            else raw_loc.index_select(0, out_loc_rows)
+        )
         partner_kv, partner_score = self._low_ratio_pair_partners(
             layer_id=layer.layer_id,
             kv=kv,
             score=score,
             req=req,
             pos=pos,
-            pad=core.raw_out_loc[:num_tokens] == 0,
+            pad=raw_loc == 0,
         )
         normalized_latent = None
         if (
@@ -4471,7 +4497,12 @@ class DeepseekV4AttnBackend(
                 torch.stack([partner_score, score], dim=1),
             )
         group_pos = torch.where(pos % 2 == 1, pos - 1, pos)
-        out_loc = core.c2_out_loc[:num_tokens]
+        out_loc = core.c2_out_loc
+        out_loc = (
+            out_loc[:num_tokens]
+            if out_loc_rows is None
+            else out_loc.index_select(0, out_loc_rows)
+        )
         slots = torch.where(out_loc >= 0, out_loc, torch.zeros_like(out_loc))
         self._low_ratio_write_group(
             layer,

@@ -14,6 +14,7 @@ from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
 from sglang.srt.arg_groups import deepseek_v4_hook
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     SWA_WINDOW,
     DeepseekV4AttnBackend,
@@ -36,6 +37,7 @@ from sglang.srt.model_executor.encoder_swa_replay import (
     _build_replay_batch,
     _check_hcu_cp_replay_plan,
     _fold_batch,
+    _hcu_fold_supported,
     drop_folded_rows,
     folded_replay_rows,
     run_encoder_swa_replay,
@@ -142,6 +144,80 @@ class TestHcuSeparateReplay(CustomTestCase):
         backend = DeepseekV4AttnBackend.__new__(DeepseekV4AttnBackend)
         with patch("sglang.srt.layers.attention.deepseek_v4_backend._is_hcu", False):
             self.assertTrue(backend.folds_encoder_swa_replay)
+
+
+class TestHcuFoldCapacity(CustomTestCase):
+    def test_fold_respects_chunk_and_megamoe_capacity(self):
+        runner = SimpleNamespace(
+            attn_backend=SimpleNamespace(is_dsv41=True),
+            spec_algorithm=SpeculativeAlgorithm.DSPARK,
+            token_to_kv_pool=object(),
+        )
+        parallel = SimpleNamespace(
+            attn_cp_size=8,
+            attn_tp_size=1,
+            attn_dp_size=1,
+            pp_size=1,
+            cp_strategy="interleave",
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            reqs=[object()],
+            prefix_lens=[2304],
+            multimodal_inputs=None,
+            global_num_tokens=None,
+        )
+        resources = SimpleNamespace(experts_capturer=None, indexer_capturer=None)
+        schedule = SimpleNamespace(chunked_prefill_size=32768)
+        with (
+            patch(
+                "sglang.srt.layers.cp.padding.get_cp_padding_align_size", return_value=8
+            ),
+            patch("sglang.srt.layers.cp.utils.enable_cp_v2", return_value=False),
+            patch(
+                "sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers."
+                "is_cp_cache_layer_split_deepseek_v4_pool",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.runtime_context.get_disagg",
+                return_value=SimpleNamespace(disaggregation_mode="prefill"),
+            ),
+            patch("sglang.srt.runtime_context.get_resources", return_value=resources),
+            patch("sglang.srt.runtime_context.get_schedule", return_value=schedule),
+            patch(
+                "sglang.srt.runtime_context.max_prefill_buffer_tokens", return_value=32768
+            ),
+            patch("sglang.srt.layers.moe.get_moe_a2a_backend") as backend,
+            patch.object(
+                envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK,
+                "get",
+            ) as rank_capacity,
+        ):
+            for new_rows, chunk_size, cap, megamoe, capture, expected in (
+                (4096, 4096, 4096, True, False, False),
+                (4096, 32768, 4096, True, True, False),
+                (4096, 32768, 512, True, False, False),
+                (4096, 32768, 528, True, False, True),
+                (4097, 32768, 528, True, False, False),  # pads to 529 rows/rank
+                (4097, 32768, 529, True, False, True),
+                (4097, 32768, 512, False, False, True),
+            ):
+                with self.subTest(
+                    new_rows=new_rows,
+                    chunk_size=chunk_size,
+                    cap=cap,
+                    megamoe=megamoe,
+                    capture=capture,
+                ):
+                    batch.extend_lens = [new_rows]
+                    schedule.chunked_prefill_size = chunk_size
+                    rank_capacity.return_value = cap
+                    backend.return_value.is_megamoe.return_value = megamoe
+                    resources.experts_capturer = object() if capture else None
+                    self.assertEqual(
+                        _hcu_fold_supported(runner, batch, parallel), expected
+                    )
 
 
 class TestHcuReplayPlanConsensus(unittest.TestCase):

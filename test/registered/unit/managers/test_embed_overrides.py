@@ -9,7 +9,9 @@ Covers:
 """
 
 import unittest
-from unittest.mock import AsyncMock, MagicMock
+from array import array
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import torch
 
@@ -17,6 +19,7 @@ from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
 from sglang.srt.entrypoints.openai.utils import convert_embeds_to_tensors
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.managers.tokenizer_manager_score_mixin import (
     TokenizerManagerScoreMixin,
@@ -194,6 +197,44 @@ class TestGenerateReqInputEmbedOverride(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req[0].positional_embed_overrides, pe0)
         self.assertIsNone(req[1].positional_embed_overrides)
+
+    def test_encoder_swa_replay_rejects_positional_override_at_tokenizer(self):
+        req = GenerateReqInput(
+            input_ids=[1, 2],
+            positional_embed_overrides=PositionalEmbeds(
+                embeds=[_vec()], positions=[0]
+            ),
+        )
+        with patch("sglang.srt.managers.tokenizer_manager.get_exec") as get_exec:
+            get_exec.return_value.features.enable_encoder_swa_bounded_replay = True
+            with self.assertRaisesRegex(ValueError, "or positional_embed_overrides"):
+                TokenizerManager._validate_one_request(MagicMock(), req, req.input_ids)
+
+    def test_encoder_swa_replay_rejects_positional_override_before_kv_allocation(self):
+        ids = array("q", [1, 2])
+        req = SimpleNamespace(
+            get_fill_ids=lambda: ids,
+            prefix_len=0,
+            extend_end=2,
+            extend_len=2,
+            origin_input_ids=ids,
+            logprob_start_len=-1,
+            full_untruncated_fill_ids=ids,
+            multimodal_inputs=None,
+            input_embeds=None,
+            positional_embed_overrides=PositionalEmbeds(
+                embeds=[_vec()], positions=[0]
+            ),
+        )
+        batch = SimpleNamespace(reqs=[req], is_dllm=lambda: False, device="cpu")
+        with (
+            patch("sglang.srt.managers.schedule_batch.get_exec") as get_exec,
+            patch("sglang.srt.managers.schedule_batch.alloc_for_extend") as allocate,
+        ):
+            get_exec.return_value.features.enable_encoder_swa_bounded_replay = True
+            with self.assertRaisesRegex(ValueError, "or positional_embed_overrides"):
+                ScheduleBatch.prepare_for_extend(batch)
+            allocate.assert_not_called()
 
 
 # ========================================================================

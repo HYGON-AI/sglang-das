@@ -66,6 +66,26 @@ class TestGetLocalSliceBackendBranch(CustomTestCase):
             out = self._slice(cap, n_local=999)
         self.assertTrue(torch.equal(out, buf[6:10, :, : self.K]))
 
+    def test_standalone_encoder_replay_preserves_cached_diagnostics(self):
+        cap, buf = self._capturer()
+        cap.host_cache = SimpleNamespace(buffer=torch.full_like(buf, -1))
+        cache_locs = torch.tensor([4, 9])
+        batch = SimpleNamespace(
+            out_cache_loc=cache_locs,
+            out_cache_loc_virtual=None,
+            encoder_swa_replay=True,
+        )
+        with mock.patch.object(cap, "_get_local_slice", return_value=buf[:2]):
+            for overlap in (False, True):
+                with self.subTest(overlap=overlap):
+                    out = cap.on_forward_end(batch, False, None, no_copy_to_cpu=overlap)
+                    self.assertIsNone(out)
+                    self.assertTrue((cap.host_cache.buffer == -1).all())
+
+            batch.encoder_swa_replay = False
+            cap.on_forward_end(batch, False, None)
+            torch.testing.assert_close(cap.host_cache.buffer[cache_locs], buf[:2])
+
 
 if __name__ == "__main__":
     unittest.main()
