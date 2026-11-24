@@ -319,6 +319,13 @@ class FlashAttentionBackend(AttentionBackend):
                 is_draft_worker=True,
                 num_draft_tokens=int(self.speculative_num_draft_tokens),
             )
+        if self.speculative_num_draft_tokens:
+            self.max_context_len = int(model_runner.model_config.context_len) + int(
+                self.speculative_num_draft_tokens
+            )
+            self.max_num_pages = (
+                self.max_context_len + self.page_size - 1
+            ) // self.page_size
         self.speculative_step_id = speculative_step_id
 
         self.local_attn_builder = self._maybe_init_local_attn_builder(model_runner)
