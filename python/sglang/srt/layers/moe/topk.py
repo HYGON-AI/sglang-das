@@ -3132,11 +3132,14 @@ def _post_process_topk_ids(
 
         lplb_solver = get_global_lplb_solver(layer_id)
         if lplb_solver is not None:
-            log2phy_prob = (
-                lplb_solver.solve(topk_ids, num_token_non_padded)
-                if dispatch_algorithm == "load_aware"
-                else lplb_solver.solve(topk_ids)
-            )
+            if dispatch_algorithm == "load_aware" or (
+                skip_deepep_padded_tokens and not use_per_rank_shared_slots
+            ):
+                log2phy_prob = lplb_solver.solve(
+                    topk_ids, num_token_non_padded=num_token_non_padded
+                )
+            else:
+                log2phy_prob = lplb_solver.solve(topk_ids)
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
