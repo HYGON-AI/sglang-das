@@ -1614,6 +1614,7 @@ class TestHCUW4A8TailDispatchMode(CustomTestCase):
 
     def test_normal_cli_mode_prepares_both_paths_only_for_qualified_hcu(self):
         config = SimpleNamespace(top_k=6, num_experts=384, num_local_experts=48,
+                                 num_dispatch_experts=None, num_dispatch_local_experts=None,
                                  hidden_size=5120, params_dtype=torch.bfloat16)
         method = HCUW4A8Int8DeepEPMoEMethod.__new__(HCUW4A8Int8DeepEPMoEMethod)
         for enabled, hcu, qualified, mode, expected in (
@@ -1627,7 +1628,6 @@ class TestHCUW4A8TailDispatchMode(CustomTestCase):
             with self.subTest(enabled=enabled, hcu=hcu, qualified=qualified, mode=mode):
                 with (
                     patch.dict("os.environ", {"SGLANG_HCU_DSV41_TAIL_MOE_LOW_LATENCY": str(int(enabled))}),
-                    patch.object(fused_moe_module, "is_building_neighbour_layer", return_value=False),
                     patch.object(fused_moe_module, "get_moe_a2a_backend", return_value=MoeA2ABackend.DEEPEP),
                     patch.object(fused_moe_module, "_get_deepep_comm_group", return_value=Mock()),
                     patch.object(fused_moe_module, "get_deepep_mode", return_value=mode),
@@ -1651,7 +1651,7 @@ class TestHCUW4A8TailDispatchMode(CustomTestCase):
                     self.dispatcher.dispatch_a(torch.empty((0, 8)), Mock())
                 with self.flags.scoped(deepep_tail_max_tokens=128 if rows > 128 else None):
                     self.dispatcher.dispatch_b()
-                    self.dispatcher.combine_a((Mock(), Mock(), Mock()))
+                    self.dispatcher.combine_a(DeepEPNormalCombineInput(Mock(), Mock(), Mock()))
                     self.dispatcher.combine_b()
                 for name in ("dispatch_a", "dispatch_b", "combine_a", "combine_b"):
                     getattr(impl, name).assert_called_once()
@@ -1665,7 +1665,7 @@ class TestHCUW4A8TailDispatchMode(CustomTestCase):
         with self.flags.scoped(deepep_tail_max_tokens=128):
             self.dispatcher.dispatch_a(torch.empty((0, 8)), Mock())
         self.dispatcher.dispatch_b()
-        self.dispatcher.combine_a((Mock(), Mock(), Mock()))
+        self.dispatcher.combine_a(DeepEPNormalCombineInput(Mock(), Mock(), Mock()))
         with self.assertRaisesRegex(RuntimeError, "combine failed"):
             self.dispatcher.combine_b()
         self.assertIsNone(self.dispatcher._active_dispatcher)

@@ -13,6 +13,8 @@ from sglang.srt.layers.attention import deepseek_v4_backend as backend
 from sglang.srt.layers.attention.dsv4 import dsv41_sparse
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import deepseek_v4 as model_module
+from sglang.srt.models import deepseek_v4_platform_stage as stage
+from sglang.srt.models.deepseek_common import moe_transport as transport
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -27,26 +29,26 @@ def test_hcu_cp_tp_moe_gathers_and_reduce_scatters():
         torch.testing.assert_close(x, global_x)
         return x
 
-    obj = SimpleNamespace(mlp=mlp)
+    obj = SimpleNamespace(mlp=mlp, config=SimpleNamespace(model_type="deepseek_v41"))
     batch = SimpleNamespace(dp_padding_mode=None)
     scoped = Mock(return_value=nullcontext())
     with (
-        patch.object(model_module, "_is_hcu", True),
-        patch.object(model_module, "is_cp_active", return_value=False),
-        patch.object(model_module, "dsa_use_prefill_cp", return_value=True),
-        patch.object(model_module, "get_parallel", return_value=SimpleNamespace(attn_dp_size=1, attn_tp_size=1)),
-        patch.object(model_module, "get_moe_a2a_backend", return_value=SimpleNamespace(is_none=lambda: True)),
-        patch.object(model_module, "get_forward", return_value=SimpleNamespace(scoped=scoped)),
-        patch.object(model_module, "_every_row_routed", return_value=nullcontext()),
-        patch.object(model_module, "attn_cp_interleave_gather", return_value=global_x) as gather,
-        patch.object(model_module, "attn_cp_interleave_reduce_scatter", return_value=local_x) as scatter,
+        patch.object(stage, "_is_hcu", True),
+        patch.object(stage, "is_cp_active", return_value=False),
+        patch.object(stage, "dsa_use_prefill_cp", return_value=True),
+        patch.object(transport, "get_parallel", return_value=SimpleNamespace(attn_dp_size=1, attn_tp_size=1)),
+        patch.object(transport, "get_moe_a2a_backend", return_value=SimpleNamespace(is_none=lambda: True)),
+        patch.object(transport, "get_forward", return_value=SimpleNamespace(scoped=scoped)),
+        patch.object(transport, "_every_row_routed", return_value=nullcontext()),
+        patch.object(transport, "attn_cp_interleave_gather", return_value=global_x) as gather,
+        patch.object(transport, "attn_cp_interleave_reduce_scatter", return_value=local_x) as scatter,
     ):
-        result = model_module.DeepseekV4DecoderLayer._run_moe_ffn_dp_sync(
+        result = stage.NonCudaDecoderMixin._run_moe_ffn_dp_sync(
             obj, local_x, batch, input_ids=None, input_ids_global=None,
         )
     gather.assert_called_once()
     scatter.assert_called_once()
-    scoped.assert_called_once_with(mlp_reduce_scatter=True)
+    scoped.assert_called_once_with(mlp_reduce_scatter=True, defer_moe_finalize=False)
     torch.testing.assert_close(result, local_x)
 
 

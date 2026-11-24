@@ -28,6 +28,9 @@ def load(path, name, namespace, class_name=None):
     nodes = tree.body
     if class_name:
         nodes = next(n for n in nodes if isinstance(n, ast.ClassDef) and n.name == class_name).body
+    if name == 'late_layer_tail_layout':
+        load(path, 'late_layer_tail_lens', namespace)
+        load(path, '_whole_extend_tail_layout', namespace)
     node = next(n for n in nodes if isinstance(n, ast.FunctionDef) and n.name == name)
     node.decorator_list = []
     future = ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)
@@ -298,7 +301,7 @@ class TestLateLayerTailUpload(CustomTestCase):
                     for n, s in zip(lengths, seq):
                         t = min(n, limit)
                         rows.extend(range(start + n - t, start + n))
-                        expected_floors.extend([s - t] * t)
+                        expected_floors.extend([max(0, s - limit)] * t)
                         start += n
                     self.assertEqual(tails, [min(n, limit) for n in lengths])
                     torch.testing.assert_close(indices, torch.tensor(rows, dtype=torch.int64))
@@ -398,11 +401,11 @@ class TestLateLayerTailMetadataLengths(CustomTestCase):
 
                         namespace = dict(torch=SimpleNamespace(tensor=forbid_host_upload,
                             int32=torch.int32, cumsum=torch.cumsum), SWA_WINDOW=128,
-                            late_layer_tail_layout=helper, _tail_rows=rows,
+                            late_layer_whole_extend=lambda batch, dspark: None, late_layer_tail_layout=helper, _tail_rows=rows,
                             is_cp_active=lambda batch: cp_active)
                         build = load(backend_path, '_build_late_layer_tail_metadata',
                                      namespace, 'DeepseekV4AttnBackend')
-                        backend = SimpleNamespace(_late_layer_tail_cp_layout=cp_layout,
+                        backend = SimpleNamespace(encoder_row_floor=None, model_runner=SimpleNamespace(spec_algorithm=SimpleNamespace(is_dspark=lambda: False)), _late_layer_tail_cp_layout=cp_layout,
                                                   init_forward_metadata_prefill=capture)
                         with self.assertRaises(Captured):
                             build(backend, batch, legacy_cp=legacy_cp)
@@ -447,6 +450,7 @@ class TestLateLayerTailRequestIndices(CustomTestCase):
                         cp_metadata = SimpleNamespace(per_rank_actual_token=[
                             (sum(tails) + 7) // 8] * 8)
                         backend = SimpleNamespace(
+                            encoder_row_floor=None, model_runner=SimpleNamespace(spec_algorithm=SimpleNamespace(is_dspark=lambda: False)),
                             _late_layer_tail_cp_layout=lambda *args: {'cp_metadata': cp_metadata},
                             init_forward_metadata_prefill=lambda **kwargs:
                                 SimpleNamespace(core_attn_metadata=SimpleNamespace()),
@@ -455,7 +459,7 @@ class TestLateLayerTailRequestIndices(CustomTestCase):
                         proxy = SimpleNamespace(int32=torch.int32, int64=torch.int64,
                             cumsum=torch.cumsum, repeat_interleave=repeat)
                         ns = dict(torch=proxy, SWA_WINDOW=128, _tail_rows=rows,
-                            late_layer_tail_layout=helper, is_cp_active=lambda batch: cp_active)
+                            late_layer_whole_extend=lambda batch, dspark: None, late_layer_tail_layout=helper, is_cp_active=lambda batch: cp_active)
                         build = load(path, '_build_late_layer_tail_metadata', ns,
                                      'DeepseekV4AttnBackend')
                         with self.assertRaises(Captured):
@@ -573,9 +577,15 @@ class TestTailMoEDispatchScope(CustomTestCase):
             nullcontext=contextlib.nullcontext, get_forward=lambda: flags,
             get_attn_backend=lambda: SimpleNamespace(forward_metadata=SimpleNamespace(
                 late_layer_tail=tail)))
-        method = load(SOURCE / 'srt/models/deepseek_v4.py', '_run_moe_ffn_dp_sync',
-                      namespace, 'DeepseekV4DecoderLayer')
-        call = lambda: method(SimpleNamespace(mlp=mlp), output, SimpleNamespace(),
+        def prepare(mlp, x, batch, ids, global_ids, **kwargs):
+            return SimpleNamespace(_use_cp=cp, _use_tp_moe_gather=False,
+                _use_tp_attn_a2a_scatter=False, do_shared_local=False, input=x,
+                input_ids=ids, input_ids_global=global_ids, scope=contextlib.nullcontext,
+                return_output=lambda result: result)
+        namespace['MoeRowTransport'] = prepare
+        method = load(SOURCE / 'srt/models/deepseek_v4_platform_stage.py', '_run_moe_ffn_dp_sync',
+                      namespace, 'NonCudaDecoderMixin')
+        call = lambda: method(SimpleNamespace(mlp=mlp, config=SimpleNamespace(model_type='deepseek_v41')), output, SimpleNamespace(),
                               input_ids=None, input_ids_global=None)
         if fail:
             with self.assertRaisesRegex(RuntimeError, "MLP failed"):

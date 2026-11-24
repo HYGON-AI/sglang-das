@@ -39,6 +39,7 @@ from sglang.srt.models.deepseek_common.moe_transport import (
 )
 from sglang.srt.models.deepseek_v2 import MoEOutput
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE, AttnOutput
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import is_in_breakable_cuda_graph
 from sglang.srt.environ import envs
@@ -51,6 +52,7 @@ if TYPE_CHECKING:
     from sglang.srt.models import deepseek_v2
 
 _is_gfx95_supported = is_gfx95_supported()
+_is_hcu = is_hcu()
 
 
 def _prepare_ffn_input(layer, hidden_states, residual, post, comb, forward_batch):
@@ -166,7 +168,7 @@ class NonCudaDecoderMixin:
             )
             tail_graph_runner = get_forward().dsv41_tail_graph_runner
             if tail_graph_runner is not None or (
-                is_hcu() and is_in_breakable_cuda_graph()
+                _is_hcu and is_in_breakable_cuda_graph()
                 and self.self_attn.is_dsv41 and is_cp_active(forward_batch)
             ):
                 from sglang.srt.models.deepseek_v4 import _hcu_tail_graph_attention
@@ -359,17 +361,19 @@ class NonCudaDecoderMixin:
         input_ids_global: Optional[torch.Tensor],
         return_moe_output: bool = False,
     ) -> Union[torch.Tensor, deepseek_v2.MoEOutput]:
+        legacy_cp = _is_hcu and dsa_use_prefill_cp(forward_batch) and not is_cp_active(forward_batch)
         prepared = MoeRowTransport(
             self.mlp,
             hidden_states,
             forward_batch,
             input_ids,
             input_ids_global,
-            cp_return_contiguous=self.config.model_type == "deepseek_v41",
+            use_cp=True if legacy_cp else None,
+            cp_return_contiguous=self.config.model_type == "deepseek_v41" and not legacy_cp,
         )
         tail_moe_context = nullcontext()
         if (
-            is_hcu()
+            _is_hcu
             and prepared._use_cp
             and envs.SGLANG_HCU_DSV41_TAIL_MOE_LOW_LATENCY.get()
             and get_moe_a2a_backend().is_deepep()
