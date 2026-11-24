@@ -86,7 +86,6 @@ def _make_accumulator(
         rust_server_mode=rust_server_mode,
         is_request_level_customized_info_key=lambda key: False,
         current_weight_version=None,
-        rust_server_mode=rust_server_mode,
     )
 
 

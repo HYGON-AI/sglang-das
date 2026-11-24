@@ -107,7 +107,14 @@ def precompute_cos_sin_table(
     freqs_cis = precompute_freqs_cis(
         dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow
     )
-    return torch.view_as_real(freqs_cis).transpose(1, 2).reshape(seqlen, -1)
+    if freqs_cis.is_meta:
+        return freqs_cis.real.new_empty((seqlen, dim))
+    return _cos_sin_table(freqs_cis)
+
+
+@lru_cache(2)
+def _cos_sin_table(freqs_cis):
+    return torch.view_as_real(freqs_cis).transpose(1, 2).reshape(freqs_cis.shape[0], -1)
 
 
 @triton.jit

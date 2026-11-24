@@ -4544,6 +4544,7 @@ class DeepseekV4Model(nn.Module):
                         input_ids=input_ids,
                         forward_batch=forward_batch,
                         input_ids_global=input_ids_global,
+                        seam_open=tail is None,
                     )
         if _is_cuda:
             state = residual_batch.read_output(
