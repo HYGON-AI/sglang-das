@@ -48,6 +48,19 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_string_list,
 )
 from sglang.srt.disaggregation.hidden_events import PDHiddenEventManager
+
+# K3-HYBRID-KV-V1: byte planner for a hybrid main MLA / draft MHA model, used by the transfers below.
+from sglang.srt.disaggregation.hybrid_kv_transfer import (
+    decode_registration as decode_hybrid_specs,
+)
+from sglang.srt.disaggregation.hybrid_kv_transfer import enabled as hybrid_fix_enabled
+from sglang.srt.disaggregation.hybrid_kv_transfer import (
+    encode_specs as encode_hybrid_specs,
+)
+from sglang.srt.disaggregation.hybrid_kv_transfer import send as send_hybrid_kv
+from sglang.srt.disaggregation.hybrid_kv_transfer import (
+    validate_peer as validate_hybrid_peer,
+)
 from sglang.srt.disaggregation.mooncake.source_drain import SourceDrainTracker
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
@@ -177,6 +190,7 @@ class KVArgsRegisterInfo:
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     v4_transfer_metadata: dict = dataclasses.field(default_factory=dict)
+    hybrid_kv_specs: Optional[dict] = None  # K3-HYBRID-KV-V1
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -212,6 +226,7 @@ class KVArgsRegisterInfo:
             ),
             dst_state_types=unpack_state_types(msg[19]) if len(msg) > 19 else [],
             v4_transfer_metadata=decode_v4_transfer_metadata(msg),
+            hybrid_kv_specs=(decode_hybrid_specs(msg[21]) if len(msg) > 21 else None),
             staging_base_ptr=(
                 struct.unpack("Q", msg[14])[0]
                 if len(msg) > 14 and len(msg[14]) == 8
@@ -1130,6 +1145,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_attn_tp_size: Optional[int] = None,
         v4_transfer_metadata=None,
     ):
+        # K3-HYBRID-KV-V1: hybrid main MLA and draft MHA use different page ABIs. The switch
+        # is read first, so that nothing else is touched while it is off.
+        if hybrid_fix_enabled() and getattr(self, "is_hybrid_mla_backend", False):
+            if dst_device_kv_indices is not None:
+                raise ValueError("Hybrid KV transfer does not support HiSparse")
+            return send_hybrid_kv(
+                self,
+                mooncake_session_id,
+                prefill_kv_indices,
+                dst_kv_indices,
+                dst_kv_ptrs,
+                dst_layer_ids,
+            )
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
         )
@@ -2865,7 +2893,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             decode_kv_args.dst_state_data_formats,
                             decode_kv_args.dst_state_item_lens,
                         )
-                    except RuntimeError as error:
+                        if hybrid_fix_enabled() and self.is_hybrid_mla_backend:
+                            validate_hybrid_peer(
+                                getattr(self.kv_args, "hybrid_kv_specs", None),
+                                decode_kv_args.hybrid_kv_specs,
+                                decode_kv_args.dst_kv_ptrs,
+                                decode_kv_args.dst_kv_layer_ids,
+                            )
+                    except (RuntimeError, ValueError) as error:
                         decode_kv_args.registration_error = str(error)
                         logger.error(
                             "Decode peer %s registered an incompatible state ABI: %s",
@@ -3457,8 +3492,26 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                             dst_dcp_size,
                             dst_dcp_rank,
                             packed_state_data_formats,
-                        ] + ([packed_state_types, encode_v4_transfer_metadata(self.kv_mgr.kv_args)]
-                             if getattr(self.kv_mgr.kv_args, "v4_transfer_metadata", None) else [])
+                            # K3-HYBRID-KV-V1: preserve legacy frames when metadata is absent.
+                        ]
+                        + (
+                            [
+                                packed_state_types,
+                                encode_v4_transfer_metadata(self.kv_mgr.kv_args),
+                            ]
+                            if (
+                                getattr(
+                                    self.kv_mgr.kv_args, "v4_transfer_metadata", None
+                                )
+                                or getattr(self.kv_mgr.kv_args, "hybrid_kv_specs", None)
+                            )
+                            else []
+                        )
+                        + (
+                            [encode_hybrid_specs(self.kv_mgr.kv_args.hybrid_kv_specs)]
+                            if getattr(self.kv_mgr.kv_args, "hybrid_kv_specs", None)
+                            else []
+                        )
                     )
             except zmq.ZMQError:
                 self.kv_mgr.record_failure(

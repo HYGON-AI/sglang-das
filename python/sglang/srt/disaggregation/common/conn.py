@@ -45,6 +45,11 @@ from sglang.srt.disaggregation.base.conn import (
     KVTransferMetric,
     StateType,
 )
+from sglang.srt.disaggregation.hybrid_kv_transfer import (
+    PROTOCOL_ID,
+    enabled,
+    peer_problem,
+)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
@@ -159,6 +164,7 @@ class PrefillServerInfo:
     # /generate to http://{bootstrap_host}:{prefill_http_port} to trigger a KV
     # recompute -- no router-injected pd_rebootstrap_prefill_url needed.
     prefill_http_port: Optional[int] = None
+    hybrid_kv_protocol: Optional[str] = None  # K3-HYBRID-KV-V1
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -723,10 +729,27 @@ class CommonKVManager(BaseKVManager):
                 f"prefill_dp_rank={-1}&prefill_cp_rank={-1}&"
                 f"target_tp_rank={-1}&target_pp_rank={-1}"
             )
+            if getattr(self.kv_args, "hybrid_kv_specs", None):
+                url += "&hybrid_kv_protocol=" + PROTOCOL_ID
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
                 info = PrefillServerInfo(**data)
+                # K3-HYBRID-KV-V1: a peer that fails this check is not cached, so
+                # the request fails as after an unreachable bootstrap, with the
+                # peers intact, instead of the scheduler going down.
+                if getattr(self.kv_args, "hybrid_kv_specs", None):
+                    problem = peer_problem(
+                        protocol=info.hybrid_kv_protocol,
+                        src_cp=info.attn_cp_size,
+                        dst_cp=self.attn_cp_size,
+                        dst_pp=self.pp_size,
+                        src_tp=info.attn_tp_size,
+                        dst_tp=self.attn_tp_size,
+                    )
+                    if problem:
+                        logger.error(f"Hybrid KV transfer refused: {problem}")
+                        return False
             else:
                 logger.error(
                     f"Failed to get prefill server info: {response.status_code}, {response.text}"
@@ -2243,7 +2266,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 cp_cache_layer_split=bool(self.cp_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
             )
-            return web.json_response(dataclasses.asdict(info), status=200)
+            body = dataclasses.asdict(info)
+            if enabled() and request.query.get("hybrid_kv_protocol") == PROTOCOL_ID:
+                body["hybrid_kv_protocol"] = PROTOCOL_ID
+            else:
+                body.pop("hybrid_kv_protocol", None)
+            return web.json_response(body, status=200)
 
         if not self._is_ready():
             return web.Response(
