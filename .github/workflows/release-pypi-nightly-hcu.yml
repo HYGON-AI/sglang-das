@@ -14,13 +14,9 @@ on:
       - release/20260825_v0.5.18
 
   # ---- 手动触发，仅构建产物，不上传 NIGHTLY ----
+  # 无 ref 输入: 手动触发只构建发起本次运行所在分支的 HEAD, 不允许指定
+  # 分支/tag/commit, 产物来源只能是实际被检出的这一次提交
   workflow_dispatch:
-    inputs:
-      ref:
-        description: '要构建的 Git ref/branch/tag/SHA，默认当前分支 HEAD'
-        required: false
-        default: ''
-        type: string
 
 jobs:
   compile:
@@ -40,7 +36,7 @@ jobs:
       # 直接使用预装 DTK 的基础镜像, CI 内不再安装 DTK; 换/加编译目标 = 改下面矩阵
       # image 按镜像总表固定格式拼接 (container.image 不允许 env 上下文, vars.HARBOR_SITE 内联):
       #   ${{ vars.HARBOR_SITE }}/hcu/base/dtk:<dtk_tag>-rockylinux8.6-py<python_version>
-      # dtk26.10 的 rockylinux8.6 编译底座目前只有 py3.12, 矩阵三目标同 vllm-plugin-das 口径
+      # dtk26.10 / dtk27.04 的 rockylinux8.6 编译底座按 py3.12 出包, 矩阵四目标同 vllm-plugin-das 口径
       image: ${{ vars.HARBOR_SITE }}/hcu/base/dtk:${{ matrix.dtk_tag }}-rockylinux8.6-py${{ matrix.python-version }}
       options: >
         --device=/dev/kfd --device=/dev/dri/ --group-add video
@@ -50,7 +46,7 @@ jobs:
         --security-opt seccomp=unconfined
         --privileged=true
 
-    # ---- Matrix: dtk26.04 (py3.10/3.12) + dtk26.10 (py3.12) 并行编译 ----
+    # ---- Matrix: dtk26.04 (py3.10/3.12) + dtk26.10 (py3.12) + dtk27.04 (py3.12) 并行编译 ----
     strategy:
       fail-fast: false
       matrix:
@@ -61,21 +57,24 @@ jobs:
             python-version: '3.12'
           - dtk_tag: "26.10"
             python-version: '3.12'
+          - dtk_tag: "27.04"
+            python-version: '3.12'
 
     env:
       TORCH_VERSION: '2.11.0'
       PYPI_URL: ${{ vars.PYPI_URL }}
       RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
-      WHEEL_COMMIT_SHA: ${{ inputs.ref || github.sha }}
+      # 不再接受 ref 输入: 产物来源固定为触发本次运行的提交
+      WHEEL_COMMIT_SHA: ${{ github.sha }}
 
     steps:
       # =======================================================================
       # 环境准备
       # =======================================================================
 
+      # 默认 checkout 触发这次运行的提交; 没有 ref 输入, 版本戳与产物同源
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.WHEEL_COMMIT_SHA }}
           submodules: 'recursive'
 
       - name: Resolve wheel commit SHA
@@ -89,7 +88,7 @@ jobs:
           PIP_TRUSTED_HOST="$(echo "${PYPI_URL}" | sed -E 's#^https?://([^/:]+).*#\1#')"
           echo "PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}" >> "${GITHUB_ENV}"
 
-      # 内网 pip 源按矩阵 dtk_tag 拼接并去掉点 (26.04 -> dtk2604, 26.10 -> dtk2610),
+      # 内网 pip 源按矩阵 dtk_tag 拼接并去掉点 (26.04 -> dtk2604, 26.10 -> dtk2610, 27.04 -> dtk2704),
       # 与基础镜像预装的 DTK 版本一致; 基础镜像自带 /opt/dtk, CI 内不再安装 DTK
       - name: Resolve pip index from matrix dtk_tag
         env:
@@ -198,7 +197,7 @@ jobs:
         env:
           CIUPLOAD_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
           GITHUB_TOKEN: ${{ github.token }}
-          # DTK 大版本号取自矩阵 dtk_tag (26.04 -> 2604, 26.10 -> 2610)
+          # DTK 大版本号取自矩阵 dtk_tag (26.04 -> 2604, 26.10 -> 2610, 27.04 -> 2704)
           RAW_DTK_VER: ${{ matrix.dtk_tag }}
         run: |
           source /opt/dtk/env.sh
