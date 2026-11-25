@@ -39,9 +39,32 @@ def validate_cp_cache_layer_split(args, hf_config):
         "requires the Mooncake transfer backend",
     )
     require(
-        not args.enable_hisparse and not args.enable_hierarchical_cache,
-        "does not yet support HiSparse or HiCache in this HCU port",
+        not args.enable_hisparse,
+        "does not support HiSparse in this HCU port",
     )
+    if args.enable_hierarchical_cache:
+        require(is_hcu(), "L2 HiCache layer split currently requires HCU")
+        require(
+            not getattr(args, "hicache_storage_backend", None),
+            "supports L2 HiCache only, without an L3 storage backend",
+        )
+        require(
+            getattr(args, "hicache_mem_layout", "layer_first") == "layer_first",
+            "L2 HiCache currently requires layer_first layout",
+        )
+        require(
+            getattr(args, "hicache_io_backend", "kernel") == "kernel",
+            "L2 HiCache currently requires kernel I/O (HCU direct SWA copy is unverified)",
+        )
+        require(
+            not args.enable_encoder_swa_bounded_replay,
+            "L2 HiCache requires paged encoder SWA, not bounded encoder replay",
+        )
+        page_size = getattr(args, "page_size", None)
+        require(
+            page_size is None or page_size % 2 == 0,
+            "L2 HiCache requires even FULL pages for C2 replay",
+        )
     require(not args.prefill_only_disable_kv_cache, "requires the prefill KV cache")
     if args.enable_encoder_swa_bounded_replay:
         require(is_hcu(), "encoder SWA bounded replay currently requires HCU")
