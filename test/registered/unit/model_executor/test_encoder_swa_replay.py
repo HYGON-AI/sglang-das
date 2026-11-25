@@ -219,6 +219,119 @@ class TestHcuFoldCapacity(CustomTestCase):
                         _hcu_fold_supported(runner, batch, parallel), expected
                     )
 
+    def test_multi_request_fold_respects_capacity_and_extend_floor(self):
+        runner = SimpleNamespace(
+            attn_backend=SimpleNamespace(is_dsv41=True),
+            spec_algorithm=SpeculativeAlgorithm.DSPARK,
+            token_to_kv_pool=object(),
+        )
+        parallel = SimpleNamespace(
+            attn_cp_size=8,
+            attn_tp_size=1,
+            attn_dp_size=1,
+            pp_size=1,
+            cp_strategy="interleave",
+        )
+        resources = SimpleNamespace(experts_capturer=None, indexer_capturer=None)
+        schedule = SimpleNamespace(chunked_prefill_size=32768)
+        with (
+            patch(
+                "sglang.srt.layers.cp.padding.get_cp_padding_align_size", return_value=8
+            ),
+            patch("sglang.srt.layers.cp.utils.enable_cp_v2", return_value=False),
+            patch(
+                "sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers."
+                "is_cp_cache_layer_split_deepseek_v4_pool",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.runtime_context.get_disagg",
+                return_value=SimpleNamespace(disaggregation_mode="prefill"),
+            ),
+            patch("sglang.srt.runtime_context.get_resources", return_value=resources),
+            patch("sglang.srt.runtime_context.get_schedule", return_value=schedule),
+            patch(
+                "sglang.srt.runtime_context.max_prefill_buffer_tokens", return_value=32768
+            ),
+            patch("sglang.srt.layers.moe.get_moe_a2a_backend") as backend,
+            patch.object(
+                envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK,
+                "get",
+            ) as rank_capacity,
+        ):
+            backend.return_value.is_megamoe.return_value = True
+            rank_capacity.return_value = 4096
+
+            # 4 hitting requests within 32768 budget: 4*(512+128)=2560 <= 32768 -> True
+            batch = SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                reqs=[object() for _ in range(4)],
+                encoder_swa_reset=[True, True, True, True],
+                prefix_lens=[3584, 3584, 3584, 3584],
+                extend_lens=[512, 512, 512, 512],
+                extend_num_tokens=2048,
+                extend_logprob_start_lens=[512, 512, 512, 512],
+                multimodal_inputs=None,
+                global_num_tokens=[2048],
+            )
+            self.assertTrue(_hcu_fold_supported(runner, batch, parallel))
+
+            # Mixed hitting + non-hitting (prefix=0, extend=64 or reset=False, extend=64) -> True
+            batch_mixed = SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                reqs=[object(), object(), object()],
+                encoder_swa_reset=[True, True, False],
+                prefix_lens=[3584, 0, 3584],
+                extend_lens=[512, 64, 64],
+                extend_num_tokens=640,
+                extend_logprob_start_lens=[512, 64, 64],
+                multimodal_inputs=None,
+                global_num_tokens=[640],
+            )
+            self.assertTrue(_hcu_fold_supported(runner, batch_mixed, parallel))
+
+            # Exceeding MegaMoE/chunk capacity: 51 * 512 + 51 * 128 = 32640 <= 32768 (True),
+            # 52 * 512 + 52 * 128 = 33280 > 32768 (False)
+            batch_51 = SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                reqs=[object() for _ in range(51)],
+                encoder_swa_reset=[True] * 51,
+                prefix_lens=[3584] * 51,
+                extend_lens=[512] * 51,
+                extend_num_tokens=51 * 512,
+                extend_logprob_start_lens=[512] * 51,
+                multimodal_inputs=None,
+                global_num_tokens=[51 * 512],
+            )
+            self.assertTrue(_hcu_fold_supported(runner, batch_51, parallel))
+
+            batch_52 = SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                reqs=[object() for _ in range(52)],
+                encoder_swa_reset=[True] * 52,
+                prefix_lens=[3584] * 52,
+                extend_lens=[512] * 52,
+                extend_num_tokens=52 * 512,
+                extend_logprob_start_lens=[512] * 52,
+                multimodal_inputs=None,
+                global_num_tokens=[52 * 512],
+            )
+            self.assertFalse(_hcu_fold_supported(runner, batch_52, parallel))
+
+            # Any hitting request with extend < 128 -> False
+            batch_short = SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                reqs=[object(), object()],
+                encoder_swa_reset=[True, True],
+                prefix_lens=[3584, 3584],
+                extend_lens=[512, 64],
+                extend_num_tokens=576,
+                extend_logprob_start_lens=[512, 64],
+                multimodal_inputs=None,
+                global_num_tokens=[576],
+            )
+            self.assertFalse(_hcu_fold_supported(runner, batch_short, parallel))
+
 
 class TestHcuReplayPlanConsensus(unittest.TestCase):
     def _check(self, plans, *, differing_frame=False, oversized_peer=False):
