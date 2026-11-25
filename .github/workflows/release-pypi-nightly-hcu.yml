@@ -25,8 +25,10 @@ jobs:
     concurrency:
       group: release-nightly-hcu-${{ github.ref }}-dtk${{ matrix.dtk_tag }}-py${{ matrix.python-version }}
       cancel-in-progress: true
-    # ---- 自托管 HCU runner，在 Docker 容器内执行 ----
-    runs-on: [ci, bw1100]
+    # ---- K8s 编译池 (hygon-build)，不占卡; job 直接运行在 container.image 中 ----
+    # 池内 job 模板已只读挂载 /opt/hyhal 与 /ci_public，没有卡，因此不使用
+    # Docker 的 --device/--privileged/-v 之类 options
+    runs-on: hygon-build
     timeout-minutes: 180
     defaults:
       run:
@@ -38,13 +40,6 @@ jobs:
       #   ${{ vars.HARBOR_SITE }}/hcu/base/dtk:<dtk_tag>-rockylinux8.6-py<python_version>
       # dtk26.10 / dtk27.04 的 rockylinux8.6 编译底座按 py3.12 出包, 矩阵四目标同 vllm-plugin-das 口径
       image: ${{ vars.HARBOR_SITE }}/hcu/base/dtk:${{ matrix.dtk_tag }}-rockylinux8.6-py${{ matrix.python-version }}
-      options: >
-        --device=/dev/kfd --device=/dev/dri/ --group-add video
-        -v /opt/hyhal/:/opt/hyhal/:ro
-        --shm-size=80G
-        --cap-add=SYS_PTRACE
-        --security-opt seccomp=unconfined
-        --privileged=true
 
     # ---- Matrix: dtk26.04 (py3.10/3.12) + dtk26.10 (py3.12) + dtk27.04 (py3.12) 并行编译 ----
     strategy:
