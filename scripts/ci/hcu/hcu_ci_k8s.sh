@@ -24,6 +24,25 @@ hcu_ci_in_k8s() {
   [[ "${HCU_CI_IN_K8S:-0}" == "1" || "${HCU_CI_IN_K8S:-0}" == "true" ]]
 }
 
+# Join two colon-separated library paths, first argument first, dropping empty
+# and repeated entries. The DTK PyTorch build dlopen()s libmpi.so.40 from
+# /opt/mpi/lib at `import torch`, so add the DTK dirs without dropping the
+# ones the image already publishes.
+merge_ld_library_path() {
+  local merged=""
+  local entry
+  local -a entries
+  IFS=':' read -r -a entries <<< "${1:-}:${2:-}"
+  for entry in "${entries[@]}"; do
+    [[ -n "${entry}" ]] || continue
+    case ":${merged}:" in
+      *":${entry}:"*) ;;
+      *) merged="${merged:+${merged}:}${entry}" ;;
+    esac
+  done
+  printf '%s' "${merged}"
+}
+
 # Drop-in for `docker exec [-i] [-w DIR] [-e KEY=VAL]... CONTAINER CMD...`.
 hcu_ci_container_exec() {
   if ! hcu_ci_in_k8s; then

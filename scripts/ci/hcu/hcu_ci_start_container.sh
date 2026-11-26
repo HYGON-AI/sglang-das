@@ -97,6 +97,21 @@ VISIBLE_DEVICES="${HCU_CI_VISIBLE_DEVICES:-}"
 DTK_ROOT="${HCU_DTK_ROOT:-/opt/dtk}"
 HCU_LD_LIBRARY_PATH="${HCU_LD_LIBRARY_PATH:-${DTK_ROOT}/hip/lib:${DTK_ROOT}/lib:${DTK_ROOT}/lib64:${DTK_ROOT}/hsa/lib:${DTK_ROOT}/llvm/lib:${DTK_ROOT}/dcc/gcvm/lib:${DTK_ROOT}/.hyhal/lib:${DTK_ROOT}/.hyhal/lib64:${DTK_ROOT}/.hyhal/rocm_smi/lib:${DTK_ROOT}/.hyhal/hydm/lib:/opt/hyhal/lib:/opt/hyhal/lib64}"
 
+# The list above only covers DTK itself; merge_ld_library_path() keeps the
+# image's own runtime directories (e.g. /opt/mpi/lib) next to it.
+
+# Fail at the source, with a readable message, instead of leaving the next step
+# to die on a dlopen() error from somewhere unrelated.
+check_torch_import() {
+  local merged="$1"
+  if LD_LIBRARY_PATH="${merged}" python3 -c "import torch" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "::error::'import torch' fails with LD_LIBRARY_PATH=${merged}" >&2
+  LD_LIBRARY_PATH="${merged}" python3 -c "import torch" || true
+  return 1
+}
+
 if hcu_ci_in_k8s; then
   # The job already runs in ${IMAGE}; the job template provides the cards,
   # /opt/hyhal, /dev/shm, /public and /ci_public. Recreate the paths and env
@@ -109,12 +124,15 @@ if hcu_ci_in_k8s; then
     ln -sfn "${WHEEL_STAGING_HOST}" "${WHEEL_STAGING_CONTAINER}"
   fi
   mkdir -p /sgl-data/hf-cache /sgl-data/pip-cache
+  # The job container already carries the image's LD_LIBRARY_PATH; keep it.
+  MERGED_LD_LIBRARY_PATH="$(merge_ld_library_path "${HCU_LD_LIBRARY_PATH}" "${LD_LIBRARY_PATH:-}")"
+  check_torch_import "${MERGED_LD_LIBRARY_PATH}" || exit 1
   {
     echo "HF_HOME=/sgl-data/hf-cache"
     echo "HF_HUB_ETAG_TIMEOUT=300"
     echo "HF_HUB_DOWNLOAD_TIMEOUT=300"
     echo "ROCM_PATH=${DTK_ROOT}"
-    echo "LD_LIBRARY_PATH=${HCU_LD_LIBRARY_PATH}"
+    echo "LD_LIBRARY_PATH=${MERGED_LD_LIBRARY_PATH}"
     echo "SGLANG_IS_IN_CI=1"
     echo "SGLANG_IS_IN_CI_HCU=1"
     echo "SGLANG_USE_AITER=0"
@@ -218,6 +236,14 @@ fi
 # Remove any leftover container from a previous run.
 docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
 
+# `-e LD_LIBRARY_PATH` replaces the image's value, so merge the image's own
+# runtime directories (e.g. /opt/mpi/lib) in explicitly.
+IMAGE_LD_LIBRARY_PATH="$(
+  docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${IMAGE}" 2>/dev/null \
+    | sed -n 's/^LD_LIBRARY_PATH=//p' | tail -n 1
+)"
+CONTAINER_LD_LIBRARY_PATH="$(merge_ld_library_path "${HCU_LD_LIBRARY_PATH}" "${IMAGE_LD_LIBRARY_PATH}")"
+
 echo "Launching container: ${CONTAINER}"
 docker run -dt --user root --privileged \
   --network="${NETWORK_MODE}" \
@@ -240,7 +266,7 @@ docker run -dt --user root --privileged \
   -e HF_HUB_ETAG_TIMEOUT=300 \
   -e HF_HUB_DOWNLOAD_TIMEOUT=300 \
   -e ROCM_PATH="${DTK_ROOT}" \
-  -e LD_LIBRARY_PATH="${HCU_LD_LIBRARY_PATH}" \
+  -e LD_LIBRARY_PATH="${CONTAINER_LD_LIBRARY_PATH}" \
   "${VISIBLE_ENV_ARGS[@]}" \
   -e SGLANG_IS_IN_CI=1 \
   -e SGLANG_IS_IN_CI_HCU=1 \
@@ -253,3 +279,11 @@ docker run -dt --user root --privileged \
 
 # Git >= 2.35.2 refuses cross-user repos; mark the mount as safe.
 docker exec "${CONTAINER}" git config --global --add safe.directory /sglang-checkout
+
+if ! docker exec -e LD_LIBRARY_PATH="${CONTAINER_LD_LIBRARY_PATH}" "${CONTAINER}" \
+  python3 -c "import torch" >/dev/null 2>&1; then
+  echo "::error::'import torch' fails inside ${CONTAINER} with LD_LIBRARY_PATH=${CONTAINER_LD_LIBRARY_PATH}" >&2
+  docker exec -e LD_LIBRARY_PATH="${CONTAINER_LD_LIBRARY_PATH}" "${CONTAINER}" \
+    python3 -c "import torch" || true
+  exit 1
+fi
