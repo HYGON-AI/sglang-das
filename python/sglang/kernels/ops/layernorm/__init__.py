@@ -537,3 +537,15 @@ for _fn in ("fused_dual_residual_rmsnorm", "fused_rmsnorm"):
         )
     )
 del _fn
+
+# Split-K mHC pre GEMM with fused square-sum, used for the large-token
+# (prefill) regime that the TileLang split-K kernel does not cover.
+for _fn in ("mhc_pre_partial_splitk",):
+    register_kernel(
+        KernelSpec(
+            op=f"layernorm.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.layernorm.mhc_pre_splitk_triton:{_fn}",
+        )
+    )
+del _fn
