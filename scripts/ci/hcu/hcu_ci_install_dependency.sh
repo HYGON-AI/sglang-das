@@ -95,6 +95,7 @@ import tvm_ffi
 from llguidance.torch import fill_next_token_bitmask_par_with_draft_tokens
 
 print("[hcu-ci] numpy:", importlib.metadata.version("numpy"))
+print("[hcu-ci] ml_dtypes:", importlib.metadata.version("ml_dtypes"))
 print("[hcu-ci] llguidance:", importlib.metadata.version("llguidance"))
 print("[hcu-ci] sgl-eval:", importlib.metadata.version("sgl-eval"))
 PY_TEST_DEPS
@@ -105,8 +106,15 @@ if [[ "${SKIP_COMPAT_INSTALL}" == "1" || "${SKIP_COMPAT_INSTALL}" == "true" ]]; 
   echo "[hcu-ci] HCU_CI_SKIP_COMPAT_INSTALL=${SKIP_COMPAT_INSTALL}; skipping HCU compatibility pins"
 else
   echo "[hcu-ci] Installing HCU compatibility pins"
+  # ml_dtypes >= 0.6 is built against the NumPy 2 C-API and requires
+  # numpy>=2.0, while the HCU image ships NumPy 1.x (requirements_hcu.txt pins
+  # 1.24.3). tilelang/onnx pull in the latest ml_dtypes, after which every
+  # `import tvm_ffi` dies with "compiled against NumPy C-API version 0x12 but
+  # the running NumPy has C-API version 0x11". 0.5.4 is the last release that
+  # runs on NumPy 1.x and it still works on NumPy 2, so pin it with the other
+  # compatibility pins.
   install_with_retry hcu_ci_container_exec "${CONTAINER}" \
-    pip install --cache-dir=/sgl-data/pip-cache "kernels<0.15" "apache-tvm-ffi==0.1.11" tabulate
+    pip install --cache-dir=/sgl-data/pip-cache "kernels<0.15" "apache-tvm-ffi==0.1.11" "ml_dtypes==0.5.4" tabulate
 fi
 
 if [[ -n "${INSTALL_WHEEL_URLS}" ]]; then
