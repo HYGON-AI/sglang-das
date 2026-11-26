@@ -407,6 +407,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          export
           CHECKOUT_DIR="${RUNNER_TEMP}/hcu-sglang-${GITHUB_RUN_ID}-stage-a"
           rm -rf "${CHECKOUT_DIR}"
           mkdir -p "${CHECKOUT_DIR}"
