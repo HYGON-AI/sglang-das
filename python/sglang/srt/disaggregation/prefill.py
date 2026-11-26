@@ -521,6 +521,16 @@ class PrefillBootstrapQueue:
                 self.token_to_kv_pool.compression_ratios
             )
 
+        # K3-HYBRID-KV-V1: describe each main/draft entry before registration.
+        from sglang.srt.disaggregation.hybrid_kv_transfer import attach_specs
+
+        attach_specs(
+            kv_args,
+            self.token_to_kv_pool,
+            draft_kv_pool,
+            scheduler=self.scheduler,
+            is_decode=False,
+        )
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,

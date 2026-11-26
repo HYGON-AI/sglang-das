@@ -662,12 +662,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
             num_main_entries = len(kv_data_ptrs)
-            draft_layer_ids = []
-            if has_kv_layer_ids:
-                target_layer_num = self.scheduler.model_config.num_hidden_layers
-                draft_layer_ids = [
-                    target_layer_num + i for i in range(len(draft_kv_data_ptrs))
-                ]
+            # K3-PD-FIX: match prefill's per-layer IDs across draft K/V groups.
+            from sglang.srt.disaggregation.utils import build_kv_layer_ids
+
+            combined_layer_ids = build_kv_layer_ids(
+                token_to_kv_pool=self.token_to_kv_pool,
+                draft_token_to_kv_pool=self.draft_token_to_kv_pool,
+                num_draft_entries=len(draft_kv_data_ptrs),
+                num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
+            )
+            kv_layer_ids = combined_layer_ids[:num_main_entries]
+            draft_layer_ids = combined_layer_ids[num_main_entries:]
             if self.is_mla_backend:
                 kv_data_ptrs += draft_kv_data_ptrs
                 kv_data_lens += draft_kv_data_lens
@@ -725,6 +730,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
+
+        # K3-HYBRID-KV-V1: describe each main/draft entry before registration.
+        from sglang.srt.disaggregation.hybrid_kv_transfer import attach_specs
+
+        attach_specs(
+            kv_args,
+            self.token_to_kv_pool,
+            self.draft_token_to_kv_pool,
+            scheduler=self.scheduler,
+            is_decode=True,
+        )
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,

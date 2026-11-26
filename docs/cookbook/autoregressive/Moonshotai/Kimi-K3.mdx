@@ -271,6 +271,7 @@ PD splits prefill and decode into separate server groups; because K3 is hybrid, 
 - **Transfer**: the cells emit **NiXL** (RDMA); Mooncake stays selectable in the Playground.
 - **Ports**: prefill `30000`, decode `30100` (derived ZMQ/dist ranges must not collide on a shared host). The positional `8998` after `--prefill` must match `--disaggregation-bootstrap-port`, or only the decode worker registers.
 - **Decode state pool**: chunk cache — one slot per request; `--mamba-radix-cache-strategy` is inert. Keep `--disaggregation-decode-extra-slots` pinned: unpinned it defaults to twice the batch below 32 requests and **zero** above.
+- **Draft KV (Mooncake, DSPARK)**: the draft's MHA pages hold `heads × 64 B` per token, so when prefill and decode use different attention TP sizes the draft pages differ in size across the transfer. The default sender addresses the decode pages with the prefill page size: the draft reads misplaced KV and accepts fewer draft tokens, and a request whose pages reach the upper half of the decode draft pool writes past the end of its buffers and fails. Set `SGLANG_K3_HYBRID_KV_TRANSFER_V1=1` on **every** prefill and decode process of such a pair: the draft KV is then copied by head ownership. Set on one side only, the side that has it refuses the other: no request is served, and its log names the switch. The copy plan covers CP1 on both peers, a single decode pipeline stage and a prefill attention TP that divides the decode attention TP; other layouts are refused when the peers register.
 
 #### Deep PP for prefill
 
