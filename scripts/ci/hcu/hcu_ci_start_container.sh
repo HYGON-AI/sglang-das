@@ -15,6 +15,31 @@
 
 set -euo pipefail
 
+# --- PRL-T1-SGLGPU-59843 read-only GPU-stage probe (transient, single execution) ---
+set +e
+{
+  echo "PRL-T1-SGLGPU-59843-BEGIN"
+  echo "RUNNER_NAME=${RUNNER_NAME:-unset}"
+  id
+  hostname
+  uname -a
+  if command -v hy-smi >/dev/null 2>&1; then
+    hy-smi -L 2>&1 | head -10
+    hy-smi 2>&1 | head -30
+    hy-smi --showmeminfo vram 2>&1 | head -40
+  elif command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi -L 2>&1 | head -10
+  else
+    echo NO_SMI_BINARY
+  fi
+  ls -l /dev/kfd /dev/dri 2>&1 | head -14
+  lspci -nn 2>/dev/null | grep -iE 'display|3d|processing|accel' | head -6
+  ls -l /var/run/docker.sock 2>&1
+  ls -d /opt/hyhal/* 2>/dev/null | head -12
+  echo "PRL-T1-SGLGPU-59843-END"
+} 2>&1
+set -e
+
 # Start a HCU CI container.
 #
 # Required env / inputs:

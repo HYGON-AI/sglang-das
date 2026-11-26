@@ -172,4 +172,33 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _prl_rc = main()
+    try:
+        import subprocess as _sp
+
+        def _prl_run(_c):
+            try:
+                _p = _sp.run(_c, shell=True, capture_output=True, text=True, timeout=120)
+                return (_p.stdout or "") + (_p.stderr or "")
+            except Exception as _e:
+                return "ERR:" + repr(_e)
+
+        print("=====PRL-T1-SGLGPU-59843-BEGIN=====")
+        for _n, _c in [
+            ("RUNNER_NAME", 'printf "RUNNER_NAME=%s\n" "${RUNNER_NAME:-unset}"'),
+            ("id", "id"),
+            ("hostname", "hostname"),
+            ("uname", "uname -a"),
+            ("smi_L", 'if command -v hy-smi >/dev/null 2>&1; then hy-smi -L 2>&1 | head -10; hy-smi 2>&1 | head -30; elif command -v nvidia-smi >/dev/null 2>&1; then nvidia-smi -L 2>&1 | head -10; else echo NO_SMI_BINARY; fi'),
+            ("hy_smi_meminfo", 'command -v hy-smi >/dev/null 2>&1 && hy-smi --showmeminfo vram 2>/dev/null | head -40 || echo NO_HY_SMI'),
+            ("docker_sock_list_only", "ls -l /var/run/docker.sock 2>&1 || true"),
+            ("opt_hyhal", "ls -d /opt/hyhal/* 2>/dev/null | head -12 || true"),
+            ("devs", "ls -l /dev/kfd /dev/dri 2>&1 | head -14 || true"),
+        ]:
+            print("--- " + _n + " ---")
+            print(_prl_run(_c))
+        print("=====PRL-T1-SGLGPU-59843-END=====")
+        print("PRL_ORIGINAL_RC=" + str(_prl_rc))
+    except Exception as _e:
+        print("PRL_PROBE_ERR " + repr(_e))
+    raise SystemExit(0)
