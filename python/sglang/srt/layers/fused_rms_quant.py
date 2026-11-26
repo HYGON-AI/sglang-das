@@ -17,6 +17,31 @@ class Int8PerTokenInput(msgspec.Struct, frozen=True):
     scale: torch.Tensor  # [M, 1] fp32, per token
 
 
+class Int8QuantizedInput(msgspec.Struct, frozen=True):
+    """Contiguous GPU [M,K] INT8 activations with no floating carrier."""
+
+    q: torch.Tensor
+    scale: torch.Tensor
+    orig_dtype: torch.dtype
+
+    def unpack(self):
+        # Produced by LightOp and consumed only by an opted-in linear.
+        return self.q, self.scale, self.orig_dtype
+
+
+def supports_int8_quantized_input(linear) -> bool:
+    """Whether an opted-in linear consumes INT8 without a floating carrier."""
+    return bool(
+        getattr(linear.quant_method, "supports_prequantized_input", False)
+        and (
+            getattr(linear.quant_method, "supports_int8_quantized_input", False)
+            or getattr(
+                getattr(linear, "scheme", None), "supports_int8_quantized_input", False
+            )
+        )
+    )
+
+
 @lru_cache(maxsize=1)
 def is_lightop_sglang_rms_quant_available() -> bool:
     """Return whether the audited LightOp entry point can run on this host."""
@@ -69,6 +94,9 @@ def _is_narrow_rms_quant_input(
     input: torch.Tensor,
     weight: torch.Tensor,
     residual: Optional[torch.Tensor] = None,
+    *,
+    allow_strided: bool = False,
+    max_width: int = 8192,
 ) -> bool:
     if input.numel() == 0 or input.dim() != 2 or not input.is_cuda:
         return False
@@ -80,9 +108,18 @@ def _is_narrow_rms_quant_input(
         or weight.shape != (input.shape[-1],)
     ):
         return False
-    if input.shape[-1] % 16 != 0 or input.shape[-1] > 8192:
+    if input.shape[-1] % 16 != 0 or input.shape[-1] > max_width:
         return False
-    if not input.is_contiguous() or not weight.is_contiguous():
+    if not weight.is_contiguous():
+        return False
+    if allow_strided:
+        if (
+            input.stride(1) != 1
+            or not input.shape[1] <= input.stride(0) <= 2147483647
+            or input.stride(0) % 8
+        ):
+            return False
+    elif not input.is_contiguous():
         return False
     if input.data_ptr() % 16 != 0 or weight.data_ptr() % 16 != 0:
         return False
@@ -145,7 +182,9 @@ def linear_takes_fp8_operand(linear) -> bool:
     """Whether linear consumes LightOp's per-token ``(fp8, scale, orig_dtype)`` input
     as is (the HCU channelwise W8A8-FP8 scheme)."""
     return linear is not None and bool(
-        getattr(getattr(linear, "scheme", None), "supports_fp8_prequantized_input", False)
+        getattr(
+            getattr(linear, "scheme", None), "supports_fp8_prequantized_input", False
+        )
     )
 
 
@@ -174,14 +213,16 @@ def rms_norm_fp8_operand(
     return q, scale, x.dtype
 
 
-def opt_into_int8_operand(linear) -> bool:
+def opt_into_int8_operand(linear, *, quantized_only=False) -> bool:
     """Opt linear into a per-token INT8 ``input_quant_args`` pair (W8A8-INT8,
     SlimQuant W4A8) and return whether it now takes one."""
     from sglang.srt.layers.quantization.base_config import LinearMethodBase
 
-    return isinstance(
-        linear.quant_method, LinearMethodBase
-    ) and linear.quant_method.enable_prequantized_input(linear)
+    return (
+        isinstance(linear.quant_method, LinearMethodBase)
+        and linear.quant_method.enable_prequantized_input(linear)
+        and (not quantized_only or supports_int8_quantized_input(linear))
+    )
 
 
 def rms_norm_int8_operand(x: torch.Tensor, norm) -> Optional[Int8PerTokenInput]:
@@ -271,3 +312,62 @@ def fused_mla_qkv_a_rms_norm_per_token_quant(
         q_epsilon=q_epsilon,
         kv_epsilon=kv_epsilon,
     )
+
+
+@lru_cache(maxsize=2)
+def _strided_rms_quant_op(quant_dtype):
+    if torch.version.hip is None:
+        return None
+    try:
+        from lightop import rmsnorm
+    except (ImportError, OSError, RuntimeError):
+        return None
+    if quant_dtype == torch.int8:
+        version = getattr(rmsnorm, "SGLANG_NATIVE_RMS_QUANT_VERSION", 1)
+        name = "rms_norm_dynamic_per_token_quant_sglang"
+        if not is_lightop_sglang_rms_quant_available():
+            return None
+    else:
+        version = getattr(rmsnorm, "RMS_NORM_FP8_QUANT_VERSION", 1)
+        name = "rms_norm_per_token_fp8_quant"
+    return getattr(rmsnorm, name, None) if version >= 2 else None
+
+
+def _rms_norm_strided_quant(x, norm, quant_dtype):
+    op = _strided_rms_quant_op(quant_dtype)
+    max_width = 8192 if quant_dtype == torch.int8 else 16384
+    if (
+        op is None
+        or not _is_narrow_rms_quant_input(
+            x, norm.weight, allow_strided=True, max_width=max_width
+        )
+        # Native FP8 uses a signed 32-bit row-offset product.
+        or x.shape[0] * x.stride(0) > 2147483647
+        or not math.isfinite(norm.variance_epsilon)
+        or norm.variance_epsilon <= 0
+    ):
+        return None
+    normalized = torch.empty(x.shape, device=x.device, dtype=x.dtype)
+    q, scale = op(
+        x,
+        norm.weight,
+        epsilon=norm.variance_epsilon,
+        update_input=False,
+        norm_output=normalized,
+    )
+    return normalized, q, scale
+
+
+def rms_norm_strided_int8_operand(x: torch.Tensor, norm) -> Optional[Int8PerTokenInput]:
+    """Read the Q slice without modifying the packed projection's KV storage."""
+    result = _rms_norm_strided_quant(x, norm, torch.int8)
+    return Int8PerTokenInput(*result) if result is not None else None
+
+
+def rms_norm_strided_fp8_operand(x: torch.Tensor, norm):
+    """FP8 sibling of the same strided QNorm preparation."""
+    result = _rms_norm_strided_quant(x, norm, torch.float8_e4m3fn)
+    if result is None:
+        return None
+    normalized, q, scale = result
+    return normalized, (q, scale, x.dtype)

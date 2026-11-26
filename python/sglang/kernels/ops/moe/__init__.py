@@ -276,3 +276,12 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="moe.per_token_quant_stage",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.per_token_quant_stage:try_quantize_and_stage_moe_inputs",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)

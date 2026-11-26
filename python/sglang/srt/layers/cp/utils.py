@@ -134,7 +134,11 @@ def enable_cp_v2() -> bool:
     if is_hcu():
         from sglang.srt.environ import envs
 
-        return bool(envs.SGLANG_ENABLE_CP_V2.get())
+        import os
+
+        return bool(envs.SGLANG_ENABLE_CP_V2.get()) or (
+            os.environ.get("SGLANG_HCU_DSV41_BCG_CP_V2") == "1"
+        )
     return not (is_npu() or is_musa())
 
 

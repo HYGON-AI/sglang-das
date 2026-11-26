@@ -14,6 +14,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 _OPERATORS = (
     "dsv41_int8_quantize_out",
     "dsv41_int8_gemm_out",
@@ -69,7 +71,7 @@ class _NativeOps:
 @lru_cache(maxsize=1)
 def backend():
     try:
-        import sgl_kernel  # Loads the installed common_ops registration.
+        import sgl_kernel  # noqa: F401 -- registers the installed common_ops.
     except ImportError as exc:
         raise RuntimeError("Rebuild the matching HCU sglang-kernel wheel with DSV4.1 INT8 support.") from exc
     ops = torch.ops.sgl_kernel
@@ -243,21 +245,25 @@ def _algorithm_config(path):
         return json.load(f)["algorithms"]
 
 
-def _project_unpacked(x, w, s, groups, rank, *, output_dtype=None, tile_n=None, group_major=False, algo_rank=None):
-    if (
-        x.ndim != 3 or x.shape[1] != groups or groups <= 0 or rank <= 0
-        or w.shape != (groups * rank, x.shape[-1])
-        or w.dtype != torch.int8 or not w.is_contiguous()
-        or s.shape != (groups * rank, 1)
-        or s.dtype != torch.float32 or not s.is_contiguous()
-        or x.device != w.device or x.device != s.device
-    ):
-        raise ValueError("Invalid channelwise INT8 projection tensors")
+def _project_unpacked(
+    x,
+    w,
+    s,
+    groups,
+    rank,
+    *,
+    output_dtype=None,
+    tile_n=None,
+    group_major=False,
+    algo_rank=None,
+):
     output_dtype = output_dtype or x.dtype
-    if output_dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        raise ValueError("HIP projection output requires BF16/FP16/FP32")
     if tile_n is None:
-        tile_n = int(os.environ.get("SGLANG_DSV41_INT8_BLASLT_TILE_N", "0")) if groups == 1 else 0
+        tile_n = (
+            int(os.environ.get("SGLANG_DSV41_INT8_BLASLT_TILE_N", "0"))
+            if groups == 1
+            else 0
+        )
     if tile_n < 0:
         raise ValueError("INT8 BLASLt tile size must be non-negative")
     ops = load_native()
@@ -272,8 +278,11 @@ def _project_unpacked(x, w, s, groups, rank, *, output_dtype=None, tile_n=None, 
     q, xs = quantize(x)
     if group_major:
         q = q.transpose(0, 1).contiguous()
-    raw = torch.empty((groups, t, rank) if group_major else (t, groups, rank),
-                      device=x.device, dtype=torch.int32)
+    raw = torch.empty(
+        (groups, t, rank) if group_major else (t, groups, rank),
+        device=x.device,
+        dtype=torch.int32,
+    )
     ops.gemm_out(q, w, raw, groups, tile_n, group_major, algo_rank)
     ops.scale_out(raw, xs, s, y, groups, group_major)
     return y
@@ -296,11 +305,13 @@ def _version(w):
 def _role(g,n,k):
  if (g,n,k)==(8,1024,4096):return 'wo_a'
  if (g,n,k)==(1,129280,5120):return 'lm_head'
+ if (g,n,k)==(1,16160,5120):return 'lm_head_tp8'
  if g==1 and k==256 and n in (16160,129280):return 'markov_tp8' if n==16160 else 'markov_full'
  return None
 
 
 def _layout(role,m,g,n,k):
+ if role=='lm_head_tp8':return 1,n,k*n,k,False
  if role=='wo_a':return g,n,k*n+131072,4224 if m in (36,40,42,48) else (k+64 if m>=64 else k),False
  if role=='lm_head':
   pitch=5120 if m<64 else (5136 if m==64 else (5248 if m<=96 else (5152 if m<=128 else 5376)))
@@ -325,12 +336,19 @@ def _pack(w,g,n,k,batches,lda,astride):
 
 
 def _prepare_packed_weight(w):
- if os.environ.get('SGLANG_DSV41_INT8_SERVICE_OPT')!='1' or not w.is_cuda:return
- if w.dtype!=torch.int8 or not w.is_contiguous() or w.ndim!=2:return
- n0,k=w.shape;g=8 if (n0,k)==(8192,4096) else 1;n=n0//g;role=_role(g,n,k)
- if role is None:return
- for m in ([1,256] if role in ('markov_tp8','markov_full') else [1]):
-  batches,lda,astride,_,_=_layout(role,m,g,n,k);_pack(w,g,n,k,batches,lda,astride)
+    if not envs.SGLANG_DSV41_INT8_SERVICE_OPT.get() or not w.is_cuda:
+        return
+    if w.dtype != torch.int8 or not w.is_contiguous() or w.ndim != 2:
+        return
+    n0, k = w.shape
+    g = 8 if (n0, k) == (8192, 4096) else 1
+    n = n0 // g
+    role = _role(g, n, k)
+    if role is None:
+        return
+    for m in [1, 256] if role in ("markov_tp8", "markov_full") else [1]:
+        batches, lda, astride, _, _ = _layout(role, m, g, n, k)
+        _pack(w, g, n, k, batches, lda, astride)
 
 
 def release_weight_cache(weight):
@@ -347,50 +365,245 @@ def release_weight_cache(weight):
  return len(keys)
 
 
-def _project_packed(x,w,s,groups,rank,*,output_dtype=None,tile_n=None,group_major=False,algo_rank=None):
- from sglang.kernels.ops.quantization import int8_kernel as quant
- k=x.shape[-1];m=x.shape[0];g=groups;n=rank;role=_role(g,n,k);dt=output_dtype or x.dtype
- if role is None or tile_n not in (None,0) or group_major or algo_rank is not None:
-  return _project_unpacked(x,w,s,g,n,output_dtype=dt,tile_n=tile_n,group_major=group_major,algo_rank=algo_rank)
- if x.ndim!=3 or x.shape[1]!=g or w.shape!=(g*n,k) or w.dtype!=torch.int8 or s.shape!=(g*n,1) or s.dtype!=torch.float32 or not w.is_contiguous() or not s.is_contiguous() or x.device!=w.device or x.device!=s.device:raise ValueError('Invalid optimized INT8 projection tensors')
- if x.dtype not in (torch.bfloat16,torch.float16,torch.float32) or dt not in (torch.bfloat16,torch.float16,torch.float32):raise ValueError('Floating activations/output required')
- # Preserve caller-requested output dtype; default follows activation dtype.
- y=torch.empty((m,g,n),device=x.device,dtype=dt)
- if m==0:return y
- x=x.contiguous();batches,lda,astride,pitch,shard=_layout(role,m,g,n,k);packed=_pack(w,g,n,k,batches,lda,astride)
- ops=_load();aid=_algorithms().get('%s:%s:%s:%s:%s:%s:%s'%(role,m,pitch,batches,lda,astride,int(shard)),'')
- key=(w.device.index,m,g,n,k,batches,lda,astride,pitch,shard,aid)
- with _lock:
-  plan=_plans.get(key)
-  if plan is None:
-   plan=ops.prepare(packed,m,g,n,k,batches,lda,astride,pitch,shard,aid);_plans[key]=plan
-   print('BLASLT_OPT_PLAN',json.dumps(dict(role=role,m=m,groups=g,rank=n,k=k,batches=batches,lda=lda,stride=astride,q_pitch=pitch,shard=shard,algorithm=aid or 'heuristic',input_dtype=str(x.dtype),output_dtype=str(dt))),flush=True)
- qstorage=torch.empty((m,g,pitch),device=x.device,dtype=torch.int8);q=qstorage[:,:,:k];xs=torch.empty((m,g,1),device=x.device,dtype=torch.float32);raw=torch.empty((m,g,n),device=x.device,dtype=torch.int32)
- block=triton.next_power_of_2(k)
- quant._per_token_quant_int8[(m*g,)](x,q,xs,None,stride_x=k,stride_xq=pitch,N=k,CAL_SUM=False,BLOCK=block,IS_HIP=quant._is_hip,num_warps=min(max(block//256,1),8),num_stages=1)
- ops.gemm(q,packed,raw,plan)
- if shard and dt!=torch.float32:
-  _scale_grid[(triton.cdiv(n//batches,2048),m,batches)](raw,xs,s,y,m,n,n//batches,2048,num_warps=4,enable_fp_fusion=False)
- elif shard:
-  schedule=_scale_schedules().get(str(m))
-  if schedule is not None:_scheduled_scale(raw,xs,s,y,m,schedule)
-  elif m<=5:_scale_grid[(triton.cdiv(n//batches,2048),m,batches)](raw,xs,s,y,m,n,n//batches,2048,num_warps=4,enable_fp_fusion=False)
-  else:ops.scale(raw,xs,s,y,g,batches,True,1)
- elif role=='wo_a' or dt==torch.float16 or (role=='markov_tp8') or (role=='markov_full' and m<=5) or (role=='lm_head' and m>=256):
-  sb=2048 if ((role=='wo_a' and m in (16,32,96,128)) or (role=='lm_head' and m>=256) or (role=='markov_tp8' and m>128)) else 1024
-  _scale_int32[(triton.cdiv(m*g*n,sb),)](raw,xs,s,y,m,g,n,False,sb,num_warps=8 if sb==2048 else 4,enable_fp_fusion=False)
- else:ops.scale(raw,xs,s,y,g,batches,False,0)
- return y
+def grouped_input_pitch(tokens, groups, rank, width):
+    """Return the existing service GEMM's pitch for this shape."""
+    if not envs.SGLANG_DSV41_INT8_SERVICE_OPT.get():
+        return None
+    role = _role(groups, rank, width)
+    return _layout(role, tokens, groups, rank, width)[3] if role == "wo_a" else None
+
+
+def _quantize_pitched(x, pitch):
+    """Prepare the same pitched activation rows as the existing service GEMM."""
+    from sglang.kernels.ops.quantization import int8_kernel as quant
+
+    x = x.contiguous()
+    m, groups, width = x.shape
+    storage = torch.empty((m, groups, pitch), device=x.device, dtype=torch.int8)
+    q = storage[..., :width]
+    scales = torch.empty((m, groups, 1), device=x.device, dtype=torch.float32)
+    block = triton.next_power_of_2(width)
+    quant._per_token_quant_int8[(m * groups,)](
+        x,
+        q,
+        scales,
+        None,
+        stride_x=width,
+        stride_xq=pitch,
+        N=width,
+        CAL_SUM=False,
+        BLOCK=block,
+        IS_HIP=quant._is_hip,
+        num_warps=min(max(block // 256, 1), 8),
+        num_stages=1,
+    )
+    return q, scales
+
+
+def _packed_projection_plan(x, w, groups, rank, role, output_dtype):
+    """Cache descriptors by layout; packed weights keep their own owner key."""
+    m, k = x.shape[0], x.shape[-1]
+    batches, lda, astride, pitch, shard = _layout(role, m, groups, rank, k)
+    packed = _pack(w, groups, rank, k, batches, lda, astride)
+    aid = _algorithms().get(
+        f"{role}:{m}:{pitch}:{batches}:{lda}:{astride}:{int(shard)}", ""
+    )
+    key = (w.device.index, m, groups, rank, k, batches, lda, astride, pitch, shard, aid)
+    with _lock:
+        plan = _plans.get(key)
+        if plan is None:
+            plan = _load().prepare(
+                packed, m, groups, rank, k, batches, lda, astride, pitch, shard, aid
+            )
+            _plans[key] = plan
+            print(
+                "BLASLT_OPT_PLAN",
+                json.dumps(
+                    dict(
+                        role=role,
+                        m=m,
+                        groups=groups,
+                        rank=rank,
+                        k=k,
+                        batches=batches,
+                        lda=lda,
+                        stride=astride,
+                        q_pitch=pitch,
+                        shard=shard,
+                        algorithm=aid or "heuristic",
+                        input_dtype=str(x.dtype),
+                        output_dtype=str(output_dtype),
+                    )
+                ),
+                flush=True,
+            )
+    return packed, plan, pitch, batches, shard
+
+
+def _scale_packed_output(raw, xs, weight_scale, output, role, batches, shard):
+    """Keep the established per-role scale kernels and launch schedules."""
+    m, groups, rank = raw.shape
+    dtype = output.dtype
+    ops = _load()
+    if shard:
+        schedule = _scale_schedules().get(str(m)) if dtype == torch.float32 else None
+        if schedule is not None:
+            _scheduled_scale(raw, xs, weight_scale, output, m, schedule)
+        elif dtype != torch.float32 or m <= 5:
+            _scale_grid[(triton.cdiv(rank // batches, 2048), m, batches)](
+                raw,
+                xs,
+                weight_scale,
+                output,
+                m,
+                rank,
+                rank // batches,
+                2048,
+                num_warps=4,
+                enable_fp_fusion=False,
+            )
+        else:
+            ops.scale(raw, xs, weight_scale, output, groups, batches, True, 1)
+    elif (
+        role in ("wo_a", "markov_tp8")
+        or dtype == torch.float16
+        or (role == "markov_full" and m <= 5)
+        or (role == "lm_head" and m >= 256)
+    ):
+        block = (
+            2048
+            if (
+                (role == "wo_a" and m in (16, 32, 96, 128))
+                or (role == "lm_head" and m >= 256)
+                or (role == "markov_tp8" and m > 128)
+            )
+            else 1024
+        )
+        _scale_int32[(triton.cdiv(m * groups * rank, block),)](
+            raw,
+            xs,
+            weight_scale,
+            output,
+            m,
+            groups,
+            rank,
+            False,
+            block,
+            num_warps=8 if block == 2048 else 4,
+            enable_fp_fusion=False,
+        )
+    else:
+        ops.scale(raw, xs, weight_scale, output, groups, batches, False, 0)
+
+
+def _project_packed(
+    x,
+    w,
+    s,
+    groups,
+    rank,
+    *,
+    output_dtype=None,
+    tile_n=None,
+    group_major=False,
+    algo_rank=None,
+    input_quant_args=None,
+    quantize_output=False,
+):
+    m, k = x.shape[0], x.shape[-1]
+    role = _role(groups, rank, k)
+    dtype = output_dtype or x.dtype
+    fused_operands = input_quant_args is not None or quantize_output
+    if role is None or tile_n not in (None, 0) or group_major or algo_rank is not None:
+        if fused_operands:
+            raise ValueError("Fused operands require the packed WoA service layout")
+        return _project_unpacked(
+            x,
+            w,
+            s,
+            groups,
+            rank,
+            output_dtype=dtype,
+            tile_n=tile_n,
+            group_major=group_major,
+            algo_rank=algo_rank,
+        )
+    if fused_operands and role != "wo_a":
+        raise ValueError("Fused operands require the token-major WoA projection")
+    if m == 0:
+        return torch.empty((m, groups, rank), device=x.device, dtype=dtype)
+
+    packed, plan, pitch, batches, shard = _packed_projection_plan(
+        x, w, groups, rank, role, dtype
+    )
+    # LightOp emits this pair using grouped_input_pitch, the same layout above.
+    q, xs = (
+        input_quant_args
+        if input_quant_args is not None
+        else _quantize_pitched(x, pitch)
+    )
+    raw = torch.empty((m, groups, rank), device=x.device, dtype=torch.int32)
+    _load().gemm(q, packed, raw, plan)
+    if quantize_output:
+        from lightop.quant import scale_per_token_quant_int8
+
+        return scale_per_token_quant_int8(
+            raw,
+            xs,
+            s,
+            output_dtype=dtype,
+            materialize_output=False,
+            threads=1024 if (groups, rank) == (8, 1024) else 512,
+        )
+    output = torch.empty((m, groups, rank), device=x.device, dtype=dtype)
+    _scale_packed_output(raw, xs, s, output, role, batches, shard)
+    return output
 
 
 def prepare_weight(w):
-    if os.environ.get("SGLANG_DSV41_INT8_SERVICE_OPT") == "1":
+    if envs.SGLANG_DSV41_INT8_SERVICE_OPT.get():
         _prepare_packed_weight(w)
 
 
-def project(x, w, s, groups, rank, **kwargs):
-    if os.environ.get("SGLANG_DSV41_INT8_SERVICE_OPT") == "1":
-        return _project_packed(x, w, s, groups, rank, **kwargs)
+def _check_projection(x, w, s, groups, rank, output_dtype):
+    """Validate shared projection contracts once at the public boundary."""
+    if (
+        x.ndim != 3
+        or x.shape[1] != groups
+        or groups <= 0
+        or rank <= 0
+        or w.shape != (groups * rank, x.shape[-1])
+        or w.dtype != torch.int8
+        or not w.is_contiguous()
+        or s.shape != (groups * rank, 1)
+        or s.dtype != torch.float32
+        or not s.is_contiguous()
+        or x.device != w.device
+        or x.device != s.device
+    ):
+        raise ValueError("Invalid channelwise INT8 projection tensors")
+    floating = (torch.bfloat16, torch.float16, torch.float32)
+    if x.dtype not in floating or output_dtype not in floating:
+        raise ValueError("HIP projection activations/output require BF16/FP16/FP32")
+
+
+def project(
+    x, w, s, groups, rank, *, input_quant_args=None, quantize_output=False, **kwargs
+):
+    _check_projection(x, w, s, groups, rank, kwargs.get("output_dtype") or x.dtype)
+    if envs.SGLANG_DSV41_INT8_SERVICE_OPT.get():
+        return _project_packed(
+            x,
+            w,
+            s,
+            groups,
+            rank,
+            input_quant_args=input_quant_args,
+            quantize_output=quantize_output,
+            **kwargs,
+        )
+    if input_quant_args is not None or quantize_output:
+        raise ValueError("prequantized grouped projection requires SERVICE_OPT=1")
     return _project_unpacked(x, w, s, groups, rank, **kwargs)
 
 

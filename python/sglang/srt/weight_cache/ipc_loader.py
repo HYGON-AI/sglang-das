@@ -28,10 +28,13 @@ from sglang.srt.runtime_context import get_exec, get_parallel
 from .protocol import (
     CacheConfig,
     check_ipc_quant_support,
+    collect_layout_env,
     compute_env_stamp,
+    compute_weight_layout_stamp,
     get_quant_method_name,
     get_socket_path,
     hash_quant_config,
+    ipc_adopts_postprocessed_layout,
     recv_msg,
     send_msg,
 )
@@ -149,13 +152,17 @@ class IpcModelLoader(BaseModelLoader):
 
         quant_config = _get_quantization_config(model_config, self.load_config)
 
+        extra_state = cache_data.get("extra_state")
         model = self._load_zero_copy_mode(
             model_config,
             device_config,
             entries,
             quant_config,
+            host_state=(extra_state or {}).get("host"),
+            extra_state=extra_state,
         )
         self.preloaded_weights_bytes = preloaded_weights_bytes
+        self._apply_extra_state(model, extra_state)
 
         # Skip _post_load_weights: the daemon already ran
         # process_weights_after_loading on the weights before exporting
@@ -179,6 +186,66 @@ class IpcModelLoader(BaseModelLoader):
         )
 
         return model.eval()
+
+    def _apply_extra_state(self, model, extra_state) -> None:
+        """Reproduce the daemon's load-time state that is not in state_dict.
+
+        Order matters: flags and derived tensors first, then the model's own
+        per-process fix-up, which reads those flags to skip the one-shot weight
+        rewrites the daemon already applied to the shared memory.
+        """
+        from .extra_state import apply_extra_state, verify_deferred_state
+
+        result = None
+        if extra_state:
+            daemon_env = extra_state.get("env") or {}
+            local_env = collect_layout_env()
+            diff = {
+                k: (daemon_env.get(k), local_env.get(k))
+                for k in sorted(set(daemon_env) | set(local_env))
+                if daemon_env.get(k) != local_env.get(k)
+            }
+            if diff:
+                logger.warning(
+                    "[IpcModelLoader] Environment differs from the weight cache "
+                    "daemon's (daemon, engine). If one of these selects a weight "
+                    "layout, the mapped weights do not match this engine: %s",
+                    diff,
+                )
+            result = apply_extra_state(
+                model, extra_state, self._transport_backend.import_extra_tensor
+            )
+            if result.keep_alive:
+                model._ipc_imported_extra_tensors = result.keep_alive
+
+        hook = getattr(model, "post_ipc_weight_load", None)
+        if hook is not None:
+            hook()
+        from sglang.srt.utils import is_hcu
+
+        if is_hcu():
+            from sglang.kernels.ops.gemm import dsv41_int8 as dsv41_int8_blaslt
+            from sglang.srt.layers.quantization.w8a8_int8 import ChannelwiseInt8Method
+
+            for module in model.modules():
+                if isinstance(
+                    getattr(module, "quant_method", None), ChannelwiseInt8Method
+                ):
+                    weight = getattr(module, "weight", None)
+                    if isinstance(weight, torch.Tensor):
+                        dsv41_int8_blaslt.prepare_weight(weight)
+            from sglang.kernels.ops.gemm.bf16_fp32 import prepare_hcu_nn_weights_for_model
+
+            prepare_hcu_nn_weights_for_model(model)
+        self._check_deferred_aliases(model)
+        if result is not None:
+            verify_deferred_state(model, result)
+
+        from .daemon import _maybe_dump_state_description
+
+        _maybe_dump_state_description(
+            model, f"engine_rank{self.load_config.tp_rank}"
+        )
 
     def _start_daemon_liveness_watchdog(self, daemon_pid: Optional[int]) -> None:
         """Fail loud if the serving daemon dies while we hold its weights.
@@ -305,12 +372,54 @@ class IpcModelLoader(BaseModelLoader):
                 delattr(obj, leaf_name)
             obj.register_buffer(leaf_name, tensor)
 
+    @staticmethod
+    def _has_parent_module(model, name: str) -> bool:
+        obj = model
+        for part in name.split(".")[:-1]:
+            obj = getattr(obj, part, None)
+            if obj is None:
+                return False
+        return True
+
+    def _check_deferred_aliases(self, model) -> None:
+        deferred = getattr(self, "_deferred_alias_entries", None) or {}
+        if not deferred:
+            return
+        broken = []
+        for name, entry in deferred.items():
+            obj = model
+            for part in name.split("."):
+                obj = getattr(obj, part, None)
+                if obj is None:
+                    break
+            if (
+                not isinstance(obj, torch.Tensor)
+                or obj.device.type == "meta"
+                or list(obj.shape) != list(entry["shape"])
+            ):
+                broken.append(name)
+        if broken:
+            raise RuntimeError(
+                f"[IpcModelLoader] {len(broken)} of {len(deferred)} tensor name(s) "
+                f"the daemon exported through post-load module links were not "
+                f"reproduced on this engine (the model needs a "
+                f"post_ipc_weight_load hook that rebuilds those links): "
+                f"{broken[:10]}"
+            )
+        logger.info(
+            f"[IpcModelLoader] {len(deferred)} aliased tensor name(s) resolved "
+            f"through rebuilt module links"
+        )
+        self._deferred_alias_entries = {}
+
     def _load_zero_copy_mode(
         self,
         model_config,
         device_config,
         entries,
         quant_config,
+        host_state=None,
+        extra_state=None,
     ) -> nn.Module:
         """Zero-copy load: map IPC tensors directly as param.data.
 
@@ -357,7 +466,21 @@ class IpcModelLoader(BaseModelLoader):
         # Iterate over ALL daemon entries (not just model params/buffers).
         # This ensures post-quantization parameters (weight_scale, etc.)
         # that were created by process_weights_after_loading are also mapped.
+        # Names that run through a module link the model only creates after
+        # loading (e.g. a layer registering its successor as a submodule) have
+        # no parent yet. They alias tensors mapped under their primary name,
+        # so they are checked, not mapped, once the model has rebuilt its links.
+        self._deferred_alias_entries = {}
+        quant_method, _ = self._resolve_engine_quant(model_config)
+        adopt_layout = ipc_adopts_postprocessed_layout(quant_method)
+        adopted_count = 0
+        # id(meta buffer) -> mapped tensor, to re-point the other modules that
+        # share one buffer object (it is exported once, under its first name).
+        replaced_buffers = {}
         for name, entry in entries.items():
+            if not self._has_parent_module(model, name):
+                self._deferred_alias_entries[name] = entry
+                continue
             imported_tensor = self._transport_backend.import_tensor(entry)
             is_param = entry.get("is_param", True)
 
@@ -367,16 +490,24 @@ class IpcModelLoader(BaseModelLoader):
                     ref_param = existing_params[name]
                 else:
                     ref_param = existing_buffers[name]
-                if (
+                layout_differs = (
                     imported_tensor.shape != ref_param.shape
                     or imported_tensor.dtype != ref_param.dtype
-                ):
+                )
+                if layout_differs and adopt_layout:
+                    # The daemon's post-processed layout; see
+                    # IPC_QUANT_POSTPROCESSED_LAYOUT.
+                    adopted_count += 1
+                elif layout_differs:
                     mismatched.append(
                         f"  {name}: IPC={imported_tensor.shape}/{imported_tensor.dtype} "
                         f"vs model={ref_param.shape}/{ref_param.dtype}"
                     )
                     del imported_tensor
                     continue
+
+            if name in existing_buffers:
+                replaced_buffers[id(existing_buffers[name])] = imported_tensor
 
             # Replace or register the tensor in the model
             self._set_module_tensor(model, name, imported_tensor, is_param=is_param)
@@ -395,6 +526,58 @@ class IpcModelLoader(BaseModelLoader):
                 f"case — it indicates the daemon's weight fingerprint is "
                 f"incomplete or the daemon/client configs drifted (a bug to fix), "
                 f"not merely uninitialized weights:\n" + "\n".join(mismatched)
+            )
+
+        for name, buf in list(model.named_buffers(remove_duplicate=False)):
+            if buf.device.type == "meta" and id(buf) in replaced_buffers:
+                self._set_module_tensor(
+                    model, name, replaced_buffers[id(buf)], is_param=False
+                )
+
+        # Weights the daemon keeps in shareable host memory are attached by
+        # their modules, not mapped as device tensors.
+        from .extra_state import attach_host_state, canonical_modules
+
+        host_modules = attach_host_state(model, host_state)
+        if host_modules:
+            logger.info(
+                f"[IpcModelLoader] Attached host-memory state of {host_modules} "
+                f"module(s) from the daemon"
+            )
+
+        # Post-processing schemes on the adopt_layout allowlist may repack
+        # canonical parameters into runtime buffers and delete the originals
+        # (e.g. HCU DeepEP MoE deleting w13_weight/w2_weight after building
+        # w13_weight_deepgemm/w2_weight_deepgemm). Drop only meta tensors that
+        # the daemon's own post-processed module explicitly removed.
+        module_tensors = (extra_state or {}).get("module_tensors")
+        removed_count = 0
+        if adopt_layout and isinstance(module_tensors, dict):
+            for module_name, module in canonical_modules(model):
+                kept = module_tensors.get(module_name)
+                if kept is None:
+                    continue
+                kept_set = set(kept)
+                for attr, param in list(module._parameters.items()):
+                    if (
+                        param is not None
+                        and param.device.type == "meta"
+                        and attr not in kept_set
+                    ):
+                        delattr(module, attr)
+                        removed_count += 1
+                for attr, buf in list(module._buffers.items()):
+                    if (
+                        buf is not None
+                        and buf.device.type == "meta"
+                        and attr not in kept_set
+                    ):
+                        delattr(module, attr)
+                        removed_count += 1
+        if removed_count:
+            logger.info(
+                f"[IpcModelLoader] Removed {removed_count} meta tensor(s) deleted "
+                f"by the daemon's post-load repacking"
             )
 
         # After mapping every daemon entry, any tensor still on the meta device
@@ -443,7 +626,8 @@ class IpcModelLoader(BaseModelLoader):
 
         logger.info(
             f"[IpcModelLoader] Zero-copy: mapped {imported_count} tensors "
-            f"({new_params_count} new post-quant), time={map_elapsed:.3f}s"
+            f"({new_params_count} new post-quant, {adopted_count} in the daemon's "
+            f"post-processed layout), time={map_elapsed:.3f}s"
         )
 
         return model
@@ -543,6 +727,7 @@ class IpcModelLoader(BaseModelLoader):
                 dtype=str(model_config.dtype),
                 revision=model_config.revision or "",
                 **compute_env_stamp(),
+                weight_layout_stamp=compute_weight_layout_stamp(),
             )
 
             logger.info(

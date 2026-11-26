@@ -5,11 +5,13 @@ an existing candidate mask/table into sorted logical blocks, scores those blocks
 with FP32 head weights and logits, and restores the backend's sorted selections.
 """
 
+import os
 from typing import Callable, Optional
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_hcu
 
 try:
     import triton
@@ -26,8 +28,17 @@ FP4_AMAX_FLOOR = 6 * 2.0**-126
 
 
 def prefill_paged_sparse_enabled() -> bool:
-    """Enable the HCU Prefill paged sparse consumer by default."""
-    return envs.SGLANG_HCU_PREFILL_PAGED_SPARSE.get()
+    """Use the HCU Prefill paged sparse consumer unless explicitly overridden or slower on gfx938."""
+    name = envs.SGLANG_HCU_PREFILL_PAGED_SPARSE.name
+    if name in os.environ:
+        return envs.SGLANG_HCU_PREFILL_PAGED_SPARSE.get()
+    if not envs.SGLANG_HCU_PREFILL_PAGED_SPARSE.get():
+        return False
+    if is_hcu() and torch.cuda.is_available():
+        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+        if arch == "gfx938":
+            return False
+    return True
 
 
 if triton is not None:

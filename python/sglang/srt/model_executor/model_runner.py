@@ -1295,6 +1295,7 @@ class ModelRunner:
             weight_cache_mode=get_model().weight_cache_mode,
             weight_cache_socket=get_model().weight_cache_socket,
             load_group=self.load_group,
+            is_draft_worker=self.is_draft_worker,
         )
 
         maybe_enable_ipc_weight_cache(

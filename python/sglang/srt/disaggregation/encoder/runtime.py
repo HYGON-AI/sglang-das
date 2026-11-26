@@ -59,7 +59,12 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, random_uuid, set_prometheus_multiproc_dir
+from sglang.srt.utils import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    configure_logger,
+    random_uuid,
+    set_prometheus_multiproc_dir,
+)
 from sglang.srt.utils.common import maybe_reindex_device_id
 from sglang.srt.utils.network import NetworkAddress, get_free_port, get_zmq_socket
 
@@ -1194,10 +1199,26 @@ def _record_pipeline_result(modality: Modality, status: str) -> None:
         )
 
 
-async def _publish_pipeline_error(req_id: str, error_msg: str) -> bool:
+def _http_status_for(e: Exception) -> int:
+    # Only MMError carries an HTTP status in this protocol; third-party
+    # exceptions may expose a callable ``code`` attribute (e.g. gRPC errors).
+    if isinstance(e, MMError):
+        return int(e.code)
+    # Client media that failed to fetch/decode escaped the preprocessor's
+    # BadRequestError wrap, but is still a caller error.
+    if isinstance(e, CLIENT_MEDIA_EXCEPTIONS):
+        return int(HTTPStatus.BAD_REQUEST)
+    return int(HTTPStatus.INTERNAL_SERVER_ERROR)
+
+
+async def _publish_pipeline_error(
+    req_id: str, error_msg: str, error_code: Optional[int] = None
+) -> bool:
     """Report a request error without letting reporting block cleanup."""
     try:
-        await server_module.meta_registry.publish(req_id, 0, 0, 0, error=error_msg)
+        await server_module.meta_registry.publish(
+            req_id, 0, 0, 0, error=error_msg, error_code=error_code
+        )
         return True
     except Exception:
         logger.exception("Failed to publish encoder error for req_id=%s", req_id)
@@ -1302,7 +1323,9 @@ async def execute_encode_pipeline(
     except asyncio.TimeoutError:
         error_msg = "encoder batch timed out"
         time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
-        error_published = await _publish_pipeline_error(req_id, error_msg)
+        error_published = await _publish_pipeline_error(
+            req_id, error_msg, HTTPStatus.GATEWAY_TIMEOUT
+        )
         await _release_failed_request(
             enc,
             req_id,
@@ -1313,7 +1336,9 @@ async def execute_encode_pipeline(
     except Exception as e:
         error_msg = str(e)
         time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
-        error_published = await _publish_pipeline_error(req_id, error_msg)
+        error_published = await _publish_pipeline_error(
+            req_id, error_msg, _http_status_for(e)
+        )
         await _release_failed_request(
             enc,
             req_id,
@@ -1325,7 +1350,7 @@ async def execute_encode_pipeline(
     nbytes, embedding_len, embedding_dim, error_msg, error_code = result
     if error_msg:
         time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
-        error_published = await _publish_pipeline_error(req_id, error_msg)
+        error_published = await _publish_pipeline_error(req_id, error_msg, error_code)
         if backend == "mooncake":
             await _release_failed_request(
                 enc,
@@ -1512,12 +1537,7 @@ async def _dp_worker_handle_request(
             f"req_id={request.get('req_id', '?')}: {e}",
             exc_info=True,
         )
-        # Only MMError carries an HTTP status in this protocol. Third-party
-        # exceptions may expose a callable ``code`` attribute (for example
-        # gRPC errors), which must not make error reporting fail a second time.
-        err_code = int(
-            e.code if isinstance(e, MMError) else HTTPStatus.INTERNAL_SERVER_ERROR
-        )
+        err_code = _http_status_for(e)
         envelope = {
             "req_id": request.get("req_id", ""),
             "_dp_type": dp_type,

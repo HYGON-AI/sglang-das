@@ -594,6 +594,7 @@ def _index_k_rope_pack_kernel(
     PAGE_SIZE: tl.constexpr,
     CACHE_STRIDE: tl.constexpr,
     AMAX_FLOOR: tl.constexpr,
+    NATIVE_ROPE: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     token = row // HEADS
@@ -607,7 +608,13 @@ def _index_k_rope_pack_kernel(
     imag = tl.load(X + row * 128 + 128 - RD + 2 * pair + 1, tail, 0).to(tl.float32)
     fr = tl.load(F + frow * F_STRIDE + 2 * pair, tail, 1.0)
     fi = tl.load(F + frow * F_STRIDE + 2 * pair + 1, tail, 0.0)
-    rotated = tl.where(imaginary, real * fi + imag * fr, real * fr - imag * fi)
+    if NATIVE_ROPE:
+        # Match the deployed AOT: separate real products, FMA for the imaginary sum.
+        rotated = tl.where(
+            imaginary, tl.fma(imag, fr, real * fi), real * fr - imag * fi
+        )
+    else:
+        rotated = tl.where(imaginary, real * fi + imag * fr, real * fr - imag * fi)
     value = tl.where(tail, rotated.to(tl.bfloat16).to(tl.float32), value)
 
     blocks = tl.reshape(value, (4, 32))

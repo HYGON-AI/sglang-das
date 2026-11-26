@@ -5,6 +5,7 @@ The mixins own platform mHC state, fusion, and TBO operations.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from functools import cached_property
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
@@ -38,14 +39,20 @@ from sglang.srt.models.deepseek_common.moe_transport import (
 )
 from sglang.srt.models.deepseek_v2 import MoEOutput
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE, AttnOutput
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import is_in_breakable_cuda_graph
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.srt.utils import is_gfx95_supported, is_hcu
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models import deepseek_v2
 
 _is_gfx95_supported = is_gfx95_supported()
+_is_hcu = is_hcu()
 
 
 def _prepare_ffn_input(layer, hidden_states, residual, post, comb, forward_batch):
@@ -136,6 +143,8 @@ class NonCudaDecoderMixin:
         input_ids: torch.Tensor,
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
+        seam_open: bool = True,
+        prefix_runner=None,
     ) -> mhc.HcState:
         """The layer's two hyper-connections, each collapsing with the previous one's
         pre-mix."""
@@ -157,14 +166,26 @@ class NonCudaDecoderMixin:
             fuse_all_reduce_mhc = self._can_fuse_attn_mhc and can_fuse_all_reduce(
                 x.shape[0], self.hc_cfg.hidden
             )
-            with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
-                y = self.self_attn(
-                    x=x,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    x_quant=quantized[0] if quantized else None,
-                    defer_all_reduce=fuse_all_reduce_mhc,
+            tail_graph_runner = get_forward().dsv41_tail_graph_runner
+            if tail_graph_runner is not None or (
+                _is_hcu and is_in_breakable_cuda_graph()
+                and self.self_attn.is_dsv41 and is_cp_active(forward_batch)
+            ):
+                from sglang.srt.models.deepseek_v4 import _hcu_tail_graph_attention
+
+                y = _hcu_tail_graph_attention(
+                    tail_graph_runner, self.self_attn, x, positions,
+                    quantized[0] if quantized else None, fuse_all_reduce_mhc,
                 )
+            else:
+                with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+                    y = self.self_attn(
+                        x=x,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        x_quant=quantized[0] if quantized else None,
+                        defer_all_reduce=fuse_all_reduce_mhc,
+                    )
             del x
             return mhc.run_attn_post(
                 self.attn_hc,
@@ -189,20 +210,26 @@ class NonCudaDecoderMixin:
             fuse_all_reduce_mhc = self._can_fuse_ffn_mhc and can_fuse_all_reduce(
                 x.shape[0], self.hc_cfg.hidden
             )
-            y = self._run_moe_ffn_dp_sync(
-                x,
-                forward_batch,
-                input_ids=input_ids,
-                input_ids_global=input_ids_global,
-                return_moe_output=fuse_all_reduce_mhc,
-            )
+            if prefix_runner is not None and not prefix_runner.capture_experts:
+                assert not fuse_all_reduce_mhc
+                from sglang.srt.models.deepseek_v4 import _prefix_moe
+
+                y = _prefix_moe(prefix_runner, self, x)
+            else:
+                y = self._run_moe_ffn_dp_sync(
+                    x,
+                    forward_batch,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                    return_moe_output=fuse_all_reduce_mhc,
+                )
             del x
             return mhc.run_moe_post(
                 self.ffn_hc,
                 y,
                 residual,
                 stats_stream=stats_stream,
-                next=self.next_boundary,
+                next=self.next_boundary if seam_open else None,
                 world_size=self.mlp.tp_size,
                 precomputed=precomputed,
             )
@@ -334,15 +361,35 @@ class NonCudaDecoderMixin:
         input_ids_global: Optional[torch.Tensor],
         return_moe_output: bool = False,
     ) -> Union[torch.Tensor, deepseek_v2.MoEOutput]:
+        legacy_cp = _is_hcu and dsa_use_prefill_cp(forward_batch) and not is_cp_active(forward_batch)
         prepared = MoeRowTransport(
             self.mlp,
             hidden_states,
             forward_batch,
             input_ids,
             input_ids_global,
-            cp_return_contiguous=self.config.model_type == "deepseek_v41",
+            use_cp=True if legacy_cp else None,
+            cp_return_contiguous=self.config.model_type == "deepseek_v41" and not legacy_cp,
         )
-        with prepared.scope():
+        tail_moe_context = nullcontext()
+        if (
+            _is_hcu
+            and prepared._use_cp
+            and envs.SGLANG_HCU_DSV41_TAIL_MOE_LOW_LATENCY.get()
+            and get_moe_a2a_backend().is_deepep()
+        ):
+            tail = get_attn_backend().forward_metadata.late_layer_tail
+            # CP metadata carries the same physical row bound on every rank.
+            # Do not select a collective mode from this rank's row count alone.
+            tail_max_tokens = (
+                max(tail.cp_metadata.per_rank_actual_token)
+                if tail is not None and tail.cp_metadata is not None
+                else None
+            )
+            tail_moe_context = get_forward().scoped(
+                deepep_tail_max_tokens=tail_max_tokens
+            )
+        with prepared.scope(), tail_moe_context:
             return_moe_output = (
                 return_moe_output
                 and not prepared._use_cp

@@ -10,6 +10,8 @@ to explicitly enable this method with custom checkpoint loaders.
 LM-head LoRA is not supported by this method.
 """
 
+from functools import lru_cache
+
 import torch
 from torch import nn
 
@@ -81,7 +83,10 @@ def enabled(quant_config, *, model_path=None):
     return checkpoint_supports_channelwise_fp8(str(model_path))
 
 
-def linear(x, weight, scale, *, output_dtype=None, out=None):
+def linear(x, weight, scale, *, output_dtype=None, out=None, quantized=None):
+    """FP8 projection. ``quantized=(xq, xs)`` supplies activations that are
+    already per-token quantized in the layout of ``x`` (``x`` then only
+    carries the shape), so the caller controls where the quantization runs."""
     import deepgemm
     from lightop.quant import per_token_quant_fp8
 
@@ -101,8 +106,11 @@ def linear(x, weight, scale, *, output_dtype=None, out=None):
         output = torch.empty(output_shape, device=x.device, dtype=dtype)
     if x.numel() == 0:
         return output
-    x = x.contiguous()
-    xq, xs = per_token_quant_fp8(x)
+    if quantized is None:
+        x = x.contiguous()
+        xq, xs = per_token_quant_fp8(x)
+    else:
+        xq, xs = quantized
     # The installed hipBLASLt dispatch is extremely slow for full-vocabulary
     # N=129280. Tile output channels within this device, without changing TP.
     tiles = (weight.shape[-2] + 16383) // 16384
@@ -147,11 +155,78 @@ def linear(x, weight, scale, *, output_dtype=None, out=None):
     return output
 
 
-def grouped(x, layer, groups, rank):
+def _swap01_contiguous(t):
+    """``t.transpose(0, 1).contiguous()`` for a contiguous 3-D tensor.
+
+    The strided copy runs on torch's generic elementwise kernel, whose cost
+    follows the element count rather than the byte count. Reinterpreting the
+    contiguous last dimension as 8-byte words moves the same bytes with 4x
+    (bf16) or 8x (fp8) fewer elements; the result is bit-identical.
+    """
+    wide = 8 // t.element_size()
+    if t.dim() == 3 and wide > 1 and t.is_contiguous() and t.shape[-1] % wide == 0:
+        return t.view(torch.int64).transpose(0, 1).contiguous().view(t.dtype)
+    return t.transpose(0, 1).contiguous()
+
+
+@lru_cache(maxsize=1)
+def transform_quant_available():
+    """Whether LightOp supplies the complete-row FP8 transform operations."""
+    if torch.version.hip is None:
+        return False
+    try:
+        from lightop.quant.fp8 import PER_TOKEN_QUANT_FP8_VERSION
+        from lightop.quant.transforms import is_transform_quant_available
+    except (ImportError, OSError, RuntimeError):
+        return False
+    return is_transform_quant_available() and PER_TOKEN_QUANT_FP8_VERSION >= 2
+
+
+def rope_grouped_input(x, frequencies, positions, groups, rope_dim):
+    """Emit group-major FP8 directly; model initialization checks kernel support."""
+    from lightop.quant import rope_per_token_quant
+
+    if (
+        x.dtype not in (torch.bfloat16, torch.float16)
+        or x.stride(2) != 1
+        or x.stride(1) < x.shape[2]
+        or x.stride(0) < x.shape[1] * x.stride(1)
+    ):
+        return None
+    return rope_per_token_quant(
+        x,
+        frequencies,
+        positions,
+        groups,
+        rope_dim,
+        inverse=True,
+        dtype=torch.float8_e4m3fn,
+        group_major=True,
+    )
+
+
+def grouped(x, layer, groups, rank, *, quantized=None, quantize_output=False):
     weight = layer.weight.view(groups, rank, -1)
     scale = layer.weight_scale_inv.view(groups, rank, 1)
-    y = linear(x.transpose(0, 1).contiguous(), weight, scale)
-    return y.transpose(0, 1).contiguous()
+    if quantized is not None:
+        xq, xs = quantized
+        y = linear(xq, weight, scale, output_dtype=x.dtype, quantized=(xq, xs))
+    elif x.dim() == 3 and x.is_contiguous() and x.numel() > 0:
+        from lightop.quant import per_token_quant_fp8
+
+        tokens, n_groups, dim = x.shape
+        xq, xs = per_token_quant_fp8(x.view(tokens * n_groups, dim))
+        xq = _swap01_contiguous(xq.view(tokens, n_groups, dim))
+        xs = xs.view(tokens, n_groups, 1).transpose(0, 1).contiguous()
+        y = linear(xq, weight, scale, output_dtype=x.dtype, quantized=(xq, xs))
+    else:
+        y = linear(x.transpose(0, 1).contiguous(), weight, scale)
+    if quantize_output and x.shape[0] > 0:
+        from lightop.quant import per_token_quant_fp8
+
+        q, scales = per_token_quant_fp8(y.transpose(0, 1), quant_ndim=2)
+        return q, scales, x.dtype
+    return _swap01_contiguous(y)
 
 
 class ChannelwiseFp8Method(QuantizeMethodBase):

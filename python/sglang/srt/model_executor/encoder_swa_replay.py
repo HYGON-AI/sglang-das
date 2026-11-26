@@ -60,7 +60,7 @@ def _hcu_fold_supported(runner, batch, parallel) -> bool:
     resources = get_resources()
     if (
         batch.forward_mode != ForwardMode.EXTEND
-        or len(batch.reqs) != 1
+        or not batch.reqs
         or parallel.attn_cp_size != 8
         or parallel.attn_dp_size != 1
         or parallel.pp_size != 1
@@ -83,14 +83,30 @@ def _hcu_fold_supported(runner, batch, parallel) -> bool:
         or resources.indexer_capturer is not None
     ):
         return False
-    prefix, extend = batch.prefix_lens[0], batch.extend_lens[0]
-    # 128 is divisible by CP8: prepending it preserves every new row's owner.
-    # The DSpark tail is at most 128 rows, including with FULL capture.
-    # At least 128 new rows therefore keep replay rows out of that tail.
-    if prefix < 128 or prefix % 2 or extend < 128:
+    resets = getattr(batch, "encoder_swa_reset", None)
+    if resets is None:
+        resets = [True] * len(batch.reqs)
+    total_replay = 0
+    replay_starts: list[Optional[int]] = []
+    for reset, prefix, extend in zip(
+        resets, batch.prefix_lens, batch.extend_lens, strict=True
+    ):
+        if reset and prefix:
+            # 128 is divisible by CP8: prepending it preserves every new row's owner.
+            # The DSpark tail is at most 128 rows, including with FULL capture.
+            # At least 128 new rows therefore keep replay rows out of that tail.
+            if prefix < 128 or prefix % 2 or extend < 128:
+                return False
+            replay = replay_len(prefix)
+            total_replay += replay
+            replay_starts.append(prefix - replay)
+        else:
+            replay_starts.append(None)
+    if total_replay == 0:
         return False
-    replay = replay_len(prefix)
-    execution_rows = ceil_align(extend + replay, parallel.attn_tp_size)
+    execution_rows = ceil_align(
+        sum(batch.extend_lens) + total_replay, parallel.attn_tp_size
+    )
     execution_rows = ceil_align(execution_rows, get_cp_padding_align_size())
     execution_limit = min(
         get_schedule().chunked_prefill_size or 0, max_prefill_buffer_tokens()
@@ -101,7 +117,7 @@ def _hcu_fold_supported(runner, batch, parallel) -> bool:
         execution_limit = min(execution_limit, per_rank_limit * parallel.attn_cp_size)
     if execution_rows > execution_limit:
         return False
-    if not _hcu_fold_images_are_before_replay(batch, prefix - replay):
+    if not _hcu_fold_images_are_before_replay(batch, replay_starts):
         return False
     counts = batch.global_num_tokens
     return counts is None or (
@@ -111,14 +127,20 @@ def _hcu_fold_supported(runner, batch, parallel) -> bool:
     )
 
 
-def _hcu_fold_images_are_before_replay(batch, replay_start: int) -> bool:
+def _hcu_fold_images_are_before_replay(
+    batch, replay_starts: list[Optional[int]]
+) -> bool:
     """Keep image features on the existing path when a forward touches them."""
-    inputs = [x for x in (batch.multimodal_inputs or []) if x is not None]
-    if not inputs:
+    raw_inputs = batch.multimodal_inputs or []
+    if not any(x is not None for x in raw_inputs):
         return True
     from sglang.srt.managers.schedule_batch import Modality
 
-    for inputs_for_request in inputs:
+    for inputs_for_request, replay_start in zip(raw_inputs, replay_starts):
+        if inputs_for_request is None:
+            continue
+        if replay_start is None:
+            return False
         items = getattr(inputs_for_request, "mm_items", ())
         if not items:
             return False
@@ -181,16 +203,29 @@ def try_fold_hcu_encoder_swa_replay(worker, batch) -> Optional[FoldedExtend]:
     _set_execution_counts(batch=folded.batch, scheduled=batch)
     folded.batch.global_cp_num_tokens = None  # legacy interleave, never CP-v2
     if parallel.attn_cp_rank == 0:
-        prefix = batch.prefix_lens[0]
-        logger.info(
-            "Encoder SWA folded replay: rid=%s prefix=%d start=%d "
-            "replay_tokens=128 new_tokens=%d execution_tokens=%d cp_size=8",
-            batch.reqs[0].rid,
-            prefix,
-            prefix - 128,
-            batch.extend_num_tokens,
-            folded.num_rows,
-        )
+        if len(batch.reqs) == 1:
+            prefix = batch.prefix_lens[0]
+            logger.info(
+                "Encoder SWA folded replay: rid=%s prefix=%d start=%d "
+                "replay_tokens=128 new_tokens=%d execution_tokens=%d cp_size=8",
+                batch.reqs[0].rid,
+                prefix,
+                prefix - 128,
+                batch.extend_num_tokens,
+                folded.num_rows,
+            )
+        else:
+            replay_reqs = sum(1 for r in folded.replay_lens if r)
+            replay_tokens = sum(folded.replay_lens)
+            logger.info(
+                "Encoder SWA folded replay: num_reqs=%d replay_reqs=%d "
+                "replay_tokens=%d new_tokens=%d execution_tokens=%d cp_size=8",
+                len(batch.reqs),
+                replay_reqs,
+                replay_tokens,
+                batch.extend_num_tokens,
+                folded.num_rows,
+            )
     return folded
 
 

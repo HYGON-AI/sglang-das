@@ -34,6 +34,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     inverse_transform_scale_ue8m0,
     transform_scale_ue8m0,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -67,7 +68,12 @@ from sglang.srt.models.dspark import (
     gather_and_crop_vocab,
     project_through_lm_head,
 )
-from sglang.srt.runtime_context import get_disagg, get_parallel, get_platform
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_forward,
+    get_parallel,
+    get_platform,
+)
 from sglang.srt.speculative.dspark_components.dspark_config import (
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
@@ -432,7 +438,19 @@ class DSparkAttention(MqaAttentionBase):
         if o.shape[1] != self.n_local_heads:
             o = o[:, : self.n_local_heads, :]
 
-        if self._use_fast_kernel:
+        input_quant_args = None
+        fp8_input_quant_args = None
+        if self.fuse_fp8_small_ops and self._use_fast_kernel:
+            fp8_input_quant_args = channelwise_fp8.rope_grouped_input(
+                o, self.freqs_cis, positions, self.n_local_groups, rd
+            )
+        if self.fuse_int8_small_ops and self._use_fast_kernel:
+            input_quant_args = channelwise_int8.rope_grouped_input(
+                o, self.freqs_cis, positions, self.n_local_groups, self.o_lora_rank, rd
+            )
+        if input_quant_args is not None or fp8_input_quant_args is not None:
+            pass  # Independent quantized operands already contain inverse RoPE.
+        elif self._use_fast_kernel:
             fused_rope_inplace(
                 o[..., -rd:], None, self.freqs_cis, positions=positions, inverse=True
             )
@@ -465,11 +483,25 @@ class DSparkAttention(MqaAttentionBase):
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         if self.wo_a_int8:
             o = channelwise_int8.grouped(
-                o, self.wo_a, self.n_local_groups, self.o_lora_rank
+                o,
+                self.wo_a,
+                self.n_local_groups,
+                self.o_lora_rank,
+                input_quant_args=input_quant_args,
+                quantize_output=(
+                    self.fuse_wo_b_int8
+                    and o.dtype == torch.bfloat16
+                    and not get_forward().sp_active
+                ),
             )
         elif self.wo_a_channelwise_fp8:
             o = channelwise_fp8.grouped(
-                o, self.wo_a, self.n_local_groups, self.o_lora_rank
+                o,
+                self.wo_a,
+                self.n_local_groups,
+                self.o_lora_rank,
+                quantized=fp8_input_quant_args,
+                quantize_output=(self.fuse_wo_b_fp8 and not get_forward().sp_active),
             )
         elif self._use_fast_kernel:
             o = _apply_wo_a_bf16_matmul(
@@ -481,7 +513,7 @@ class DSparkAttention(MqaAttentionBase):
             )
         else:
             o = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float()).to(q.dtype)
-        value = o.reshape(o.shape[0], o.shape[1] * o.shape[2])
+        value = o.flatten(1) if isinstance(o, torch.Tensor) else o
         out, _ = self.wo_b(value, skip_all_reduce=defer_all_reduce)
         return (
             mhc.AttnOutput(out)
@@ -1459,6 +1491,35 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
+        )
+
+        self._maybe_prepack_bf16_main_proj()
+
+    def _maybe_prepack_bf16_main_proj(self) -> None:
+        if not (
+            _is_hcu
+            and envs.SGLANG_HCU_DSV41_BF16_MAIN_PROJ_PREPACK.get()
+            and get_disagg().disaggregation_mode == "prefill"
+        ):
+            return
+        main_proj = self.stages[0].main_proj
+        weight = main_proj.weight
+        if not (
+            isinstance(main_proj.quant_method, UnquantizedLinearMethod)
+            and weight.is_cuda
+            and weight.dtype == torch.bfloat16
+            and weight.ndim == 2
+            and weight.is_contiguous()
+        ):
+            return
+        # Keep the logical [out, in] parameter and loader attributes, replacing
+        # its storage once before KV allocation. F.linear then uses an NN GEMM
+        # without a per-forward transpose or a second persistent weight copy.
+        weight.data = weight.data.t().contiguous().t()
+        logger.info(
+            "DSV4.1 BF16 main_proj prepacked: shape=%s stride=%s bytes=%d",
+            tuple(weight.shape), tuple(weight.stride()),
+            weight.numel() * weight.element_size(),
         )
 
     def _assert_confidence_head_loaded(

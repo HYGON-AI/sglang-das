@@ -4,16 +4,18 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
 import pytest
 import torch
-from sglang.srt.layers.attention import deepseek_v4_backend as b
-from sglang.srt.layers.attention.dsv4.dsv41_sparse import rope_tail
-from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_fp4
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
+
 from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hcu import (
     index_q_rope_pack_weights_hcu,
 )
+from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_fp4
+from sglang.srt.layers.attention import deepseek_v4_backend as b
+from sglang.srt.layers.attention.dsv4.dsv41_sparse import rope_tail
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not b._is_hcu, reason="HCU required"
@@ -198,3 +200,39 @@ def test_default_enabled_in_fresh_process():
         env=env,
         check=True,
     )
+
+
+@pytest.mark.parametrize("tokens", [40, 48, 96])
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("prequantized_input", [False, True])
+def test_opt_in_native_route_keeps_indexer_abi(tokens, heads, prequantized_input):
+    from sglang.srt.layers.attention.dsv4.dsv41_sparse import _rope_fq4
+    from sglang.srt.layers.fused_rms_quant import Int8PerTokenInput
+
+    if not torch.cuda.get_device_properties(0).gcnArchName.startswith(
+        ("gfx936", "gfx938")
+    ):
+        pytest.skip("native query fusion requires gfx936 or gfx938")
+    data = list(fixture(tokens, heads))
+    backend, layer, _, q_lora, _ = data
+    q, _ = layer.indexer.wq_b(q_lora)
+    layer.indexer.queries = Mock(
+        side_effect=lambda _, frequencies: _rope_fq4(
+            q.view(tokens, heads, 128), frequencies, 64
+        )
+    )
+    if prequantized_input:
+        data[3] = Int8PerTokenInput(
+            x=q_lora,
+            q=torch.zeros_like(q_lora, dtype=torch.int8),
+            scale=torch.ones((tokens, 1), device=q_lora.device),
+        )
+    expected, calls = invoke(data, False, native=True)
+    assert calls == 0
+    layer.indexer.queries.reset_mock()
+    backend.fuse_small_ops = True
+    actual, calls = invoke(data, False, native=True)
+    assert calls == 1 and layer.indexer.queries.call_count == 0
+    for value, reference in zip(actual, expected):
+        assert value.dtype == reference.dtype
+        assert torch.equal(value, reference)

@@ -782,6 +782,139 @@ def _simulate_balanced_routing(
     )
 
 
+@triton.jit
+def _fused_hip_static_remap_and_pad_kernel(
+    ids_ptr,
+    weights_ptr,
+    map_ptr,
+    num_token_non_padded_ptr,
+    num_tokens,
+    stride_im,
+    stride_ik,
+    stride_wm,
+    stride_wk,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    HAS_MAP: tl.constexpr,
+    HAS_PAD_MASK: tl.constexpr,
+    ZERO_WEIGHTS: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    cols = tl.arange(0, BLOCK_K)[None, :]
+    in_bounds = (rows < num_tokens) & (cols < K)
+
+    if HAS_PAD_MASK:
+        n_valid = tl.load(num_token_non_padded_ptr).to(tl.int64)
+        is_valid = rows < n_valid
+    else:
+        is_valid = rows < num_tokens
+
+    if HAS_MAP:
+        lid = tl.load(
+            ids_ptr + rows * stride_im + cols * stride_ik,
+            mask=in_bounds,
+            other=0,
+        ).to(tl.int64)
+        safe_lid = tl.where(is_valid & (lid >= 0), lid, 0)
+        pid = tl.load(map_ptr + safe_lid, mask=in_bounds, other=0)
+        tl.store(
+            ids_ptr + rows * stride_im + cols * stride_ik,
+            pid.to(ids_ptr.dtype.element_ty),
+            mask=in_bounds,
+        )
+    elif HAS_PAD_MASK:
+        pad_mask = in_bounds & (~is_valid)
+        tl.store(
+            ids_ptr + rows * stride_im + cols * stride_ik,
+            tl.zeros((BLOCK_M, BLOCK_K), dtype=ids_ptr.dtype.element_ty),
+            mask=pad_mask,
+        )
+
+    if HAS_PAD_MASK and ZERO_WEIGHTS:
+        pad_mask = in_bounds & (~is_valid)
+        tl.store(
+            weights_ptr + rows * stride_wm + cols * stride_wk,
+            tl.zeros((BLOCK_M, BLOCK_K), dtype=weights_ptr.dtype.element_ty),
+            mask=pad_mask,
+        )
+
+
+def _fused_hip_static_remap_and_pad(
+    topk_ids: torch.Tensor,
+    topk_weights: Optional[torch.Tensor],
+    physical_map: Optional[torch.Tensor],
+    num_token_non_padded: Optional[torch.Tensor],
+    *,
+    zero_weights: bool,
+) -> bool:
+    # Single-kernel static EPLB remap, padded-ID fill(0), and weight zeroing.
+    if (
+        not topk_ids.is_cuda
+        or topk_ids.ndim != 2
+        or topk_ids.dtype not in (torch.int32, torch.int64)
+    ):
+        return False
+    num_tokens, k = topk_ids.shape
+    if num_tokens == 0 or k == 0:
+        return True
+    if k > 64:
+        return False
+    if physical_map is None and num_token_non_padded is None:
+        return True
+
+    if physical_map is not None and (
+        not physical_map.is_cuda
+        or physical_map.ndim != 1
+        or physical_map.numel() == 0
+        or not physical_map.is_contiguous()
+        or physical_map.dtype not in (torch.int32, torch.int64)
+    ):
+        return False
+
+    if num_token_non_padded is not None and (
+        not num_token_non_padded.is_cuda
+        or num_token_non_padded.numel() == 0
+        or num_token_non_padded.dtype not in (torch.int32, torch.int64)
+    ):
+        return False
+
+    apply_zero_weights = zero_weights and num_token_non_padded is not None
+    if apply_zero_weights and (
+        topk_weights is None
+        or not topk_weights.is_cuda
+        or topk_weights.shape != topk_ids.shape
+        or topk_weights.dtype not in (torch.float32, torch.bfloat16, torch.float16)
+    ):
+        return False
+
+    w_ptr = topk_weights if apply_zero_weights else topk_ids
+    w_s0 = topk_weights.stride(0) if apply_zero_weights else 0
+    w_s1 = topk_weights.stride(1) if apply_zero_weights else 0
+    m_ptr = physical_map if physical_map is not None else topk_ids
+    n_ptr = num_token_non_padded if num_token_non_padded is not None else topk_ids
+
+    block_m = 16
+    _fused_hip_static_remap_and_pad_kernel[(triton.cdiv(num_tokens, block_m),)](
+        topk_ids,
+        w_ptr,
+        m_ptr,
+        n_ptr,
+        num_tokens,
+        topk_ids.stride(0),
+        topk_ids.stride(1),
+        w_s0,
+        w_s1,
+        K=k,
+        BLOCK_M=block_m,
+        BLOCK_K=triton.next_power_of_2(k),
+        HAS_MAP=physical_map is not None,
+        HAS_PAD_MASK=num_token_non_padded is not None,
+        ZERO_WEIGHTS=apply_zero_weights,
+    )
+    return True
+
+
 # -------------------------------- TopK ---------------------------------------
 
 
@@ -801,6 +934,70 @@ def _load_hcu_bf16_mega_gate_op() -> Optional[Callable]:
     if not {"return_logits", "renormalize", "apply_scale"}.issubset(parameters):
         return None
     return bf16_mega_gate_hcu
+
+
+def _hcu_mega_gate_dispatch_supported(info) -> bool:
+    if info is None:
+        return not is_expert_remapping_enabled()
+    moe = get_exec().moe
+    mapping = info.partial_logical_to_rank_dispatch_physical_map
+    return (
+        not moe.enable_eplb
+        and moe.ep_num_redundant_experts == 0
+        and info.ep_dispatch_algorithm == "static"
+        and mapping is not None
+    )
+
+
+def _hcu_mega_gate_remap_ids(
+    topk_ids, info, valid_token_mask, num_token_non_padded=None
+):
+    # Mega Gate emits valid logical IDs or -1; restore -1 after remapping.
+    if info is None:
+        return topk_ids
+    if (
+        info.ep_dispatch_algorithm == "static"
+        and num_token_non_padded is not None
+        and num_token_non_padded.device == topk_ids.device
+        and num_token_non_padded.dtype in (torch.int32, torch.int64)
+        and num_token_non_padded.numel() == 1
+        and num_token_non_padded.is_contiguous()
+    ):
+        # The batch builds valid_token_mask as arange(M) < this same count.
+        # Mega Gate emits only valid logical IDs or -1. The existing compiled
+        # gather safely wraps -1 and restores the final -1 padding sentinel.
+        return _topk_ids_postprocess_torch(
+            topk_ids, info, num_token_non_padded,
+            output_int64=topk_ids.dtype == torch.int64,
+        )
+    valid = valid_token_mask[:, None]
+    safe_ids = torch.where(valid, topk_ids, 0)
+    physical_ids = topk_ids_logical_to_physical(safe_ids, info)
+    return torch.where(valid, physical_ids, -1)
+
+
+def _fake_hcu_bf16_static_mega_gate(x, weight, bias, topk, renormalize,
+                                 scale, apply_scale, mask, physical_map):
+    return _fake_hcu_bf16_mega_gate(
+        x, weight, bias, topk, renormalize, scale, apply_scale, mask)
+
+
+@register_custom_op(mutates_args=[], fake_impl=_fake_hcu_bf16_static_mega_gate)
+def hcu_bf16_static_mega_gate(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, topk: int,
+    renormalize: bool, scale: float, apply_scale: bool, mask: torch.Tensor,
+    physical_map: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    op = _load_hcu_bf16_mega_gate_op()
+    ids, weights, logits = op(
+        x, weight, num_topk=topk, use_shared_as_routed=False,
+        num_shared_experts=0, routed_scaling_factor=scale, ep_rank=0,
+        scoring_func="sqrtsoftplus", mask=mask, bias=bias,
+        to_physical_map=physical_map, return_logits=True,
+        renormalize=renormalize, apply_scale=apply_scale,
+        logits_dtype=torch.bfloat16,
+    )
+    return weights, ids, logits
 
 
 def _hcu_mega_gate_inputs_supported(
@@ -989,11 +1186,14 @@ class TopK(BaseFusedOp):
         hidden_states: torch.Tensor,
         weight: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor],
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+        num_token_non_padded: Optional[torch.Tensor] = None,
     ) -> Optional[StandardTopKOutput]:
         """Try fused GEMM + routing; None selects the existing router.
 
         The batch prepares its mask once before the layer loop. LightOp emits
-        final INT64 IDs (-1 for padding) and zero padded weights in the kernel.
+        INT64 logical IDs (-1 for padding) and zero padded weights in the kernel.
+        Static layouts are remapped before recording or dispatching these IDs.
         V4.1's fused_gate_packed_ids preference only applies to CUDA/FlashInfer;
         this HCU/DeepEP path returns standard IDs regardless of that preference.
         """
@@ -1004,7 +1204,7 @@ class TopK(BaseFusedOp):
             and valid_token_mask is not None
         ):
             return None
-        if not self._hcu_mega_gate_routing_supported():
+        if not self._hcu_mega_gate_routing_supported(expert_location_dispatch_info):
             return None
         config = self.topk_config
         x, bias = hidden_states, config.correction_bias
@@ -1012,9 +1212,43 @@ class TopK(BaseFusedOp):
             x, weight, bias, valid_token_mask, config.top_k
         ):
             return None
+        if expert_location_dispatch_info is not None:
+            mapping = expert_location_dispatch_info.partial_logical_to_rank_dispatch_physical_map
+            if not (
+                mapping.shape == (weight.shape[0],)
+                and mapping.device == x.device
+                and mapping.dtype in (torch.int32, torch.int64)
+                and mapping.is_contiguous()
+                and expert_location_dispatch_info.num_physical_experts == weight.shape[0]
+            ):
+                return None
+        # The formal LightOp API rounds before scoring, matching the
+        # original BF16-output gate GEMM, and can emit static physical IDs.
+        op = _load_hcu_bf16_mega_gate_op()
+        if op is not None and "logits_dtype" in inspect.signature(op).parameters:
+            if tuple(weight.shape) == (384, 5120) and config.top_k == 6:
+                props = torch.cuda.get_device_properties(x.device)
+                supported = (props.gcnArchName.split(":")[0] == "gfx936"
+                             and props.multi_processor_count == 80)
+                if supported and expert_location_dispatch_info is not None:
+                    key = (mapping.data_ptr(), mapping._version, str(mapping.device))
+                    cached = getattr(self, "_hcu_static_physical_map", None)
+                    if cached is None or cached[0] != key:
+                        if torch.cuda.is_current_stream_capturing():
+                            raise RuntimeError("Warm static Mega Gate mapping before capture")
+                        if sorted(mapping.cpu().tolist()) != list(range(weight.shape[0])):
+                            return None
+                        cached = (key, mapping, mapping.to(dtype=torch.int64))
+                        self._hcu_static_physical_map = cached
+                    return StandardTopKOutput(*hcu_bf16_static_mega_gate(
+                        x, weight, bias, config.top_k, config.renormalize,
+                        config.routed_scaling_factor,
+                        config.apply_routed_scaling_factor_on_output,
+                        valid_token_mask, cached[2],
+                    ))
         if _load_hcu_bf16_mega_gate_op() is None:
             return None
-        return StandardTopKOutput(
+        output = StandardTopKOutput(
             *hcu_bf16_mega_gate(
                 x,
                 weight,
@@ -1027,7 +1261,14 @@ class TopK(BaseFusedOp):
             )
         )
 
-    def _hcu_mega_gate_routing_supported(self) -> bool:
+        return output._replace(
+            topk_ids=_hcu_mega_gate_remap_ids(
+                output.topk_ids, expert_location_dispatch_info, valid_token_mask,
+                num_token_non_padded,
+            )
+        )
+
+    def _hcu_mega_gate_routing_supported(self, expert_location_dispatch_info=None) -> bool:
         """Keep mutable routing settings and runtime overrides live."""
         config = self.topk_config
         if (
@@ -1042,7 +1283,7 @@ class TopK(BaseFusedOp):
             or config.routed_scaling_factor is None
             or not math.isfinite(config.routed_scaling_factor)
             or get_exec().deterministic.enable_deterministic_inference
-            or is_expert_remapping_enabled()
+            or not _hcu_mega_gate_dispatch_supported(expert_location_dispatch_info)
             or _use_aiter
             or _skip_hip_pad_mask
             or not get_moe_a2a_backend().is_deepep()
@@ -1061,7 +1302,7 @@ class TopK(BaseFusedOp):
 
     def record_mega_gate_output(self, output: StandardTopKOutput) -> None:
         # Keep these hooks at the original TopK site, after shared experts have
-        # been scheduled. No padding, remapping or dtype-conversion kernels.
+        # been scheduled. IDs are already physical and padding is finalized.
         capture_routed_experts_if_allowed(
             self.topk_config, self.layer_id, output.topk_ids
         )
@@ -3011,6 +3252,7 @@ def _post_process_topk_ids(
         and (get_moe_runner_backend().is_deep_gemm() or _use_deepgemm_moe)
     )
     hip_deepep_postprocessed = False
+    hip_fused_remap_and_pad = False
     _fold_pad_weights_into_append = False
     log2phy_prob = None
     lplb_solver = None
@@ -3024,11 +3266,14 @@ def _post_process_topk_ids(
 
         lplb_solver = get_global_lplb_solver(layer_id)
         if lplb_solver is not None:
-            log2phy_prob = (
-                lplb_solver.solve(topk_ids, num_token_non_padded)
-                if dispatch_algorithm == "load_aware"
-                else lplb_solver.solve(topk_ids)
-            )
+            if dispatch_algorithm == "load_aware" or (
+                skip_deepep_padded_tokens and not use_per_rank_shared_slots
+            ):
+                log2phy_prob = lplb_solver.solve(
+                    topk_ids, num_token_non_padded=num_token_non_padded
+                )
+            else:
+                log2phy_prob = lplb_solver.solve(topk_ids)
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
@@ -3127,7 +3372,46 @@ def _post_process_topk_ids(
             _fold_pad_weights_into_append = (
                 _fold_pad_into_append and not use_per_rank_shared_slots
             )
-        if not skip_deepep_padded_tokens and not _fold_pad_into_append and not padded_rows_masked:
+        use_mega_eplb_load_record = (
+            envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
+            and envs.SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD.get()
+            and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
+            and layer_id is not None
+            and get_moe_a2a_backend().is_megamoe()
+        )
+        can_fuse_remap = remap_info is None or (
+            remap_info.ep_dispatch_algorithm == "static"
+            and remap_info.partial_logical_to_rank_dispatch_physical_map is not None
+        )
+        if (
+            not skip_deepep_padded_tokens
+            and not _aiter_append
+            and not _fold_pad_into_append
+            and not padded_rows_masked
+            and num_fused_shared_experts == 0
+            and not use_mega_eplb_load_record
+            and can_fuse_remap
+        ):
+            phys_map = (
+                remap_info.partial_logical_to_rank_dispatch_physical_map
+                if remap_info is not None
+                else None
+            )
+            hip_fused_remap_and_pad = _fused_hip_static_remap_and_pad(
+                topk_ids,
+                topk_weights,
+                phys_map,
+                num_token_non_padded,
+                zero_weights=(
+                    not _skip_hip_pad_mask and not _fold_pad_weights_into_append
+                ),
+            )
+        if (
+            not skip_deepep_padded_tokens
+            and not hip_fused_remap_and_pad
+            and not _fold_pad_into_append
+            and not padded_rows_masked
+        ):
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         if (
             envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
@@ -3158,6 +3442,7 @@ def _post_process_topk_ids(
         if (
             remap_info is not None
             and not hip_deepep_postprocessed
+            and not hip_fused_remap_and_pad
             and not recorder_was_fused
         ):
             topk_ids = _lp_or_static_remap(topk_ids, remap_info, lplb_solver, log2phy_prob)
@@ -3267,6 +3552,7 @@ def _post_process_topk_ids(
     elif (
         _is_hip
         and not skip_deepep_padded_tokens
+        and not hip_fused_remap_and_pad
         and not _skip_hip_pad_mask
         and not _fold_pad_weights_into_append
         and not padded_rows_masked

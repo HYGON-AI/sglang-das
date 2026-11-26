@@ -1,6 +1,7 @@
 import functools
 import importlib.util
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -27,6 +28,9 @@ _AUTO_AITER_DISABLED = False
 _AUTO_SGL_DISABLED = False
 _HIP_BF16_OUT_DTYPE_SUPPORTED: Optional[bool] = None
 _HPC_GEMM_WEIGHT_CACHE_ATTR = "_sglang_bf16xfp32_weight_cache"
+_HCU_NN_WEIGHT_CACHE_ATTR = "_sglang_hcu_nn_weight_cache"
+_HCU_ROCBLAS_NN_MIN_OUT_FEATURES = 128
+_HCU_ROCBLAS_NN_ENABLED = _is_hcu and get_bool_env_var("SGLANG_HCU_ROCBLAS_NN", "true")
 # The HPC-Ops bf16xfp32 GEMM consumes the fp32 weight decomposed into two
 # bf16 halves: w_high = w.bf16 and w_low = ((w - w_high) / scale).bf16 with
 # scale = 1/256, so that w ~= w_high + scale * w_low.
@@ -131,13 +135,78 @@ def _hip_bf16_out_dtype_error(exc: BaseException) -> bool:
     return "out_dtype" in message or "not implemented" in message
 
 
+def prepare_hcu_nn_weight(y: torch.Tensor) -> Optional[torch.Tensor]:
+    """Return a cached contiguous (K, M) BF16 transpose of (M, K) weight `y`
+    so `torch.mm(x, y_t)` dispatches rocBLAS `NN` (`Cijk_Ailk_Bljk_BBH`) instead of `TN`.
+    """
+    if not _HCU_ROCBLAS_NN_ENABLED:
+        return None
+    if (
+        not isinstance(y, torch.Tensor)
+        or not y.is_cuda
+        or y.device.type == "meta"
+        or y.dtype != torch.bfloat16
+        or y.dim() != 2
+        or not y.is_contiguous()
+        or y.shape[0] < _HCU_ROCBLAS_NN_MIN_OUT_FEATURES
+    ):
+        return None
+
+    cache_key = (
+        y.data_ptr(),
+        tuple(y.shape),
+        tuple(y.stride()),
+        y.device.index,
+        y.dtype,
+    )
+    cache = getattr(y, _HCU_NN_WEIGHT_CACHE_ATTR, None)
+    if cache is not None and cache[0] == cache_key:
+        return cache[1]
+
+    # Never allocate into a CUDA/HIP graph private pool during stream capture.
+    if torch.cuda.is_current_stream_capturing():
+        return None
+
+    with torch.no_grad():
+        y_t = y.t().contiguous()
+    setattr(y, _HCU_NN_WEIGHT_CACHE_ATTR, (cache_key, y_t))
+    return y_t
+
+
+def prepare_hcu_nn_weights_for_model(model: torch.nn.Module) -> int:
+    """Eagerly pre-transpose eligible BF16 Linear / MoEGate weights on an engine
+    after weight loading or IPC mapping (skips embeddings and weight_cache daemon).
+    """
+    if not _HCU_ROCBLAS_NN_ENABLED or os.environ.get("WEIGHT_CACHE") == "daemon":
+        return 0
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+    count = 0
+    for module in model.modules():
+        cls_name = module.__class__.__name__
+        if cls_name == "MoEGate":
+            w = getattr(module, "weight", None)
+            if prepare_hcu_nn_weight(w) is not None:
+                count += 1
+        elif (
+            isinstance(getattr(module, "quant_method", None), UnquantizedLinearMethod)
+            and getattr(module, "bias", None) is None
+        ):
+            w = getattr(module, "weight", None)
+            if prepare_hcu_nn_weight(w) is not None:
+                count += 1
+    return count
+
+
 def _linear_bf16_fp32_cublas(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     global _HIP_BF16_OUT_DTYPE_SUPPORTED
 
     if x.is_cuda and x.dtype == torch.bfloat16 and y.dtype == torch.bfloat16:
         if _is_hcu:
             # Preserve the V4.1 HCU BF16 GEMM rounding before exposing FP32 output.
-            return torch.mm(x, y.t(), out_dtype=x.dtype).float()
+            y_t = prepare_hcu_nn_weight(y)
+            rhs = y_t if y_t is not None else y.t()
+            return torch.mm(x, rhs, out_dtype=x.dtype).float()
         if not _is_hip:
             return torch.mm(x, y.t(), out_dtype=torch.float32)
         if _HIP_BF16_OUT_DTYPE_SUPPORTED is not False:

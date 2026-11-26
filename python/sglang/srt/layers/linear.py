@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+from functools import partial
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple
 
 import msgspec
@@ -98,8 +99,15 @@ _lightop_fuse_silu_mul_clamp_quant = None
 if _use_fused_silu_mul_quant or _is_hcu:
     try:
         from lightop import fuse_silu_mul_clamp_quant
+        from lightop.fuse_silu_mul_quant import (
+            is_silu_clamp_product_rounding_available,
+        )
 
-        _lightop_fuse_silu_mul_clamp_quant = fuse_silu_mul_clamp_quant
+        # Match silu_and_mul_clamp: round the final product, not SiLU alone.
+        if is_silu_clamp_product_rounding_available():
+            _lightop_fuse_silu_mul_clamp_quant = partial(
+                fuse_silu_mul_clamp_quant, round_silu=False
+            )
     except ImportError:
         pass
 

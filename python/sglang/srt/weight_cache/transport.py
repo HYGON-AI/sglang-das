@@ -74,6 +74,7 @@ class WeightCacheTransportBackend(ABC):
         entries: Dict[str, Dict[str, Any]],
         pid: int,
         preloaded_weights_bytes: int = 0,
+        extra_state: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Send a successful fetch_state response."""
 
@@ -114,6 +115,7 @@ class TorchIpcTransportBackend(WeightCacheTransportBackend):
         entries: Dict[str, Dict[str, Any]],
         pid: int,
         preloaded_weights_bytes: int = 0,
+        extra_state: Optional[Dict[str, Any]] = None,
     ) -> None:
         send_msg(
             conn,
@@ -124,8 +126,15 @@ class TorchIpcTransportBackend(WeightCacheTransportBackend):
                 "pid": pid,
                 "transport_backend": self.name,
                 "preloaded_weights_bytes": preloaded_weights_bytes,
+                "extra_state": extra_state,
             },
         )
+
+    def export_extra_tensor(self, tensor: torch.Tensor) -> Any:
+        return MultiprocessingSerializer.serialize(tensor.data, output_str=True)
+
+    def import_extra_tensor(self, handle: Any) -> torch.Tensor:
+        return MultiprocessingSerializer.deserialize(handle)
 
     def recv_fetch_state_response(
         self, sock: socket.socket, result: Dict[str, Any]
@@ -175,6 +184,7 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
         entries: Dict[str, Dict[str, Any]],
         pid: int,
         preloaded_weights_bytes: int = 0,
+        extra_state: Optional[Dict[str, Any]] = None,
     ) -> None:
         self._raise_not_implemented()
 

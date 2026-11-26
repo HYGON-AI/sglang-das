@@ -280,7 +280,14 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.sglang_kvalloc_kernel:
             alloc_extend_kernel_impl = (
                 _get_lightop_alloc_extend_kernel()
+                # The per-request block avoids serial token writes for long
+                # extends. Keep short-request batches on the native path: a
+                # faster allocator did not improve their end-to-end prefill.
+                # Large batches also retain native because LightOp computes
+                # request offsets serially per block.
                 if self.lightop_kvalloc_kernel
+                and 0 < bs <= 64
+                and extend_num_tokens >= bs * 8192
                 else None
             )
             if alloc_extend_kernel_impl is None:

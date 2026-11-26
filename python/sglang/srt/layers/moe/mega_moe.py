@@ -30,15 +30,18 @@ from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+from sglang.srt.layers.dp_attention import get_attention_dp_size, get_dp_global_num_tokens
 from sglang.srt.layers.moe.mega_moe_sm90 import (
     is_sm90_fp8_mega_moe_available,
     run_sm90_mega_routed,
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.models.deepseek_common.utils import _device_sm
-from sglang.srt.runtime_context import get_disagg, get_exec
+from sglang.srt.runtime_context import get_disagg, get_exec, get_forward
 from sglang.srt.utils import is_hcu, is_hip, is_sm100_supported
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 
@@ -230,6 +233,31 @@ def _get_hcu_w8a8_pre_dispatch_quant():
     return _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT
 
 
+def _try_stage_standalone_megamoe_inputs(hidden_states, topk_ids, topk_weights, buf):
+    # Eager validation and dispatch cost more than the saved copies on small inputs.
+    # Use workload size so this policy is independent of the device and quant dtype.
+    if (
+        not envs.SGLANG_OPT_DSV41_SMALL_OP_FUSION.get()
+        or hidden_states.ndim != 2
+        or hidden_states.shape[0] < 1024
+        or hidden_states.numel() < 4 * 1024 * 1024
+    ):
+        return False
+    from sglang.kernels.ops.moe.per_token_quant_stage import (
+        try_quantize_and_stage_moe_inputs,
+    )
+
+    return try_quantize_and_stage_moe_inputs(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        buf.x,
+        buf.x_sf,
+        buf.topk_idx,
+        buf.topk_weights,
+    )
+
+
 def _prepare_standalone_megamoe_inputs(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -238,6 +266,10 @@ def _prepare_standalone_megamoe_inputs(
     num_tokens: int,
 ) -> None:
     quant = _get_hcu_w8a8_pre_dispatch_quant()
+    if quant is not None and _try_stage_standalone_megamoe_inputs(
+        hidden_states, topk_ids, topk_weights, buf
+    ):
+        return
     if quant is not None:
         quant_input = (
             hidden_states
@@ -622,6 +654,83 @@ def forward_mega_moe(
     return y
 
 
+_PREFIX_GRAPH_EXPERTS = _is_hcu and envs.SGLANG_HCU_BOUNDED_PREFIX_BCG.get() > 0
+
+
+def _mega_topk(moe, hidden_states, forward_batch, input_ids_global):
+    router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
+    topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
+    num_token_non_padded = (
+        forward_batch.moe_num_token_non_padded()
+        if forward_batch is not None
+        else None
+    )
+    # DSpark stage indices overlap the target layers, but its weight loader
+    # keeps logical expert order. Only route through a map the weights used.
+    dispatch_info = (
+        None
+        if getattr(moe.experts, "_skip_expert_location", False)
+        else ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
+    )
+    use_vision_topk = (
+        not moe.is_hash
+        and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None
+    )
+    if use_vision_topk and _is_hcu and forward_batch is not None:
+        # Local batch metadata describes every routed row only without attention DP.
+        # During capture keep the token-dependent choice available for graph replay.
+        if (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            and get_attention_dp_size() == 1
+            and not get_is_capture_mode()
+            and forward_batch.input_embeds is None
+            and forward_batch.mm_input_embeds is None
+            and not forward_batch.contains_mm_inputs()
+        ):
+            use_vision_topk = False
+    if use_vision_topk:
+        topk_output = vision_topk(
+            moe,
+            router_logits,
+            input_ids_global,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=dispatch_info,
+        )
+    else:
+        topk_output = moe.topk(
+            hidden_states,
+            router_logits,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=dispatch_info,
+            **topk_kwargs,
+        )
+    return topk_output.topk_ids, topk_output.topk_weights
+
+
+def _prefix_topk_stub(runner, moe, x):
+    return tuple(
+        x.new_empty((x.shape[0], *dims), dtype=dtype)
+        for dims, dtype in moe._prefix_topk_spec
+    )
+
+
+@eager_on_graph(capture_stub=_prefix_topk_stub)
+def _prefix_topk(runner, moe, x):
+    live_rows = getattr(runner, "live_rows", None)
+    if live_rows is not None and live_rows < x.shape[0]:
+        ids_live, w_live = _mega_topk(
+            moe, x[:live_rows], runner.forward_batch, runner.global_ids
+        )
+        # Fill padded rows with valid distinct expert IDs (from row 0) and zero
+        # weights so MegaMoE never sees duplicate expert-0 IDs on a single token.
+        ids = ids_live[:1].expand(x.shape[0], *ids_live.shape[1:]).contiguous()
+        w = w_live.new_zeros((x.shape[0], *w_live.shape[1:]))
+        ids[:live_rows].copy_(ids_live)
+        w[:live_rows].copy_(w_live)
+        return ids, w
+    return _mega_topk(moe, x, runner.forward_batch, runner.global_ids)
+
+
 def _run_mega_routed(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
@@ -632,38 +741,23 @@ def _run_mega_routed(
     hidden_size = moe.config.hidden_size
 
     if num_tokens > 0:
-        router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
-        topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
-        num_token_non_padded = (
-            forward_batch.moe_num_token_non_padded()
-            if forward_batch is not None
-            else None
-        )
-        dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
-        if (
-            not moe.is_hash
-            and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None
-        ):
-            topk_output = vision_topk(
-                moe,
-                router_logits,
-                input_ids_global,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=dispatch_info,
-            )
+        prefix = get_forward().dsv41_tail_graph_runner if _PREFIX_GRAPH_EXPERTS else None
+        if prefix is not None and getattr(prefix, "capture_experts", False):
+            topk_ids, topk_weights = _prefix_topk(prefix, moe, hidden_states)
         else:
-            topk_output = moe.topk(
-                hidden_states,
-                router_logits,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=dispatch_info,
-                **topk_kwargs,
+            topk_ids, topk_weights = _mega_topk(
+                moe, hidden_states, forward_batch, input_ids_global
             )
-        topk_ids = topk_output.topk_ids
-        topk_weights = topk_output.topk_weights
+            if _PREFIX_GRAPH_EXPERTS and not hasattr(moe, "_prefix_topk_spec"):
+                # Capture only needs a bridge with the warmed router layout.
+                moe._prefix_topk_spec = tuple(
+                    (t.shape[1:], t.dtype) for t in (topk_ids, topk_weights)
+                )
     else:
         # An empty rank still joins the per-layer LPLB count all-reduce.
-        if get_exec().moe.ep_dispatch_algorithm == "lp":
+        if get_exec().moe.ep_dispatch_algorithm == "lp" and not getattr(
+            moe.experts, "_skip_expert_location", False
+        ):
             moe.topk.empty_topk_output(hidden_states.device, layer_id=moe.layer_id)
         topk_ids = None
         topk_weights = None
@@ -781,7 +875,12 @@ def run_mega_routed_experts(
     if _is_hcu:
         is_w4a8 = getattr(experts, "_mega_moe_hcu_w4a8_weights", False)
         if is_w4a8:
-            y = _run_standalone_hcu_w4a8_mega_moe(
+            run_w4a8 = (
+                _run_standalone_hcu_w4a8_mega_moe
+                if runtime == _HCU_MEGA_MOE_RUNTIME_MEGAMOE
+                else _run_deep_gemm_hcu_w4a8_mega_moe
+            )
+            y = run_w4a8(
                 hidden_states,
                 topk_ids,
                 topk_weights,
@@ -1034,6 +1133,37 @@ def _run_standalone_hcu_w8a8_mega_moe(
     return y[:num_tokens]
 
 
+def _run_deep_gemm_hcu_w4a8_mega_moe(
+    hidden_states, topk_ids, topk_weights, experts, buf, *, activation_clamp=None
+):
+    import deepgemm.mega
+
+    tokens, hidden = hidden_states.shape
+    if tokens:
+        deepgemm.mega.mega_moe_preprocess(
+            hidden_states.to(torch.bfloat16).contiguous(),
+            topk_ids.contiguous(),
+            topk_weights.contiguous(),
+            buf,
+            tokens,
+            mode="w4a8",
+        )
+    y = torch.empty((tokens, hidden), dtype=torch.bfloat16, device=hidden_states.device)
+    # Empty ranks still join the fused kernel's peer-memory barriers.
+    deepgemm.mega.fp8_mega_moe(
+        y,
+        experts.mega_l1_weights,
+        experts.mega_l2_weights,
+        buf,
+        mode="w4a8",
+        activation_clamp=(
+            activation_clamp if activation_clamp is not None else float("inf")
+        ),
+        fast_math=True,
+    )
+    return y
+
+
 def _run_standalone_hcu_w4a8_mega_moe(
     hidden_states, topk_ids, topk_weights, experts, buf, *, activation_clamp=None
 ):
@@ -1041,7 +1171,9 @@ def _run_standalone_hcu_w4a8_mega_moe(
     from megamoe.w4a8 import w4a8_mega_moe
 
     tokens, hidden = hidden_states.shape
-    if tokens:
+    if tokens and not _try_stage_standalone_megamoe_inputs(
+        hidden_states, topk_ids, topk_weights, buf
+    ):
         qx, scale = per_token_quant_int8(hidden_states)
         buf.x[:tokens].copy_(qx)
         buf.x_sf[:tokens].copy_(scale.reshape(-1))
@@ -1067,16 +1199,28 @@ def build_hcu_w4a8_mega_moe_experts_weights(experts) -> None:
 
     if getattr(experts, "_mega_moe_weights_built", False):
         return
-    if not _is_hcu or get_hcu_mega_moe_runtime() != "megamoe":
-        raise ValueError(
-            "W4A8 MegaMoE requires HCU and SGLANG_HCU_MEGA_MOE_RUNTIME=megamoe"
-        )
+    if not _is_hcu:
+        raise ValueError("W4A8 MegaMoE requires HCU")
+    runtime = get_hcu_mega_moe_runtime()
     if get_exec().moe.enable_eplb:
         raise ValueError(
             "W4A8 MegaMoE supports offline EPLB via --init-expert-location; online EPLB is unsupported"
         )
     if not cuda_graph_fully_disabled():
         raise ValueError("W4A8 MegaMoE prefill currently requires --disable-cuda-graph")
+    if runtime == _HCU_MEGA_MOE_RUNTIME_DEEP_GEMM:
+        from deepgemm.mega import tile256_gate_up
+
+        if (
+            experts.w13_weight.shape[1:] != (4608, 2560)
+            or experts.w2_weight.shape[1:] != (5120, 1152)
+            or experts.w13_weight.shape[0] > 64
+        ):
+            raise ValueError("DeepGEMM W4A8 MegaMoE requires H=5120, I=2304, local experts <=64")
+        experts.w13_weight.data = tile256_gate_up(experts.w13_weight.data)
+        experts.w13_weight_scale.data = tile256_gate_up(
+            experts.w13_weight_scale.data
+        )
     # The loader has already placed logical experts into the static physical
     # slots. Repack each slot independently without changing expert order.
     for name in ("w13_weight", "w2_weight"):
@@ -1119,7 +1263,7 @@ def build_hcu_w4a8_mega_moe_experts_weights(experts) -> None:
         if torch.equal(groups, physical_groups):
             groups = None
         experts.register_buffer("mega_w4a8_combine_groups", groups, persistent=False)
-    experts._mega_moe_hcu_runtime = "megamoe"
+    experts._mega_moe_hcu_runtime = runtime
     experts._mega_moe_hcu_w4a8_weights = True
     experts._mega_moe_weights_built = True
 

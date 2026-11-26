@@ -26,6 +26,9 @@ class HostSharedMemoryManager:
     Keep the manager alive while its tensors are in use.
     """
 
+    # Host memory, not tensor state: see weight_cache.extra_state.
+    _weight_cache_skip = True
+
     def __init__(self, base_name: str, *, group=None, use_hsa_ipc: bool = False):
         if use_hsa_ipc and not is_hcu():
             raise ValueError("HSA IPC host allocations require HCU")
@@ -76,6 +79,19 @@ class HostSharedMemoryManager:
 
         self._records.append(_Record(tensor, tensor.data_ptr(), shm))
         return tensor
+
+    def export_ipc(self) -> dict:
+        """Process-independent description of the single HSA IPC allocation."""
+        if not self._use_hsa_ipc or len(self._records) != 1:
+            raise RuntimeError(
+                "Only a manager holding one HSA IPC allocation can be exported"
+            )
+        allocation = self._records[0].owner
+        return {
+            "handle": bytes(allocation.handle),
+            "span": allocation.span,
+            "nbytes": allocation.nbytes,
+        }
 
     def device_pointer(self, tensor: torch.Tensor) -> int:
         """GPU address of a contiguous tensor allocated by this manager.
@@ -256,6 +272,39 @@ class _NumaPolicy:
                 self.lib.set_mempolicy(self.mode.value, self.mask, self.count),
                 "restore NUMA policy",
             )
+
+
+class HcuAttachedAllocation:
+    """Import of a pinned host allocation exported by another process group.
+
+    The HSA IPC handle is process independent, so a weight-cache engine can map
+    the table its daemon already loaded instead of pinning and filling a second
+    copy. The exporting group owns the backing and must outlive this object.
+    """
+
+    # Host memory, not tensor state: see weight_cache.extra_state.
+    _weight_cache_skip = True
+
+    def __init__(self, handle: bytes, span: int, nbytes: int):
+        if os.environ.get("HSA_USERPTR_FOR_PAGED_MEM") != "0":
+            raise RuntimeError(
+                "HCU shared host allocations require HSA_USERPTR_FOR_PAGED_MEM=0 "
+                "in the launch environment before HIP/HSA initialization"
+            )
+        self.hip, self.hsa = _hcu_runtime()
+        self.nbytes, self.span = nbytes, span
+        self.handle = _HsaIpcHandle.from_buffer_copy(handle)
+        self.base = ctypes.c_void_p()
+        _check_hsa(
+            self.hsa,
+            self.hsa.hsa_amd_ipc_memory_attach(
+                ctypes.byref(self.handle), span, 0, None, ctypes.byref(self.base)
+            ),
+            "hsa_amd_ipc_memory_attach",
+        )
+        self.device_ptr = self.base.value
+        buffer = (ctypes.c_ubyte * nbytes).from_address(self.base.value)
+        self.bytes = torch.frombuffer(buffer, dtype=torch.uint8)
 
 
 class _HcuSharedAllocation:

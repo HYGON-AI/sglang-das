@@ -509,8 +509,9 @@ class Envs:
     SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS = EnvBool(False)
-    # Use the LightOp kernel for paged KV-cache extend allocation.
-    SGLANG_LIGHTOP_KVALLOC_KERNEL = EnvBool(False)
+    # Prefer LightOp for supported HCU paged KV-cache extend workloads.
+    # Set to false to restore the native allocator kernel.
+    SGLANG_LIGHTOP_KVALLOC_KERNEL = EnvBool(True)
     # NaN-fill the unified memory pool at boot (debug repro switch).
     SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
@@ -1152,6 +1153,7 @@ class Envs:
     SGLANG_USE_LIGHTOP = EnvBool(False)
     # Use fused HCU BF16 routing when the backend and inputs are supported.
     SGLANG_HCU_ENABLE_DSV41_BF16_MEGA_GATE = EnvBool(True)
+    SGLANG_HCU_DSV41_BF16_MAIN_PROJ_PREPACK = EnvBool(False)
     SGLANG_HCU_HC_MIX_STATS_OPT = EnvBool(True)
     SGLANG_HCU_MEGA_MHC_OPT = EnvBool(True)
     # Opt-in: DSV4.1 decode/verify on HCU runs the Triton fused mHC boundary instead of
@@ -1187,6 +1189,10 @@ class Envs:
     SGLANG_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS = EnvBool(True)
     # Consume Prefill candidates directly from the paged index-K cache on HCU.
     SGLANG_HCU_PREFILL_PAGED_SPARSE = EnvBool(True)
+    # Existing packed INT8 service projections and their consumer layout.
+    SGLANG_DSV41_INT8_SERVICE_OPT = EnvBool(False)
+    # DSV4.1 prefill/decode normalization, layout, staging and quantization fusions.
+    SGLANG_OPT_DSV41_SMALL_OP_FUSION = EnvBool(False)
     # Eager HCU C1/C2 keeps a compact layout; opt in to TopK-union dequantization.
     SGLANG_DSV41_PREFILL_TOPK_KV_WORKSPACE = EnvBool(True)
     # Use LightOp pointwise/geometry/output fusion; GEMMs and scorer stay unchanged.
@@ -1196,17 +1202,36 @@ class Envs:
     SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
     SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC = EnvBool(False)
     SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA = EnvBool(False)
+    # HCU W4A8 normal/auto: use low-latency MoE for CP bounded tails that fit.
+    SGLANG_HCU_DSV41_TAIL_MOE_LOW_LATENCY = EnvBool(False)
+    SGLANG_HCU_DSV41_TAIL_MOE_CUDA_GRAPH = EnvBool(False)
+    # Capture CP8 pre-tail and bounded SWA tail MegaMoE layers with live eager
+    # attention/routing while preserving --enable-decoder-swa-bounded-replay.
+    SGLANG_HCU_BOUNDED_PREFIX_BCG = EnvInt(0)
+    SGLANG_HCU_BOUNDED_PREFIX_BCG_LOG_REPLAYS = EnvBool(False)
     # With --enable-decoder-swa-bounded-replay: a chunked-prefill step in which every
     # request still has at least SWA_WINDOW prompt tokens after this chunk stops at
     # the last kv_source layer. Nothing reads the later layers' rows of such a chunk.
     SGLANG_DSV41_SKIP_MID_CHUNK_DECODER = EnvBool(True)
     # Gather the packed FP8 DSV4 KV cache into a temporary BF16 workspace before
-    # invoking the existing HCU FlashMLA sparse-decode kernel. With the unified
-    # MLA path this covers ordinary prefill as well as decode-family forwards.
-    SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA = EnvBool(False)
+    # invoking the existing HCU FlashMLA sparse-decode kernel for decode,
+    # target verify, and draft extend. Ordinary prefill keeps its original path.
+    # Left unset, it only applies on HCU with an FP8 attention KV cache.
+    SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA = EnvBool(True)
     # Use the native LightOp single/dual-cache gather+upconvert kernels instead
-    # of the Triton fallback above. This switch requires the BF16 FlashMLA path.
-    SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER = EnvBool(False)
+    # of the Triton fallback above. This switch requires the BF16 FlashMLA path;
+    # left unset, a missing LightOp package falls back to the Triton gather.
+    SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER = EnvBool(True)
+    # Deduplicate the LightOp gather across queries that select the same KV
+    # location (MTP verify / draft-extend tokens of one request share most of
+    # their SWA/C128/C4 rows): each location is upconverted once and duplicate
+    # rows point their compact index at it. Only takes effect with the LightOp
+    # gather above (i.e. FP8 KV cache); left unset, it is skipped silently otherwise.
+    SGLANG_DSV4_HCU_BF16_GATHER_DEDUP = EnvBool(True)
+    # Upper bound on query tokens for the dedup path; larger verify/draft
+    # batches keep the plain gather. Measured >=2x faster up to 8192 queries
+    # (bench_dsv4_gather_dedup.py, 4 verify tokens); untested beyond that.
+    SGLANG_DSV4_HCU_BF16_GATHER_DEDUP_MAX_QUERIES = EnvInt(8192)
     SGLANG_HACK_SKIP_FP4_FP8_GEMM = EnvBool(False)
     SGLANG_LIGHTOP_TOPK = EnvBool(False)
     SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN = EnvBool(False)
@@ -1877,6 +1902,14 @@ class Envs:
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
     SGLANG_DSV4_FUSE_MHC_REPEAT_CP_SPLIT = EnvBool(True)
     SGLANG_DSV4_CP_OUTPUT_INPLACE = EnvBool(True)
+    # >0: only reorder the CP gather in place when the longest cycle of the row
+    # permutation is at most this many rows (the LightOp kernel walks each cycle
+    # serially, ~3.6us/row); longer cycles use the out-of-place copy. 0 keeps the
+    # unconditional in-place path.
+    SGLANG_DSV4_CP_OUTPUT_INPLACE_MAX_CYCLE = EnvInt(128)
+    # Smallest row count that takes the compensated BF16x3 mHC projection
+    # instead of the TF32 one on HCU. LightOp's kernel also accepts fewer rows.
+    SGLANG_DSV4_HC_BF16X3_MIN_ROWS = EnvInt(128)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     # Store the DSV4 C4 indexer K cache as signed INT8 plus one FP32 scale
     # per token on HCU gfx936. The packed page ABI remains 132 bytes/token.
@@ -1996,6 +2029,9 @@ class Envs:
     SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE = EnvBool(False)
     SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER = EnvBool(False)
     SGLANG_OPT_USE_OLD_COMPRESSOR = EnvBool(False)
+    # Ratio-1/2 CP prefill: project each shard before gathering KV/score.
+    # Opt-in because changing the GEMM row count can change rounding.
+    SGLANG_OPT_DSV41_CP_LOCAL_COMPRESSOR_PROJECTION = EnvBool(False)
     SGLANG_OPT_USE_TRITON_SWA_PREPARE = EnvBool(True)
     SGLANG_OPT_USE_AITER_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_AITER_MHC_POST = EnvBool(True)
@@ -2277,6 +2313,24 @@ class Envs:
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
+    # DeepSeek-V4.1 ViT: lightop RMSNorm / fused SiLU-mul / Triton fp32 rotary.
+    # Set False to fall back to the native torch ops.
+    SGLANG_DSV41_VIT_FUSED_KERNELS = EnvBool(True)
+    # DeepSeek-V4.1 ViT CUDA graphs (enabled by SGLANG_VIT_ENABLE_CUDA_GRAPH):
+    # inputs are padded up to a multiple of BUCKET_PATCHES so nearby image sizes
+    # share one graph; packs above MAX_PATCHES run eagerly. Graphs are captured
+    # only at server startup from WARMUP_PACKS (entries "num_images:padded_patches",
+    # e.g. "1:1536,2:3072"); shapes outside the warmup set run eagerly. Defaults
+    # are arbitrary; small images are launch-bound, large ones GPU-bound.
+    # MAX_PATCHES and the two largest WARMUP_PACKS entries are the 8192-patch
+    # bucket, the top of the range seen from real 4K-ish images.
+    SGLANG_DSV41_VIT_CUDA_GRAPH_BUCKET_PATCHES = EnvInt(256)
+    SGLANG_DSV41_VIT_CUDA_GRAPH_MAX_PATCHES = EnvInt(8192)
+    SGLANG_DSV41_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(24)
+    SGLANG_DSV41_VIT_CUDA_GRAPH_WARMUP_PACKS = EnvStr(
+        "1:1536,1:1792,1:2048,1:2304,1:2560,1:2816,1:3072,1:3328,1:3584,1:3840,"
+        "1:4096,1:4608,1:5120,1:6144,1:7168,1:8192,2:1536,2:2304,2:3072,3:2048,3:3584"
+    )
 
     # ===================================================================
     # Symmetric memory
@@ -2338,6 +2392,12 @@ class Envs:
     SGLANG_WEIGHT_CACHE_READY_TEMPLATE = EnvStr(
         "/tmp/sglang_weight_cache_{device_uuid}.ready"
     )
+    # Debug: daemon and engine each write a fingerprint of their load-time
+    # model state (one JSON per rank) into this directory, for diffing when an
+    # engine served from the weight cache disagrees with a disk load.
+    SGLANG_WEIGHT_CACHE_DEBUG_DIR = EnvStr("")
+    # Debug: also checksum every tensor in that fingerprint (slow).
+    SGLANG_WEIGHT_CACHE_DEBUG_CHECKSUM = EnvBool(False)
 
     # HCU GLM5-Next kernel controls.
     SGLANG_USE_LIGHTOP_PREFILL_DEQUANT = EnvBool(True)

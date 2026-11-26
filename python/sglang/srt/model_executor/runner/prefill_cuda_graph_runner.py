@@ -874,7 +874,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
-                input_ids = forward_batch.input_ids
+                input_ids = getattr(forward_batch, "bcg_cp_input_ids", forward_batch.input_ids)
+                positions = getattr(forward_batch, "bcg_cp_positions", positions)
                 kwargs = _build_layer_model_forward_kwargs(
                     self.layer_model, forward_batch, pp_proxy_tensors
                 )
@@ -2374,3 +2375,212 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     **kwargs,
                 )
             return self._finalize_execute_output(output)
+
+
+
+class HcuDSV41TailGraphRunner:
+    """Lazy bounded-tail BCG: dynamic attention breaks, captured mHC and LL MoE.
+
+    Only exact CP row layouts are replayed. The first occurrence warms the
+    native kernels; capture happens on the second. At most four layouts are
+    retained, sharing a pool because forwards execute serially on one worker.
+    """
+
+    def __init__(self, model):
+        self.model = model
+        self.forward_batch = None
+        self._entries = {}
+        self._warmed = set()
+        self._pool = torch.cuda.graph_pool_handle()
+
+    def run(self, state, positions, input_ids, input_ids_global, batch,
+            tail, capture_dspark, capture_layers):
+        from sglang.srt.models import deepseek_v4_mhc as mhc
+        from sglang.srt.runtime_context import get_forward, get_parallel
+
+        cp = tail.cp_metadata
+        if cp is None or torch.cuda.is_current_stream_capturing():
+            return None
+        layers = self.model.layers[self.model.late_layer_start:self.model.end_layer]
+        # Engram has stateful hashing, and SBO dispatchers have their own graph
+        # lifecycle. Neither is part of this exact-shape CP tail implementation.
+        if any(layer.engram is not None or layer.self_attn.attn_tp_size != 1
+               for layer in layers):
+            return None
+        dispatchers = []
+        for layer in layers:
+            dispatcher = layer.mlp.experts.dispatcher
+            inners = getattr(dispatcher, "_inners", None)
+            if inners is not None:
+                if len(inners) != 1:
+                    return None
+                dispatcher = inners[0]
+            dispatchers.append(getattr(dispatcher, "_low_latency_dispatcher", None))
+        bound = max(cp.per_rank_actual_token)
+        if not dispatchers or any(
+            ll is None or not ll.quant_config.get("hcu_w4a8_int8_dispatch", False)
+            or bound > ll.num_max_dispatch_tokens_per_rank
+            for ll in dispatchers
+        ):
+            return None
+        if not isinstance(state.streams, torch.Tensor) or state.input is not None:
+            return None
+        capture_layers = tuple(capture_layers or ()) if capture_dspark else ()
+        inputs = (state.residual, state.pre, positions, input_ids, input_ids_global)
+        key = (tuple(cp.per_rank_actual_token), tuple(cp.per_rank_logical_token),
+               tuple(tail.extend_seq_lens_cpu), capture_layers,
+               tuple((tuple(x.shape), x.dtype) if x is not None else None for x in inputs))
+        if key not in self._entries:
+            if len(self._entries) >= 4:
+                return None
+            if key not in self._warmed:
+                self._warmed.add(key)
+                return None
+        self.forward_batch = batch
+        flags = get_forward()
+        try:
+            # Target and DSPARK draft share the DeepEP allocation. Re-establish
+            # target layout and clear NORMAL counters before every graph replay.
+            dispatchers[0]._get_buffer()
+            entry = self._entries.get(key)
+            if entry is None:
+                from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+                    BreakableCUDAGraph, BreakableCUDAGraphCapture,
+                )
+                from sglang.srt.model_executor.runner_utils.pool import (
+                    graph_pool_capture_scope,
+                )
+                static_inputs = tuple(x.clone() if x is not None else None for x in inputs)
+                stream = torch.cuda.current_stream()
+                torch.cuda.synchronize()
+                get_parallel().tp_group.barrier()
+                graph = BreakableCUDAGraph()
+                with (
+                    flags.scoped(dsv41_tail_graph_runner=self),
+                    graph_pool_capture_scope(),
+                    BreakableCUDAGraphCapture(
+                        graph, pool=self._pool, stream=stream,
+                        barrier_fn=get_parallel().tp_group.barrier,
+                    ),
+                ):
+                    result = self._forward(static_inputs, batch, capture_layers)
+                entry = (graph, static_inputs, result)
+                self._entries[key] = entry
+                logger.info("HCU bounded tail LL graph captured: local_rows=%d, "
+                            "segments=%d, attention_breaks=%d", positions.shape[0],
+                            len(graph._segments), len(graph._break_fns))
+            graph, static_inputs, result = entry
+            for source, target in zip(inputs, static_inputs):
+                if source is not None:
+                    target.copy_(source)
+            from sglang.srt.model_executor.runner_utils.pool import graph_pool_replay_scope
+            with flags.scoped(dsv41_tail_graph_runner=self), graph_pool_replay_scope():
+                graph.replay()
+            residual, pre, aux = result
+            return mhc.HcState(residual, pre), aux
+        finally:
+            self.forward_batch = None
+
+    def _forward(self, inputs, batch, capture_layers):
+        from sglang.srt.models import deepseek_v4_mhc as mhc
+
+        residual, pre, positions, input_ids, input_ids_global = inputs
+        state = mhc.HcState(residual, pre)
+        aux = []
+        for i in range(self.model.late_layer_start, self.model.end_layer):
+            layer = self.model.layers[i]
+            if i in capture_layers:
+                aux.append(state.residual.mean(dim=1))
+            state = layer.forward_hc_pre_from_prev(
+                positions=positions, state=state, input_ids=input_ids,
+                forward_batch=batch, input_ids_global=input_ids_global,
+                seam_open=False,
+            )
+        state = state.materialized(layer.hc_cfg)
+        return state.residual, state.pre, tuple(aux)
+
+
+class HcuBoundedPrefixRunner:
+    """Replay the fixed-row prefix; hand untrimmed mHC state to the eager tail."""
+
+    def __init__(self, model):
+        self.model = model
+        self.pool = torch.cuda.graph_pool_handle()
+        self.entries = {}
+        self.seen = set()
+        self.forward_batch = None
+        self.live_inputs = None
+        import os
+        self.capture_experts = os.environ.get("SGLANG_HCU_BOUNDED_PREFIX_BCG") == "2"
+
+    def run(self, hidden, positions, ids, global_ids, hashes, batch, tail_rows):
+        from sglang.srt.runtime_context import get_forward, get_parallel
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+            BreakableCUDAGraph, BreakableCUDAGraphCapture,
+        )
+        from sglang.srt.model_executor.runner_utils.pool import graph_pool_capture_scope, graph_pool_replay_scope
+        from sglang.srt.models import deepseek_v4_mhc as mhc
+
+        tokens = sum(batch.extend_seq_lens_cpu)
+        cp = get_parallel().attn_cp_size
+        # Exact, unpadded local rows. Bound graph memory and warm each shape
+        # eagerly before capture. All ranks use the same global admission key.
+        if (tokens < 256 or tokens > 16384 or tokens % 256
+                or cp != 8 or hidden.shape[0] != tokens // cp
+                or positions.shape[0] != hidden.shape[0]):
+            return None
+        if tokens not in self.entries:
+            if len(self.entries) >= 12:
+                return None
+            if tokens not in self.seen:
+                self.seen.add(tokens)
+                return None
+
+        self.forward_batch = batch
+        self.live_inputs = (batch, ids, global_ids, hashes)
+        flags = get_forward()
+        try:
+            with flags.scoped(dsv41_tail_graph_runner=self):
+                if tokens not in self.entries:
+                    static_hidden = hidden.clone()
+                    static_pos = positions.clone()
+                    graph = BreakableCUDAGraph()
+                    self.routing_breaks = 0
+                    torch.cuda.synchronize()
+                    group = get_parallel().tp_group
+                    group.barrier()
+                    with graph_pool_capture_scope(), BreakableCUDAGraphCapture(
+                        graph, pool=self.pool, stream=torch.cuda.current_stream(),
+                        barrier_fn=group.barrier,
+                    ):
+                        state = self._forward(static_hidden, static_pos, ids, global_ids, batch)
+                    self.entries[tokens] = (graph, static_hidden, static_pos, state.residual, state.pre)
+                    logger.info("bounded prefix capture tokens=%d layers=%d segments=%d breaks=%d routing_breaks=%d",
+                                tokens, self.model.late_layer_start, len(graph._segments), len(graph._break_fns), self.routing_breaks)
+                graph, static_hidden, static_pos, residual, pre = self.entries[tokens]
+                static_hidden.copy_(hidden)
+                static_pos.copy_(positions)
+                with graph_pool_replay_scope():
+                    graph.replay()
+                if get_parallel().attn_cp_rank == 0:
+                    logger.info("bounded prefix replay tokens=%d tail_start=%d tail_rows=%d",
+                                tokens, self.model.late_layer_start,
+                                tail_rows)
+                return mhc.HcState(residual, pre)
+        finally:
+            self.forward_batch = None
+            self.live_inputs = None
+
+    def _forward(self, hidden, positions, ids, global_ids, batch):
+        from sglang.srt.models import deepseek_v4_mhc as mhc
+        from sglang.srt.models.deepseek_v4 import _prefix_engram
+
+        state = mhc.HcState(hidden)
+        for i in range(self.model.start_layer, self.model.late_layer_start):
+            layer = self.model.layers[i]
+            if layer.engram is not None:
+                state = state.with_residual(_prefix_engram(self, layer.engram, state.residual))
+            state = layer.forward_hc_pre_from_prev(
+                positions, state, ids, batch, global_ids, seam_open=False, prefix_runner=self,
+            )
+        return state.materialized(layer.hc_cfg)

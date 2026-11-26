@@ -54,6 +54,10 @@ class CacheConfig(msgspec.Struct):
     # Comparing these turns that into a clean mismatch. See compute_env_stamp().
     device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
     torch_version: str  # torch.__version__ of the process that built the weights
+    # Options that change which tensors a rank holds without being part of the
+    # parallel topology above (static expert placement). See
+    # compute_weight_layout_stamp().
+    weight_layout_stamp: str = ""
 
     def matches(self, other: "CacheConfig") -> bool:
         """Check if two configs are compatible for weight sharing."""
@@ -157,12 +161,58 @@ def _fp8_round_trips_via_ipc(quant_config: Any) -> bool:
     return _get_quant_field(quant_config, "weight_block_size") is not None
 
 
+def _hcu_channelwise_fp8_round_trips_via_ipc(quant_config: Any) -> bool:
+    """HCU per-channel W8A8 FP8 served as compressed-tensors (DeepSeek V4.1
+    Channel-FP8 checkpoints).
+
+    The serialized FP8 weights are loaded as-is and the per-channel scales are
+    ordinary parameters, so the state_dict carries the whole numeric state.
+    What the load leaves outside it (fix-up flags, derived tensors) is carried
+    by weight_cache.extra_state. Other compressed-tensors schemes repack
+    weights (Marlin, W4A8) and stay unsupported.
+    """
+    from sglang.srt.utils import is_hcu
+
+    if not is_hcu():
+        return False
+    if _get_quant_field(quant_config, "format") != "float-quantized":
+        return False
+    groups = _get_quant_field(quant_config, "config_groups")
+    if not isinstance(groups, dict) or not groups:
+        return False
+    for group in groups.values():
+        weights = group.get("weights") if isinstance(group, dict) else None
+        if not isinstance(weights, dict) or not (
+            weights.get("num_bits") == 8
+            and weights.get("type") == "float"
+            and weights.get("strategy") == "channel"
+            and not weights.get("dynamic")
+        ):
+            return False
+    return True
+
+
 # quant_method name -> predicate(quant_config) -> bool (True == verified safe).
 # A method absent from this registry is unsupported and hard-errors.
 IPC_QUANT_ALLOWLIST = {
     "": lambda _quant_config: True,  # unquantized
     "fp8": _fp8_round_trips_via_ipc,  # only block-wise FP8 verified
+    # HCU per-channel FP8 only (DeepSeek V4.1 Channel-FP8)
+    "compressed-tensors": _hcu_channelwise_fp8_round_trips_via_ipc,
 }
+
+
+# Verified methods whose process_weights_after_loading changes a parameter's
+# layout (the HCU channel-FP8 scheme stores linear weights transposed). The
+# engine cannot reproduce that on a meta-initialized model, so it adopts the
+# daemon's tensors as they are; the flags that describe the new layout arrive
+# through weight_cache.extra_state. Never add a method here without checking
+# that every such flag lives in module (or sglang object) attributes.
+IPC_QUANT_POSTPROCESSED_LAYOUT = frozenset({"compressed-tensors"})
+
+
+def ipc_adopts_postprocessed_layout(quant_method: str) -> bool:
+    return quant_method in IPC_QUANT_POSTPROCESSED_LAYOUT
 
 
 def is_ipc_quant_supported(quant_method: str, quant_config: Any) -> bool:
@@ -194,7 +244,8 @@ def check_ipc_quant_support(
         f"meta-initialized client cannot reproduce, which would silently serve "
         f"wrong-numerics weights. Verified methods: {verified}. Note: FP8 is "
         f"only verified for block-wise configs (weight_block_size set), not "
-        f"per-tensor FP8. Disable the weight cache (--weight-cache-mode off) "
+        f"per-tensor FP8; compressed-tensors only for HCU per-channel FP8. "
+        f"Disable the weight cache (--weight-cache-mode off) "
         f"for this model."
     )
 
@@ -266,6 +317,53 @@ def compute_env_stamp() -> Dict[str, str]:
     except Exception:
         pass
     return {"device_capability": device_capability, "torch_version": torch_version}
+
+
+def compute_weight_layout_stamp() -> str:
+    """Fingerprint of the static expert placement.
+
+    ``--init-expert-location`` / ``--ep-num-redundant-experts`` decide which
+    expert weights each EP rank materializes. A client started with another
+    placement would map tensors of the right shape holding the wrong experts,
+    so the placement has to be part of the cache identity. The placement file
+    is hashed by content: it is routinely regenerated under the same name.
+    """
+    from sglang.srt.runtime_context import get_exec
+
+    moe = get_exec().moe
+    location = moe.init_expert_location
+    digest = hashlib.sha256()
+    digest.update(f"redundant={moe.ep_num_redundant_experts};".encode())
+    if isinstance(location, str) and os.path.isfile(location):
+        with open(location, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+    else:
+        digest.update(f"location={location}".encode())
+    return digest.hexdigest()[:16]
+
+
+# Environment prefixes whose values routinely select a weight layout or a
+# kernel path at load time. They are not part of the cache identity (most are
+# runtime-only), but a daemon/engine difference is worth a loud warning.
+LAYOUT_ENV_PREFIXES = ("SGLANG_", "DSPARK", "MOE_", "K3_", "ROCM_USE_", "MEGAMOE_")
+# Per-process knobs that legitimately differ between a daemon and an engine.
+LAYOUT_ENV_IGNORED = frozenset(
+    {
+        "SGLANG_TORCH_PROFILER_DIR",
+        "SGLANG_BLOCK_NONZERO_RANK_CHILDREN",
+        "SGLANG_RUN_ID",
+        "SGLANG_WEIGHT_CACHE_DEBUG_DIR",
+    }
+)
+
+
+def collect_layout_env() -> Dict[str, str]:
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if k.startswith(LAYOUT_ENV_PREFIXES) and k not in LAYOUT_ENV_IGNORED
+    }
 
 
 def compute_global_rank(tp_size: int, pp_rank: int, tp_rank: int) -> int:
