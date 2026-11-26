@@ -205,6 +205,9 @@ class RequestWindow:
             self._ensure_workspace(workspace_rows)
         self.layout = None
         self.prepared = None
+        self._history_src_cache = None
+        self._history_src_last_layer = None
+        self._history_src_capturing = None
         self._prevalidated_history_layers = set()
         self._pending_prevalidated_history = None
 
@@ -233,6 +236,9 @@ class RequestWindow:
         # synchronizes queued work. index_fill_ passes the scalar to the kernel.
         self.tags.index_fill_(1, loc.flatten(), -1)
         self.prepared = None
+        self._history_src_cache = None
+        self._history_src_last_layer = None
+        self._history_src_capturing = None
         self._prevalidated_history_layers = set()
         self._pending_prevalidated_history = None
 
@@ -275,6 +281,9 @@ class RequestWindow:
         pending = getattr(self, "_pending_prevalidated_history", None)
         self.layout = layout
         self.prepared = None
+        self._history_src_cache = None
+        self._history_src_last_layer = None
+        self._history_src_capturing = None
         self._prevalidated_history_layers = (
             pending[1] if pending is not None and pending[0] is layout else set()
         )
@@ -296,6 +305,9 @@ class RequestWindow:
             buf.zero_()
         self.tags[:, loc] = layout.history_pos
         self.prepared = None
+        self._history_src_cache = None
+        self._history_src_last_layer = None
+        self._history_src_capturing = None
         self._prevalidated_history_layers = set()
         self._pending_prevalidated_history = None
 
@@ -350,7 +362,8 @@ class RequestWindow:
     def buffer(self, layer):
         # The runner's capture scope includes eager warmups before CUDA capture
         # starts, so the phase is part of the key: leaving the scope revalidates.
-        in_capture = get_is_capture_mode() or _capturing()
+        capturing = _capturing()
+        in_capture = get_is_capture_mode() or capturing
         if in_capture:
             self._prevalidated_history_layers = set()
             self._pending_prevalidated_history = None
@@ -359,7 +372,22 @@ class RequestWindow:
             layout = self.layout
             if layout is None:
                 raise RuntimeError("request-window metadata was not activated")
-            src = self._history_src(layout)
+            # History source indices depend only on step-invariant layout
+            # metadata, so layer 0 computes them once per step (or graph
+            # capture) and layers 1..L-1 reuse that tensor.
+            src = getattr(self, "_history_src_cache", None)
+            last_layer = getattr(self, "_history_src_last_layer", None)
+            cache_capturing = getattr(self, "_history_src_capturing", None)
+            if (
+                src is None
+                or last_layer is None
+                or layer <= last_layer
+                or cache_capturing != capturing
+            ):
+                src = self._history_src(layout)
+                self._history_src_cache = src
+                self._history_src_capturing = capturing
+            self._history_src_last_layer = layer
             if not in_capture:
                 checked = getattr(self, "_prevalidated_history_layers", ())
                 if layer in checked:

@@ -782,6 +782,139 @@ def _simulate_balanced_routing(
     )
 
 
+@triton.jit
+def _fused_hip_static_remap_and_pad_kernel(
+    ids_ptr,
+    weights_ptr,
+    map_ptr,
+    num_token_non_padded_ptr,
+    num_tokens,
+    stride_im,
+    stride_ik,
+    stride_wm,
+    stride_wk,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    HAS_MAP: tl.constexpr,
+    HAS_PAD_MASK: tl.constexpr,
+    ZERO_WEIGHTS: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    cols = tl.arange(0, BLOCK_K)[None, :]
+    in_bounds = (rows < num_tokens) & (cols < K)
+
+    if HAS_PAD_MASK:
+        n_valid = tl.load(num_token_non_padded_ptr).to(tl.int64)
+        is_valid = rows < n_valid
+    else:
+        is_valid = rows < num_tokens
+
+    if HAS_MAP:
+        lid = tl.load(
+            ids_ptr + rows * stride_im + cols * stride_ik,
+            mask=in_bounds,
+            other=0,
+        ).to(tl.int64)
+        safe_lid = tl.where(is_valid & (lid >= 0), lid, 0)
+        pid = tl.load(map_ptr + safe_lid, mask=in_bounds, other=0)
+        tl.store(
+            ids_ptr + rows * stride_im + cols * stride_ik,
+            pid.to(ids_ptr.dtype.element_ty),
+            mask=in_bounds,
+        )
+    elif HAS_PAD_MASK:
+        pad_mask = in_bounds & (~is_valid)
+        tl.store(
+            ids_ptr + rows * stride_im + cols * stride_ik,
+            tl.zeros((BLOCK_M, BLOCK_K), dtype=ids_ptr.dtype.element_ty),
+            mask=pad_mask,
+        )
+
+    if HAS_PAD_MASK and ZERO_WEIGHTS:
+        pad_mask = in_bounds & (~is_valid)
+        tl.store(
+            weights_ptr + rows * stride_wm + cols * stride_wk,
+            tl.zeros((BLOCK_M, BLOCK_K), dtype=weights_ptr.dtype.element_ty),
+            mask=pad_mask,
+        )
+
+
+def _fused_hip_static_remap_and_pad(
+    topk_ids: torch.Tensor,
+    topk_weights: Optional[torch.Tensor],
+    physical_map: Optional[torch.Tensor],
+    num_token_non_padded: Optional[torch.Tensor],
+    *,
+    zero_weights: bool,
+) -> bool:
+    # Single-kernel static EPLB remap, padded-ID fill(0), and weight zeroing.
+    if (
+        not topk_ids.is_cuda
+        or topk_ids.ndim != 2
+        or topk_ids.dtype not in (torch.int32, torch.int64)
+    ):
+        return False
+    num_tokens, k = topk_ids.shape
+    if num_tokens == 0 or k == 0:
+        return True
+    if k > 64:
+        return False
+    if physical_map is None and num_token_non_padded is None:
+        return True
+
+    if physical_map is not None and (
+        not physical_map.is_cuda
+        or physical_map.ndim != 1
+        or physical_map.numel() == 0
+        or not physical_map.is_contiguous()
+        or physical_map.dtype not in (torch.int32, torch.int64)
+    ):
+        return False
+
+    if num_token_non_padded is not None and (
+        not num_token_non_padded.is_cuda
+        or num_token_non_padded.numel() == 0
+        or num_token_non_padded.dtype not in (torch.int32, torch.int64)
+    ):
+        return False
+
+    apply_zero_weights = zero_weights and num_token_non_padded is not None
+    if apply_zero_weights and (
+        topk_weights is None
+        or not topk_weights.is_cuda
+        or topk_weights.shape != topk_ids.shape
+        or topk_weights.dtype not in (torch.float32, torch.bfloat16, torch.float16)
+    ):
+        return False
+
+    w_ptr = topk_weights if apply_zero_weights else topk_ids
+    w_s0 = topk_weights.stride(0) if apply_zero_weights else 0
+    w_s1 = topk_weights.stride(1) if apply_zero_weights else 0
+    m_ptr = physical_map if physical_map is not None else topk_ids
+    n_ptr = num_token_non_padded if num_token_non_padded is not None else topk_ids
+
+    block_m = 16
+    _fused_hip_static_remap_and_pad_kernel[(triton.cdiv(num_tokens, block_m),)](
+        topk_ids,
+        w_ptr,
+        m_ptr,
+        n_ptr,
+        num_tokens,
+        topk_ids.stride(0),
+        topk_ids.stride(1),
+        w_s0,
+        w_s1,
+        K=k,
+        BLOCK_M=block_m,
+        BLOCK_K=triton.next_power_of_2(k),
+        HAS_MAP=physical_map is not None,
+        HAS_PAD_MASK=num_token_non_padded is not None,
+        ZERO_WEIGHTS=apply_zero_weights,
+    )
+    return True
+
+
 # -------------------------------- TopK ---------------------------------------
 
 
@@ -3119,6 +3252,7 @@ def _post_process_topk_ids(
         and (get_moe_runner_backend().is_deep_gemm() or _use_deepgemm_moe)
     )
     hip_deepep_postprocessed = False
+    hip_fused_remap_and_pad = False
     _fold_pad_weights_into_append = False
     log2phy_prob = None
     lplb_solver = None
@@ -3238,7 +3372,46 @@ def _post_process_topk_ids(
             _fold_pad_weights_into_append = (
                 _fold_pad_into_append and not use_per_rank_shared_slots
             )
-        if not skip_deepep_padded_tokens and not _fold_pad_into_append and not padded_rows_masked:
+        use_mega_eplb_load_record = (
+            envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
+            and envs.SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD.get()
+            and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
+            and layer_id is not None
+            and get_moe_a2a_backend().is_megamoe()
+        )
+        can_fuse_remap = remap_info is None or (
+            remap_info.ep_dispatch_algorithm == "static"
+            and remap_info.partial_logical_to_rank_dispatch_physical_map is not None
+        )
+        if (
+            not skip_deepep_padded_tokens
+            and not _aiter_append
+            and not _fold_pad_into_append
+            and not padded_rows_masked
+            and num_fused_shared_experts == 0
+            and not use_mega_eplb_load_record
+            and can_fuse_remap
+        ):
+            phys_map = (
+                remap_info.partial_logical_to_rank_dispatch_physical_map
+                if remap_info is not None
+                else None
+            )
+            hip_fused_remap_and_pad = _fused_hip_static_remap_and_pad(
+                topk_ids,
+                topk_weights,
+                phys_map,
+                num_token_non_padded,
+                zero_weights=(
+                    not _skip_hip_pad_mask and not _fold_pad_weights_into_append
+                ),
+            )
+        if (
+            not skip_deepep_padded_tokens
+            and not hip_fused_remap_and_pad
+            and not _fold_pad_into_append
+            and not padded_rows_masked
+        ):
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         if (
             envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
@@ -3269,6 +3442,7 @@ def _post_process_topk_ids(
         if (
             remap_info is not None
             and not hip_deepep_postprocessed
+            and not hip_fused_remap_and_pad
             and not recorder_was_fused
         ):
             topk_ids = _lp_or_static_remap(topk_ids, remap_info, lplb_solver, log2phy_prob)
@@ -3378,6 +3552,7 @@ def _post_process_topk_ids(
     elif (
         _is_hip
         and not skip_deepep_padded_tokens
+        and not hip_fused_remap_and_pad
         and not _skip_hip_pad_mask
         and not _fold_pad_weights_into_append
         and not padded_rows_masked
