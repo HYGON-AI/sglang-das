@@ -85,7 +85,9 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: pr-test-hcu-k8s-${{ github.event_name }}-${{ github.event.pull_request.number || github.head_ref || github.ref_name || 'default' }}-${{ inputs.pr_head_sha || inputs.ref || 'current' }}-${{ inputs.target_stage_select || 'all' }}
+  # Unrelated label events get a throwaway group: they skip every job and must
+  # not cancel or queue behind the HCU run they share a PR with.
+  group: pr-test-hcu-k8s-${{ github.event_name }}-${{ github.event.pull_request.number || github.head_ref || github.ref_name || 'default' }}-${{ inputs.pr_head_sha || inputs.ref || 'current' }}-${{ inputs.target_stage_select || 'all' }}-${{ github.event.action == 'labeled' && github.event.label.name != 'run-ci' && github.run_id || 'checks' }}
   cancel-in-progress: true
 
 # Steps in a job container default to sh, not bash.
@@ -101,7 +103,6 @@ jobs:
     timeout-minutes: 10
     outputs:
       hcu: ${{ steps.filter.outputs.hcu }}
-      auto_run_ci: ${{ steps.filter.outputs.auto_run_ci }}
       run_stage_a: ${{ steps.plan.outputs.run_stage_a }}
       run_stage_b: ${{ steps.plan.outputs.run_stage_b }}
       wheel_required: ${{ steps.wheel.outputs.wheel_required }}
@@ -140,7 +141,6 @@ jobs:
 
           if [[ "${EVENT_NAME}" != "pull_request_target" ]]; then
             echo "hcu=true" >> "${GITHUB_OUTPUT}"
-            echo "auto_run_ci=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
 
@@ -151,10 +151,8 @@ jobs:
 
           if echo "${changed_files}" | grep -Eq "${hcu_path_pattern}"; then
             echo "hcu=true" >> "${GITHUB_OUTPUT}"
-            echo "auto_run_ci=true" >> "${GITHUB_OUTPUT}"
           else
             echo "hcu=false" >> "${GITHUB_OUTPUT}"
-            echo "auto_run_ci=false" >> "${GITHUB_OUTPUT}"
           fi
 
       - name: Select HCU stages
@@ -295,7 +293,6 @@ jobs:
           echo "PR Draft: ${{ steps.pr.outputs.draft }}"
           echo "PR User: ${{ steps.pr.outputs.user }}"
           echo "Require run-ci: true"
-          echo "Auto run HCU CI: ${{ needs.check-changes.outputs.auto_run_ci }}"
           echo "============================"
 
       - name: Block draft PR
@@ -304,18 +301,14 @@ jobs:
           echo "PR is draft. Blocking HCU CI."
           exit 1
 
-      - name: Require run-ci label or HCU auto-run
+      # HCU CI is gated on `run-ci` alone since the workflow only triggers on
+      # `labeled`; changing HCU-impacted paths no longer auto-runs it.
+      - name: Require run-ci label
         env:
-          AUTO_RUN_CI: ${{ needs.check-changes.outputs.auto_run_ci || 'false' }}
           HAS_RUN_CI_LABEL: ${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}
         run: |
           if [[ "${HAS_RUN_CI_LABEL}" == "true" ]]; then
             echo "Found run-ci label. Proceeding with HCU CI."
-            exit 0
-          fi
-
-          if [[ "${AUTO_RUN_CI}" == "true" ]]; then
-            echo "Auto-run HCU CI because HCU-impact paths changed."
             exit 0
           fi
 
