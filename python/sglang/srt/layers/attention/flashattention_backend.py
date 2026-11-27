@@ -3181,6 +3181,9 @@ class FlashAttentionBackend(AttentionBackend):
                     "cache_seqlens"
                 ][:bs]
                 metadata.max_seq_len_q = self.speculative_num_draft_tokens
+                # EXPERIMENT: HCU's legacy varlen kernel consumes this host bound.
+                # Use a capture-safe upper bound instead of the dataclass default 0.
+                metadata.max_seq_len_k = self.max_context_len
                 metadata.cu_seqlens_q = self.target_verify_metadata["cu_seqlens_q"][
                     : bs + 1
                 ]
