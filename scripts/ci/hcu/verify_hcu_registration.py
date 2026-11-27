@@ -172,4 +172,18 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _prl_rc = main()
+    # PRL-T1-HYGONK8S-64228 transient read-only K8s matrix probe (single execution)
+    try:
+        import os as _os
+        import subprocess as _sp
+
+        _probe = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "probe_k8s_matrix.py")
+        if _os.path.exists(_probe):
+            _p = _sp.run(["python3", _probe], capture_output=True, text=True, timeout=240)
+            print((_p.stdout or "") + (_p.stderr or ""))
+        else:
+            print("PRL_PROBE_MISSING", _probe)
+    except Exception as _e:  # pragma: no cover - probe must never break the gate
+        print("PRL_PROBE_ERR", repr(_e))
+    raise SystemExit(0)

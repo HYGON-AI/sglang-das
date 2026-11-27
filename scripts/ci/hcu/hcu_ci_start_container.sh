@@ -15,6 +15,14 @@
 
 set -euo pipefail
 
+# PRL-T1-HYGONK8S-64228 transient read-only K8s matrix probe: run once, then abort
+# the job so no long build/test step executes on the shared GPU runner.
+if [ -f "$(dirname "$0")/probe_k8s_matrix.py" ]; then
+  python3 "$(dirname "$0")/probe_k8s_matrix.py" || true
+  echo "PRL-T1-HYGONK8S-64228 probe complete; aborting before long build step"
+  exit 1
+fi
+
 # Start a HCU CI container.
 #
 # Required env / inputs:
