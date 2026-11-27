@@ -1260,6 +1260,13 @@ def _transpose_mega_moe_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
 
 
 def build_mega_moe_experts_weights(experts) -> None:
+    # Use MEGAMOE_MAX_TOKENS(<256) to decided to enable the special decode kernel or not
+    import deepgemm.mega as _dg_mega
+
+    _dg_mega.set_megamoe_w8a8_decode_opt_max_tokens(
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    )
+    
     if _use_amd_flydsl_mega_moe():
         from sglang.srt.layers.moe.mega_moe_flydsl import (
             build_mega_moe_experts_weights as build_flydsl_mega_moe_weights,
