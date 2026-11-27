@@ -24,6 +24,10 @@ kernel. Inside the DiT, any call the kernels cannot serve -- cross/refiner
 attention, short sequences, non-bf16 -- runs dense instead. On any other GPU
 the resolver refuses the backend at startup rather than falling back.
 
+HCU gfx936/gfx938 uses the optional DCU BSA BF16/D128 forward kernel. Its
+ascending-index contract is handled at the HCU call boundary; the router and
+existing NVIDIA dispatch are unchanged.
+
 ``--attention-backend`` reaches every component, and the text encoder admits
 only fa / torch_sdpa / sage_attn_3, so pair it with
 ``--component-attention-backends text_encoder=fa``; see the README.
@@ -201,6 +205,11 @@ def _sm100_sparse_attention(
 @functools.lru_cache(maxsize=None)
 def _get_subblock_sparse_attention_runner(device: torch.device):
     """Resolve the architecture-specific kernel once per CUDA device."""
+    if torch.version.hip is not None:
+        arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+        if arch not in ("gfx936", "gfx938"):
+            raise RuntimeError(f"DCU BSA 0.2.0 does not support {arch}.")
+        return _hcu_sparse_attention
     capability = torch.cuda.get_device_capability(device)
     if capability == (9, 0):
         return _sm90_sparse_attention
@@ -210,6 +219,35 @@ def _get_subblock_sparse_attention_runner(device: torch.device):
         "SubBlock sparse attention supports compute capability 9.0 or 10.0; "
         f"this tensor is on a {capability[0]}.{capability[1]} device."
     )
+
+
+def _hcu_sparse_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    topk: int,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Run the delivered DCU kernel without changing SubBlock selection.
+
+    DCU BSA 0.2.0 requires ascending indices. Sorting preserves the selected
+    set; NVIDIA kernels retain their existing input and dispatch paths.
+    """
+    from dcu_bsa import bsa_attn_blk64_fwd
+
+    index = q2k_block_index.sort(dim=-1).values.contiguous()
+    out, _ = bsa_attn_blk64_fwd(
+        q,
+        k,
+        v,
+        index,
+        topk,
+        block_sizes=_cached_block_sizes(k.shape[1], k.device),
+        q2k_block_nums=None,
+        softmax_scale=softmax_scale,
+    )
+    return out
 
 
 def _run_subblock_sparse_attention(
