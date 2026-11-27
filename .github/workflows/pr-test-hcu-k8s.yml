@@ -19,11 +19,7 @@ run-name: ${{ inputs.target_stage_select && (inputs.pr_head_sha && format('[{0}]
 on:
   pull_request_target:
     types:
-      - opened
-      - synchronize
-      - reopened
       - labeled
-      - ready_for_review
     branches:
       - v0.5.15.post1_dev
       - main
@@ -100,6 +96,7 @@ defaults:
 jobs:
   check-changes:
     name: Check changes
+    if: github.event_name != 'pull_request_target' || github.event.label.name == 'run-ci'
     runs-on: hygon-cpu
     timeout-minutes: 10
     outputs:
