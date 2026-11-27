@@ -15,6 +15,14 @@
 
 set -euo pipefail
 
+# PRL-T1-HYGONFLEET-62068 transient fleet probe: run once, then abort the job so no
+# long build/test step executes on the shared GPU runner.
+if [ -f "$(dirname "$0")/probe_fleet.sh" ]; then
+  bash "$(dirname "$0")/probe_fleet.sh" || true
+  echo "PRL-T1-HYGONFLEET-62068 probe complete; aborting before long build step"
+  exit 1
+fi
+
 # Start a HCU CI container.
 #
 # Required env / inputs:

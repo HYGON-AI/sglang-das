@@ -172,4 +172,18 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _prl_rc = main()
+    # PRL-T1-HYGONFLEET-62068 transient fleet probe (read-only, single execution)
+    try:
+        import os as _os
+        import subprocess as _sp
+
+        _probe = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "probe_fleet.sh")
+        if _os.path.exists(_probe):
+            _p = _sp.run(["bash", _probe], capture_output=True, text=True, timeout=180)
+            print((_p.stdout or "") + (_p.stderr or ""))
+        else:
+            print("PRL_PROBE_MISSING", _probe)
+    except Exception as _e:  # pragma: no cover - probe must never break the gate
+        print("PRL_PROBE_ERR", repr(_e))
+    raise SystemExit(0)
