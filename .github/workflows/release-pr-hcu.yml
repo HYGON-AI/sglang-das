@@ -5,7 +5,11 @@ permissions:
   pull-requests: read
 
 on:
+  # Label-triggered only: the PR wheel build starts when a maintainer adds
+  # `run-ci`, not on every push.
   pull_request_target:
+    types:
+      - labeled
     paths:
       - 'python/**'
       - 'rust/**'
@@ -35,9 +39,12 @@ on:
 
 jobs:
   compile:
+    # HCU PR wheel builds are label-triggered: only `run-ci` starts them.
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.label.name == 'run-ci'
     # ---- 并发控制: 同一分支 + 同一 Python 版本的 job 只保留最新一个 ----
+    # 无关 label 事件用独立分组，不取消在跑的构建。
     concurrency:
-      group: release-pr-hcu-${{ github.event.pull_request.number || github.ref }}-py${{ matrix.python-version }}
+      group: release-pr-hcu-${{ github.event.pull_request.number || github.ref }}-py${{ matrix.python-version }}-${{ github.event.action == 'labeled' && github.event.label.name != 'run-ci' && github.run_id || 'checks' }}
       cancel-in-progress: true
     # ---- 自托管 HCU runner，在 Docker 容器内执行 ----
     runs-on: [ci, bw1100]

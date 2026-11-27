@@ -66,7 +66,7 @@ class TestHcuChangeDetection(unittest.TestCase):
             "Detect HCU-relevant changes",
             self.large_paths("python/sglang/srt/server.py"),
         )
-        self.assertEqual(outputs, {"hcu": "true", "auto_run_ci": "true"})
+        self.assertEqual(outputs, {"hcu": "true"})
 
     def test_large_pr_requires_python_wheels(self):
         outputs = self.run_filter(
@@ -90,7 +90,7 @@ class TestHcuChangeDetection(unittest.TestCase):
         paths = ["docs/guide.md", "README.md"]
         self.assertEqual(
             self.run_filter("Detect HCU-relevant changes", paths),
-            {"hcu": "false", "auto_run_ci": "false"},
+            {"hcu": "false"},
         )
         self.assertEqual(
             self.run_filter("Classify HCU wheel sync mode", paths),
@@ -100,7 +100,7 @@ class TestHcuChangeDetection(unittest.TestCase):
     def test_non_pr_run_mode(self):
         self.assertEqual(
             self.run_filter("Detect HCU-relevant changes", [], PR_NUMBER=""),
-            {"hcu": "true", "auto_run_ci": "false"},
+            {"hcu": "true"},
         )
         self.assertEqual(
             self.run_filter(

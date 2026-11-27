@@ -6,10 +6,15 @@ permissions:
 on:
   push:
     branches: [main, v0.5.12_dev]
+  # Label-triggered only on PRs: HCU lint runs when a maintainer adds `run-ci`,
+  # not on every PR event.
   pull_request_target:
+    types:
+      - labeled
 
 jobs:
   lint-hcu:
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.label.name == 'run-ci'
     runs-on: [ci, bw1100]
     timeout-minutes: 30
 
